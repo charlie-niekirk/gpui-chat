@@ -45,6 +45,9 @@ toml = "1.2"
 notify = "8.2"
 dirs = "7.0"
 
+# Test-only
+tempfile = "3"
+
 # Errors and logging
 thiserror = "2.0"
 anyhow = "1.0"
