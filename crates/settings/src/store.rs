@@ -91,9 +91,12 @@ impl Settings {
         }
     }
 
-    /// Serialise to TOML text.
+    /// Serialise to TOML text. Always stamps the current [`SCHEMA_VERSION`],
+    /// whatever version the settings were loaded from.
     pub fn to_toml(&self) -> Result<String, SettingsError> {
-        toml::to_string_pretty(self).map_err(|e| SettingsError::Serialize(e.to_string()))
+        let mut current = self.clone();
+        current.schema_version = SCHEMA_VERSION;
+        toml::to_string_pretty(&current).map_err(|e| SettingsError::Serialize(e.to_string()))
     }
 
     /// Save atomically: write a temp file in the same directory, fsync it,
@@ -304,10 +307,57 @@ mod tests {
     }
 
     #[test]
-    fn bad_enum_value_is_a_parse_error() {
-        let err =
-            Settings::parse("[appearance]\ntheme = \"purple\"\n", Path::new("x")).unwrap_err();
+    fn unknown_theme_mode_falls_back_instead_of_rejecting_the_file() {
+        let s = Settings::parse(
+            "[appearance]\ntheme = \"high-contrast\"\nfont_size = 17.0\n",
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(s.appearance.theme, ThemeMode::System);
+        assert_eq!(s.appearance.font_size, 17.0);
+        // Known values still parse as themselves.
+        for (text, mode) in [
+            ("system", ThemeMode::System),
+            ("light", ThemeMode::Light),
+            ("dark", ThemeMode::Dark),
+        ] {
+            let s = Settings::parse(
+                &format!("[appearance]\ntheme = \"{text}\"\n"),
+                Path::new("x"),
+            )
+            .unwrap();
+            assert_eq!(s.appearance.theme, mode);
+        }
+        // A non-string value is still a type error.
+        let err = Settings::parse("[appearance]\ntheme = 3\n", Path::new("x")).unwrap_err();
         assert!(matches!(err, SettingsError::Parse { .. }));
+    }
+
+    #[test]
+    fn missing_schema_version_reads_as_the_unversioned_version() {
+        let s = Settings::parse("[chat]\nscrollback = 50\n", Path::new("x")).unwrap();
+        assert_eq!(s.schema_version, crate::schema::UNVERSIONED_SCHEMA_VERSION);
+        assert_eq!(crate::schema::UNVERSIONED_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn save_stamps_the_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir);
+        let newer = Settings {
+            schema_version: SCHEMA_VERSION + 6,
+            ..Settings::default()
+        };
+        newer.save(&path).unwrap();
+        assert_eq!(
+            Settings::try_load(&path).unwrap().schema_version,
+            SCHEMA_VERSION
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(&format!("schema_version = {SCHEMA_VERSION}"))
+        );
     }
 
     #[test]

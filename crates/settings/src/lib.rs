@@ -34,7 +34,10 @@ pub use paths::{
     CACHE_DIR_ENV, CONFIG_DIR_ENV, KEYMAP_FILE_NAME, PathsError, SETTINGS_FILE_NAME, SettingsPaths,
     THEMES_DIR_NAME,
 };
-pub use schema::{AppearanceSettings, ChatSettings, SCHEMA_VERSION, Settings, ThemeMode};
+pub use schema::{
+    AppearanceSettings, ChatSettings, SCHEMA_VERSION, Settings, ThemeMode,
+    UNVERSIONED_SCHEMA_VERSION,
+};
 pub use store::LoadOutcome;
 pub use watch::{
     DEFAULT_DEBOUNCE, SettingsEvent, SettingsWatcher, WatchOptions, watch, watch_channel,

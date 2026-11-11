@@ -44,7 +44,9 @@ impl Default for WatchOptions {
 pub enum SettingsEvent {
     /// The file changed and now yields these settings (deleting the file
     /// yields the defaults). Not sent when the result equals the previously
-    /// reported settings.
+    /// reported settings, **except** right after a [`Failed`](Self::Failed):
+    /// the first successful load following a failure is always sent, even if
+    /// the settings are unchanged, so observers can clear their error display.
     Reloaded(Settings),
     /// The file changed but could not be used. The previously reported
     /// settings stay in effect and the file is left untouched. Repeats of the
@@ -115,8 +117,9 @@ pub fn watch(
     Ok(SettingsWatcher { _watcher: watcher })
 }
 
-/// [`watch`] delivering events over a std channel. The worker stops when the
-/// receiver is dropped or the returned watcher is.
+/// [`watch`] delivering events over a std channel. Dropping the returned
+/// watcher stops the worker. Dropping only the receiver does not: events are
+/// then discarded until the watcher is dropped too.
 pub fn watch_channel(
     path: impl Into<PathBuf>,
     initial: Settings,
@@ -160,8 +163,8 @@ fn run_worker(
         let outcome = Settings::reload(path, &current);
         match outcome.error {
             None => {
-                last_error = None;
-                if outcome.settings != current {
+                let recovered = last_error.take().is_some();
+                if recovered || outcome.settings != current {
                     current = outcome.settings.clone();
                     on_event(SettingsEvent::Reloaded(outcome.settings));
                 }
@@ -358,10 +361,41 @@ mod tests {
         )
         .unwrap();
         for n in [11, 12, 13, 14] {
-            fs::write(&path, format!("[chat]\nscrollback = {}0\n", n)).unwrap();
+            fs::write(&path, format!("[chat]\nscrollback = {n}0\n")).unwrap();
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(expect_reloaded(&rx).chat.scrollback, 140);
+        // On a loaded runner the writes may be split across more than one
+        // debounce window, so assert on where the stream ends up, not on how
+        // many events it took.
+        let mut last = expect_reloaded(&rx);
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(800)) {
+            match event {
+                SettingsEvent::Reloaded(s) => last = s,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(last.chat.scrollback, 140);
+    }
+
+    #[test]
+    fn restoring_identical_content_after_a_failure_still_emits_reloaded() {
+        let (_dir, path) = setup();
+        let good = "[chat]\nscrollback = 500\n";
+        fs::write(&path, good).unwrap();
+        let baseline = Settings::try_load(&path).unwrap();
+        let (_w, rx) = watch_channel(&path, baseline.clone(), opts()).unwrap();
+
+        fs::write(&path, "[chat\nbroken").unwrap();
+        assert!(matches!(
+            rx.recv_timeout(WAIT).unwrap(),
+            SettingsEvent::Failed(_)
+        ));
+
+        // Byte-identical to what the app already has: still must be reported.
+        fs::write(&path, good).unwrap();
+        assert_eq!(expect_reloaded(&rx), baseline);
+        // ...and only once; a further identical write is a no-op again.
+        fs::write(&path, good).unwrap();
         expect_no_event(&rx);
     }
 

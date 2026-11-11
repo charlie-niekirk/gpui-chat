@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 /// version 1.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// What a file with no `schema_version` key is taken to be. Deliberately a
+/// separate constant from [`SCHEMA_VERSION`]: when the schema moves to 2, an
+/// old unversioned file must still read as 1 so migrations run on it.
+pub const UNVERSIONED_SCHEMA_VERSION: u32 = 1;
+
+fn unversioned_schema_version() -> u32 {
+    UNVERSIONED_SCHEMA_VERSION
+}
+
 /// Allowed range for [`AppearanceSettings::font_size`] (points).
 pub(crate) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 /// Allowed range for [`AppearanceSettings::line_height`] (multiplier).
@@ -26,7 +35,10 @@ pub(crate) const SCROLLBACK_RANGE: (usize, usize) = (10, 100_000);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Schema version of the file. See [`SCHEMA_VERSION`].
+    /// Schema version of the file. See [`SCHEMA_VERSION`]. A file without this
+    /// key reads as [`UNVERSIONED_SCHEMA_VERSION`]. `save` always writes the
+    /// current [`SCHEMA_VERSION`].
+    #[serde(default = "unversioned_schema_version")]
     pub schema_version: u32,
     pub appearance: AppearanceSettings,
     pub chat: ChatSettings,
@@ -92,11 +104,15 @@ impl AppearanceSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
-    /// Follow the operating system appearance.
-    #[default]
-    System,
     Light,
     Dark,
+    /// Follow the operating system appearance. Also the fallback for any
+    /// value this build does not know (e.g. a mode added by a newer version),
+    /// so such a file still loads instead of being rejected. Serde requires
+    /// the `other` variant to be last.
+    #[default]
+    #[serde(other)]
+    System,
 }
 
 /// `[chat]`

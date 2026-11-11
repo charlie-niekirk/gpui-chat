@@ -44,8 +44,13 @@ timestamps = true
 - `schema_version` is bumped only for changes a default cannot express (rename,
   changed meaning). A file with a *newer* version still loads (with a
   `tracing` warning).
-- **Bad files never win.** Invalid TOML, a wrong type, an unknown enum value or
-  an out-of-range number gives a `SettingsError` (with line and column where
+- **Unknown enum values fall back.** `appearance.theme` accepts `system`,
+  `light`, `dark`; any other string reads as `system`, so a value from a newer
+  build does not reject the file.
+- A file with no `schema_version` reads as version 1; `save` always writes the
+  current version.
+- **Bad files never win.** Invalid TOML, a wrong type
+  or an out-of-range number gives a `SettingsError` (with line and column where
   the parser knows them). The caller keeps defaults at startup and the last
   good value on reload. The file is never modified by loading. All-or-nothing:
   one bad value rejects the whole file, so the error message is the single
@@ -64,7 +69,8 @@ failed to load** unless the user asked for it; see `docs/BACKLOG.md`.
 `watch` / `watch_channel` watch the config *directory* (so rename-over saves
 from editors are seen), filter to `settings.toml`, debounce (default 200 ms),
 reload, and emit `SettingsEvent::Reloaded(Settings)` only if the result differs
-from the last one reported, or `SettingsEvent::Failed(SettingsError)` (repeats of
+from the last one reported (except the first successful load after a `Failed`,
+which is always reported so the UI can clear its error), or `SettingsEvent::Failed(SettingsError)` (repeats of
 the same error are suppressed). The worker is a plain thread; it ends when the
 `SettingsWatcher` is dropped. The app's own saves also produce a `Reloaded`
 event when the content differs from the baseline; observers should treat equal
