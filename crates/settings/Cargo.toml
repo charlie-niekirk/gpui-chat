@@ -1,0 +1,11 @@
+[package]
+name = "gpui-chat-settings"
+description = "Typed settings: load, save, watch and paths."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

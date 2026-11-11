@@ -1,0 +1,19 @@
+[package]
+name = "gpui-chat"
+description = "Native Twitch chat client built on GPUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gpui-chat"
+path = "src/main.rs"
+
+[dependencies]
+gpui-chat-core = { workspace = true }
+gpui-kit = { workspace = true }
+
+[lints]
+workspace = true
