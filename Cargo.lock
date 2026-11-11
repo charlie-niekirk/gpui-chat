@@ -2036,8 +2036,12 @@ dependencies = [
 name = "gpui-chat"
 version = "0.0.0"
 dependencies = [
+ "dirs 7.0.0",
  "gpui-chat-core",
  "gpui-kit",
+ "serde",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
