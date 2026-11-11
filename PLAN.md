@@ -286,7 +286,7 @@ Left in `docs/BACKLOG.md` for the owner to pull in: whispers, polls and predicti
 ## Status
 
 - [x] Step 0
-- [ ] Phase 0: ~~0.1~~ ✅ · 0.2 · 0.3 · 0.4
+- [ ] Phase 0: ~~0.1~~ ✅ · 0.2 · ~~0.3~~ ✅ · 0.4
 - [ ] Phase 1: 1.1 · 1.2 · 1.3 · 1.4 · 1.5 · 1.6 → M1
 - [ ] Phase 2: 2.1 · 2.2 · 2.3 · 2.4 · 2.5 → M2
 - [ ] Phase 3: 3.1 · 3.2 · 3.3 · 3.4 · 3.5 → M3
