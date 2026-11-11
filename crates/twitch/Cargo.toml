@@ -1,0 +1,11 @@
+[package]
+name = "gpui-chat-twitch"
+description = "Twitch IRC transport, Helix client and auth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

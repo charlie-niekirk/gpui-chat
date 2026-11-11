@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/charlie-niekirk/gpui-chat"
+publish = false
+
+# Dependencies are declared here (pinned) and opted into per crate with
+# `dep = { workspace = true }` only when a PR actually uses them. Nothing below
+# is pulled into a crate until then. Bumping `gpui-kit` is always its own PR.
+[workspace.dependencies]
+# Internal crates
+gpui-chat-core = { path = "crates/core" }
+gpui-chat-twitch = { path = "crates/twitch" }
+gpui-chat-emotes = { path = "crates/emotes" }
+gpui-chat-media = { path = "crates/media" }
+gpui-chat-settings = { path = "crates/settings" }
+gpui-chat-streamlink = { path = "crates/streamlink" }
+
+# UI: only `crates/app` may depend on this.
+gpui-kit = "=0.9.1"
+
+# Async runtime and networking
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "http2"] }
+
+# Twitch
+twitch-irc = { version = "=6.1.3", default-features = false, features = ["transport-tcp-rustls-webpki-roots", "transport-ws-rustls-webpki-roots"] }
+twitch_api = { version = "=0.8.0", features = ["helix", "reqwest"] }
+twitch_oauth2 = { version = "=0.17.1", features = ["reqwest"] }
+
+# Media (WebP preferred, GIF/PNG fallback; no AVIF)
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+
+# Platform services, settings and paths
+keyring = "4.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.2"
+notify = "8.2"
+dirs = "7.0"
+
+# Errors and logging
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

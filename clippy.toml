@@ -1,0 +1,4 @@
+# Clippy configuration. Workspace lint levels live in the root Cargo.toml
+# ([workspace.lints]); CI runs `cargo clippy --workspace --all-targets -- -D warnings`.
+msrv = "1.88"
+cognitive-complexity-threshold = 30

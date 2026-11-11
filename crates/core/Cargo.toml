@@ -1,0 +1,11 @@
+[package]
+name = "gpui-chat-core"
+description = "Domain types, message store and tokenizer. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
