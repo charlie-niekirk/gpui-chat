@@ -42,6 +42,22 @@ only when it actually uses the dependency.
 the name or derives an identifier (window title, config dir, keychain service,
 bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 
+### App shell (`crates/app`)
+
+- `shell.rs` — root view: Kit `TitleBar`, collapsible Kit `Sidebar`, main area. Handles the
+  window actions (`ToggleSidebar`, `CloseWindow`, `MinimizeWindow`, `About`); `Quit` is global.
+- `theme.rs` — our own `Tokens` (dark/light), chosen from the system appearance (live, via
+  `observe_window_appearance`) and mirrored into Kit's `Theme` so Kit components match.
+  Theme packs (PR 4.4) extend `Tokens`.
+- `fonts.rs` / `assets.rs` — bundled JetBrains Mono TTFs (`assets/fonts/`, OFL in `OFL.txt`) are
+  embedded, registered with the text system at startup and the family is resolved against the
+  installed list (GPUI panics on unknown families, so there is no blind fallback).
+- `actions.rs` + `platform/` — action definitions; key bindings and the native menu bar are
+  per-platform and live only under `platform/`. The Kit `native_menu` is a popup context menu;
+  the application menu bar uses GPUI `cx.set_menus`.
+- `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
+  (validated against connected displays on restore). Separate from user settings.
+
 ## Data flow
 
 ```

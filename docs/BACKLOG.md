@@ -18,3 +18,7 @@ an entry here instead of expanding a PR. Format:
 - **Join the watcher worker on drop** (found in PR 0.3) — dropping `SettingsWatcher` ends the worker but does not wait for it, so an in-flight reload/callback can still run briefly afterwards.
 - **Preserve file mode on atomic save** (found in PR 0.3) — the temp file gets default permissions, so a user's chmod on `settings.toml` is lost on save.
 - **Re-check for edits between load and `watch()`** (found in PR 0.3) — a change made after the initial load but before the watch starts is not noticed until the next event; reload once right after the watch is established.
+- **Persist sidebar collapsed state and width** (found in PR 0.2) — `state.toml` only stores window placement; sidebar collapse resets on launch.
+- **Set up a `tracing` subscriber** (found in PR 0.2) — the app logs via `tracing` (e.g. resolved font family) but nothing installs a subscriber yet, so output is dropped.
+- **Per-glyph font fallback cascade** (found in PR 0.2) — the font chain picks one installed family; add `FontFallbacks` (e.g. Nerd Font → JetBrains Mono → emoji/CJK) once chat text is shaped by the custom element.
+- **Custom About window** (found in PR 0.2) — About is a Kit dialog showing name/version/ID; a proper panel with licences (incl. OFL notice for JetBrains Mono) can come later.
