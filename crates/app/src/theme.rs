@@ -86,7 +86,10 @@ fn apply(cx: &mut App) {
         colors.foreground = tokens.text;
         colors.muted_foreground = tokens.text_muted;
         colors.border = tokens.border;
-        colors.accent = tokens.accent;
+        // Brand colour goes on `primary`; Kit's `accent` is the neutral hover background of
+        // menu/list items and ghost buttons, so it is left alone.
+        colors.primary = tokens.accent;
+        colors.primary_foreground = hex(0xffffff);
         colors.title_bar = tokens.title_bar_bg;
         colors.title_bar_border = tokens.border;
         colors.sidebar = tokens.sidebar_bg;

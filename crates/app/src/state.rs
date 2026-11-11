@@ -21,9 +21,12 @@ pub enum Mode {
     Fullscreen,
 }
 
-/// Window rectangle in logical pixels (global screen coordinates) plus display mode. For
-/// maximized and fullscreen windows the rectangle is the restore size.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Window rectangle in logical pixels plus display mode.
+///
+/// On macOS GPUI reports and consumes window bounds **relative to the display the window is
+/// on** (`display.bounds()` always has origin 0,0), so `x`/`y` are only meaningful together
+/// with `display`. For maximized and fullscreen windows the rectangle is the restore size.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowPlacement {
     pub x: f32,
     pub y: f32,
@@ -31,6 +34,10 @@ pub struct WindowPlacement {
     pub height: f32,
     #[serde(default)]
     pub mode: Mode,
+    /// Stable UUID of the display the window was on (`PlatformDisplay::uuid`). `None` when
+    /// the platform could not provide one; restore then assumes the primary display.
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 /// Contents of `state.toml`.
@@ -40,27 +47,42 @@ pub struct AppState {
     pub window: Option<WindowPlacement>,
 }
 
-/// An axis-aligned rectangle, used for display bounds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
+/// A connected display as far as restore logic cares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayInfo {
+    /// Stable display UUID, if the platform provides one.
+    pub uuid: Option<String>,
+    pub is_primary: bool,
     pub width: f32,
     pub height: f32,
 }
 
 impl WindowPlacement {
-    /// Whether enough of the window lies on one of `displays` to be grabbed and used. A
-    /// monitor that has since been unplugged must not strand the window off-screen.
-    pub fn is_visible_on(&self, displays: &[Rect]) -> bool {
+    /// Index into `displays` of the display this placement can be restored on, or `None` if
+    /// the window should be centred on the primary display instead (saved display gone,
+    /// non-finite values, window larger than the display, or not enough of it on-screen).
+    pub fn restore_display(&self, displays: &[DisplayInfo]) -> Option<usize> {
+        if !self.is_sane() {
+            return None;
+        }
+        let index = match &self.display {
+            Some(uuid) => displays
+                .iter()
+                .position(|display| display.uuid.as_deref() == Some(uuid)),
+            None => displays.iter().position(|display| display.is_primary),
+        }?;
+        self.fits(&displays[index]).then_some(index)
+    }
+
+    /// The window is no larger than the display and enough of it lies on it to be grabbed.
+    fn fits(&self, display: &DisplayInfo) -> bool {
         const MIN_VISIBLE: f32 = 120.0;
-        displays.iter().any(|display| {
-            let overlap_w =
-                (self.x + self.width).min(display.x + display.width) - self.x.max(display.x);
-            let overlap_h =
-                (self.y + self.height).min(display.y + display.height) - self.y.max(display.y);
-            overlap_w >= MIN_VISIBLE.min(self.width) && overlap_h >= MIN_VISIBLE.min(self.height)
-        })
+        if self.width > display.width || self.height > display.height {
+            return false;
+        }
+        let overlap_w = (self.x + self.width).min(display.width) - self.x.max(0.0);
+        let overlap_h = (self.y + self.height).min(display.height) - self.y.max(0.0);
+        overlap_w >= MIN_VISIBLE.min(self.width) && overlap_h >= MIN_VISIBLE.min(self.height)
     }
 
     pub fn is_sane(&self) -> bool {
@@ -119,9 +141,16 @@ pub fn load() -> AppState {
         .unwrap_or_default()
 }
 
-/// Best-effort save of the window placement; failures are logged, never fatal.
+/// Serialises writers (the debounced background save and the synchronous quit flush).
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Best-effort save of the window placement; failures are logged, never fatal. Safe to call
+/// from any thread.
 pub fn save_window(placement: WindowPlacement) {
     let Some(path) = state_path() else { return };
+    let _guard = SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut state = load_from(&path);
     state.window = Some(placement);
     if let Err(error) = save_to(&path, &state) {
@@ -133,6 +162,9 @@ pub fn save_window(placement: WindowPlacement) {
 mod tests {
     use super::*;
 
+    const PRIMARY: &str = "11111111-1111-1111-1111-111111111111";
+    const EXTERNAL: &str = "22222222-2222-2222-2222-222222222222";
+
     fn placement() -> WindowPlacement {
         WindowPlacement {
             x: 100.0,
@@ -140,15 +172,26 @@ mod tests {
             width: 900.0,
             height: 600.0,
             mode: Mode::Windowed,
+            display: Some(EXTERNAL.to_string()),
         }
     }
 
-    const DISPLAY: Rect = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: 1728.0,
-        height: 1117.0,
-    };
+    fn display(uuid: &str, is_primary: bool, width: f32, height: f32) -> DisplayInfo {
+        DisplayInfo {
+            uuid: Some(uuid.to_string()),
+            is_primary,
+            width,
+            height,
+        }
+    }
+
+    /// Laptop panel (primary) plus a larger external monitor.
+    fn displays() -> Vec<DisplayInfo> {
+        vec![
+            display(PRIMARY, true, 1512.0, 982.0),
+            display(EXTERNAL, false, 2560.0, 1440.0),
+        ]
+    }
 
     #[test]
     fn toml_roundtrip() {
@@ -168,7 +211,8 @@ mod tests {
 
     #[test]
     fn file_roundtrip_and_missing_and_corrupt() {
-        let dir = std::env::temp_dir().join(format!("gpui-chat-state-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("{APP_NAME}-state-test-{}", std::process::id()));
         let path = dir.join("nested").join(FILE_NAME);
         assert_eq!(load_from(&path), AppState::default());
         let state = AppState {
@@ -182,45 +226,77 @@ mod tests {
     }
 
     #[test]
-    fn visibility_check() {
-        assert!(placement().is_visible_on(&[DISPLAY]));
-        // Entirely on a monitor that is no longer attached.
-        let gone = WindowPlacement {
-            x: 3000.0,
+    fn restores_on_the_saved_display_when_present() {
+        // The saved display is the second one: restore must target it, not the primary.
+        assert_eq!(placement().restore_display(&displays()), Some(1));
+        // x beyond the primary's width is fine because it is relative to the external display.
+        let far = WindowPlacement {
+            x: 1800.0,
             ..placement()
         };
-        assert!(!gone.is_visible_on(&[DISPLAY]));
-        // Mostly off-screen but a usable part remains.
-        let edge = WindowPlacement {
-            x: 1728.0 - 200.0,
+        assert_eq!(far.restore_display(&displays()), Some(1));
+    }
+
+    #[test]
+    fn missing_display_falls_back_to_centred() {
+        let only_primary = vec![display(PRIMARY, true, 1512.0, 982.0)];
+        assert_eq!(placement().restore_display(&only_primary), None);
+        assert_eq!(placement().restore_display(&[]), None);
+    }
+
+    #[test]
+    fn rect_larger_than_display_falls_back_to_centred() {
+        let small = vec![
+            display(PRIMARY, true, 1512.0, 982.0),
+            display(EXTERNAL, false, 800.0, 600.0),
+        ];
+        assert_eq!(placement().restore_display(&small), None);
+        // Fits in size but pushed off the display.
+        let off = WindowPlacement {
+            x: 2500.0,
             ..placement()
         };
-        assert!(edge.is_visible_on(&[DISPLAY]));
-        // Only a sliver on-screen.
+        assert_eq!(off.restore_display(&displays()), None);
         let sliver = WindowPlacement {
-            x: 1728.0 - 20.0,
+            x: 2560.0 - 20.0,
             ..placement()
         };
-        assert!(!sliver.is_visible_on(&[DISPLAY]));
-        assert!(!placement().is_visible_on(&[]));
+        assert_eq!(sliver.restore_display(&displays()), None);
+    }
+
+    #[test]
+    fn partially_off_display_is_kept_while_grabbable() {
+        let edge = WindowPlacement {
+            x: 2560.0 - 200.0,
+            ..placement()
+        };
+        assert_eq!(edge.restore_display(&displays()), Some(1));
+    }
+
+    #[test]
+    fn no_saved_display_means_primary() {
+        let legacy = WindowPlacement {
+            display: None,
+            ..placement()
+        };
+        assert_eq!(legacy.restore_display(&displays()), Some(0));
+        let no_primary = vec![display(EXTERNAL, false, 2560.0, 1440.0)];
+        assert_eq!(legacy.restore_display(&no_primary), None);
     }
 
     #[test]
     fn rejects_non_finite() {
         assert!(placement().is_sane());
-        assert!(
-            !WindowPlacement {
-                width: f32::NAN,
-                ..placement()
-            }
-            .is_sane()
-        );
-        assert!(
-            !WindowPlacement {
-                height: 0.0,
-                ..placement()
-            }
-            .is_sane()
-        );
+        let nan = WindowPlacement {
+            width: f32::NAN,
+            ..placement()
+        };
+        assert!(!nan.is_sane());
+        assert_eq!(nan.restore_display(&displays()), None);
+        let flat = WindowPlacement {
+            height: 0.0,
+            ..placement()
+        };
+        assert!(!flat.is_sane());
     }
 }

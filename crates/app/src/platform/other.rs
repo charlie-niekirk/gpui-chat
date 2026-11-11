@@ -6,6 +6,8 @@ use gpui_kit::{KeyBinding, Menu};
 use super::{about_item, quit_item, view_menu, window_menu};
 use crate::actions::{CloseWindow, MinimizeWindow, Quit, ToggleSidebar};
 
+pub const TOGGLE_SIDEBAR_LABEL: &str = "Ctrl+B";
+
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-q", Quit, None),

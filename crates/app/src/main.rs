@@ -17,28 +17,44 @@ use gpui_kit::*;
 
 use crate::actions::Quit;
 use crate::shell::{AppShell, DEFAULT_SIZE, MIN_SIZE};
-use crate::state::Rect;
+use crate::state::DisplayInfo;
 
-/// Window bounds restored from `state.toml` when still on a connected display, else centred.
-fn initial_bounds(cx: &App) -> WindowBounds {
-    let displays: Vec<Rect> = cx
-        .displays()
+/// Where to open the main window: the saved bounds on the saved display when that display is
+/// still connected and the rect fits on it, else centred on the primary display.
+///
+/// GPUI reports/accepts window bounds relative to the display the window is on, so the
+/// display is restored through `WindowOptions::display_id` rather than by global coordinates.
+fn initial_placement(cx: &App) -> (WindowBounds, Option<DisplayId>) {
+    let centred = || {
+        (
+            WindowBounds::centered(size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx),
+            None,
+        )
+    };
+    let Some(saved) = state::load().window else {
+        return centred();
+    };
+    let primary = cx.primary_display().map(|display| display.id());
+    let displays = cx.displays();
+    let infos: Vec<DisplayInfo> = displays
         .iter()
         .map(|display| {
             let bounds = display.bounds();
-            Rect {
-                x: bounds.origin.x.as_f32(),
-                y: bounds.origin.y.as_f32(),
+            DisplayInfo {
+                uuid: display.uuid().ok().map(|uuid| uuid.to_string()),
+                is_primary: Some(display.id()) == primary,
                 width: bounds.size.width.as_f32(),
                 height: bounds.size.height.as_f32(),
             }
         })
         .collect();
-    state::load()
-        .window
-        .filter(|placement| placement.is_sane() && placement.is_visible_on(&displays))
-        .map(shell::bounds_from_placement)
-        .unwrap_or_else(|| WindowBounds::centered(size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx))
+    match saved.restore_display(&infos) {
+        Some(index) => (
+            shell::bounds_from_placement(&saved),
+            Some(displays[index].id()),
+        ),
+        None => centred(),
+    }
 }
 
 fn main() {
@@ -68,8 +84,10 @@ fn main() {
             })
             .detach();
 
+            let (window_bounds, display_id) = initial_placement(cx);
             let options = WindowOptions {
-                window_bounds: Some(initial_bounds(cx)),
+                window_bounds: Some(window_bounds),
+                display_id,
                 window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
                 ..TitleBar::window_options()
             };

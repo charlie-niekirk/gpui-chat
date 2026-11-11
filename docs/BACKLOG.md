@@ -22,3 +22,5 @@ an entry here instead of expanding a PR. Format:
 - **Set up a `tracing` subscriber** (found in PR 0.2) — the app logs via `tracing` (e.g. resolved font family) but nothing installs a subscriber yet, so output is dropped.
 - **Per-glyph font fallback cascade** (found in PR 0.2) — the font chain picks one installed family; add `FontFallbacks` (e.g. Nerd Font → JetBrains Mono → emoji/CJK) once chat text is shaped by the custom element.
 - **Custom About window** (found in PR 0.2) — About is a Kit dialog showing name/version/ID; a proper panel with licences (incl. OFL notice for JetBrains Mono) can come later.
+- **Maximized state is never saved on macOS** (found in PR 0.2) — gpui-pre 0.3.12's macOS `window_bounds()` reports only `Windowed`/`Fullscreen`, so `Mode::Maximized` in `state.toml` is never written; revisit if upstream reports zoomed windows.
+- **Verify restore on a secondary display with a non-zero screen origin** (found in PR 0.2) — GPUI's macOS `bounds()` mixes the screen's y origin into the display-relative y; round trip is verified on the primary display only.

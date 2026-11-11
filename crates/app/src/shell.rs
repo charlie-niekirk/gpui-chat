@@ -16,6 +16,7 @@ use gpui_kit::{
 
 use crate::actions::{About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleSidebar};
 use crate::fonts::FontConfig;
+use crate::platform;
 use crate::state::{self, Mode, WindowPlacement};
 use crate::theme::Tokens;
 
@@ -27,11 +28,11 @@ pub const DEFAULT_SIZE: (f32, f32) = (1100.0, 700.0);
 pub const MIN_SIZE: (f32, f32) = (640.0, 400.0);
 
 /// Latest window placement seen by the shell, flushed to disk on quit.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LatestPlacement(WindowPlacement);
 impl gpui_kit::Global for LatestPlacement {}
 
-pub fn placement_from_bounds(bounds: WindowBounds) -> WindowPlacement {
+pub fn placement_from_bounds(bounds: WindowBounds, display: Option<String>) -> WindowPlacement {
     let (rect, mode) = match bounds {
         WindowBounds::Windowed(rect) => (rect, Mode::Windowed),
         WindowBounds::Maximized(rect) => (rect, Mode::Maximized),
@@ -43,10 +44,12 @@ pub fn placement_from_bounds(bounds: WindowBounds) -> WindowPlacement {
         width: rect.size.width.as_f32(),
         height: rect.size.height.as_f32(),
         mode,
+        display,
     }
 }
 
-pub fn bounds_from_placement(placement: WindowPlacement) -> WindowBounds {
+/// Bounds are relative to the placement's display; the caller selects that display.
+pub fn bounds_from_placement(placement: &WindowPlacement) -> WindowBounds {
     let rect = Bounds::new(
         gpui_kit::point(px(placement.x), px(placement.y)),
         size(
@@ -64,7 +67,7 @@ pub fn bounds_from_placement(placement: WindowPlacement) -> WindowBounds {
 /// Writes the most recent placement to disk, if there is one.
 pub fn flush_placement(cx: &App) {
     if let Some(LatestPlacement(placement)) = cx.try_global::<LatestPlacement>() {
-        state::save_window(*placement);
+        state::save_window(placement.clone());
     }
 }
 
@@ -98,12 +101,24 @@ impl AppShell {
     }
 
     fn placement_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let display = window
+            .display(cx)
+            .and_then(|display| display.uuid().ok())
+            .map(|uuid| uuid.to_string());
         cx.set_global(LatestPlacement(placement_from_bounds(
             window.window_bounds(),
+            display,
         )));
+        // Coalesce bursts of move/resize events and write off the main thread. Replacing the
+        // task drops (cancels) the previous pending write. The quit flush stays synchronous.
         self.save_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            cx.update(|cx| flush_placement(cx));
+            let latest = cx.update(|cx| cx.try_global::<LatestPlacement>().cloned());
+            if let Some(LatestPlacement(placement)) = latest {
+                cx.background_executor()
+                    .spawn(async move { state::save_window(placement) })
+                    .await;
+            }
         }));
     }
 
@@ -158,12 +173,10 @@ impl AppShell {
                     .items_center()
                     .gap_2()
                     .child(div().text_xl().child(APP_NAME))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(tokens.text_muted)
-                            .child("Chat will appear here. Press ⌘B to toggle the sidebar."),
-                    ),
+                    .child(div().text_sm().text_color(tokens.text_muted).child(format!(
+                        "Chat will appear here. Press {} to toggle the sidebar.",
+                        platform::TOGGLE_SIDEBAR_LABEL
+                    ))),
             )
     }
 }

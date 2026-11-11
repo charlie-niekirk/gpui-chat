@@ -16,6 +16,9 @@ use macos as imp;
 #[cfg(not(target_os = "macos"))]
 use other as imp;
 
+/// Human-readable label of the Toggle Sidebar shortcut (kept in sync with `bindings()`).
+pub use imp::TOGGLE_SIDEBAR_LABEL;
+
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
     imp::bindings()
