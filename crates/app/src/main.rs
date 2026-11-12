@@ -6,21 +6,38 @@
 mod actions;
 mod assets;
 mod bridge;
+mod channels;
+mod cli;
 mod config;
+mod diagnostics;
+mod firehose;
 mod fonts;
+mod hud;
+mod placeholder_chat;
 mod platform;
 mod runtime;
 mod shell;
 mod state;
 mod theme;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gpui_chat_core::APP_NAME;
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::actions::Quit;
-use crate::shell::{AppShell, DEFAULT_SIZE, MIN_SIZE};
+use crate::channels::ChannelHub;
+use crate::cli::{Cli, Parsed};
+use crate::diagnostics::Diagnostics;
+use crate::firehose::FirehoseConfig;
+use crate::shell::{AppShell, DEFAULT_SIZE, MIN_SIZE, ShellParts};
 use crate::state::DisplayInfo;
+
+/// Events the bridge queue holds before a producer is slowed (or, for the firehose, sheds).
+const INGEST_QUEUE: usize = 16_384;
+/// Most events one frame applies; the rest stay queued for the next frame.
+const INGEST_BATCH: usize = 4_096;
 
 /// Where to open the main window: the saved bounds on the saved display when that display is
 /// still connected and the rect fits on it, else centred on the primary display.
@@ -60,10 +77,59 @@ fn initial_placement(cx: &App) -> (WindowBounds, Option<DisplayId>) {
     }
 }
 
+/// Hooks the chat backends up to the UI: a hub of per-channel stores fed through the bridge, and
+/// (with `--firehose`) the synthetic source on the backend runtime.
+fn start_chat(cli: &Cli, window: &Window, cx: &mut App) -> ShellParts {
+    let diagnostics = Diagnostics::new();
+    let scrollback = config::current(cx).chat.scrollback;
+    let hub = cx.new(|_| ChannelHub::new(scrollback, diagnostics.clone()));
+    let (sender, receiver) = bridge::channel(INGEST_QUEUE, INGEST_BATCH);
+    bridge::attach(
+        &hub,
+        window.window_handle(),
+        receiver,
+        cx,
+        |hub, events, cx| hub.apply_batch(events, cx),
+    )
+    .detach();
+    if let Some(rate) = cli.firehose {
+        let start_ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        let config = FirehoseConfig {
+            rate,
+            seed: cli.seed,
+            channels: firehose::channel_names(cli.firehose_channels),
+            start_ts_ms,
+        };
+        // The handle is dropped on purpose: the task ends when the bridge closes or on quit.
+        drop(runtime::spawn_backend(
+            cx,
+            firehose::run(sender, config, diagnostics.counters()),
+        ));
+    }
+    ShellParts {
+        hub,
+        diagnostics,
+        hud_visible: cli.hud,
+    }
+}
+
 fn main() {
+    let cli = match cli::parse(std::env::args().skip(1)) {
+        Ok(Parsed::Run(cli)) => cli,
+        Ok(Parsed::Help) => {
+            print!("{}", cli::USAGE);
+            return;
+        }
+        Err(error) => {
+            eprintln!("{APP_NAME}: {error}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
     gpui_kit::application()
         .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             gpui_kit::init(cx);
             // The backend runtime exists before any window and stops when the app quits.
             runtime::init(cx)
@@ -118,7 +184,8 @@ fn main() {
                     )
                     .detach();
                 }
-                cx.new(|cx| AppShell::new(window, cx))
+                let parts = start_chat(&cli, window, cx);
+                cx.new(|cx| AppShell::new(window, parts, cx))
             })
             .unwrap_or_else(|error| panic!("failed to open the {APP_NAME} main window: {error}"));
             cx.activate(true);

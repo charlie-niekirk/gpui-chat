@@ -95,7 +95,7 @@ impl<E> BridgeReceiver<E> {
     }
 
     /// `first` plus everything already queued (oldest first), capped at the batch size.
-    fn drain(&mut self, first: E) -> Vec<E> {
+    pub(crate) fn drain(&mut self, first: E) -> Vec<E> {
         let mut batch = vec![first];
         while batch.len() < self.max_batch {
             match self.rx.try_recv() {

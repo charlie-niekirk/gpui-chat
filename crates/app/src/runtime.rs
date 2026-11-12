@@ -22,7 +22,6 @@ pub struct Backend {
     /// `None` once [`Backend::shutdown`] has run.
     runtime: Option<Runtime>,
     /// Stays usable after shutdown; tasks spawned through it are then dropped unrun.
-    #[allow(dead_code)] // read by `spawn`, first used by the backends of PR 1.2 / 1.3
     handle: Handle,
 }
 
@@ -44,7 +43,6 @@ impl Backend {
 
     /// Runs `future` on the runtime. After shutdown the future is dropped without running and
     /// the returned handle reports a cancelled task.
-    #[allow(dead_code)] // first used by the backends of PR 1.2 / 1.3
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -82,7 +80,6 @@ pub fn init(cx: &mut App) -> io::Result<()> {
 /// Runs async backend work on the app's tokio runtime. The future may use tokio I/O and
 /// timers; send results to the UI with a [`crate::bridge::BridgeSender`], never by touching
 /// GPUI state from the task.
-#[allow(dead_code)] // first used by the backends of PR 1.2 / 1.3
 pub fn spawn_backend<F>(cx: &App, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,

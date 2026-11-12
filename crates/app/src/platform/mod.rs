@@ -4,7 +4,7 @@
 
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
-use crate::actions::{About, CloseWindow, MinimizeWindow, Quit, ToggleSidebar};
+use crate::actions::{About, CloseWindow, MinimizeWindow, Quit, ToggleDebugHud, ToggleSidebar};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -17,7 +17,7 @@ use macos as imp;
 use other as imp;
 
 /// Human-readable label of the Toggle Sidebar shortcut (kept in sync with `bindings()`).
-pub use imp::TOGGLE_SIDEBAR_LABEL;
+pub use imp::{TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
 
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
@@ -31,7 +31,10 @@ pub fn menus() -> Vec<Menu> {
 
 /// Items shared by every platform's menu bar.
 fn view_menu() -> Menu {
-    Menu::new("View").items([MenuItem::action("Toggle Sidebar", ToggleSidebar)])
+    Menu::new("View").items([
+        MenuItem::action("Toggle Sidebar", ToggleSidebar),
+        MenuItem::action("Toggle Debug HUD", ToggleDebugHud),
+    ])
 }
 
 fn window_menu() -> Menu {

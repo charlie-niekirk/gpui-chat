@@ -8,6 +8,7 @@ section of `PLAN.md` for your PR before changing anything.
 
 ```bash
 cargo run -p gpui-chat                                # launch the app
+cargo run -p gpui-chat --release -- --firehose 1000 --hud  # offline synthetic chat + debug HUD (⌘⇧D)
 cargo fmt --all --check                               # formatting
 cargo clippy --workspace --all-targets -- -D warnings # lints (must be warning-free)
 cargo test --workspace                                # all tests

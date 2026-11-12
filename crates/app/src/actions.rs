@@ -5,7 +5,14 @@ use gpui_kit::actions;
 
 actions!(
     gpui_chat,
-    [About, Quit, CloseWindow, MinimizeWindow, ToggleSidebar]
+    [
+        About,
+        Quit,
+        CloseWindow,
+        MinimizeWindow,
+        ToggleSidebar,
+        ToggleDebugHud
+    ]
 );
 
 /// Key context set on the root shell view.

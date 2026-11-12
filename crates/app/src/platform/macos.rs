@@ -4,9 +4,10 @@ use gpui_chat_core::APP_NAME;
 use gpui_kit::{KeyBinding, Menu, MenuItem, SystemMenuType};
 
 use super::{about_item, quit_item, view_menu, window_menu};
-use crate::actions::{CloseWindow, MinimizeWindow, Quit, ToggleSidebar};
+use crate::actions::{CloseWindow, MinimizeWindow, Quit, ToggleDebugHud, ToggleSidebar};
 
 pub const TOGGLE_SIDEBAR_LABEL: &str = "⌘B";
+pub const TOGGLE_HUD_LABEL: &str = "⌘⇧D";
 
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
@@ -15,6 +16,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
+        KeyBinding::new("cmd-shift-d", ToggleDebugHud, None),
     ]
 }
 

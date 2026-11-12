@@ -21,6 +21,23 @@ Requires a Rust toolchain (version pinned in [`rust-toolchain.toml`](rust-toolch
 cargo run -p gpui-chat
 ```
 
+Developer flags (offline, no network or login needed):
+
+```bash
+cargo run -p gpui-chat --release -- --firehose 1000 --hud   # synthetic chat, 1 000 msgs/s, HUD open
+cargo run -p gpui-chat -- --help                            # all flags
+```
+
+| Flag | Meaning |
+|---|---|
+| `--firehose <msgs/sec>` | Feed the app deterministic synthetic chat at a steady rate |
+| `--seed <n>` | Seed of the synthetic chat (default is fixed, so runs repeat) |
+| `--firehose-channels <n>` | Spread the synthetic chat over `n` channels (default 1) |
+| `--hud` | Start with the debug HUD visible |
+
+The debug HUD (frame time against the 8.3 ms budget, messages/sec, batch size, store sizes,
+dropped events) toggles with ⌘⇧D (Ctrl+Shift+D elsewhere) or View > Toggle Debug HUD.
+
 Tests (everything except the GPUI app also runs on Linux in CI):
 
 ```bash

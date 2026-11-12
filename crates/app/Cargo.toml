@@ -27,6 +27,8 @@ tracing = { workspace = true }
 # `gpui-kit` does not resolve: it pulls in `gpui-fast`, which needs a `proptest` the index lacks).
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 tempfile = { workspace = true }
+# `start_paused` virtual time for the firehose pacing tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
