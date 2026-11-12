@@ -576,6 +576,65 @@ fn cheermotes_need_a_known_prefix_and_clean_digits() {
     assert_eq!(tok("Cheer100"), [text("Cheer100")]);
 }
 
+#[test]
+fn cheermote_prefix_may_contain_digits() {
+    let t = Tokenizer::new().with_cheermote_prefixes(DEFAULT_CHEERMOTE_PREFIXES);
+    let out = t.tokenize("4Head100 4head5 Kappa1000 4Head", &[]).fragments;
+    assert_eq!(
+        shape(&out),
+        [
+            "C:4Head:100",
+            "T: ",
+            "C:4head:5",
+            "T: ",
+            "C:Kappa:1000",
+            "T: 4Head"
+        ]
+    );
+    // Digits-only and zero-leading amounts are still rejected.
+    for s in ["4Head0", "4Head007", "100", "4Head1x"] {
+        assert_eq!(t.tokenize(s, &[]).fragments, [text(s)], "{s}");
+    }
+}
+
+#[test]
+fn ignored_tag_char_is_stripped() {
+    let t = Tokenizer::new();
+    // Appended at the end (the usual case).
+    assert_eq!(
+        t.tokenize("hello world \u{E0000}", &[]).fragments,
+        [text("hello world ")]
+    );
+    assert_eq!(t.tokenize("\u{E0000}", &[]).fragments, []);
+    // Inside a word: the word is rejoined, so link detection still works.
+    assert_eq!(
+        t.tokenize("exam\u{E0000}ple.com", &[]).fragments,
+        [link("example.com", "https://example.com")]
+    );
+    // Other tag characters (emoji tag sequences) are not touched.
+    let england = "🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+    assert_eq!(t.tokenize(england, &[]).fragments, [emoji(england)]);
+}
+
+#[test]
+fn ranges_are_rebased_when_ignored_chars_are_stripped() {
+    // Original code points: a0 \u{E0000}1 ' '2 K3..a7 ' '8 K9..a13
+    let s = "a\u{E0000} Kappa Kappa";
+    let r = [range("Kappa", 3, 7), range("Kappa", 9, 13)];
+    let out = Tokenizer::new().tokenize(s, &r).fragments;
+    assert_eq!(shape(&out), ["T:a ", "E:Kappa+", "T: ", "E:Kappa+"]);
+    // A range that covered only the stripped char is dropped, not mis-applied.
+    let out = Tokenizer::new()
+        .tokenize("ab\u{E0000}", &[range("X", 2, 2)])
+        .fragments;
+    assert_eq!(out, [text("ab")]);
+    // Out-of-range ends stay out of range after re-basing.
+    let out = Tokenizer::new()
+        .tokenize("a\u{E0000}b", &[range("X", 0, 3)])
+        .fragments;
+    assert_eq!(out, [text("ab")]);
+}
+
 // ---- Misc / robustness -----------------------------------------------------------
 
 #[test]

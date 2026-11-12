@@ -173,6 +173,33 @@ impl Fragment {
     }
 }
 
+/// The raw IRC tags of a message, kept so later features (PR 5.1 and others) can read
+/// tags core does not model. Cheap to clone (shared), preserves wire order, empty by
+/// default. Values are stored as received (still IRC-escaped).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawTags(Arc<[(String, String)]>);
+
+impl RawTags {
+    pub fn new(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+
+    /// The value of the first tag called `key`.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A chat message. Immutable; share it as `Arc<Message>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -184,6 +211,13 @@ pub struct Message {
     pub fragments: Vec<Fragment>,
     /// The `system-msg` line of a [`MessageKind::UserNotice`].
     pub system_text: Option<String>,
+    /// The `msg-id` of a [`MessageKind::UserNotice`] (`sub`, `resub`, `raid`,
+    /// `announcement`, ...) or [`MessageKind::Notice`].
+    pub notice_id: Option<String>,
+    /// Bits cheered with this message (the IRC `bits` tag).
+    pub bits: Option<u32>,
+    /// All raw IRC tags as received; empty for synthetic messages.
+    pub raw_tags: RawTags,
     pub flags: MessageFlags,
     pub reply: Option<ReplyRef>,
 }
@@ -203,6 +237,9 @@ impl Message {
             author: Some(author),
             fragments,
             system_text: None,
+            notice_id: None,
+            bits: None,
+            raw_tags: RawTags::default(),
             flags: MessageFlags::default(),
             reply: None,
         }
@@ -223,6 +260,9 @@ impl Message {
             author: None,
             fragments: vec![Fragment::Text(text.into())],
             system_text: None,
+            notice_id: None,
+            bits: None,
+            raw_tags: RawTags::default(),
             flags: MessageFlags::default(),
             reply: None,
         }
@@ -261,6 +301,28 @@ mod tests {
         assert_eq!(Rgb::from_hex("#12345"), None);
         assert_eq!(Rgb::from_hex("#gggggg"), None);
         assert_eq!(Rgb::from_hex("#éééé"), None);
+    }
+
+    #[test]
+    fn raw_tags_lookup_and_cheap_clone() {
+        let tags = RawTags::new([
+            ("msg-id".to_owned(), "raid".to_owned()),
+            ("bits".to_owned(), "100".to_owned()),
+        ]);
+        assert_eq!(tags.get("bits"), Some("100"));
+        assert_eq!(tags.get("nope"), None);
+        assert_eq!(
+            tags.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            ["msg-id", "bits"]
+        );
+        assert!(RawTags::default().is_empty());
+        let mut m = Message::plain("1", Timestamp(0), MessageKind::Notice, "x");
+        m.raw_tags = tags.clone();
+        assert!(
+            Arc::ptr_eq(&m.clone().raw_tags.0, &tags.0),
+            "clone shares the tags"
+        );
+        assert_eq!((m.notice_id.as_deref(), m.bits), (None, None));
     }
 
     #[test]

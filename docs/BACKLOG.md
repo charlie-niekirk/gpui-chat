@@ -30,4 +30,6 @@ an entry here instead of expanding a PR. Format:
 - **Mentions by display name** (found in PR 1.1) — own-login detection matches the login only (ASCII case-insensitive), not a differently spelled non-ASCII display name.
 - **Strip reply `@user` prefix** (found in PR 1.1) — Twitch prepends `@parent ` to reply text; mapping (PR 1.2) should drop it before tokenizing, or the UI hides it when `reply` is set.
 - **Animated Twitch emotes** (found in PR 1.1) — `Emote::twitch` sets `animated: false` because the IRC tag does not say; PR 2.2 should detect via the `default` CDN format or the emote metadata.
-
+- **Bare-domain false positives for short TLDs** (found in PR 1.1) — `ok.so`, `main.rs`, `readme.md`, `1.2.3.4` are linkified; consider requiring a path/port, a minimum label length, or an allow-list for ccTLDs that collide with file extensions and words.
+- **`mark_all_deleted` deep-clones every message** (found in PR 1.1) — CLEARCHAT of a full 1 000-message store clones each `Message` (fragments included); consider a shared body behind `Arc` or a per-store deleted-set instead of replacing the message.
+- **Emote name cache keyed by id only** (found in PR 1.1) — `twitch_emote_ranges` caches one `Arc<Emote>` per id within a message, so if the same id appears with different covered text (should not happen on Twitch) the first name wins.

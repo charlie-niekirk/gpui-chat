@@ -236,7 +236,19 @@ impl<'a> Tokenizer<'a> {
     /// Tokenizes `text`. `twitch_ranges` come from the IRC `emotes` tag (see
     /// [`twitch_emote_ranges`]); pass `&[]` when there are none. Never panics, whatever
     /// the ranges contain.
+    ///
+    /// U+E0000 (appended by some clients to bypass duplicate-message checks) is removed
+    /// first; `twitch_ranges` must be relative to the *original* text, they are
+    /// re-based here.
     pub fn tokenize(&self, text: &str, twitch_ranges: &[EmoteRange]) -> Tokenized {
+        if text.contains(IGNORED_CHAR) {
+            let (clean, ranges) = strip_ignored(text, twitch_ranges);
+            return self.tokenize_clean(&clean, &ranges);
+        }
+        self.tokenize_clean(text, twitch_ranges)
+    }
+
+    fn tokenize_clean(&self, text: &str, twitch_ranges: &[EmoteRange]) -> Tokenized {
         let mut builder = Builder::default();
         let ranges = normalise_ranges(text, twitch_ranges);
         let mut pos = 0;
@@ -306,18 +318,23 @@ impl<'a> Tokenizer<'a> {
         if self.cheermote_prefixes.is_empty() {
             return None;
         }
-        let digits_at = word.find(|c: char| c.is_ascii_digit())?;
-        let (prefix, digits) = word.split_at(digits_at);
-        if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let bits: u32 = digits.parse().ok()?;
-        self.cheermote_prefixes
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(prefix))
-            .then(|| Fragment::Cheer {
-                prefix: prefix.to_owned(),
-                bits,
+        // The amount is the trailing run of digits; prefixes may themselves contain
+        // digits (`4Head100` is prefix `4Head`, 100 bits), so try each split of the run.
+        let run_start = word
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map(|i| i + word[i..].chars().next().map_or(1, char::len_utf8))?;
+        (run_start..word.len())
+            .filter(|&i| i > 0 && !word[i..].starts_with('0'))
+            .find_map(|i| {
+                let (prefix, digits) = word.split_at(i);
+                let bits: u32 = digits.parse().ok()?;
+                self.cheermote_prefixes
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(prefix))
+                    .then(|| Fragment::Cheer {
+                        prefix: prefix.to_owned(),
+                        bits,
+                    })
             })
     }
 
@@ -369,6 +386,34 @@ impl<'a> Tokenizer<'a> {
         self.own_login
             .is_some_and(|own| !own.is_empty() && own.eq_ignore_ascii_case(login))
     }
+}
+
+/// Invisible character some clients append to dodge duplicate-message detection.
+const IGNORED_CHAR: char = '\u{E0000}';
+
+/// Removes [`IGNORED_CHAR`] from `text` and re-bases the code-point `ranges` onto the
+/// result. A range whose last character was removed shrinks; one consisting only of
+/// removed characters becomes inverted and is dropped later.
+fn strip_ignored(text: &str, ranges: &[EmoteRange]) -> (String, Vec<EmoteRange>) {
+    let removed: Vec<usize> = text
+        .chars()
+        .enumerate()
+        .filter_map(|(i, c)| (c == IGNORED_CHAR).then_some(i))
+        .collect();
+    let clean: String = text.chars().filter(|&c| c != IGNORED_CHAR).collect();
+    let ranges = ranges
+        .iter()
+        .map(|r| EmoteRange {
+            emote: r.emote.clone(),
+            start: r
+                .start
+                .saturating_sub(removed.partition_point(|&i| i < r.start)),
+            end: r
+                .end
+                .saturating_sub(removed.partition_point(|&i| i <= r.end)),
+        })
+        .collect();
+    (clean, ranges)
 }
 
 /// Validates ranges against `text` and returns `(byte_start, byte_end_exclusive, emote)`

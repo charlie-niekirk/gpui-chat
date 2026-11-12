@@ -163,15 +163,16 @@ fn is_pictographic(c: char) -> bool {
     in_table(PICTOGRAPHIC, c)
 }
 
-/// Does an emoji sequence start with `c`? `vs16` says whether U+FE0F follows it.
-fn starts_emoji(c: char, vs16: bool) -> bool {
+/// Does an emoji sequence start with `c`? `emoji_selector` says whether U+FE0F or a
+/// skin-tone modifier follows it; either makes a text-default base an emoji.
+fn starts_emoji(c: char, emoji_selector: bool) -> bool {
     if is_skin_tone(c) {
         return true;
     }
     if c as u32 >= 0x1F000 {
         return is_pictographic(c);
     }
-    in_table(BMP_EMOJI_PRESENTATION, c) || (vs16 && is_pictographic(c))
+    in_table(BMP_EMOJI_PRESENTATION, c) || (emoji_selector && is_pictographic(c))
 }
 
 /// Byte length of the emoji sequence at the start of `s`, or `None` if `s` does
@@ -205,7 +206,8 @@ pub(crate) fn emoji_len(s: &str) -> Option<usize> {
     }
 
     let next = chars.clone().next();
-    if next == Some(VS15) || !starts_emoji(first, next == Some(VS16)) {
+    let selector = next.is_some_and(|c| c == VS16 || is_skin_tone(c));
+    if next == Some(VS15) || !starts_emoji(first, selector) {
         return None;
     }
 
@@ -267,6 +269,21 @@ mod tests {
         assert!(whole("❤\u{FE0F}\u{200D}🔥"));
         assert!(whole("🧑🏽\u{200D}💻"));
         assert!(whole("🏃\u{200D}♀\u{FE0F}"));
+    }
+
+    #[test]
+    fn text_default_base_with_skin_tone_is_one_emoji() {
+        // No VS16: the modifier alone makes the base an emoji.
+        assert!(whole("☝🏽"));
+        assert!(whole("✌🏻"));
+        assert!(whole("✍🏼"));
+        assert!(whole("⛹🏽"));
+        assert!(whole("⛹🏽\u{200D}♀\u{FE0F}"));
+        assert!(whole("⛹\u{FE0F}\u{200D}♀\u{FE0F}"));
+        // Without either selector the base stays text.
+        assert_eq!(emoji_len("☝"), None);
+        assert_eq!(emoji_len("✌x"), None);
+        assert_eq!(emoji_len("☝\u{FE0E}🏽"), None);
     }
 
     #[test]
