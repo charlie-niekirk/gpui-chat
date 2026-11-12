@@ -58,6 +58,25 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore). Separate from user settings.
 
+### Domain model (`crates/core`)
+
+Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowercase login,
+`MessageId`, `EmoteId`), `emote` (`Emote`, `EmoteProvider`, `ImageUrls` by scale, `BadgeId` /
+`Badge`), `message` (`Message`, `Author`, `Fragment`, `MessageKind`, `MessageFlags`, `ReplyRef`),
+`store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`.
+
+- **`MessageStore`** hands out a monotonically increasing *sequence number* per pushed message
+  (never reused; `first_seq`/`next_seq`/`iter_since` let the UI see what is new or scrolled out) and a
+  *generation* that bumps on every change, including deletes and resizes. Deleting replaces the stored
+  `Arc<Message>` with a copy flagged `deleted`; the old `Arc` is untouched.
+- **Tokenizer** (`Tokenizer::tokenize(text, twitch_ranges)`): Twitch emote ranges first (code-point
+  indices, invalid or overlapping ranges dropped), then per whitespace-delimited word: `WordResolver`
+  (third-party emotes, whole word) → cheermote → emoji split → mention / link on the pieces. Zero-width
+  emotes stack onto a directly preceding emote. Plain words and whitespace are merged into `Text`
+  runs, so fragments concatenate back to the message text.
+- Emoji detection uses small built-in Unicode range tables (no data crate); the TLD allow-list for
+  bare domains is likewise built in.
+
 ## Data flow
 
 ```

@@ -1,8 +1,30 @@
-//! Domain types, message store and tokenizer. No I/O.
+//! Domain types, message store and tokenizer. No I/O, no GPUI.
 //!
-//! Stub crate: the domain model arrives in PR 1.1 (see `PLAN.md`). For now this
-//! crate holds the application identity constants so that every crate (and the
-//! eventual rename PR) has exactly one place to look.
+//! * [`Message`] / [`Fragment`]: the immutable chat message (shared as `Arc<Message>`)
+//!   and its tokenized body.
+//! * [`MessageStore`]: per-channel ring buffer with lookup by id and change tracking.
+//! * [`tokenizer`]: text → fragments (emote ranges, links, mentions, emoji, cheers).
+//! * [`ChatEvent`]: what network backends send to the UI.
+//! * [`APP_NAME`] / [`APP_ID`]: the one place the application identity lives.
+
+pub mod emote;
+pub mod event;
+pub mod ids;
+pub mod message;
+pub mod store;
+pub mod tokenizer;
+
+pub use emote::{Badge, BadgeId, Emote, EmoteProvider, ImageScale, ImageUrls};
+pub use event::{
+    ChatEvent, ClearTarget, ConnectionState, FollowersOnly, RoomState, RoomStateUpdate,
+};
+pub use ids::{ChannelId, EmoteId, MessageId};
+pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
+pub use store::{DEFAULT_CAPACITY, MessageStore};
+pub use tokenizer::{
+    DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,
+    WordResolver, parse_emotes_tag, twitch_emote_ranges,
+};
 
 /// Name of this crate, used by the placeholder test below.
 pub const CRATE_NAME: &str = "gpui-chat-core";
