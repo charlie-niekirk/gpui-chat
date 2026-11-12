@@ -1,0 +1,3 @@
+# CLEARMSG fixtures: one message deleted by a moderator or AutoMod.
+@login=spammer;room-id=1000;target-msg-id=33333333-0000-4000-8000-000000000001;tmi-sent-ts=1700000003001 :tmi.twitch.tv CLEARMSG #testchan :this message was deleted
+@room-id=1000;target-msg-id=33333333-0000-4000-8000-000000000002;tmi-sent-ts=1700000003002 :tmi.twitch.tv CLEARMSG #testchan :no login tag

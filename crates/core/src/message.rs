@@ -175,7 +175,8 @@ impl Fragment {
 
 /// The raw IRC tags of a message, kept so later features (PR 5.1 and others) can read
 /// tags core does not model. Cheap to clone (shared), preserves wire order, empty by
-/// default. Values are stored as received (still IRC-escaped).
+/// default. Values are stored as the transport hands them over: the Twitch backend
+/// unescapes them (`\s` is already a space) and orders the pairs by key.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RawTags(Arc<[(String, String)]>);
 

@@ -1,0 +1,7 @@
+# CLEARCHAT fixtures: user timeout (ban-duration), permanent ban (no ban-duration), whole channel.
+# timeout, 600 s
+@ban-duration=600;room-id=1000;target-user-id=3001;tmi-sent-ts=1700000002001 :tmi.twitch.tv CLEARCHAT #testchan :timeduser
+# permanent ban
+@room-id=1000;target-user-id=3002;tmi-sent-ts=1700000002002 :tmi.twitch.tv CLEARCHAT #testchan :banneduser
+# whole channel cleared
+@room-id=1000;tmi-sent-ts=1700000002003 :tmi.twitch.tv CLEARCHAT #testchan
