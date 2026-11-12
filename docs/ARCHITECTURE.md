@@ -77,6 +77,37 @@ Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowe
 - Emoji detection uses small built-in Unicode range tables (no data crate); the TLD allow-list for
   bare domains is likewise built in.
 
+### Media pipeline (`crates/media`)
+
+GPUI-free; takes a tokio `Handle` and the cache directory from the caller. `ImageCache<V>`
+looks up memory LRU → in-flight load (joined, so N requests for a URL make one fetch) →
+remembered failure → new load task: disk cache → network (`reqwest`/rustls, `User-Agent:
+<APP_NAME>/<version>`, bounded concurrency, per-attempt timeout, exponential retry on
+timeouts/network errors/408/429/5xx) → decode on the blocking pool (bounded) → disk write →
+memory insert. 404/410 and undecodable images are remembered for 10 min, other failures 30 s.
+
+- **Pixels:** every frame is **BGRA8, straight (non-premultiplied) alpha**, tightly packed,
+  full canvas size — what `gpui-pre 0.3.12`'s `RenderImage` stores (its own decoders only swap
+  R/B on `image`'s straight RGBA). `DecodedFrame::into_pixels` hands the buffer over without a
+  copy for `image::RgbaImage::from_raw` → `image::Frame::from_parts` → `RenderImage::new`.
+- **Decode:** PNG/APNG, GIF, WebP (still + animated, composited on a transparent canvas like
+  browsers). Delays of 10 ms or less become 100 ms. `DecodeLimits` (default 2048 px per side,
+  1024 frames, 64 MB decoded) reject oversized canvases and truncate long animations.
+  Decode cost is benchmarked in `crates/media/benches/decode.rs`.
+- **Memory:** `ByteLru` with a byte budget (default 256 MB). `V: CacheValue` lets the app store
+  its own value (e.g. `Arc<RenderImage>` plus a `Timeline`) so pixels are held once.
+  `on_evict` fires for every entry leaving memory (to release GPU textures), `on_ready` when a
+  load finishes (to repaint); both run off the UI thread with no locks held.
+- **Render path:** `get_if_ready(url)` (memory only, never blocks) or `get_or_request(url)`;
+  `Timeline::frame_at(elapsed)` maps one global animation clock to a frame index and the time
+  to the next frame change.
+- **Disk:** `<dir>/v1/<aa>/<sha256(url)[..16] hex>`, each entry with a header holding the full
+  URL and body length; written to a temp file and renamed; size cap (default 256 MB) with LRU
+  eviction by mtime; truncated or corrupt entries are deleted and refetched.
+- **Scale:** `scale::select(urls, display_scale, emote_scale)` takes the smallest variant with
+  at least `display_scale × emote_scale` density, else the largest below;
+  `logical_size` gives the draw size independent of the variant.
+
 ## Data flow
 
 ```
