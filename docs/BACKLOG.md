@@ -24,3 +24,10 @@ an entry here instead of expanding a PR. Format:
 - **Custom About window** (found in PR 0.2) — About is a Kit dialog showing name/version/ID; a proper panel with licences (incl. OFL notice for JetBrains Mono) can come later.
 - **Maximized state is never saved on macOS** (found in PR 0.2) — gpui-pre 0.3.12's macOS `window_bounds()` reports only `Windowed`/`Fullscreen`, so `Mode::Maximized` in `state.toml` is never written; revisit if upstream reports zoomed windows.
 - **Verify restore on a secondary display with a non-zero screen origin** (found in PR 0.2) — GPUI's macOS `bounds()` mixes the screen's y origin into the display-relative y; round trip is verified on the primary display only.
+- **Badge info in messages** (found in PR 1.1) — `BadgeId` carries only set and version; the IRC `badge-info` tag (e.g. subscriber months for the tooltip) is not modelled.
+- **Replace hand-rolled emoji and TLD tables** (found in PR 1.1) — `tokenizer/emoji.rs` and `tokenizer/links.rs` embed range/TLD tables to keep core dependency-free; consider `unicode-segmentation`/emoji data and a public-suffix list if they drift (new gTLDs and IDN TLDs are not recognised for bare domains).
+- **Links: IPv6, userinfo, non-ASCII TLDs** (found in PR 1.1) — only hostnames and IPv4, optional port; `http://[::1]/` and `user@host` URLs are left as text.
+- **Mentions by display name** (found in PR 1.1) — own-login detection matches the login only (ASCII case-insensitive), not a differently spelled non-ASCII display name.
+- **Strip reply `@user` prefix** (found in PR 1.1) — Twitch prepends `@parent ` to reply text; mapping (PR 1.2) should drop it before tokenizing, or the UI hides it when `reply` is set.
+- **Animated Twitch emotes** (found in PR 1.1) — `Emote::twitch` sets `animated: false` because the IRC tag does not say; PR 2.2 should detect via the `default` CDN format or the emote metadata.
+
