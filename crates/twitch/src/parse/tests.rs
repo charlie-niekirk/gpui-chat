@@ -575,21 +575,6 @@ fn errors_are_reported_not_panicked() {
         Err(ParseError::MissingPrefix { .. })
     ));
     assert!(matches!(
-        parse_line("@slow=fast :tmi.twitch.tv ROOMSTATE #c"),
-        Err(ParseError::InvalidTag { tag: "slow", .. })
-    ));
-    assert!(matches!(
-        parse_line("@emote-only=yes :tmi.twitch.tv ROOMSTATE #c"),
-        Err(ParseError::InvalidTag {
-            tag: "emote-only",
-            ..
-        })
-    ));
-    assert!(matches!(
-        parse_line("@bits=lots;id=1 :a!a@a PRIVMSG #c :hi"),
-        Err(ParseError::InvalidTag { tag: "bits", .. })
-    ));
-    assert!(matches!(
         parse_line("@target-msg-id= :tmi.twitch.tv CLEARMSG #c :x"),
         Err(ParseError::MissingTag {
             tag: "target-msg-id",
@@ -605,4 +590,58 @@ fn bad_emote_ranges_do_not_break_the_message() {
         panic!()
     };
     assert_eq!(message.plain_text(), "hi");
+}
+
+#[test]
+fn malformed_optional_tags_are_treated_as_absent() {
+    let Some(ChatEvent::Message { message: m, .. }) = parse_line(
+        "@id=1;bits=-5;first-msg=true;tmi-sent-ts=1 :a!a@a.tmi.twitch.tv PRIVMSG #c :Cheer100 hi",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(m.bits, None);
+    assert!(!m.flags.first_message);
+    assert_eq!(m.plain_text(), "Cheer100 hi", "no cheermote without bits");
+    assert_eq!(
+        m.raw_tags.get("bits"),
+        Some("-5"),
+        "the raw tag is still kept"
+    );
+
+    let Some(ChatEvent::RoomState { update, .. }) = parse_line(
+        "@slow=fast;emote-only=yes;followers-only=99999999999;r9k=1;room-id=5 :tmi.twitch.tv ROOMSTATE #c",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(update.slow_mode, None);
+    assert_eq!(update.emote_only, None);
+    assert_eq!(update.followers_only, None);
+    assert_eq!(update.unique_chat, Some(true), "good tags still apply");
+
+    let Some(ChatEvent::ClearChat { target, .. }) =
+        parse_line("@ban-duration=soon :tmi.twitch.tv CLEARCHAT #c :someone").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        target,
+        ClearTarget::User {
+            login: "someone".into(),
+            duration: None
+        }
+    );
+}
+
+#[test]
+fn action_without_closing_marker_is_still_an_action() {
+    let line =
+        "@id=1;emotes=25:5-9;tmi-sent-ts=1 :a!a@a.tmi.twitch.tv PRIVMSG #c :\u{1}ACTION wave Kappa";
+    let Some(ChatEvent::Message { message: m, .. }) = parse_line(line).unwrap() else {
+        panic!()
+    };
+    assert_eq!(m.kind, MessageKind::Action);
+    assert_eq!(m.plain_text(), "wave Kappa");
+    assert_eq!(emotes(&m), [("25", "Kappa")]);
 }

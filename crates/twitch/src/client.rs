@@ -7,9 +7,11 @@
 //!
 //! # Events
 //!
-//! Everything leaves through one bounded [`mpsc::Receiver<ChatEvent>`]. When it fills
-//! up the supervisor stops reading the socket (TCP back-pressure) rather than dropping
-//! events. Dropping the receiver shuts the client down.
+//! Everything leaves through one bounded [`mpsc::Receiver<ChatEvent>`]. If the UI falls
+//! behind, events wait in an outbox of the same size while the connection keeps being
+//! serviced (PINGs answered, join/part/shutdown handled); only if the UI stays behind
+//! past both buffers are chat *messages* dropped (warned in the log), never state
+//! changes. Dropping the receiver shuts the client down at once.
 //!
 //! * `Connection { channel: None, .. }` describes the whole connection and applies to
 //!   every channel: `Connecting`, `Connected` (login accepted), `Reconnecting`,
@@ -413,13 +415,15 @@ impl<C: Connector> Supervisor<C> {
         }
     }
 
+    /// Runs one connection to its end. Events are queued in an outbox and delivered by a
+    /// `select!` branch, so a full event channel never stops the loop from answering
+    /// PINGs or handling commands (see [`SessionState::queue`]).
     async fn session(&mut self, mut conn: C::Conn) -> SessionEnd {
         let started = Instant::now();
         let mut options = ParseOptions {
             own_login: (!self.credentials.is_anonymous()).then(|| self.credentials.login.clone()),
             fallback_timestamp: Timestamp::default(),
         };
-
         let mut handshake = vec![irc!["CAP", "REQ", "twitch.tv/tags twitch.tv/commands"]];
         if let Some(token) = &self.credentials.token {
             handshake.push(irc!["PASS", format!("oauth:{token}")]);
@@ -438,8 +442,61 @@ impl<C: Connector> Supervisor<C> {
             welcomed_at: None,
             pending: VecDeque::new(),
             sent: HashSet::new(),
+            outbox: VecDeque::new(),
+            outbox_limit: self.config.event_capacity.max(1),
+            dropped: 0,
         };
+        let end = self.session_loop(&mut conn, &mut state, &mut options).await;
+        // Deliver what is still queued before the caller reports the reconnect, so
+        // events stay in order. `Shutdown` is best effort.
+        match end {
+            SessionEnd::Shutdown => {
+                for event in state.outbox.drain(..) {
+                    let _ = self.events.try_send(event);
+                }
+                SessionEnd::Shutdown
+            }
+            end => {
+                if self.flush(&mut state.outbox).await {
+                    end
+                } else {
+                    SessionEnd::Shutdown
+                }
+            }
+        }
+    }
 
+    /// Delivers `outbox`, still applying commands meanwhile. `false` = shut down.
+    async fn flush(&mut self, outbox: &mut VecDeque<ChatEvent>) -> bool {
+        while !outbox.is_empty() {
+            tokio::select! {
+                permit = self.events.reserve() => match permit {
+                    Ok(permit) => {
+                        if let Some(event) = outbox.pop_front() {
+                            permit.send(event);
+                        }
+                    }
+                    Err(_) => return false,
+                },
+                command = self.commands.recv() => match offline_command(&mut self.wanted, &mut self.credentials, &self.events, command).await {
+                    Offline::Shutdown => return false,
+                    // The new credentials are used by the next connection.
+                    Offline::Continue | Offline::Credentials => {}
+                },
+            }
+        }
+        true
+    }
+
+    async fn session_loop(
+        &mut self,
+        conn: &mut C::Conn,
+        state: &mut SessionState,
+        options: &mut ParseOptions,
+    ) -> SessionEnd {
+        // A local handle: the select below borrows it (and the `Permit` it hands out)
+        // while the branch handlers need `&mut self`.
+        let events = self.events.clone();
         loop {
             let join_at = (state.welcomed_at.is_some() && !state.pending.is_empty())
                 .then(|| self.limiter.ready_at(Instant::now()));
@@ -463,11 +520,7 @@ impl<C: Connector> Supervisor<C> {
                             }
                         }
                     }
-                    Some(Command::Part(channel)) => {
-                        if self.part(&mut conn, &mut state, &channel).await.is_err() {
-                            return SessionEnd::Shutdown;
-                        }
-                    }
+                    Some(Command::Part(channel)) => self.part(conn, state, &channel).await,
                 },
 
                 received = conn.recv() => {
@@ -477,26 +530,38 @@ impl<C: Connector> Supervisor<C> {
                         Err(reason) => return lost(reason, state.connected_for(), false),
                     };
                     state.pong_deadline = None;
-                    match self.handle(&mut conn, &mut state, message, &mut options).await {
+                    match self.handle(conn, state, message, options).await {
                         Ok(Flow::Continue) => {}
                         Ok(Flow::Reconnect) => {
-                            return lost("server asked to reconnect".into(), state.connected_for(), false);
+                            return lost("server asked to reconnect".into(), state.connected_for(), true);
                         }
-                        Ok(Flow::Shutdown) => return SessionEnd::Shutdown,
                         Err(reason) => return lost(reason, state.connected_for(), false),
                     }
                 }
 
+                // Hand queued events to the UI as soon as the channel has room.
+                permit = events.reserve(), if !state.outbox.is_empty() => match permit {
+                    Ok(permit) => {
+                        if let Some(event) = state.outbox.pop_front() {
+                            permit.send(event);
+                        }
+                    }
+                    Err(_) => return SessionEnd::Shutdown,
+                },
+
+                // The receiver was dropped: stop even if the connection is quiet.
+                () = events.closed() => return SessionEnd::Shutdown,
+
                 () = sleep_until(join_at.unwrap_or_else(Instant::now)), if join_at.is_some() => {
-                    if let Err(end) = self.send_next_join(&mut conn, &mut state).await {
-                        return end;
+                    if let Err(reason) = self.send_next_join(conn, state).await {
+                        return lost(reason, state.connected_for(), false);
                     }
                 }
 
                 () = sleep_until(state.next_ping), if state.welcomed_at.is_some() => {
                     state.next_ping = Instant::now() + self.config.ping_interval;
                     state.pong_deadline.get_or_insert(Instant::now() + self.config.ping_timeout);
-                    if let Err(reason) = self.write(&mut conn, irc!["PING", "tmi.twitch.tv"]).await {
+                    if let Err(reason) = self.write(conn, irc!["PING", "tmi.twitch.tv"]).await {
                         return lost(reason, state.connected_for(), false);
                     }
                 }
@@ -528,9 +593,7 @@ impl<C: Connector> Supervisor<C> {
                 state.welcomed_at = Some(Instant::now());
                 state.login_deadline = None;
                 state.pending = self.wanted.iter().cloned().collect();
-                if !self.emit_connection(ConnectionState::Connected).await {
-                    return Ok(Flow::Shutdown);
-                }
+                state.queue(connection_event(None, ConnectionState::Connected));
                 return Ok(Flow::Continue);
             }
             // Confirmation of our own JOIN (membership is not requested, so only ours arrive).
@@ -540,12 +603,8 @@ impl<C: Connector> Supervisor<C> {
                     && nick.eq_ignore_ascii_case(&self.credentials.login)
                 {
                     let channel = ChannelId::new(name);
-                    if self.wanted.contains(&channel)
-                        && !self
-                            .emit(connection_event(Some(channel), ConnectionState::Connected))
-                            .await
-                    {
-                        return Ok(Flow::Shutdown);
+                    if self.wanted.contains(&channel) {
+                        state.queue(connection_event(Some(channel), ConnectionState::Connected));
                     }
                 }
                 return Ok(Flow::Continue);
@@ -555,11 +614,7 @@ impl<C: Connector> Supervisor<C> {
 
         options.fallback_timestamp = now_timestamp();
         match map_message(&message, options) {
-            Ok(Some(event)) => {
-                if !self.emit(event).await {
-                    return Ok(Flow::Shutdown);
-                }
-            }
+            Ok(Some(event)) => state.queue(event),
             Ok(None) => {}
             Err(e) => tracing::warn!("ignoring {} line: {e}", message.command),
         }
@@ -570,7 +625,7 @@ impl<C: Connector> Supervisor<C> {
         &mut self,
         conn: &mut C::Conn,
         state: &mut SessionState,
-    ) -> Result<(), SessionEnd> {
+    ) -> Result<(), String> {
         let Some(channel) = state.pending.pop_front() else {
             return Ok(());
         };
@@ -578,28 +633,16 @@ impl<C: Connector> Supervisor<C> {
             return Ok(());
         }
         self.limiter.record(Instant::now());
-        if let Err(reason) = self.write(conn, irc!["JOIN", channel.irc_name()]).await {
-            return Err(lost(reason, state.connected_for(), false));
-        }
+        self.write(conn, irc!["JOIN", channel.irc_name()]).await?;
         state.sent.insert(channel.clone());
-        if !self
-            .emit(connection_event(Some(channel), ConnectionState::Connecting))
-            .await
-        {
-            return Err(SessionEnd::Shutdown);
-        }
+        state.queue(connection_event(Some(channel), ConnectionState::Connecting));
         Ok(())
     }
 
-    /// Handles [`Command::Part`]. `Err` = shut down.
-    async fn part(
-        &mut self,
-        conn: &mut C::Conn,
-        state: &mut SessionState,
-        channel: &ChannelId,
-    ) -> Result<(), ()> {
+    /// Handles [`Command::Part`].
+    async fn part(&mut self, conn: &mut C::Conn, state: &mut SessionState, channel: &ChannelId) {
         if !self.wanted.contains(channel) {
-            return Ok(());
+            return;
         }
         self.wanted.retain(|c| c != channel);
         state.pending.retain(|c| c != channel);
@@ -608,17 +651,10 @@ impl<C: Connector> Supervisor<C> {
             // longer wanted either way, so it is not rejoined.
             let _ = self.write(conn, irc!["PART", channel.irc_name()]).await;
         }
-        if self
-            .emit(connection_event(
-                Some(channel.clone()),
-                ConnectionState::Disconnected { reason: None },
-            ))
-            .await
-        {
-            Ok(())
-        } else {
-            Err(())
-        }
+        state.queue(connection_event(
+            Some(channel.clone()),
+            ConnectionState::Disconnected { reason: None },
+        ));
     }
 
     async fn write(&self, conn: &mut C::Conn, message: IRCMessage) -> Result<(), String> {
@@ -628,7 +664,8 @@ impl<C: Connector> Supervisor<C> {
             .map_err(|_| "write timed out".to_owned())?
     }
 
-    /// `false` when the receiver is gone.
+    /// `false` when the receiver is gone. Only for use while no connection is open;
+    /// a session queues events instead (see [`SessionState::queue`]).
     async fn emit(&self, event: ChatEvent) -> bool {
         self.events.send(event).await.is_ok()
     }
@@ -650,7 +687,6 @@ impl<C: Connector> Supervisor<C> {
 enum Flow {
     Continue,
     Reconnect,
-    Shutdown,
 }
 
 struct SessionState {
@@ -662,9 +698,34 @@ struct SessionState {
     pending: VecDeque<ChannelId>,
     /// Channels a JOIN was sent for on this connection.
     sent: HashSet<ChannelId>,
+    /// Events waiting for room in the (bounded) event channel.
+    outbox: VecDeque<ChatEvent>,
+    outbox_limit: usize,
+    /// Chat messages dropped because both the channel and the outbox were full.
+    dropped: u64,
 }
 
 impl SessionState {
+    /// Queues an event for the UI. The socket keeps being read while the UI is slow, so
+    /// PINGs are answered and commands handled. The outbox holds up to one more channel
+    /// capacity of events; past that, chat *messages* are dropped (with a warning) and
+    /// everything else (state changes, moderation) is still kept, so a UI that is
+    /// stalled for minutes costs messages rather than the connection.
+    fn queue(&mut self, event: ChatEvent) {
+        if self.outbox.len() >= self.outbox_limit && matches!(event, ChatEvent::Message { .. }) {
+            if self.dropped == 0 {
+                tracing::warn!("event channel is full; dropping chat messages until it drains");
+            }
+            self.dropped += 1;
+            return;
+        }
+        if self.dropped > 0 && self.outbox.len() < self.outbox_limit {
+            tracing::warn!(dropped = self.dropped, "event channel drained again");
+            self.dropped = 0;
+        }
+        self.outbox.push_back(event);
+    }
+
     fn connected_for(&self) -> Option<Duration> {
         self.welcomed_at.map(|t| t.elapsed())
     }

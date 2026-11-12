@@ -513,14 +513,59 @@ async fn shutdown_reports_disconnected_and_ends() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn dropping_the_receiver_stops_the_task() {
+async fn dropping_the_receiver_stops_the_task_even_on_a_quiet_connection() {
     let mut rig = rig();
     let mut server = connected(&mut rig, "chan").await;
     let Rig { events, .. } = rig;
     drop(events);
-    // The next event finds nobody listening; the client closes the connection.
-    server.say("@id=1;tmi-sent-ts=1 :a!a@a.tmi.twitch.tv PRIVMSG #chan :nobody listens");
+    // Nothing is sent by the server: the client notices on its own and hangs up.
     assert!(server.client_hung_up().await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_ui_does_not_stop_pongs_or_commands() {
+    let mut rig = rig_with(ClientConfig {
+        event_capacity: 2,
+        ..config()
+    });
+    let mut server = connected(&mut rig, "chan").await;
+
+    // The UI stops draining. Far more messages than channel + outbox can hold arrive,
+    // then a server PING: it must still be answered, and part must still go out.
+    for i in 0..50 {
+        server.say(&format!(
+            "@id=m{i:02};tmi-sent-ts={i} :a!a@a.tmi.twitch.tv PRIVMSG #chan :msg {i}"
+        ));
+    }
+    server.say("PING :tmi.twitch.tv");
+    assert_eq!(server.line().await, "PONG tmi.twitch.tv");
+    rig.client.part(&chan("chan"));
+    assert_eq!(server.line().await, "PART #chan");
+
+    // Now the UI catches up: messages come in order (the overflow was dropped, not
+    // reordered), and the state change is never dropped.
+    let mut ids = Vec::new();
+    loop {
+        match rig.event().await {
+            ChatEvent::Message { message, .. } => ids.push(message.id.as_str().to_owned()),
+            ChatEvent::Connection {
+                channel: Some(c),
+                state: ConnectionState::Disconnected { .. },
+            } => {
+                assert_eq!(c, chan("chan"));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(ids.first().map(String::as_str), Some("m00"));
+    assert!(
+        ids.len() >= 2 && ids.len() <= 4,
+        "kept {} messages",
+        ids.len()
+    );
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "in order: {ids:?}");
+    assert_eq!(rig.net.attempts().len(), 1, "never disconnected");
 }
 
 #[tokio::test(start_paused = true)]

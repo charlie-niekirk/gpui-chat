@@ -13,6 +13,9 @@
 //! * Every tag is kept in [`Message::raw_tags`], sorted by key, with values
 //!   **unescaped** (`\s` is already a space), whatever the typed fields say.
 //! * A missing or empty `color` tag stays `None`; the renderer picks a colour.
+//! * Optional tags that do not parse (`bits=-5`, `first-msg=true`) are treated as absent
+//!   (logged at debug level) instead of failing the message. Tags a message cannot be
+//!   built without (`id`) are errors.
 //! * Lines that are not chat (PING, JOIN, 001, CAP, USERSTATE, ...) map to `Ok(None)`.
 
 use std::sync::Arc;
@@ -41,13 +44,6 @@ pub enum ParseError {
     /// A tag the event cannot be built without was absent or empty.
     #[error("{command} line is missing tag `{tag}`")]
     MissingTag { command: String, tag: &'static str },
-    /// A tag had a value that does not parse.
-    #[error("{command} line has invalid value {value:?} for tag `{tag}`")]
-    InvalidTag {
-        command: String,
-        tag: &'static str,
-        value: String,
-    },
 }
 
 /// Knobs for [`parse_line_with`]. The default is what [`parse_line`] uses.
@@ -143,29 +139,28 @@ fn required_tag<'a>(msg: &'a IRCMessage, key: &'static str) -> Result<&'a str, P
     })
 }
 
-fn invalid(msg: &IRCMessage, key: &'static str, value: &str) -> ParseError {
-    ParseError::InvalidTag {
-        command: msg.command.clone(),
-        tag: key,
-        value: value.to_owned(),
+/// Optional numeric tag. A value that does not parse (`bits=-5`) counts as absent: one
+/// odd tag must not cost the whole message.
+fn number<N: std::str::FromStr>(msg: &IRCMessage, key: &'static str) -> Option<N> {
+    let value = tag(msg, key)?;
+    match value.parse() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::debug!(command = %msg.command, tag = key, value, "ignoring malformed tag");
+            None
+        }
     }
 }
 
-fn number<N: std::str::FromStr>(
-    msg: &IRCMessage,
-    key: &'static str,
-) -> Result<Option<N>, ParseError> {
-    tag(msg, key)
-        .map(|v| v.parse().map_err(|_| invalid(msg, key, v)))
-        .transpose()
-}
-
-fn flag(msg: &IRCMessage, key: &'static str) -> Result<Option<bool>, ParseError> {
-    match tag(msg, key) {
-        None => Ok(None),
-        Some("1") => Ok(Some(true)),
-        Some("0") => Ok(Some(false)),
-        Some(other) => Err(invalid(msg, key, other)),
+/// Optional `0`/`1` tag; anything else (`true`) counts as absent.
+fn flag(msg: &IRCMessage, key: &'static str) -> Option<bool> {
+    match tag(msg, key)? {
+        "1" => Some(true),
+        "0" => Some(false),
+        value => {
+            tracing::debug!(command = %msg.command, tag = key, value, "ignoring malformed tag");
+            None
+        }
     }
 }
 
@@ -257,15 +252,13 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
     let channel = channel(msg)?;
     let mut text = param(msg, 1)?;
     let mut kind = MessageKind::Chat;
-    if let Some(inner) = text
-        .strip_prefix("\u{1}ACTION ")
-        .and_then(|t| t.strip_suffix('\u{1}'))
-    {
-        text = inner;
+    // The closing \x01 is optional: some clients (and truncated lines) omit it.
+    if let Some(inner) = text.strip_prefix("\u{1}ACTION ") {
+        text = inner.strip_suffix('\u{1}').unwrap_or(inner);
         kind = MessageKind::Action;
     }
     let id = MessageId::from(required_tag(msg, "id")?);
-    let bits: Option<u32> = number(msg, "bits")?;
+    let bits: Option<u32> = number(msg, "bits");
     let (fragments, mentions_self) = fragments(msg, text, bits.is_some(), options);
 
     let message = Message {
@@ -280,7 +273,7 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
         raw_tags: raw_tags(msg),
         flags: MessageFlags {
             mention: mentions_self,
-            first_message: flag(msg, "first-msg")?.unwrap_or(false),
+            first_message: flag(msg, "first-msg").unwrap_or(false),
             highlighted: tag(msg, "msg-id") == Some("highlighted-message"),
             deleted: false,
             history: tag(msg, "historical") == Some("1"),
@@ -298,7 +291,7 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
 fn usernotice(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseError> {
     let channel = channel(msg)?;
     let text = msg.params.get(1).map_or("", String::as_str);
-    let bits: Option<u32> = number(msg, "bits")?;
+    let bits: Option<u32> = number(msg, "bits");
     let (fragments, mentions_self) = fragments(msg, text, bits.is_some(), options);
 
     let message = Message {
@@ -330,7 +323,7 @@ fn clearchat(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
         None => ClearTarget::Channel,
         Some(login) => ClearTarget::User {
             login: login.clone(),
-            duration: number::<u64>(msg, "ban-duration")?.map(Duration::from_secs),
+            duration: number::<u64>(msg, "ban-duration").map(Duration::from_secs),
         },
     };
     Ok(ChatEvent::ClearChat { channel, target })
@@ -345,25 +338,20 @@ fn clearmsg(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
 }
 
 fn roomstate(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
-    let followers_only = match number::<i64>(msg, "followers-only")? {
-        None => None,
-        Some(n) if n < 0 => Some(FollowersOnly::Off),
-        Some(0) => Some(FollowersOnly::All),
-        Some(n) => {
-            Some(FollowersOnly::Minutes(u32::try_from(n).map_err(|_| {
-                invalid(msg, "followers-only", &n.to_string())
-            })?))
-        }
-    };
+    let followers_only = number::<i64>(msg, "followers-only").and_then(|n| match n {
+        n if n < 0 => Some(FollowersOnly::Off),
+        0 => Some(FollowersOnly::All),
+        n => u32::try_from(n).ok().map(FollowersOnly::Minutes),
+    });
     Ok(ChatEvent::RoomState {
         channel: channel(msg)?,
         update: RoomStateUpdate {
             room_id: tag(msg, "room-id").map(str::to_owned),
-            emote_only: flag(msg, "emote-only")?,
+            emote_only: flag(msg, "emote-only"),
             followers_only,
-            unique_chat: flag(msg, "r9k")?,
-            slow_mode: number::<u64>(msg, "slow")?.map(Duration::from_secs),
-            subscribers_only: flag(msg, "subs-only")?,
+            unique_chat: flag(msg, "r9k"),
+            slow_mode: number::<u64>(msg, "slow").map(Duration::from_secs),
+            subscribers_only: flag(msg, "subs-only"),
         },
     })
 }
