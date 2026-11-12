@@ -14,6 +14,9 @@
 //! (2 ms worst case, measured in the pacing tests) but never change the rate and never accumulate
 //! drift. The UI applies events once per frame (8 ms or more), so that is below what it can see.
 //!
+//! Each wake-up is capped ([`WorkLimits`]): a rate the generator cannot sustain makes it fall
+//! behind, reported as `behind` on the HUD, instead of monopolising a tokio worker.
+//!
 //! Sending uses `try_send`: a real-time source cannot wait for a slow UI, so events that do not
 //! fit the bridge queue are discarded and counted (`dropped` on the HUD).
 
@@ -513,11 +516,44 @@ fn due_time(count: u64, rate: f64) -> Duration {
     Duration::from_secs_f64(count as f64 / rate)
 }
 
+/// Caps on the work one wake-up may do, so a rate the generator cannot sustain makes it fall
+/// behind (and say so, as `behind` on the HUD) instead of monopolising a tokio worker.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkLimits {
+    /// Most events produced per wake-up.
+    pub max_messages: usize,
+    /// Most wall-clock time spent producing per wake-up (checked every [`CLOCK_CHECK_EVERY`]
+    /// events). The source then sleeps at least [`MIN_TICK`], so it uses at most about half a
+    /// worker at the default.
+    pub max_time: Duration,
+}
+
+impl Default for WorkLimits {
+    fn default() -> Self {
+        Self {
+            max_messages: 4096,
+            max_time: Duration::from_millis(1),
+        }
+    }
+}
+
+/// How many events are produced between two looks at the clock.
+const CLOCK_CHECK_EVERY: usize = 16;
+
 /// Produces events at `config.rate` until the UI side of the bridge is gone.
 pub async fn run(
     sender: BridgeSender<ChatEvent>,
     config: FirehoseConfig,
     counters: Arc<IngestCounters>,
+) {
+    run_with(sender, config, counters, WorkLimits::default()).await;
+}
+
+async fn run_with(
+    sender: BridgeSender<ChatEvent>,
+    config: FirehoseConfig,
+    counters: Arc<IngestCounters>,
+    limits: WorkLimits,
 ) {
     let rate = config.rate;
     let mut generator = Generator::new(&config);
@@ -525,7 +561,17 @@ pub async fn run(
     loop {
         let now = Instant::now();
         let due = due_count(now - start, rate);
+        // Real elapsed time, not tokio's (which stands still under paused test time).
+        let work_started = std::time::Instant::now();
+        let mut done = 0usize;
         while generator.produced() < due {
+            if done >= limits.max_messages
+                || (done.is_multiple_of(CLOCK_CHECK_EVERY)
+                    && done > 0
+                    && work_started.elapsed() >= limits.max_time)
+            {
+                break;
+            }
             match sender.try_send(generator.next_event()) {
                 Ok(()) => {
                     counters.sent.fetch_add(1, Ordering::Relaxed);
@@ -535,7 +581,12 @@ pub async fn run(
                 }
                 Err(TrySendError::Closed(_)) => return,
             }
+            done += 1;
         }
+        counters
+            .behind
+            .store(due.saturating_sub(generator.produced()), Ordering::Relaxed);
+        // The sleep also yields to other tasks when the cap cut this wake-up short.
         let next_due = start + due_time(generator.produced(), rate);
         sleep_until(next_due.max(now + MIN_TICK)).await;
     }
@@ -798,6 +849,41 @@ mod tests {
         };
         assert_eq!(message.id.as_str(), "firehose-000000000000");
         source.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unsustainable_rate_falls_behind_and_reports_it_instead_of_hogging_the_worker() {
+        let (tx, mut rx) = bridge::channel::<ChatEvent>(1_000_000, usize::MAX);
+        let counters = Arc::new(IngestCounters::default());
+        let limits = WorkLimits {
+            max_messages: 10,
+            max_time: Duration::from_secs(60),
+        };
+        // 100 000/s asked for, but at most 10 per wake-up and one wake-up per millisecond.
+        let source = tokio::spawn(run_with(tx, config(100_000.0, 1), counters.clone(), limits));
+        sleep_until(Instant::now() + Duration::from_secs(1)).await;
+        let produced = counters.sent() + counters.dropped();
+        assert!(
+            (9_000..=10_100).contains(&produced),
+            "capped at ~10 per ms, got {produced}"
+        );
+        // Due by the clock: ~100 000. The shortfall is exactly what was not produced.
+        let behind = counters.behind();
+        assert!((88_000..=91_500).contains(&behind), "behind by {behind}");
+        assert!(produced + behind >= 99_000, "{produced} + {behind}");
+        // What was produced is still the start of the same deterministic stream.
+        let first = rx.first().await.unwrap();
+        let ChatEvent::Message { message, .. } = first else {
+            panic!("expected a message");
+        };
+        assert_eq!(message.id.as_str(), "firehose-000000000000");
+        source.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sustainable_rate_is_never_behind() {
+        let (_, counters) = run_for(1000.0, 3, 100_000).await;
+        assert!(counters.behind() <= 2, "behind by {}", counters.behind());
     }
 
     #[tokio::test(start_paused = true)]

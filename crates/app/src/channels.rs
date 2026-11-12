@@ -195,7 +195,8 @@ impl ChannelHub {
     /// notified once. Returns `true` when a channel appeared (the hub's own observers have
     /// something new to show).
     pub fn apply_batch(&mut self, events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
-        self.diagnostics.record_batch(Instant::now(), events.len());
+        let started = Instant::now();
+        let count = events.len();
         let (groups, unrouted) = split_by_channel(events);
         self.unrouted += unrouted.len() as u64;
         let mut appeared = false;
@@ -216,6 +217,9 @@ impl ChannelHub {
                 }
             });
         }
+        // The bridge runs this before the frame's draw starts, so the draw probe cannot see it.
+        self.diagnostics
+            .record_batch(started, count, started.elapsed());
         appeared
     }
 }

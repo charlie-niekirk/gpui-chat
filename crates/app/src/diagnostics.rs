@@ -1,15 +1,22 @@
 //! Frame and ingest measurements behind the debug HUD.
 //!
+//! A frame is `apply` (ingest) followed by `draw`:
+//!
+//! * **Apply time** is how long the bridge's `apply` took ([`Diagnostics::record_batch`]). GPUI runs
+//!   next-frame callbacks, and therefore the bridge, *before* it starts the draw, so this cost
+//!   happens outside the probe below; it is timed separately by the caller.
 //! * **Draw time** is measured by [`FrameProbe`], an element wrapped around the whole window
-//!   content: it stamps `Instant::now()` when layout is requested (the start of the draw, which
-//!   is when the shell's views are rendered into elements) and again when its subtree has been
-//!   painted. That covers render, layout, prepaint and paint; it does not cover handing the scene
-//!   to the GPU (`Window::present`), which GPUI does after `draw` and offers no hook for outside
-//!   its `profiler` feature.
+//!   content: it stamps `Instant::now()` when the draw reaches it (the root view has been rendered
+//!   into elements by then, so the shell's own `render` is not counted, but everything below it is
+//!   rendered inside the probe's `request_layout`) and again when its subtree has been painted.
+//!   That covers the children's render, layout, prepaint and paint; it does not cover handing the
+//!   scene to the GPU (`Window::present`), which GPUI does after `draw` and offers no hook for
+//!   outside its `profiler` feature.
+//! * **Frame total** is the apply that preceded a draw plus that draw; the budget check
+//!   ([`FRAME_BUDGET`]) is against the total, because ingest cost is what the burst-ingest budget
+//!   is about.
 //! * **Frame interval** is the time between the starts of consecutive draws. Gaps over
 //!   [`IDLE_GAP`] are idle time, not slow frames, and are left out.
-//! * **Ingest** is recorded by the bridge `apply` callback, which runs at the start of a frame, so
-//!   its timestamps are frame timestamps.
 //!
 //! Recording never schedules a frame: the HUD reads these numbers when it renders.
 
@@ -28,8 +35,9 @@ use gpui_kit::{
 /// One frame at 120 Hz, the draw budget of the performance table in `docs/ARCHITECTURE.md`.
 pub const FRAME_BUDGET: Duration = Duration::from_micros(8_333);
 
-/// Draws kept for the percentiles (two seconds at 120 Hz).
-const FRAME_WINDOW: usize = 240;
+/// Samples kept for the percentiles: about eight seconds at 240 Hz, so a p99 rests on ~20 slow
+/// frames rather than two.
+const FRAME_WINDOW: usize = 2_048;
 
 /// Gap between draws above which the app was idle rather than slow.
 pub const IDLE_GAP: Duration = Duration::from_millis(100);
@@ -66,11 +74,19 @@ pub struct FrameSummary {
     pub total_draws: u64,
     /// Draws in the rolling window.
     pub window_draws: usize,
+    /// Draw time (see the module docs).
     pub last: Duration,
     pub p50: Duration,
     pub p99: Duration,
     pub max: Duration,
-    /// Draws in the window slower than [`FRAME_BUDGET`].
+    /// Time the bridge `apply` took, per batch.
+    pub apply_last: Duration,
+    pub apply_p50: Duration,
+    pub apply_p99: Duration,
+    pub apply_max: Duration,
+    /// 99th percentile of apply + draw per frame.
+    pub total_p99: Duration,
+    /// Draws in the window whose apply + draw exceeded [`FRAME_BUDGET`].
     pub over_budget: usize,
     /// Median / 99th percentile time between consecutive draws while busy.
     pub interval_p50: Duration,
@@ -83,6 +99,11 @@ pub struct FrameSummary {
 #[derive(Debug, Default)]
 pub struct FrameStats {
     draws: VecDeque<Duration>,
+    applies: VecDeque<Duration>,
+    /// Apply + draw per draw.
+    totals: VecDeque<Duration>,
+    /// Apply work since the last draw: when it started and how long it took in all.
+    pending_apply: Option<(Instant, Duration)>,
     intervals: VecDeque<Duration>,
     last_start: Option<Instant>,
     /// Start times of the draws in the last second (for the draws-per-second figure).
@@ -91,14 +112,28 @@ pub struct FrameStats {
 }
 
 impl FrameStats {
+    /// Records one bridge `apply` that started at `at` and took `took`. It is charged to the
+    /// next draw.
+    pub fn record_apply(&mut self, at: Instant, took: Duration) {
+        push_capped(&mut self.applies, took, FRAME_WINDOW);
+        self.pending_apply = Some(match self.pending_apply {
+            Some((first, total)) => (first, total + took),
+            None => (at, took),
+        });
+    }
+
     /// Records one draw that started at `start` and ended at `end`.
     pub fn record_draw(&mut self, start: Instant, end: Instant) {
         self.total_draws += 1;
-        push_capped(
-            &mut self.draws,
-            end.saturating_duration_since(start),
-            FRAME_WINDOW,
-        );
+        let draw = end.saturating_duration_since(start);
+        push_capped(&mut self.draws, draw, FRAME_WINDOW);
+        // Apply work belongs to this frame if it just preceded the draw; an apply that changed
+        // nothing (no notify, no draw) must not be charged to a draw much later.
+        let apply = match self.pending_apply.take() {
+            Some((at, took)) if start.saturating_duration_since(at) <= IDLE_GAP => took,
+            _ => Duration::ZERO,
+        };
+        push_capped(&mut self.totals, apply + draw, FRAME_WINDOW);
         if let Some(previous) = self.last_start {
             let gap = start.saturating_duration_since(previous);
             if gap <= IDLE_GAP {
@@ -124,6 +159,8 @@ impl FrameStats {
     /// of its last burst.
     pub fn summary(&self, now: Instant) -> FrameSummary {
         let draws = sorted(&self.draws);
+        let applies = sorted(&self.applies);
+        let totals = sorted(&self.totals);
         let intervals = sorted(&self.intervals);
         FrameSummary {
             total_draws: self.total_draws,
@@ -132,7 +169,12 @@ impl FrameStats {
             p50: percentile(&draws, 0.50),
             p99: percentile(&draws, 0.99),
             max: draws.last().copied().unwrap_or_default(),
-            over_budget: draws.iter().filter(|d| **d > FRAME_BUDGET).count(),
+            apply_last: self.applies.back().copied().unwrap_or_default(),
+            apply_p50: percentile(&applies, 0.50),
+            apply_p99: percentile(&applies, 0.99),
+            apply_max: applies.last().copied().unwrap_or_default(),
+            total_p99: percentile(&totals, 0.99),
+            over_budget: totals.iter().filter(|d| **d > FRAME_BUDGET).count(),
             interval_p50: percentile(&intervals, 0.50),
             interval_p99: percentile(&intervals, 0.99),
             draws_last_second: self
@@ -210,6 +252,9 @@ pub struct IngestCounters {
     pub sent: AtomicU64,
     /// Events a producer discarded because the bridge queue was full (the UI was behind).
     pub dropped: AtomicU64,
+    /// Events the source is late by right now: due by the clock but not yet produced because it
+    /// hit its per-wake-up work cap (a rate it cannot sustain). A gauge, not a total.
+    pub behind: AtomicU64,
 }
 
 impl IngestCounters {
@@ -219,6 +264,10 @@ impl IngestCounters {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn behind(&self) -> u64 {
+        self.behind.load(Ordering::Relaxed)
     }
 }
 
@@ -260,8 +309,12 @@ impl Diagnostics {
         self.inner.borrow_mut().frames.record_draw(start, end);
     }
 
-    pub fn record_batch(&self, at: Instant, events: usize) {
-        self.inner.borrow_mut().ingest.record_batch(at, events);
+    /// A bridge batch of `events` was applied; it started at `at` and `apply_took` is how long
+    /// `apply` ran.
+    pub fn record_batch(&self, at: Instant, events: usize, apply_took: Duration) {
+        let mut inner = self.inner.borrow_mut();
+        inner.ingest.record_batch(at, events);
+        inner.frames.record_apply(at, apply_took);
     }
 
     pub fn frame_summary(&self, now: Instant) -> FrameSummary {
@@ -395,6 +448,46 @@ mod tests {
         assert_eq!(s.draws_last_second, 10);
         // A while later, with nothing drawn since, the rate reads zero.
         assert_eq!(stats.summary(t0 + ms(5_000)).draws_last_second, 0);
+    }
+
+    #[test]
+    fn apply_time_is_charged_to_the_draw_that_follows_it() {
+        let t0 = Instant::now();
+        let mut stats = FrameStats::default();
+        // Draw alone: 2 ms, within budget.
+        stats.record_draw(t0, t0 + ms(2));
+        // A 7 ms apply right before a 2 ms draw: 9 ms in all, over the 8.3 ms budget, although
+        // neither half is.
+        stats.record_apply(t0 + ms(8), ms(7));
+        stats.record_draw(t0 + ms(15), t0 + ms(17));
+        let s = stats.summary(t0 + ms(20));
+        assert_eq!((s.apply_last, s.apply_max), (ms(7), ms(7)));
+        assert_eq!(s.max, ms(2), "draw time alone stays within budget");
+        assert_eq!(s.total_p99, ms(9));
+        assert_eq!(s.over_budget, 1);
+    }
+
+    #[test]
+    fn several_applies_before_one_draw_add_up_and_stale_ones_are_dropped() {
+        let t0 = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.record_apply(t0, ms(3));
+        stats.record_apply(t0 + ms(4), ms(3));
+        stats.record_draw(t0 + ms(8), t0 + ms(10));
+        assert_eq!(stats.summary(t0 + ms(10)).total_p99, ms(8));
+
+        // An apply that changed nothing and was followed by no draw for seconds is not charged
+        // to a later, unrelated draw.
+        stats.record_apply(t0 + ms(100), ms(50));
+        stats.record_draw(t0 + ms(5_000), t0 + ms(5_001));
+        let s = stats.summary(t0 + ms(5_001));
+        assert_eq!(
+            s.total_p99,
+            ms(8),
+            "the 1 ms draw alone is below the earlier 8 ms total"
+        );
+        assert_eq!(s.apply_max, ms(50), "the apply itself is still reported");
+        assert_eq!(s.over_budget, 0);
     }
 
     #[test]

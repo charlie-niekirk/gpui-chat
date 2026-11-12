@@ -191,8 +191,24 @@ impl Render for DebugHud {
                 budget_colour(frames.p99),
             ))
             .child(line(
+                "apply",
+                format!(
+                    "{} ms  p50 {}  p99 {}  max {}",
+                    ms(frames.apply_last),
+                    ms(frames.apply_p50),
+                    ms(frames.apply_p99),
+                    ms(frames.apply_max)
+                ),
+                budget_colour(frames.apply_p99),
+            ))
+            .child(line(
                 "over",
-                format!("{}/{} frames", frames.over_budget, frames.window_draws),
+                format!(
+                    "{}/{} (apply+draw, p99 {})",
+                    frames.over_budget,
+                    frames.window_draws,
+                    ms(frames.total_p99)
+                ),
                 if frames.over_budget > 0 {
                     tokens.danger
                 } else {
@@ -225,6 +241,15 @@ impl Render for DebugHud {
                 tokens.text,
             ))
             .child(stores)
+            .child(line(
+                "behind",
+                format!("{} msgs", counters.behind()),
+                if counters.behind() > 0 {
+                    tokens.danger
+                } else {
+                    tokens.text
+                },
+            ))
             .child(line(
                 "dropped",
                 format!("{dropped} of {}", counters.sent() + dropped),
