@@ -1,16 +1,15 @@
-//! Twitch IRC transport, Helix client and auth.
+//! Twitch chat transport: IRC over TLS (this PR), plus Helix and auth (later PRs).
 //!
-//! Stub crate: real functionality arrives in later PRs (see `PLAN.md`).
+//! * [`parse_line`] / [`parse_line_with`]: pure mapping of one raw IRC line to a
+//!   [`gpui_chat_core::ChatEvent`]. No network, no runtime; used by fixtures,
+//!   `--replay`, and later by recent-messages history.
+//! * [`TwitchClient`]: the live anonymous (or, later, authenticated) connection that
+//!   feeds the same mapping, with reconnect, backoff and join pacing.
 
-/// Name of this crate, used by the placeholder test below.
-pub const CRATE_NAME: &str = "gpui-chat-twitch";
+mod client;
+mod limits;
+mod parse;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crate_name_matches_package() {
-        assert_eq!(CRATE_NAME, env!("CARGO_PKG_NAME"));
-    }
-}
+pub use client::{ClientConfig, Credentials, TwitchClient};
+pub use limits::{Backoff, JoinRateLimit};
+pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
