@@ -47,8 +47,14 @@ impl SettingsStore {
     }
 
     /// Applies watcher events in order. `Reloaded` replaces the settings and clears the error;
-    /// `Failed` records the error and keeps the previous settings.
-    pub fn apply_events(&mut self, events: impl IntoIterator<Item = SettingsEvent>) {
+    /// `Failed` records the error and keeps the previous settings. Returns whether the settings
+    /// or the shown error changed, so a no-op batch (equal settings, a repeated error) does not
+    /// notify observers.
+    pub fn apply_events(&mut self, events: impl IntoIterator<Item = SettingsEvent>) -> bool {
+        let before = (
+            self.settings.clone(),
+            self.error.as_ref().map(ToString::to_string),
+        );
         for event in events {
             match event {
                 SettingsEvent::Reloaded(settings) => {
@@ -58,6 +64,11 @@ impl SettingsStore {
                 SettingsEvent::Failed(error) => self.error = Some(error),
             }
         }
+        before
+            != (
+                self.settings.clone(),
+                self.error.as_ref().map(ToString::to_string),
+            )
     }
 }
 
@@ -97,7 +108,7 @@ fn watch_baseline() -> Settings {
 fn start_watcher(
     path: &std::path::Path,
 ) -> Result<(SettingsWatcher, BridgeReceiver<SettingsEvent>), SettingsError> {
-    let (tx, rx) = bridge::channel(EVENT_QUEUE);
+    let (tx, rx) = bridge::channel(EVENT_QUEUE, EVENT_QUEUE);
     let watcher = watch(
         path,
         watch_baseline(),
@@ -207,6 +218,23 @@ mod tests {
         let shown = store.error().unwrap().to_string();
         assert!(shown.contains("settings.toml"), "{shown}");
         assert!(shown.contains("expected `=`"), "{shown}");
+    }
+
+    #[test]
+    fn apply_events_reports_whether_anything_changed() {
+        let mut store = store_with(with_size(18.0));
+        assert!(!store.apply_events([SettingsEvent::Reloaded(with_size(18.0))]));
+        assert!(store.apply_events([SettingsEvent::Failed(failure())]));
+        // The same error again changes nothing visible.
+        assert!(!store.apply_events([SettingsEvent::Failed(failure())]));
+        // Recovery with unchanged settings still clears the banner.
+        assert!(store.apply_events([SettingsEvent::Reloaded(with_size(18.0))]));
+        assert!(store.error().is_none());
+        // A batch that ends where it started is not a change.
+        assert!(!store.apply_events([
+            SettingsEvent::Failed(failure()),
+            SettingsEvent::Reloaded(with_size(18.0)),
+        ]));
     }
 
     #[test]

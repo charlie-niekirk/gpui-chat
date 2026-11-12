@@ -89,10 +89,11 @@ impl AppShell {
             }),
             // A settings change (or a load error appearing/clearing) applies live: font,
             // size and theme are pushed into the global font config and Kit theme, which
-            // refreshes every window; the notify re-renders the banner.
+            // refreshes every window, but only when the appearance section actually changed;
+            // the notify re-renders the banner.
             cx.observe_in(&config::store(cx), window, |_, store, window, cx| {
                 let appearance = store.read(cx).settings().appearance.clone();
-                theme::apply_settings(&appearance, Some(window), cx);
+                theme::apply_settings_if_changed(&appearance, Some(window), cx);
                 cx.notify();
             }),
             cx.observe_window_bounds(window, |this, window, cx| {

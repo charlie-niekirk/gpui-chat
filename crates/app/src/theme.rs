@@ -13,6 +13,12 @@ use gpui_kit::{App, Global, Hsla, Window, rgb};
 
 use crate::fonts::{self, FontConfig};
 
+/// The appearance section last applied by [`apply_settings`], to skip redundant re-applies.
+#[derive(Clone, Debug)]
+struct AppliedAppearance(AppearanceSettings);
+
+impl Global for AppliedAppearance {}
+
 /// The `appearance.theme` setting currently in effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ThemePreference(ThemeSetting);
@@ -85,6 +91,7 @@ impl Tokens {
 /// our tokens on top. Call at startup and whenever settings change. `window` is only used to
 /// read the system appearance when the preference is `system`.
 pub fn apply_settings(appearance: &AppearanceSettings, window: Option<&mut Window>, cx: &mut App) {
+    cx.set_global(AppliedAppearance(appearance.clone()));
     cx.set_global(ThemePreference(appearance.theme));
     fonts::apply(appearance, cx);
     match appearance.theme {
@@ -93,6 +100,23 @@ pub fn apply_settings(appearance: &AppearanceSettings, window: Option<&mut Windo
         ThemeSetting::System => Theme::sync_system_appearance(window, cx),
     }
     apply(cx);
+}
+
+/// [`apply_settings`], unless `appearance` is what was last applied (a failed reload, or a
+/// reload that changed other sections only): then nothing is recomputed, in particular the
+/// installed-font enumeration is skipped. Returns whether it applied.
+pub fn apply_settings_if_changed(
+    appearance: &AppearanceSettings,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) -> bool {
+    let unchanged = cx
+        .try_global::<AppliedAppearance>()
+        .is_some_and(|applied| applied.0 == *appearance);
+    if !unchanged {
+        apply_settings(appearance, window, cx);
+    }
+    !unchanged
 }
 
 /// Whether the OS appearance currently drives the theme (`appearance.theme = "system"`).
@@ -190,6 +214,26 @@ mod tests {
                 assert_eq!(Theme::global(cx).mode, ThemeMode::Light);
             })
             .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn unchanged_appearance_is_not_reapplied(cx: &mut gpui_kit::TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            let dark = appearance(ThemeSetting::Dark, 14.0, "Menlo");
+            assert!(apply_settings_if_changed(&dark, None, cx));
+            assert!(!apply_settings_if_changed(&dark, None, cx));
+            // Something Kit's theme would otherwise be reset by a re-apply.
+            Theme::update(cx, |theme| theme.font_size = gpui_kit::px(99.0));
+            assert!(!apply_settings_if_changed(&dark, None, cx));
+            assert_eq!(Theme::global(cx).font_size, gpui_kit::px(99.0));
+            assert!(apply_settings_if_changed(
+                &appearance(ThemeSetting::Dark, 15.0, "Menlo"),
+                None,
+                cx
+            ));
+            assert_eq!(Theme::global(cx).font_size, gpui_kit::px(15.0));
+        });
     }
 
     #[gpui_kit::test]

@@ -7,9 +7,10 @@
 //!   (`send().await` waits, `try_send` reports `Full`) instead of growing memory;
 //! - the receiver sleeps while the channel is empty (no polling, no idle frames);
 //! - once an event arrives it is drained in a **next-frame callback**, so events are applied
-//!   **at most once per frame**: everything that queued up meanwhile (up to the channel
-//!   capacity) is handed to `apply` as one ordered `Vec`, followed by **one**
-//!   `cx.notify()` for the whole batch.
+//!   **at most once per frame**: everything that queued up meanwhile (up to `max_batch`) is
+//!   handed to `apply` as one ordered `Vec`, followed by **one** `cx.notify()` for the whole
+//!   batch, if `apply` reports a change. Events beyond `max_batch` stay queued, in order, and
+//!   the next frame takes the next batch, so a huge queue never costs one huge layout pass.
 //!
 //! A burst of 1 000 events therefore costs one `apply`, one notify and one layout pass. This
 //! is the ingest-batching foundation for the firehose source (PR 1.3) and chat view (PR 1.4);
@@ -25,15 +26,17 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use mpsc::error::{SendError, TrySendError};
 
-/// Creates a bounded bridge channel. `capacity` is both the queue length (backpressure
-/// threshold) and the largest batch one frame will apply; it must be at least 1.
-pub fn channel<E>(capacity: usize) -> (BridgeSender<E>, BridgeReceiver<E>) {
-    let (tx, rx) = mpsc::channel(capacity);
+/// Creates a bounded bridge channel. `capacity` is the queue length (the backpressure
+/// threshold: size it for the largest burst a producer may send at once); `max_batch` is the
+/// most events one frame applies (size it for what one layout pass can take). Both are clamped
+/// to at least 1.
+pub fn channel<E>(capacity: usize, max_batch: usize) -> (BridgeSender<E>, BridgeReceiver<E>) {
+    let (tx, rx) = mpsc::channel(capacity.max(1));
     (
         BridgeSender { tx },
         BridgeReceiver {
             rx,
-            max_batch: capacity,
+            max_batch: max_batch.max(1),
         },
     )
 }
@@ -104,16 +107,18 @@ impl<E> BridgeReceiver<E> {
     }
 }
 
-/// Connects `receiver` to `entity`: each frame that follows an event, `apply` gets every
-/// queued event in order and the entity is notified once. Returns the task driving it; drop
-/// or `detach` it. The task ends (dropping the receiver) when all senders are gone, the
-/// window closes or the entity is released.
+/// Connects `receiver` to `entity`: each frame that follows an event, `apply` gets the queued
+/// events in order (at most `max_batch`) and returns whether it changed anything; the entity is
+/// notified once per batch, only when it did. While events remain queued the next frame is
+/// requested immediately. Returns the task driving it; drop or `detach` it. The task ends
+/// (dropping the receiver) when all senders are gone, the window closes or the entity is
+/// released.
 pub fn attach<E, T>(
     entity: &Entity<T>,
     window: AnyWindowHandle,
     receiver: BridgeReceiver<E>,
     cx: &mut App,
-    apply: impl FnMut(&mut T, Vec<E>, &mut Context<T>) + 'static,
+    apply: impl FnMut(&mut T, Vec<E>, &mut Context<T>) -> bool + 'static,
 ) -> Task<()>
 where
     E: 'static,
@@ -136,8 +141,9 @@ where
                     let batch = receiver.drain(first);
                     let alive = entity
                         .update(cx, |target, cx| {
-                            apply(target, batch, cx);
-                            cx.notify();
+                            if apply(target, batch, cx) {
+                                cx.notify();
+                            }
                         })
                         .is_ok();
                     let _ = done_tx.send(alive.then_some((receiver, apply)));
@@ -172,7 +178,7 @@ mod tests {
 
     #[test]
     fn drain_coalesces_everything_queued_in_order() {
-        let (tx, mut rx) = channel::<u32>(16);
+        let (tx, mut rx) = channel::<u32>(16, 16);
         for event in 0..10 {
             tx.try_send(event).unwrap();
         }
@@ -186,7 +192,7 @@ mod tests {
 
     #[test]
     fn batch_is_capped_and_the_rest_stays_queued_in_order() {
-        let (tx, mut rx) = channel::<u32>(4);
+        let (tx, mut rx) = channel::<u32>(4, 4);
         for event in 0..4 {
             tx.try_send(event).unwrap();
         }
@@ -204,7 +210,7 @@ mod tests {
 
     #[test]
     fn full_queue_pushes_back_on_producers() {
-        let (tx, mut rx) = channel::<u32>(2);
+        let (tx, mut rx) = channel::<u32>(2, 2);
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
         assert!(matches!(tx.try_send(3), Err(TrySendError::Full(3))));
@@ -226,7 +232,7 @@ mod tests {
 
     #[test]
     fn senders_see_closed_when_the_receiver_is_dropped() {
-        let (tx, rx) = channel::<u32>(2);
+        let (tx, rx) = channel::<u32>(2, 2);
         assert!(!tx.is_closed());
         drop(rx);
         assert!(tx.is_closed());
@@ -236,7 +242,7 @@ mod tests {
 
     #[test]
     fn receiver_ends_after_the_last_sender_and_still_yields_queued_events() {
-        let (tx, mut rx) = channel::<u32>(4);
+        let (tx, mut rx) = channel::<u32>(4, 4);
         let tx2 = tx.clone();
         tx.try_send(1).unwrap();
         drop(tx);
@@ -271,17 +277,22 @@ mod tests {
 
     impl Harness {
         fn new(cx: &mut TestAppContext, capacity: usize) -> Self {
+            Self::with_batch(cx, capacity, capacity)
+        }
+
+        fn with_batch(cx: &mut TestAppContext, capacity: usize, max_batch: usize) -> Self {
             let window = cx.add_window(|_, _| Root);
             let sink = cx.new(|_| Sink::default());
             let notifications = Rc::new(Cell::new(0));
-            let (tx, rx) = channel(capacity);
+            let (tx, rx) = channel(capacity, max_batch);
             let counter = notifications.clone();
             let observer =
                 cx.update(|cx| cx.observe(&sink, move |_, _| counter.set(counter.get() + 1)));
             observer.detach();
             let task = cx.update(|cx| {
                 attach(&sink, window.into(), rx, cx, |sink: &mut Sink, batch, _| {
-                    sink.batches.push(batch)
+                    sink.batches.push(batch);
+                    true
                 })
             });
             Self {
@@ -365,6 +376,67 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_backlog_larger_than_max_batch_drains_over_frames_in_order(cx: &mut TestAppContext) {
+        // A big queue for bursts, a small per-frame batch.
+        let harness = Harness::with_batch(cx, 64, 4);
+        for event in 0..10 {
+            harness.tx.try_send(event).unwrap();
+        }
+        harness.frame(cx);
+        assert_eq!(harness.batches(cx), vec![vec![0, 1, 2, 3]]);
+        assert_eq!(harness.notifications.get(), 1);
+        // The leftovers request the next frame on their own, without a new event.
+        harness.frame(cx);
+        assert_eq!(harness.batches(cx).len(), 2);
+        assert_eq!(harness.batches(cx)[1], vec![4, 5, 6, 7]);
+        harness.frame(cx);
+        assert_eq!(
+            harness.batches(cx),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]]
+        );
+        assert_eq!(harness.notifications.get(), 3);
+        // Drained: further frames are idle.
+        harness.frame(cx);
+        assert_eq!(harness.batches(cx).len(), 3);
+        assert_eq!(harness.notifications.get(), 3);
+    }
+
+    #[gpui_kit::test]
+    fn no_notify_when_apply_reports_no_change(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Root);
+        let sink = cx.new(|_| Sink::default());
+        let notifications = Rc::new(Cell::new(0));
+        let counter = notifications.clone();
+        cx.update(|cx| cx.observe(&sink, move |_, _| counter.set(counter.get() + 1)))
+            .detach();
+        let (tx, rx) = channel::<u32>(8, 8);
+        let task = cx.update(|cx| {
+            attach(&sink, window.into(), rx, cx, |sink: &mut Sink, batch, _| {
+                let changed = batch.contains(&1);
+                sink.batches.push(batch);
+                changed
+            })
+        });
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        tx.try_send(0).unwrap();
+        frame(cx);
+        assert_eq!(sink.read_with(cx, |sink, _| sink.batches.len()), 1);
+        assert_eq!(notifications.get(), 0, "unchanged batch: no notify");
+        tx.try_send(1).unwrap();
+        frame(cx);
+        assert_eq!(notifications.get(), 1);
+        drop(task);
+    }
+
+    #[gpui_kit::test]
     fn dropping_the_entity_closes_the_bridge(cx: &mut TestAppContext) {
         let Harness {
             window,
@@ -416,7 +488,7 @@ mod tests {
         let applied = Rc::new(RefCell::new(Vec::new()));
         let window = cx.add_window(|_, _| Root);
         let sink = cx.new(|_| Sink::default());
-        let (tx, rx) = channel::<u32>(8);
+        let (tx, rx) = channel::<u32>(8, 8);
         let log = applied.clone();
         let task = cx.update(|cx| {
             attach(
@@ -424,7 +496,10 @@ mod tests {
                 window.into(),
                 rx,
                 cx,
-                move |_: &mut Sink, batch, _| log.borrow_mut().push(batch),
+                move |_: &mut Sink, batch, _| {
+                    log.borrow_mut().push(batch);
+                    true
+                },
             )
         });
         tx.try_send(5).unwrap();

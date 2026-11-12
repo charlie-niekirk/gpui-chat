@@ -102,21 +102,46 @@ pub fn resolve(appearance: &AppearanceSettings, installed: &[String]) -> FontCon
 }
 
 /// Walks the user's `preferred` families, then the default chain, and returns the first one
-/// present in `installed`. Never returns a family that is not installed, except the virtual
-/// system UI family as the very last resort.
+/// present in `installed`. Names match case-insensitively (`menlo` finds `Menlo`) and the
+/// **installed spelling** is returned, because GPUI looks families up by exact name. Never
+/// returns a family that is not installed, except the virtual system UI family as the very
+/// last resort. Logs a warning naming the user's families when none of them is installed.
 pub fn pick_family<'a>(
     preferred: impl IntoIterator<Item = &'a str>,
     installed: &[String],
 ) -> SharedString {
-    preferred
+    let find = |candidate: &str| {
+        let candidate = candidate.trim();
+        (!candidate.is_empty())
+            .then(|| {
+                installed
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(candidate))
+            })
+            .flatten()
+    };
+    let preferred: Vec<&str> = preferred.into_iter().collect();
+    if let Some(name) = preferred.iter().find_map(|candidate| find(candidate)) {
+        return name.clone().into();
+    }
+    let requested: Vec<&str> = preferred
+        .iter()
+        .map(|candidate| candidate.trim())
+        .filter(|candidate| !candidate.is_empty())
+        .collect();
+    let chosen = [NERD_FAMILY, BUNDLED_FAMILY]
         .into_iter()
-        .chain([NERD_FAMILY, BUNDLED_FAMILY])
         .chain(SYSTEM_MONO_FAMILIES.iter().copied())
-        .map(str::trim)
-        .find(|candidate| installed.iter().any(|name| name == candidate))
-        .unwrap_or(SYSTEM_UI_FAMILY)
-        .to_string()
-        .into()
+        .find_map(find)
+        .map_or(SYSTEM_UI_FAMILY, String::as_str);
+    if !requested.is_empty() {
+        tracing::warn!(
+            requested = ?requested,
+            using = chosen,
+            "none of the configured font families is installed; falling back"
+        );
+    }
+    chosen.to_string().into()
 }
 
 #[cfg(test)]
@@ -152,6 +177,21 @@ mod tests {
         assert_eq!(pick_family(["Fira Code"], &installed), "Fira Code");
         // The first installed entry of the user's chain is used, not simply the first entry.
         assert_eq!(pick_family(["Nope", "Menlo"], &installed), "Menlo");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_returns_the_installed_spelling() {
+        let installed = names(&[BUNDLED_FAMILY, "Menlo"]);
+        assert_eq!(pick_family(["menlo"], &installed), "Menlo");
+        assert_eq!(pick_family(["MENLO"], &installed), "Menlo");
+        assert_eq!(pick_family(["Jetbrains Mono"], &installed), BUNDLED_FAMILY);
+        assert_eq!(
+            pick_family(["  jetbrains mono "], &installed),
+            BUNDLED_FAMILY
+        );
+        // The default chain is matched the same way, whatever the platform spells it.
+        let odd = names(&["jetbrains mono"]);
+        assert_eq!(pick_family([], &odd), "jetbrains mono");
     }
 
     #[test]
