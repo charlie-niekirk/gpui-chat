@@ -97,7 +97,11 @@ fn map_err(err: reqwest::Error) -> FetchError {
         FetchError::Timeout
     } else if let Some(status) = err.status() {
         FetchError::Status(status.as_u16())
+    } else if err.is_builder() || err.is_redirect() || err.is_decode() {
+        // Retrying cannot fix an invalid URL, a redirect loop or a bad content encoding.
+        FetchError::Request(err.to_string().into())
     } else {
+        // Connect, send and body errors: the connection failed and may work next time.
         FetchError::Network(err.to_string().into())
     }
 }
@@ -148,6 +152,7 @@ mod tests {
         assert!(!FetchError::Status(403).is_transient());
         assert!(!FetchError::NotFound(404).is_transient());
         assert!(!FetchError::TooLarge { limit: 1 }.is_transient());
+        assert!(!FetchError::Request("bad url".into()).is_transient());
     }
 
     #[test]
@@ -258,7 +263,11 @@ mod tests {
             Err(FetchError::TooLarge { limit: 1024 })
         );
         assert_eq!(fetcher.fetch(&get("/slow")).await, Err(FetchError::Timeout));
-        // Nothing listens on port 9 of localhost: a network error.
+        // Not a URL: a permanent request error, not retried.
+        let invalid = fetcher.fetch("not a url").await.unwrap_err();
+        assert!(matches!(invalid, FetchError::Request(_)), "{invalid:?}");
+        assert!(!invalid.is_transient());
+        // Nothing listens on port 9 of localhost: a (transient) network error.
         assert!(matches!(
             fetcher.fetch("http://127.0.0.1:9/x").await,
             Err(FetchError::Network(_))

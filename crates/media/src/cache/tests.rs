@@ -73,6 +73,17 @@ impl Fetcher for FakeFetcher {
     }
 }
 
+/// Disk writes happen after waiters are served; waits for the entry for `url` to land.
+async fn disk_entry(dir: &std::path::Path, url: &str) -> Vec<u8> {
+    for _ in 0..400 {
+        if let Some(bytes) = DiskCache::new(dir, 1 << 20).read(url).unwrap() {
+            return bytes;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no disk entry for {url}");
+}
+
 fn test_config() -> ImageCacheConfig {
     ImageCacheConfig {
         request_timeout: Duration::from_millis(300),
@@ -169,6 +180,7 @@ async fn disk_cache_hit_after_restart() {
     let a = first.load(URL).await.unwrap();
     assert_eq!(online.calls(URL), 1);
     assert_eq!(first.stats().disk_hits, 0);
+    assert_eq!(disk_entry(dir.path(), URL).await, fixture("animated.gif"));
     assert!(first.stats().disk_bytes.unwrap() > 0);
     drop(first);
 
@@ -202,11 +214,7 @@ async fn corrupt_disk_entry_is_refetched() {
     assert_eq!(fetcher.calls(URL), 1);
     assert_eq!(cache.stats().disk_hits, 0);
     // The good bytes replaced the bad entry.
-    let on_disk = DiskCache::new(dir.path(), 1 << 20)
-        .read(URL)
-        .unwrap()
-        .unwrap();
-    assert_eq!(on_disk, png_bytes(4, 4));
+    assert_eq!(disk_entry(dir.path(), URL).await, png_bytes(4, 4));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,4 +478,39 @@ async fn custom_cache_value() {
     let w = cache.load("a").await.unwrap();
     assert_eq!(w.frames, 4);
     assert_eq!(cache.stats().memory_bytes, w.bytes);
+}
+
+/// A value whose conversion panics, standing in for a decoder bug.
+#[derive(Debug)]
+struct Panics;
+
+impl CacheValue for Panics {
+    fn from_decoded(_: DecodedImage) -> Self {
+        panic!("simulated decoder bug");
+    }
+
+    fn byte_size(&self) -> usize {
+        0
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_decoder_is_negatively_cached() {
+    let fetcher = FakeFetcher::new(Duration::ZERO).route("p", Route::Ok(png_bytes(2, 2)));
+    let cache = ImageCache::<Panics>::builder(Handle::current())
+        .config(test_config())
+        .fetcher(fetcher.clone())
+        .build()
+        .unwrap();
+    let err = cache.load("p").await.unwrap_err();
+    assert!(
+        matches!(err, MediaError::Decode(DecodeError::Malformed(_))),
+        "{err:?}"
+    );
+    // Remembered: the render path asking again does not refetch and re-panic.
+    assert!(matches!(cache.status("p"), ImageStatus::Failed(_)));
+    assert!(cache.get_or_request("p").is_none());
+    assert_eq!(cache.load("p").await.unwrap_err(), err);
+    assert_eq!(fetcher.calls("p"), 1);
+    assert_eq!(cache.stats().decode_failures, 1);
 }

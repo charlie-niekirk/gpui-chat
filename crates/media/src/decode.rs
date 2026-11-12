@@ -25,10 +25,10 @@ use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat};
 
 use crate::error::DecodeError;
 
-/// Frame delays below this are treated as "unspecified", like browsers do for GIF
-/// (a delay of 0 or 10 ms would otherwise spin at 100 fps or faster).
-pub const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
-/// What a delay below [`MIN_FRAME_DELAY`] is replaced with.
+/// Frame delays at or below this are treated as "unspecified", like Chromium and Firefox do
+/// (old GIFs use 0 or 10 ms and expect ~10 fps). Anything longer, e.g. 16 ms, is kept.
+pub const MAX_UNSPECIFIED_DELAY: Duration = Duration::from_millis(10);
+/// What a delay at or below [`MAX_UNSPECIFIED_DELAY`] is replaced with.
 pub const CLAMPED_FRAME_DELAY: Duration = Duration::from_millis(100);
 
 /// Bounds that protect against decompression bombs and absurd inputs.
@@ -82,7 +82,7 @@ impl DecodedFrame {
         self.pixels
     }
 
-    /// How long this frame is shown. Already clamped (see [`MIN_FRAME_DELAY`]). Zero for
+    /// How long this frame is shown. Already clamped (see [`MAX_UNSPECIFIED_DELAY`]). Zero for
     /// still images.
     pub fn delay(&self) -> Duration {
         self.delay
@@ -402,8 +402,8 @@ fn decode_frames(
     Ok(DecodedImage::new(w, h, format, out, truncated))
 }
 
-/// Browser-style delay clamping: anything shorter than [`MIN_FRAME_DELAY`] becomes
-/// [`CLAMPED_FRAME_DELAY`].
+/// Browser-style delay clamping: [`MAX_UNSPECIFIED_DELAY`] (10 ms) or less becomes
+/// [`CLAMPED_FRAME_DELAY`] (100 ms).
 pub fn clamp_delay(delay: image::Delay) -> Duration {
     let (numer, denom) = delay.numer_denom_ms();
     let delay = if denom == 0 {
@@ -411,7 +411,7 @@ pub fn clamp_delay(delay: image::Delay) -> Duration {
     } else {
         Duration::from_micros(u64::from(numer) * 1000 / u64::from(denom))
     };
-    if delay < MIN_FRAME_DELAY {
+    if delay <= MAX_UNSPECIFIED_DELAY {
         CLAMPED_FRAME_DELAY
     } else {
         delay
@@ -503,6 +503,35 @@ mod tests {
         assert_animation(&img, SourceFormat::WebP);
     }
 
+    /// Rewrites the duration of animation frame `index` in an animated WebP.
+    fn set_webp_frame_delay(webp: &mut [u8], index: usize, ms: u32) {
+        let mut pos = 12; // after "RIFF" <size> "WEBP"
+        let mut frame = 0;
+        while pos + 8 <= webp.len() {
+            let size = u32::from_le_bytes(webp[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if &webp[pos..pos + 4] == b"ANMF" {
+                if frame == index {
+                    // Payload: x, y, width-1, height-1 (3 bytes each), then 3-byte duration.
+                    let at = pos + 8 + 12;
+                    webp[at..at + 3].copy_from_slice(&ms.to_le_bytes()[..3]);
+                    return;
+                }
+                frame += 1;
+            }
+            pos += 8 + size + (size & 1);
+        }
+        panic!("frame {index} not found");
+    }
+
+    #[test]
+    fn a_16ms_webp_frame_keeps_its_delay() {
+        let mut webp = fixture("animated.webp");
+        set_webp_frame_delay(&mut webp, 2, 16);
+        let img = decode(&webp, &DecodeLimits::default()).unwrap();
+        let delays: Vec<_> = img.frames().iter().map(DecodedFrame::delay).collect();
+        assert_eq!(delays, vec![ms(100), ms(50), ms(16), ms(30)]);
+    }
+
     #[test]
     fn larger_animations_decode() {
         for name in ["animated-112.gif", "animated-112.webp"] {
@@ -586,7 +615,8 @@ mod tests {
         let d = |n| clamp_delay(image::Delay::from_numer_denom_ms(n, 1));
         assert_eq!(d(0), ms(100));
         assert_eq!(d(10), ms(100));
-        assert_eq!(d(19), ms(100));
+        assert_eq!(d(11), ms(11));
+        assert_eq!(d(16), ms(16));
         assert_eq!(d(20), ms(20));
         assert_eq!(d(70), ms(70));
     }

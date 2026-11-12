@@ -91,7 +91,7 @@ memory insert. 404/410 and undecodable images are remembered for 10 min, other f
   R/B on `image`'s straight RGBA). `DecodedFrame::into_pixels` hands the buffer over without a
   copy for `image::RgbaImage::from_raw` → `image::Frame::from_parts` → `RenderImage::new`.
 - **Decode:** PNG/APNG, GIF, WebP (still + animated, composited on a transparent canvas like
-  browsers). Delays under 20 ms become 100 ms. `DecodeLimits` (default 2048 px per side,
+  browsers). Delays of 10 ms or less become 100 ms. `DecodeLimits` (default 2048 px per side,
   1024 frames, 64 MB decoded) reject oversized canvases and truncate long animations.
   Decode cost is benchmarked in `crates/media/benches/decode.rs`.
 - **Memory:** `ByteLru` with a byte budget (default 256 MB). `V: CacheValue` lets the app store

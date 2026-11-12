@@ -14,7 +14,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::decode::{DecodeLimits, DecodedImage, decode};
 use crate::disk::DiskCache;
-use crate::error::{BuildError, FetchError, MediaError};
+use crate::error::{BuildError, DecodeError, FetchError, MediaError};
 use crate::fetch::{Fetcher, HttpConfig, HttpFetcher, RetryPolicy};
 use crate::memory::{ByteLru, ImageKey};
 use crate::scale::{self, Selected};
@@ -134,6 +134,8 @@ fn bump(counter: &AtomicU64) {
 }
 
 type LoadResult<V> = Result<Arc<V>, MediaError>;
+/// Downloaded, still-encoded bytes shared between decode and the disk write.
+type Bytes = Arc<Vec<u8>>;
 type Slot<V> = Option<LoadResult<V>>;
 type EvictFn<V> = Arc<dyn Fn(&ImageKey, &Arc<V>) + Send + Sync>;
 type ReadyFn = Arc<dyn Fn(&ImageKey) + Send + Sync>;
@@ -399,6 +401,9 @@ impl<V: CacheValue> ImageCache<V> {
     pub fn stats(&self) -> CacheStats {
         let c = &self.inner.counters;
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        // Read the disk index first: it has its own lock, which must never be taken while the
+        // state lock is held (the render path takes the state lock).
+        let disk_bytes = self.inner.disk.as_ref().and_then(|d| d.total_bytes());
         let state = self.state();
         CacheStats {
             memory_hits: get(&c.memory_hits),
@@ -415,7 +420,7 @@ impl<V: CacheValue> ImageCache<V> {
             memory_entries: state.lru.len(),
             memory_budget: state.lru.budget(),
             in_flight: state.in_flight.len(),
-            disk_bytes: self.inner.disk.as_ref().and_then(|d| d.total_bytes()),
+            disk_bytes,
         }
     }
 
@@ -428,20 +433,25 @@ impl<V: CacheValue> ImageCache<V> {
         }
     }
 
-    /// The load pipeline for one URL. Runs on the tokio runtime.
-    async fn load_uncached(&self, key: &ImageKey) -> LoadResult<V> {
+    /// The load pipeline for one URL. Runs on the tokio runtime. On success also returns the
+    /// downloaded bytes when they still need writing to the disk cache, which the caller does
+    /// after publishing the image.
+    async fn load_uncached(&self, key: &ImageKey) -> Result<(Arc<V>, Option<Bytes>), MediaError> {
         let url = key.url();
         if let Some(disk) = &self.inner.disk {
             let (disk, u) = (disk.clone(), url.to_owned());
-            let cached = tokio::task::spawn_blocking(move || disk.read(&u))
-                .await
-                .map_err(|_| MediaError::Cancelled)?;
+            let cached = match tokio::task::spawn_blocking(move || disk.read(&u)).await {
+                Ok(read) => read,
+                Err(e) if e.is_panic() => Err(std::io::Error::other("disk read panicked")),
+                Err(_) => return Err(MediaError::Cancelled),
+            };
             match cached {
                 Ok(Some(bytes)) => match self.decode(Arc::new(bytes)).await {
                     Ok(v) => {
                         bump(&self.inner.counters.disk_hits);
-                        return Ok(v);
+                        return Ok((v, None));
                     }
+                    Err(MediaError::Cancelled) => return Err(MediaError::Cancelled),
                     Err(err) => {
                         tracing::debug!(url, %err, "disk cache entry does not decode; refetching");
                         self.disk_op(move |d, u| d.remove(u), url).await;
@@ -460,8 +470,7 @@ impl<V: CacheValue> ImageCache<V> {
             bump(&self.inner.counters.decode_failures);
         })?;
         // Only bytes that decoded are worth keeping.
-        self.disk_op(move |d, u| d.write(u, &bytes), url).await;
-        Ok(value)
+        Ok((value, Some(bytes)))
     }
 
     async fn disk_op(
@@ -513,7 +522,7 @@ impl<V: CacheValue> ImageCache<V> {
     }
 
     /// Decodes and converts on the blocking pool, at most `max_concurrent_decodes` at a time.
-    async fn decode(&self, bytes: Arc<Vec<u8>>) -> LoadResult<V> {
+    async fn decode(&self, bytes: Bytes) -> LoadResult<V> {
         let permit = self
             .inner
             .decode_permits
@@ -527,7 +536,16 @@ impl<V: CacheValue> ImageCache<V> {
             decode(&bytes, &limits).map(|img| Arc::new(V::from_decoded(img)))
         })
         .await
-        .map_err(|_| MediaError::Cancelled)?
+        .map_err(|e| {
+            if e.is_panic() {
+                // Remembered like any undecodable image, so a bad file is not refetched and
+                // re-panicked on every repaint.
+                tracing::warn!("image decoder panicked");
+                MediaError::Decode(DecodeError::Malformed("decoder panicked".into()))
+            } else {
+                MediaError::Cancelled
+            }
+        })?
         .map_err(MediaError::from)
     }
 
@@ -574,8 +592,7 @@ impl<V: CacheValue> ImageCache<V> {
     }
 }
 
-/// Owns an in-flight entry. If the load future is dropped unfinished (runtime shutdown or a
-/// panic), waiters get [`MediaError::Cancelled`] instead of hanging and the URL can be
+/// Owns an in-flight entry. If the load future is dropped unfinished (runtime shutdown), waiters get [`MediaError::Cancelled`] instead of hanging and the URL can be
 /// requested again.
 struct LoadGuard<V: CacheValue> {
     cache: ImageCache<V>,
@@ -585,12 +602,21 @@ struct LoadGuard<V: CacheValue> {
 
 impl<V: CacheValue> LoadGuard<V> {
     async fn run(mut self) {
-        let result = self.cache.load_uncached(&self.key).await;
-        if let Err(err) = &result {
-            tracing::debug!(url = %self.key, %err, "image load failed");
-        }
+        let (result, to_write) = match self.cache.load_uncached(&self.key).await {
+            Ok((value, to_write)) => (Ok(value), to_write),
+            Err(err) => {
+                tracing::debug!(url = %self.key, %err, "image load failed");
+                (Err(err), None)
+            }
+        };
         self.finished = true;
+        // Waiters get the image first; persisting it (and disk eviction) happens afterwards.
         self.cache.finish(&self.key, result);
+        if let Some(bytes) = to_write {
+            self.cache
+                .disk_op(move |d, u| d.write(u, &bytes), self.key.url())
+                .await;
+        }
     }
 }
 

@@ -14,21 +14,25 @@ pub enum FetchError {
     /// No complete response within the request timeout.
     #[error("timed out")]
     Timeout,
-    /// Connection, TLS or protocol failure.
+    /// Connection, TLS or protocol failure while talking to the server (transient).
     #[error("network error: {0}")]
     Network(Arc<str>),
+    /// The request itself is wrong: invalid URL, redirect policy, undecodable content encoding
+    /// (permanent; not retried).
+    #[error("request error: {0}")]
+    Request(Arc<str>),
     /// The body was larger than `ImageCacheConfig::max_download_bytes`.
     #[error("response larger than {limit} bytes")]
     TooLarge { limit: u64 },
 }
 
 impl FetchError {
-    /// Worth retrying: timeouts, network failures, 408, 429 and 5xx.
+    /// Worth retrying: timeouts, connection/network failures, 408, 429 and 5xx.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Timeout | Self::Network(_) => true,
             Self::Status(s) => *s == 408 || *s == 429 || *s >= 500,
-            Self::NotFound(_) | Self::TooLarge { .. } => false,
+            Self::NotFound(_) | Self::Request(_) | Self::TooLarge { .. } => false,
         }
     }
 }
@@ -58,7 +62,9 @@ pub enum MediaError {
     Fetch(#[from] FetchError),
     #[error(transparent)]
     Decode(#[from] DecodeError),
-    /// The load task was dropped before finishing (runtime shut down, or it panicked).
+    /// The load task was dropped before finishing because the runtime shut down. Not
+    /// remembered: the next request retries. (A panicking decoder is reported as
+    /// [`DecodeError::Malformed`] and remembered like any undecodable image.)
     #[error("image load cancelled")]
     Cancelled,
 }

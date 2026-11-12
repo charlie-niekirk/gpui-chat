@@ -72,7 +72,10 @@ impl Index {
 pub struct DiskCache {
     root: PathBuf,
     max_bytes: u64,
+    /// `None` until the first operation has scanned the directory.
     index: Mutex<Option<Index>>,
+    /// Serialises the first-use scan so `index` is not held during directory I/O.
+    scan_lock: Mutex<()>,
     tmp_counter: AtomicU64,
 }
 
@@ -83,6 +86,7 @@ impl DiskCache {
             root: dir.into().join(LAYOUT_DIR),
             max_bytes,
             index: Mutex::new(None),
+            scan_lock: Mutex::new(()),
             tmp_counter: AtomicU64::new(0),
         }
     }
@@ -90,7 +94,7 @@ impl DiskCache {
     /// The stored bytes for `url`, or `None` on a miss. A corrupt or truncated entry is
     /// deleted and reported as a miss.
     pub fn read(&self, url: &str) -> io::Result<Option<Vec<u8>>> {
-        self.ensure_index()?;
+        self.ensure_index();
         let name = file_name(url);
         let path = self.entry_path(&name);
         let data = match fs::read(&path) {
@@ -132,7 +136,7 @@ impl DiskCache {
 
     /// Stores `body` for `url` atomically, then evicts old entries if over the cap.
     pub fn write(&self, url: &str, body: &[u8]) -> io::Result<()> {
-        self.ensure_index()?;
+        self.ensure_index();
         let name = file_name(url);
         let path = self.entry_path(&name);
         let tmp = self.root.join(TMP_DIR).join(format!(
@@ -141,7 +145,14 @@ impl DiskCache {
             self.tmp_counter.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| {
-            let mut file = File::create(&tmp)?;
+            let mut file = match File::create(&tmp) {
+                // The scan could not create it, or someone deleted it since.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir_all(self.root.join(TMP_DIR))?;
+                    File::create(&tmp)?
+                }
+                other => other?,
+            };
             file.write_all(MAGIC)?;
             file.write_all(&[FORMAT_VERSION])?;
             file.write_all(&(url.len() as u32).to_le_bytes())?;
@@ -177,6 +188,7 @@ impl DiskCache {
 
     /// Deletes the entry for `url`, if any.
     pub fn remove(&self, url: &str) -> io::Result<()> {
+        self.ensure_index();
         let name = file_name(url);
         self.with_index(|ix| ix.take(&name));
         match fs::remove_file(self.entry_path(&name)) {
@@ -208,20 +220,43 @@ impl DiskCache {
         f(guard.get_or_insert_with(Index::default))
     }
 
-    fn ensure_index(&self) -> io::Result<()> {
-        let mut guard = self.index.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(self.scan()?);
-        }
-        Ok(())
+    fn index_built(&self) -> bool {
+        self.index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
-    /// Creates the layout, drops stale temp files and indexes existing entries.
-    fn scan(&self) -> io::Result<Index> {
+    /// Builds the index on first use. The scan runs without holding the index lock, so
+    /// [`Self::total_bytes`] never waits on directory I/O.
+    fn ensure_index(&self) {
+        if self.index_built() {
+            return;
+        }
+        let _scan = self
+            .scan_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.index_built() {
+            return;
+        }
+        let index = self.scan();
+        let mut guard = self.index.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(index);
+        }
+    }
+
+    /// Creates the layout, drops stale temp files and indexes existing entries. Never fails:
+    /// whatever cannot be read is skipped (and simply not counted towards the cap), so a bad
+    /// directory does not make every operation rescan.
+    fn scan(&self) -> Index {
         let tmp_dir = self.root.join(TMP_DIR);
-        fs::create_dir_all(&tmp_dir)?;
+        if let Err(err) = fs::create_dir_all(&tmp_dir) {
+            tracing::warn!(%err, dir = %tmp_dir.display(), "cannot create disk image cache");
+        }
         let now = SystemTime::now();
-        for entry in fs::read_dir(&tmp_dir)?.flatten() {
+        for entry in read_dir_or_skip(&tmp_dir) {
             let old = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -232,11 +267,11 @@ impl DiskCache {
             }
         }
         let mut index = Index::default();
-        for shard in fs::read_dir(&self.root)?.flatten() {
+        for shard in read_dir_or_skip(&self.root) {
             if shard.file_name() == TMP_DIR || !shard.path().is_dir() {
                 continue;
             }
-            for entry in fs::read_dir(shard.path())?.flatten() {
+            for entry in read_dir_or_skip(&shard.path()) {
                 let Ok(meta) = entry.metadata() else { continue };
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
@@ -260,7 +295,7 @@ impl DiskCache {
             dir = %self.root.display(),
             "disk image cache indexed"
         );
-        Ok(index)
+        index
     }
 
     /// Deletes least recently used entries until under [`EVICT_TO_PERCENT`] of the cap.
@@ -294,6 +329,14 @@ impl DiskCache {
             tracing::debug!(evicted = victims.len(), "disk image cache over cap");
         }
     }
+}
+
+/// The readable entries of `dir`; an unreadable directory or entry is logged and skipped.
+fn read_dir_or_skip(dir: &Path) -> impl Iterator<Item = fs::DirEntry> + use<> {
+    let entries = fs::read_dir(dir)
+        .inspect_err(|err| tracing::debug!(%err, dir = %dir.display(), "skipping unreadable dir"))
+        .ok();
+    entries.into_iter().flatten().flatten()
 }
 
 /// 128 bits of SHA-256(url) as lowercase hex.
@@ -429,6 +472,34 @@ mod tests {
         // No temp files left behind.
         let tmp = fs::read_dir(cache.root().join(TMP_DIR)).unwrap().count();
         assert_eq!(tmp, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_shard_is_skipped_and_the_index_is_still_built() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = DiskCache::new(dir.path(), 1 << 20);
+        writer.write("good", b"ok").unwrap();
+        // A shard directory nobody can list (another user's, or broken permissions).
+        let bad = dir.path().join(LAYOUT_DIR).join("zz");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("f".repeat(32)), b"x").unwrap();
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root can list it anyway; then its file is simply counted.
+        let extra = if fs::read_dir(&bad).is_ok() { 1 } else { 0 };
+        let cache = DiskCache::new(dir.path(), 1 << 20);
+        assert_eq!(cache.read("good").unwrap().as_deref(), Some(&b"ok"[..]));
+        assert_eq!(cache.total_bytes(), Some(header_len("good") + 2 + extra));
+        // Built once: further operations neither fail nor rescan.
+        cache.write("more", b"x").unwrap();
+        assert_eq!(
+            cache.total_bytes(),
+            Some(header_len("good") + 2 + extra + header_len("more") + 1)
+        );
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
