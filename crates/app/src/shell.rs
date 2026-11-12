@@ -11,13 +11,20 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    App, Bounds, Context, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, Styled, Subscription, Task, Window, WindowBounds, div, px, size,
+    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Task,
+    Window, WindowBounds, div, px, size,
 };
 
-use crate::actions::{About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleSidebar};
+use crate::actions::{
+    About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleDebugHud, ToggleSidebar,
+};
+use crate::channels::ChannelHub;
 use crate::config;
+use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::fonts::FontConfig;
+use crate::hud::DebugHud;
+use crate::placeholder_chat::PlaceholderChat;
 use crate::platform;
 use crate::state::{self, Mode, WindowPlacement};
 use crate::theme::{self, Tokens};
@@ -73,16 +80,37 @@ pub fn flush_placement(cx: &App) {
     }
 }
 
+/// What the shell shows besides its own chrome: the channel stores (fed by the bridge) and the
+/// measurements behind the debug HUD.
+pub struct ShellParts {
+    pub hub: Entity<ChannelHub>,
+    pub diagnostics: Diagnostics,
+    pub hud_visible: bool,
+}
+
 pub struct AppShell {
     focus_handle: FocusHandle,
     sidebar_collapsed: bool,
+    diagnostics: Diagnostics,
+    hub: Entity<ChannelHub>,
+    hud: Entity<DebugHud>,
+    /// The placeholder list over the first channel that has appeared (PR 1.5 adds selection).
+    chat: Option<Entity<PlaceholderChat>>,
     save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AppShell {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, parts: ShellParts, cx: &mut Context<Self>) -> Self {
+        let ShellParts {
+            hub,
+            diagnostics,
+            hud_visible,
+        } = parts;
+        let hud = cx.new(|cx| DebugHud::new(diagnostics.clone(), hub.clone(), hud_visible, cx));
         let subscriptions = vec![
+            // A channel appearing in the hub gives the main area something to show.
+            cx.observe(&hub, |this, _, cx| this.hub_changed(cx)),
             // Follow the system light/dark setting live, but only when `theme = "system"`.
             cx.observe_window_appearance(window, |_, window, cx| {
                 theme::system_appearance_changed(window, cx);
@@ -103,11 +131,35 @@ impl AppShell {
         window.set_window_title(APP_NAME);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        Self {
+        let mut shell = Self {
             focus_handle,
             sidebar_collapsed: false,
+            diagnostics,
+            hub,
+            hud,
+            chat: None,
             save_task: None,
             _subscriptions: subscriptions,
+        };
+        shell.hub_changed(cx);
+        shell
+    }
+
+    /// Shows the first channel's store in the main area once there is one.
+    fn hub_changed(&mut self, cx: &mut Context<Self>) {
+        if self.chat.is_some() {
+            return;
+        }
+        let first = {
+            let hub = self.hub.read(cx);
+            hub.channels()
+                .first()
+                .and_then(|channel| hub.store(channel))
+                .cloned()
+        };
+        if let Some(store) = first {
+            self.chat = Some(cx.new(|cx| PlaceholderChat::new(store, cx)));
+            cx.notify();
         }
     }
 
@@ -194,25 +246,22 @@ impl AppShell {
             .child(div().text_sm().child(error.to_string()))
     }
 
-    fn main_area(tokens: &Tokens) -> impl IntoElement {
-        div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .bg(tokens.main_bg)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
+    fn main_area(&self, tokens: &Tokens) -> impl IntoElement {
+        let area = div().flex_1().min_h_0().w_full().bg(tokens.main_bg);
+        match &self.chat {
+            Some(chat) => area.child(chat.clone()),
+            None => area.flex().items_center().justify_center().child(
                 v_flex()
                     .items_center()
                     .gap_2()
                     .child(div().text_xl().child(APP_NAME))
                     .child(div().text_sm().text_color(tokens.text_muted).child(format!(
-                        "Chat will appear here. Press {} to toggle the sidebar.",
-                        platform::TOGGLE_SIDEBAR_LABEL
+                        "Chat will appear here. Press {} to toggle the sidebar, {} for the debug HUD.",
+                        platform::TOGGLE_SIDEBAR_LABEL,
+                        platform::TOGGLE_HUD_LABEL
                     ))),
-            )
+            ),
+        }
     }
 }
 
@@ -228,13 +277,16 @@ impl Render for AppShell {
         let font = cx.global::<FontConfig>().clone();
         let settings_error = config::store(cx).read(cx).error().cloned();
 
-        v_flex()
+        let root = v_flex()
             .key_context(SHELL_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
             .on_action(cx.listener(|_, _: &About, window, cx| Self::show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleDebugHud, _, cx| {
+                this.hud.update(cx, |hud, cx| hud.toggle(cx));
+            }))
             .size_full()
             .bg(tokens.window_bg)
             .text_color(tokens.text)
@@ -262,6 +314,7 @@ impl Render for AppShell {
                     .child(self.sidebar(&tokens))
                     .child(
                         v_flex()
+                            .relative()
                             .flex_1()
                             .min_w_0()
                             .h_full()
@@ -270,8 +323,11 @@ impl Render for AppShell {
                                     .as_ref()
                                     .map(|error| Self::settings_error_banner(error, &tokens)),
                             )
-                            .child(Self::main_area(&tokens)),
+                            .child(self.main_area(&tokens))
+                            .child(self.hud.clone()),
                     ),
-            )
+            );
+        // Times the draw of everything above for the HUD.
+        frame_probe(self.diagnostics.clone(), root)
     }
 }

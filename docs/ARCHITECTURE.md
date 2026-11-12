@@ -55,6 +55,26 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 - `actions.rs` + `platform/` — action definitions; key bindings and the native menu bar are
   per-platform and live only under `platform/`. The Kit `native_menu` is a popup context menu;
   the application menu bar uses GPUI `cx.set_menus`.
+- `channels.rs` — `ChannelStore` (GPUI entity: core `MessageStore` + room/connection state, one per
+  channel) and `ChannelHub` (owns the stores; its `apply_batch` is the bridge's `apply`: it splits a
+  frame's batch by channel, applies each run in order and notifies each touched store once).
+- `firehose.rs` / `cli.rs` — `--firehose <msgs/sec>`: a seeded synthetic `ChatEvent` source on the
+  tokio runtime (messages are due at `i / rate`; each wake-up sends everything due in one batch;
+  `try_send`, so a UI that falls behind makes it drop and count rather than stall). `cli.rs` is a
+  std-only flag parser.
+- `replay.rs` — `--replay <file> [--replay-speed <x>]`: feeds a recorded raw IRC log through
+  `gpui_chat_twitch::parse_line`. At speed 1 events follow `tmi-sent-ts` (gaps capped at 5 s,
+  backwards stamps never rewind, untimestamped events go with the previous one; a log with no
+  stamps runs at 100 events/s); speed 0 is as fast as the UI takes events. Lossless (`send().await`),
+  unlike the firehose; rejected lines are counted as parse errors on the HUD.
+- `diagnostics.rs` / `hud.rs` — debug HUD (⌘⇧D, View menu). `FrameProbe` wraps the window content
+  and times the draw (layout request → paint end) with `Instant`s; ingest is timestamped in the
+  bridge `apply`. The HUD re-renders only when something happened (ingest, drops, foreign draws)
+  plus one settle refresh, from a 4 Hz timer that exists only while it is visible, so an idle window
+  never redraws. `present` (GPU hand-off) is not included: GPUI has no hook for it outside its
+  `profiler` feature.
+- `placeholder_chat.rs` — the stand-in list (`uniform_list` over the newest 200 rows) that PR 1.4
+  replaces with the real chat view.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore). Separate from user settings.
 
@@ -114,8 +134,8 @@ memory insert. 404/410 and undecodable images are remembered for 10 min, other f
 twitch-irc / Helix / emote APIs   (tokio threads)
         │  ChatEvent over a bounded channel
         ▼
-ChannelStore (one GPUI entity per joined channel)   ← tokenizer + EmoteResolver
-        │  drained at most once per frame, one notify per batch
+ChannelHub → ChannelStore (one GPUI entity per joined channel)   ← tokenizer + EmoteResolver
+        │  drained at most once per frame, one notify per touched store per batch
         ▼
 ChatView → list() → MessageElement (custom Element)  ← ImageCache
 ```

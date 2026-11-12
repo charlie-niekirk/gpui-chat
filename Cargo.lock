@@ -2326,6 +2326,7 @@ dependencies = [
  "dirs 7.0.0",
  "gpui-chat-core",
  "gpui-chat-settings",
+ "gpui-chat-twitch",
  "gpui-kit",
  "gpui-pre",
  "serde",
