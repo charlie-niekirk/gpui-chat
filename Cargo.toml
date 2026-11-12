@@ -37,6 +37,7 @@ twitch_oauth2 = { version = "=0.17.1", features = ["reqwest"] }
 
 # Media (WebP preferred, GIF/PNG fallback; no AVIF)
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+sha2 = "0.10"
 
 # Platform services, settings and paths
 keyring = "4.2"
@@ -47,6 +48,7 @@ dirs = "7.0"
 
 # Test-only
 tempfile = "3"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # Errors and logging
 thiserror = "2.0"
