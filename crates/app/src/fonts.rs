@@ -1,15 +1,16 @@
 //! Bundled JetBrains Mono and the default font-family chain.
 //!
 //! The four upstream TTFs (OFL-1.1, see `assets/fonts/OFL.txt`) are compiled in and
-//! registered with the text system at startup. The family actually used is picked once:
-//! `JetBrainsMono Nerd Font` if installed, else the bundled `JetBrains Mono`, else a system
-//! monospace. GPUI panics when it lays out text in a family that does not exist, so the pick
-//! is made against the installed-family list instead of being left to a fallback cascade.
-//!
-//! Family and size are hard-coded defaults until PR 0.4 wires them to settings.
+//! registered with the text system at startup. The family actually used is picked from the
+//! user's `appearance.font_family` + `font_fallbacks`, then `JetBrainsMono Nerd Font`, the
+//! bundled `JetBrains Mono` and a system monospace, taking the first one that is installed.
+//! GPUI panics when it lays out text in a family that does not exist, so the pick is always
+//! validated against the installed-family list instead of being left to a fallback cascade.
+//! [`apply`] re-runs the pick when settings change.
 
 use std::borrow::Cow;
 
+use gpui_chat_settings::AppearanceSettings;
 use gpui_kit::{App, Global, Pixels, SharedString, px};
 
 /// Family name of the bundled fonts, as stored in the TTF name tables.
@@ -18,9 +19,6 @@ pub const BUNDLED_FAMILY: &str = "JetBrains Mono";
 pub const NERD_FAMILY: &str = "JetBrainsMono Nerd Font";
 /// GPUI's virtual system UI family; the last resort.
 const SYSTEM_UI_FAMILY: &str = ".SystemUIFont";
-
-/// Default font size (hard-coded until settings are wired in PR 0.4).
-pub const DEFAULT_FONT_SIZE: Pixels = px(14.0);
 
 /// System monospace families, tried in order after the JetBrains Mono ones.
 const SYSTEM_MONO_FAMILIES: &[&str] = if cfg!(target_os = "macos") {
@@ -73,8 +71,8 @@ pub fn embedded_paths() -> impl Iterator<Item = &'static str> {
     FONT_FILES.iter().map(|(name, _)| *name)
 }
 
-/// Registers the bundled fonts and stores the resolved [`FontConfig`] as a global.
-pub fn init(cx: &mut App) {
+/// Registers the bundled fonts, then resolves and stores the [`FontConfig`] for `appearance`.
+pub fn init(appearance: &AppearanceSettings, cx: &mut App) {
     let faces: Vec<Cow<'static, [u8]>> = FONT_FILES
         .iter()
         .map(|(_, bytes)| Cow::Borrowed(*bytes))
@@ -82,24 +80,68 @@ pub fn init(cx: &mut App) {
     if let Err(error) = cx.text_system().add_fonts(faces) {
         tracing::warn!(%error, "failed to register bundled JetBrains Mono");
     }
-    let installed = cx.text_system().all_font_names();
-    let family = pick_family(&installed);
-    tracing::info!(%family, "resolved UI font family");
-    cx.set_global(FontConfig {
-        family,
-        size: DEFAULT_FONT_SIZE,
-    });
+    apply(appearance, cx);
 }
 
-/// Walks the default chain and returns the first family present in `installed`.
-pub fn pick_family(installed: &[String]) -> SharedString {
-    [NERD_FAMILY, BUNDLED_FAMILY]
+/// Resolves the font for `appearance` against the installed families and stores it as the
+/// [`FontConfig`] global. Callers re-apply the theme afterwards (see `theme::apply_settings`)
+/// so Kit components pick the new font up too.
+pub fn apply(appearance: &AppearanceSettings, cx: &mut App) {
+    let installed = cx.text_system().all_font_names();
+    let config = resolve(appearance, &installed);
+    tracing::info!(family = %config.family, size = config.size.as_f32(), "resolved UI font");
+    cx.set_global(config);
+}
+
+/// The family and size to use for `appearance`, given the installed family names.
+pub fn resolve(appearance: &AppearanceSettings, installed: &[String]) -> FontConfig {
+    FontConfig {
+        family: pick_family(appearance.font_chain(), installed),
+        size: px(appearance.font_size),
+    }
+}
+
+/// Walks the user's `preferred` families, then the default chain, and returns the first one
+/// present in `installed`. Names match case-insensitively (`menlo` finds `Menlo`) and the
+/// **installed spelling** is returned, because GPUI looks families up by exact name. Never
+/// returns a family that is not installed, except the virtual system UI family as the very
+/// last resort. Logs a warning naming the user's families when none of them is installed.
+pub fn pick_family<'a>(
+    preferred: impl IntoIterator<Item = &'a str>,
+    installed: &[String],
+) -> SharedString {
+    let find = |candidate: &str| {
+        let candidate = candidate.trim();
+        (!candidate.is_empty())
+            .then(|| {
+                installed
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(candidate))
+            })
+            .flatten()
+    };
+    let preferred: Vec<&str> = preferred.into_iter().collect();
+    if let Some(name) = preferred.iter().find_map(|candidate| find(candidate)) {
+        return name.clone().into();
+    }
+    let requested: Vec<&str> = preferred
+        .iter()
+        .map(|candidate| candidate.trim())
+        .filter(|candidate| !candidate.is_empty())
+        .collect();
+    let chosen = [NERD_FAMILY, BUNDLED_FAMILY]
         .into_iter()
         .chain(SYSTEM_MONO_FAMILIES.iter().copied())
-        .find(|candidate| installed.iter().any(|name| name == candidate))
-        .unwrap_or(SYSTEM_UI_FAMILY)
-        .to_string()
-        .into()
+        .find_map(find)
+        .map_or(SYSTEM_UI_FAMILY, String::as_str);
+    if !requested.is_empty() {
+        tracing::warn!(
+            requested = ?requested,
+            using = chosen,
+            "none of the configured font families is installed; falling back"
+        );
+    }
+    chosen.to_string().into()
 }
 
 #[cfg(test)]
@@ -113,20 +155,69 @@ mod tests {
     #[test]
     fn nerd_font_wins_when_installed() {
         let installed = names(&[BUNDLED_FAMILY, NERD_FAMILY, "Menlo"]);
-        assert_eq!(pick_family(&installed), NERD_FAMILY);
+        assert_eq!(pick_family([], &installed), NERD_FAMILY);
     }
 
     #[test]
     fn bundled_font_is_next() {
         let installed = names(&[BUNDLED_FAMILY, "Menlo"]);
-        assert_eq!(pick_family(&installed), BUNDLED_FAMILY);
+        assert_eq!(pick_family([], &installed), BUNDLED_FAMILY);
     }
 
     #[test]
     fn system_monospace_then_system_ui() {
         let mono = SYSTEM_MONO_FAMILIES[0];
-        assert_eq!(pick_family(&names(&[mono])), mono);
-        assert_eq!(pick_family(&names(&["Helvetica"])), SYSTEM_UI_FAMILY);
+        assert_eq!(pick_family([], &names(&[mono])), mono);
+        assert_eq!(pick_family([], &names(&["Helvetica"])), SYSTEM_UI_FAMILY);
+    }
+
+    #[test]
+    fn preferred_family_wins_when_installed() {
+        let installed = names(&[BUNDLED_FAMILY, NERD_FAMILY, "Menlo", "Fira Code"]);
+        assert_eq!(pick_family(["Fira Code"], &installed), "Fira Code");
+        // The first installed entry of the user's chain is used, not simply the first entry.
+        assert_eq!(pick_family(["Nope", "Menlo"], &installed), "Menlo");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_returns_the_installed_spelling() {
+        let installed = names(&[BUNDLED_FAMILY, "Menlo"]);
+        assert_eq!(pick_family(["menlo"], &installed), "Menlo");
+        assert_eq!(pick_family(["MENLO"], &installed), "Menlo");
+        assert_eq!(pick_family(["Jetbrains Mono"], &installed), BUNDLED_FAMILY);
+        assert_eq!(
+            pick_family(["  jetbrains mono "], &installed),
+            BUNDLED_FAMILY
+        );
+        // The default chain is matched the same way, whatever the platform spells it.
+        let odd = names(&["jetbrains mono"]);
+        assert_eq!(pick_family([], &odd), "jetbrains mono");
+    }
+
+    #[test]
+    fn missing_preferred_family_falls_back_through_the_default_chain() {
+        let installed = names(&[BUNDLED_FAMILY, "Menlo"]);
+        assert_eq!(pick_family(["Not Installed"], &installed), BUNDLED_FAMILY);
+        // Generic names like `monospace` are not installed families and are skipped.
+        assert_eq!(pick_family(["monospace"], &installed), BUNDLED_FAMILY);
+        assert_eq!(pick_family([""], &names(&["Helvetica"])), SYSTEM_UI_FAMILY);
+    }
+
+    #[test]
+    fn resolve_uses_settings_chain_and_size() {
+        let mut appearance = AppearanceSettings {
+            font_family: "Menlo".into(),
+            font_size: 20.0,
+            ..AppearanceSettings::default()
+        };
+        let config = resolve(&appearance, &names(&[BUNDLED_FAMILY, "Menlo"]));
+        assert_eq!(config.family, "Menlo");
+        assert_eq!(config.size, px(20.0));
+        // User fallbacks are honoured between the primary family and the built-in chain.
+        appearance.font_family = "Missing".into();
+        appearance.font_fallbacks = vec!["Menlo".into()];
+        let config = resolve(&appearance, &names(&[BUNDLED_FAMILY, "Menlo"]));
+        assert_eq!(config.family, "Menlo");
     }
 
     #[test]

@@ -13,11 +13,20 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-chat-core = { workspace = true }
+gpui-chat-settings = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Headless GPUI windows and `TestAppContext` for the bridge tests: the same pinned GPUI snapshot
+# `gpui-kit` re-exports, with its `test-support` feature (enabling that feature through
+# `gpui-kit` does not resolve: it pulls in `gpui-fast`, which needs a `proptest` the index lacks).
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
