@@ -5,20 +5,22 @@
 use std::time::Duration;
 
 use gpui_chat_core::{APP_ID, APP_NAME};
+use gpui_chat_settings::SettingsError;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
 };
 use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    App, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, Styled, Subscription, Task, Window, WindowBounds, div, px, size,
+    App, Bounds, Context, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, Styled, Subscription, Task, Window, WindowBounds, div, px, size,
 };
 
 use crate::actions::{About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleSidebar};
+use crate::config;
 use crate::fonts::FontConfig;
 use crate::platform;
 use crate::state::{self, Mode, WindowPlacement};
-use crate::theme::Tokens;
+use crate::theme::{self, Tokens};
 
 const SIDEBAR_WIDTH: Pixels = px(240.0);
 /// Disk writes while dragging/resizing are coalesced into one write after this pause.
@@ -81,9 +83,17 @@ pub struct AppShell {
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
-            // Follow the system light/dark setting live.
+            // Follow the system light/dark setting live, but only when `theme = "system"`.
             cx.observe_window_appearance(window, |_, window, cx| {
-                crate::theme::sync_with_system(Some(window), cx);
+                theme::system_appearance_changed(window, cx);
+            }),
+            // A settings change (or a load error appearing/clearing) applies live: font,
+            // size and theme are pushed into the global font config and Kit theme, which
+            // refreshes every window; the notify re-renders the banner.
+            cx.observe_in(&config::store(cx), window, |_, store, window, cx| {
+                let appearance = store.read(cx).settings().appearance.clone();
+                theme::apply_settings(&appearance, Some(window), cx);
+                cx.notify();
             }),
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.placement_changed(window, cx);
@@ -159,11 +169,35 @@ impl AppShell {
             .child(SidebarMenu::new().child(SidebarMenuItem::new("No channels yet")))
     }
 
+    /// A non-blocking strip above the content while `settings.toml` fails to load. The
+    /// previous settings stay in effect; it disappears when the file loads again.
+    fn settings_error_banner(error: &SettingsError, tokens: &Tokens) -> impl IntoElement {
+        let danger = tokens.danger;
+        v_flex()
+            .id("settings-error-banner")
+            .w_full()
+            .flex_none()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .bg(danger.opacity(0.14))
+            .border_b_1()
+            .border_color(danger)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(danger)
+                    .child("Settings not applied: keeping the previous settings"),
+            )
+            .child(div().text_sm().child(error.to_string()))
+    }
+
     fn main_area(tokens: &Tokens) -> impl IntoElement {
         div()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
+            .w_full()
             .bg(tokens.main_bg)
             .flex()
             .items_center()
@@ -191,6 +225,7 @@ impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let font = cx.global::<FontConfig>().clone();
+        let settings_error = config::store(cx).read(cx).error().cloned();
 
         v_flex()
             .key_context(SHELL_CONTEXT)
@@ -224,7 +259,18 @@ impl Render for AppShell {
                     .min_h_0()
                     .w_full()
                     .child(self.sidebar(&tokens))
-                    .child(Self::main_area(&tokens)),
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .children(
+                                settings_error
+                                    .as_ref()
+                                    .map(|error| Self::settings_error_banner(error, &tokens)),
+                            )
+                            .child(Self::main_area(&tokens)),
+                    ),
             )
     }
 }
