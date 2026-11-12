@@ -5,8 +5,11 @@
 
 mod actions;
 mod assets;
+mod bridge;
+mod config;
 mod fonts;
 mod platform;
+mod runtime;
 mod shell;
 mod state;
 mod theme;
@@ -62,8 +65,15 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
-            fonts::init(cx);
-            theme::sync_with_system(None, cx);
+            // The backend runtime exists before any window and stops when the app quits.
+            runtime::init(cx)
+                .unwrap_or_else(|error| panic!("failed to start the backend runtime: {error}"));
+            // Settings (a bad file falls back to defaults and is shown in the window), then
+            // the font and theme they ask for.
+            let settings_events = config::init(cx);
+            let appearance = config::current(cx).appearance.clone();
+            fonts::init(&appearance, cx);
+            theme::apply_settings(&appearance, None, cx);
 
             cx.bind_keys(platform::default_bindings());
             cx.set_menus(platform::menus());
@@ -93,8 +103,21 @@ fn main() {
             };
 
             gpui_kit::open_window(options, cx, |window, cx| {
-                // Re-sync once the window exists: its appearance is authoritative on Linux.
-                theme::sync_with_system(Some(window), cx);
+                // Re-apply once the window exists: its appearance is authoritative on Linux.
+                let appearance = config::current(cx).appearance.clone();
+                theme::apply_settings(&appearance, Some(window), cx);
+                // Settings changes reach the UI through the bridge: the watcher thread sends,
+                // and the store is updated once per frame on the main thread.
+                if let Some(events) = settings_events {
+                    bridge::attach(
+                        &config::store(cx),
+                        window.window_handle(),
+                        events,
+                        cx,
+                        |store, events, _| store.apply_events(events),
+                    )
+                    .detach();
+                }
                 cx.new(|cx| AppShell::new(window, cx))
             })
             .unwrap_or_else(|error| panic!("failed to open the {APP_NAME} main window: {error}"));

@@ -76,13 +76,24 @@ the same error are suppressed). The worker is a plain thread; it ends when the
 event when the content differs from the baseline; observers should treat equal
 settings as a no-op.
 
-## API for PR 0.4
+## How the app uses it (PR 0.4)
+
+`crates/app/src/config.rs` loads `settings.toml` at startup into a `SettingsStore` entity
+(settings in effect + the last load error), exposed as a GPUI global:
 
 ```rust
-let paths = SettingsPaths::from_env()?;              // or SettingsPaths::new(..) in tests
-let LoadOutcome { settings, error } = Settings::load_or_default(&paths.settings_file());
-// show `error` (Display) as a notification if Some; `settings` is always usable
-let watcher = watch(paths.settings_file(), settings.clone(), WatchOptions::default(),
-    move |event| { /* push into the app's channel-to-entity bridge */ })?;
-// keep `watcher` alive for the app's lifetime
+let store = config::store(cx);          // Entity<SettingsStore>, for cx.observe / observe_in
+let settings = config::current(cx);     // &Settings in effect
 ```
+
+The watcher's callback pushes each `SettingsEvent` into a bounded `bridge` channel; the bridge
+applies the events to the store on the UI thread, once per frame, with one notify per batch. The
+app shell observes the store and calls `theme::apply_settings`, so **font family, font size and
+theme (`system` / `light` / `dark`) change live** when the file is edited. A file that fails to
+load keeps the previous settings in effect and shows a banner with the file path and the parse
+message; it disappears when the file loads again. The OS light/dark appearance only drives the
+theme while `appearance.theme = "system"`.
+
+`appearance.font_family` and `font_fallbacks` are validated against the installed font families
+(first installed entry wins, then the built-in chain) so a missing family never reaches GPUI.
+`line_height` and `chat.*` are not wired to the UI yet.
