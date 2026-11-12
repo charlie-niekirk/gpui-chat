@@ -1,0 +1,17 @@
+# ROOMSTATE fixtures: full state on join (real), then the partial updates Twitch sends on change.
+# [real] full state on join
+@emote-only=0;r9k=0;slow=0;room-id=71092938;subs-only=0;followers-only=1440 :tmi.twitch.tv ROOMSTATE #xqc
+# [real] followers-only 10 minutes
+@subs-only=0;followers-only=10;slow=0;room-id=411377640;r9k=0;emote-only=0 :tmi.twitch.tv ROOMSTATE #jynxzi
+# slow mode 30 s (partial)
+@room-id=1000;slow=30 :tmi.twitch.tv ROOMSTATE #testchan
+# slow mode off (partial): zero is meaningful
+@room-id=1000;slow=0 :tmi.twitch.tv ROOMSTATE #testchan
+# followers-only: -1 off, 0 all followers, N minutes
+@followers-only=-1;room-id=1000 :tmi.twitch.tv ROOMSTATE #testchan
+@followers-only=0;room-id=1000 :tmi.twitch.tv ROOMSTATE #testchan
+@followers-only=15;room-id=1000 :tmi.twitch.tv ROOMSTATE #testchan
+# emote-only / r9k / subs-only toggles, one at a time
+@emote-only=1;room-id=1000 :tmi.twitch.tv ROOMSTATE #testchan
+@r9k=1;room-id=1000 :tmi.twitch.tv ROOMSTATE #testchan
+@room-id=1000;subs-only=1 :tmi.twitch.tv ROOMSTATE #testchan

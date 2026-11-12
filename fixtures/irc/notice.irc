@@ -1,0 +1,4 @@
+# NOTICE fixtures: channel notices carry msg-id; pre-login notices target `*` and have no tags.
+@msg-id=slow_off :tmi.twitch.tv NOTICE #testchan :This room is no longer in slow mode.
+@msg-id=msg_banned :tmi.twitch.tv NOTICE #testchan :You are permanently banned from talking in testchan.
+:tmi.twitch.tv NOTICE * :Login authentication failed

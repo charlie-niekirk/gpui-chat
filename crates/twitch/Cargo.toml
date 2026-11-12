@@ -9,3 +9,15 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+gpui-chat-core = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+twitch-irc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }

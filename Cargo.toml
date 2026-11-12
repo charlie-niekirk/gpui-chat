@@ -31,6 +31,7 @@ tokio-tungstenite = { version = "=0.30.0", default-features = false, features = 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "http2"] }
 
 # Twitch
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 twitch-irc = { version = "=6.1.3", default-features = false, features = ["transport-tcp-rustls-webpki-roots", "transport-ws-rustls-webpki-roots"] }
 twitch_api = { version = "=0.8.0", features = ["helix", "reqwest"] }
 twitch_oauth2 = { version = "=0.17.1", features = ["reqwest"] }

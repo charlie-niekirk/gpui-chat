@@ -1,0 +1,14 @@
+# Lines that are valid but not chat: parse_line returns Ok(None) for every one of them.
+# [real] connection handshake and join confirmation
+:tmi.twitch.tv 001 justinfan88391 :Welcome, GLHF!
+:tmi.twitch.tv CAP * ACK :twitch.tv/tags twitch.tv/commands
+:justinfan88391.tmi.twitch.tv 353 justinfan88391 = #caedrel justinfan88391
+:justinfan88391.tmi.twitch.tv 366 justinfan88391 #caedrel :End of /NAMES list
+:justinfan88391!justinfan88391@justinfan88391.tmi.twitch.tv JOIN #caedrel
+PING :tmi.twitch.tv
+:tmi.twitch.tv PONG tmi.twitch.tv :tmi.twitch.tv
+:tmi.twitch.tv RECONNECT
+:viewer!viewer@viewer.tmi.twitch.tv PART #testchan
+@badge-info=;badges=;color=#FF0000;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #testchan
+@badge-info=;badges=;color=#FF0000;display-name=Viewer;emote-sets=0,300374282;user-id=4001;user-type= :tmi.twitch.tv GLOBALUSERSTATE
+
