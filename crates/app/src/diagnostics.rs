@@ -255,6 +255,8 @@ pub struct IngestCounters {
     /// Events the source is late by right now: due by the clock but not yet produced because it
     /// hit its per-wake-up work cap (a rate it cannot sustain). A gauge, not a total.
     pub behind: AtomicU64,
+    /// Replay lines that were not valid IRC or lacked something a chat command needs.
+    pub parse_errors: AtomicU64,
 }
 
 impl IngestCounters {
@@ -264,6 +266,10 @@ impl IngestCounters {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn parse_errors(&self) -> u64 {
+        self.parse_errors.load(Ordering::Relaxed)
     }
 
     pub fn behind(&self) -> u64 {

@@ -15,11 +15,13 @@ mod fonts;
 mod hud;
 mod placeholder_chat;
 mod platform;
+mod replay;
 mod runtime;
 mod shell;
 mod state;
 mod theme;
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_chat_core::APP_NAME;
@@ -79,7 +81,12 @@ fn initial_placement(cx: &App) -> (WindowBounds, Option<DisplayId>) {
 
 /// Hooks the chat backends up to the UI: a hub of per-channel stores fed through the bridge, and
 /// (with `--firehose`) the synthetic source on the backend runtime.
-fn start_chat(cli: &Cli, window: &Window, cx: &mut App) -> ShellParts {
+fn start_chat(
+    cli: &Cli,
+    replay_log: Option<Arc<str>>,
+    window: &Window,
+    cx: &mut App,
+) -> ShellParts {
     let diagnostics = Diagnostics::new();
     let scrollback = config::current(cx).chat.scrollback;
     let hub = cx.new(|_| ChannelHub::new(scrollback, diagnostics.clone()));
@@ -105,7 +112,14 @@ fn start_chat(cli: &Cli, window: &Window, cx: &mut App) -> ShellParts {
         // The handle is dropped on purpose: the task ends when the bridge closes or on quit.
         drop(runtime::spawn_backend(
             cx,
-            firehose::run(sender, config, diagnostics.counters()),
+            firehose::run(sender.clone(), config, diagnostics.counters()),
+        ));
+    }
+    if let Some(log) = replay_log {
+        let speed = replay::Speed::from_factor(cli.replay_speed);
+        drop(runtime::spawn_backend(
+            cx,
+            replay::run(sender, log, speed, diagnostics.counters()),
         ));
     }
     ShellParts {
@@ -127,6 +141,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Read the log before any window exists, so a bad path fails with a message, not a blank app.
+    let replay_log: Option<Arc<str>> = cli.replay.as_ref().map(|path| {
+        std::fs::read_to_string(path)
+            .map(Arc::from)
+            .unwrap_or_else(|error| {
+                eprintln!("{APP_NAME}: cannot read {}: {error}", path.display());
+                std::process::exit(2);
+            })
+    });
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -184,7 +207,7 @@ fn main() {
                     )
                     .detach();
                 }
-                let parts = start_chat(&cli, window, cx);
+                let parts = start_chat(&cli, replay_log.clone(), window, cx);
                 cx.new(|cx| AppShell::new(window, parts, cx))
             })
             .unwrap_or_else(|error| panic!("failed to open the {APP_NAME} main window: {error}"));

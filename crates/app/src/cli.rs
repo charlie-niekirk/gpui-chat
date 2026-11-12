@@ -2,6 +2,7 @@
 //! runs, not a user-facing CLI.
 
 use std::fmt;
+use std::path::PathBuf;
 
 /// Default seed of the synthetic source, so two runs see the same chat unless `--seed` says
 /// otherwise.
@@ -9,6 +10,9 @@ pub const DEFAULT_SEED: u64 = 0x6770_7569_6368_6174;
 
 /// Upper bound accepted for `--firehose`; beyond this a developer typo is more likely than a test.
 pub const MAX_FIREHOSE_RATE: f64 = 1_000_000.0;
+
+/// Upper bound accepted for `--replay-speed` (a typo guard; `0` means as fast as possible).
+pub const MAX_REPLAY_SPEED: f64 = 1_000_000.0;
 
 /// Upper bound for `--firehose-channels`.
 pub const MAX_FIREHOSE_CHANNELS: usize = 64;
@@ -20,6 +24,10 @@ Options:
   --firehose <msgs/sec>        Feed the app synthetic chat at a steady rate (offline)
   --seed <n>                   Seed of the synthetic chat (default: fixed, so runs repeat)
   --firehose-channels <n>      Spread the synthetic chat over n channels (default: 1)
+  --replay <file>              Replay a recorded raw IRC log (one line per message, offline)
+  --replay-speed <x>           Replay speed: 1 follows the log's tmi-sent-ts spacing (or a fixed
+                               100 msgs/s without timestamps), 2 is twice as fast, 0 is as fast
+                               as possible (default: 1)
   --hud                        Start with the debug HUD visible (toggle: View > Toggle Debug HUD)
   -h, --help                   Print this help
 ";
@@ -31,6 +39,10 @@ pub struct Cli {
     pub firehose: Option<f64>,
     pub seed: u64,
     pub firehose_channels: usize,
+    /// Raw IRC log to replay.
+    pub replay: Option<PathBuf>,
+    /// Replay speed factor; `0` is as fast as possible.
+    pub replay_speed: f64,
     /// Open with the debug HUD visible.
     pub hud: bool,
 }
@@ -41,6 +53,8 @@ impl Default for Cli {
             firehose: None,
             seed: DEFAULT_SEED,
             firehose_channels: 1,
+            replay: None,
+            replay_speed: 1.0,
             hud: false,
         }
     }
@@ -71,6 +85,7 @@ fn error(message: impl Into<String>) -> CliError {
 /// Parses the arguments after the program name. Both `--flag value` and `--flag=value` work.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError> {
     let mut cli = Cli::default();
+    let mut speed_given = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -118,8 +133,28 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError>
                 }
                 cli.firehose_channels = count;
             }
+            "--replay" => cli.replay = Some(PathBuf::from(value("--replay")?)),
+            "--replay-speed" => {
+                let raw = value("--replay-speed")?;
+                let speed: f64 = raw
+                    .parse()
+                    .map_err(|_| error(format!("--replay-speed: `{raw}` is not a number")))?;
+                if !speed.is_finite() || !(0.0..=MAX_REPLAY_SPEED).contains(&speed) {
+                    return Err(error(format!(
+                        "--replay-speed: must be between 0 and {MAX_REPLAY_SPEED}"
+                    )));
+                }
+                cli.replay_speed = speed;
+                speed_given = true;
+            }
             other => return Err(error(format!("unknown argument `{other}`"))),
         }
+    }
+    if cli.replay.is_some() && cli.firehose.is_some() {
+        return Err(error("--replay and --firehose are two sources; pick one"));
+    }
+    if speed_given && cli.replay.is_none() {
+        return Err(error("--replay-speed needs --replay"));
     }
     Ok(Parsed::Run(cli))
 }
@@ -143,6 +178,8 @@ mod tests {
             firehose: Some(1000.0),
             seed: 7,
             firehose_channels: 3,
+            replay: None,
+            replay_speed: 1.0,
             hud: true,
         });
         assert_eq!(
@@ -167,6 +204,40 @@ mod tests {
                 ..Cli::default()
             }))
         );
+    }
+
+    #[test]
+    fn replay_flags() {
+        assert_eq!(
+            parse_args(&["--replay", "log.irc", "--replay-speed=0"]),
+            Ok(Parsed::Run(Cli {
+                replay: Some(PathBuf::from("log.irc")),
+                replay_speed: 0.0,
+                ..Cli::default()
+            }))
+        );
+        assert_eq!(
+            parse_args(&["--replay=a b.irc", "--replay-speed", "2.5"]),
+            Ok(Parsed::Run(Cli {
+                replay: Some(PathBuf::from("a b.irc")),
+                replay_speed: 2.5,
+                ..Cli::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn replay_conflicts_are_reported() {
+        for args in [
+            &["--replay", "x", "--firehose", "10"][..],
+            &["--replay-speed", "2"],
+            &["--replay"],
+            &["--replay", "x", "--replay-speed", "-1"],
+            &["--replay", "x", "--replay-speed", "fast"],
+            &["--replay", "x", "--replay-speed", "1e9"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?} should be rejected");
+        }
     }
 
     #[test]

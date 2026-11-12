@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-chat-core = { workspace = true }
 gpui-chat-settings = { workspace = true }
+gpui-chat-twitch = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }
 serde = { workspace = true }

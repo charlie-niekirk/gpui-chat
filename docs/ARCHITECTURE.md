@@ -62,6 +62,11 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   tokio runtime (messages are due at `i / rate`; each wake-up sends everything due in one batch;
   `try_send`, so a UI that falls behind makes it drop and count rather than stall). `cli.rs` is a
   std-only flag parser.
+- `replay.rs` — `--replay <file> [--replay-speed <x>]`: feeds a recorded raw IRC log through
+  `gpui_chat_twitch::parse_line`. At speed 1 events follow `tmi-sent-ts` (gaps capped at 5 s,
+  backwards stamps never rewind, untimestamped events go with the previous one; a log with no
+  stamps runs at 100 events/s); speed 0 is as fast as the UI takes events. Lossless (`send().await`),
+  unlike the firehose; rejected lines are counted as parse errors on the HUD.
 - `diagnostics.rs` / `hud.rs` — debug HUD (⌘⇧D, View menu). `FrameProbe` wraps the window content
   and times the draw (layout request → paint end) with `Instant`s; ingest is timestamped in the
   bridge `apply`. The HUD re-renders only when something happened (ingest, drops, foreign draws)

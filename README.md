@@ -33,10 +33,12 @@ cargo run -p gpui-chat -- --help                            # all flags
 | `--firehose <msgs/sec>` | Feed the app deterministic synthetic chat at a steady rate |
 | `--seed <n>` | Seed of the synthetic chat (default is fixed, so runs repeat) |
 | `--firehose-channels <n>` | Spread the synthetic chat over `n` channels (default 1) |
+| `--replay <file>` | Replay a recorded raw IRC log (e.g. `fixtures/irc/privmsg.irc`) through the real parser |
+| `--replay-speed <x>` | `1` follows the log's `tmi-sent-ts` spacing (100 msgs/s if it has none), `2` is twice as fast, `0` is as fast as possible (default `1`) |
 | `--hud` | Start with the debug HUD visible |
 
-The debug HUD (frame time against the 8.3 ms budget, messages/sec, batch size, store sizes,
-dropped events) toggles with ⌘⇧D (Ctrl+Shift+D elsewhere) or View > Toggle Debug HUD.
+The debug HUD (frame time and ingest apply time against the 8.3 ms budget, messages/sec, batch size, store
+sizes, dropped events, replay parse errors) toggles with ⌘⇧D (Ctrl+Shift+D elsewhere) or View > Toggle Debug HUD.
 
 Tests (everything except the GPUI app also runs on Linux in CI):
 

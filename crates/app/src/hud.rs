@@ -251,6 +251,15 @@ impl Render for DebugHud {
                 },
             ))
             .child(line(
+                "parse",
+                format!("{} errors", counters.parse_errors()),
+                if counters.parse_errors() > 0 {
+                    tokens.danger
+                } else {
+                    tokens.text
+                },
+            ))
+            .child(line(
                 "dropped",
                 format!("{dropped} of {}", counters.sent() + dropped),
                 if dropped > 0 {
