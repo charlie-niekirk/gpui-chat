@@ -183,7 +183,7 @@ runs non-GPUI crate tests on Ubuntu from PR 0.1 (job `linux`).
 |---|---|---|
 | UI | `gpui-kit = "=0.9.1"` (exact pin) | Kit usage stays inside `crates/app`. Version bumps are their own PRs |
 | Async I/O | `tokio` | Background threads; channels to the UI |
-| Chat read | `twitch-irc` over TLS (rustls) | Anonymous by default; same parser handles history lines |
+| Chat read | `twitch-irc` TLS transport and IRC types (rustls); own connection supervisor | Anonymous by default. `gpui_chat_twitch::parse_line` maps a raw line to a `ChatEvent` with no network, and also handles recent-messages history lines. `twitch-irc`'s pooled client is not used: it reports no connection state, has no reconnect backoff and no JOIN pacing |
 | Helix + auth | `twitch_api` (helix) + `twitch_oauth2` device flow | Send, badges, emotes, streams, moderation |
 | HTTP | `reqwest` (rustls) | `User-Agent: gpui-chat/<version>` |
 | Images | `image` crate, WebP preferred, GIF/PNG fallback | Avoid AVIF (native decoder dependency) |
