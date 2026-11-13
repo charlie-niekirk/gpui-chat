@@ -73,8 +73,11 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   plus one settle refresh, from a 4 Hz timer that exists only while it is visible, so an idle window
   never redraws. `present` (GPU hand-off) is not included: GPUI has no hook for it outside its
   `profiler` feature.
-- `placeholder_chat.rs` — the stand-in list (`uniform_list` over the newest 200 rows) that PR 1.4
-  replaces with the real chat view.
+- `chat/` — the chat view (PR 1.4), see *Rendering* below: `display` (a message as one line of
+  text with span roles), `flow` (line wrapping and hit-testing, pure), `layout` (shaping into
+  grapheme atoms, per-message layout cache), `colors` (fallback and readability-adjusted username
+  colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
+  (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore). Separate from user settings.
 
@@ -163,16 +166,45 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
 
 ## Rendering (the performance-critical part)
 
-- **`MessageElement`** implements GPUI's `Element` directly. It shapes text runs
-  with the window text system, flows fragments into lines itself, and paints
-  emote and badge images at computed positions. One element per message — not
-  one element per word.
-- **Layout cache** per message keyed by (width, font generation, scale factor);
-  invalidated on resize or settings change.
-- **Virtualisation** with GPUI `list()` / `ListState` in bottom-follow mode.
-  Scrolling up pauses following and shows a "new messages" pill.
+- **`MessageElement`** (`chat/element.rs`) implements GPUI's `Element` directly, one element
+  per message — not one per word. Its display text (`[HH:MM] name: body`, spans tagged with a
+  role: timestamp, name, text, mention, self-mention, link, emote, …) is shaped **once as a
+  single unwrapped line** with `WindowTextSystem::layout_line` (bold runs for names/mentions),
+  then cut into **atoms** at extended grapheme-cluster boundaries with their advance widths.
+  `flow` places atoms into lines itself: break before a word that does not fit, trailing spaces
+  hang, a word wider than the line is hard-broken between clusters (an emoji ZWJ sequence or a
+  letter with combining marks never splits). Paint draws each glyph at its atom's flowed
+  position (`paint_glyph` / `paint_emoji`), plus link underlines, the self-mention/highlight
+  background and a strikethrough for deleted messages. Colours are resolved at paint time from
+  the theme, so a theme switch re-lays out nothing.
+  *Seams:* PR 2.2 adds `AtomKind::Inline` atoms (emote images with a known width) to the same
+  stream — flow already treats them as unbreakable boxes and the painter skips their glyphs;
+  PR 5.6 hit-tests with `Flow::index_at` / `position_of` (point ↔ byte offset in the display
+  text).
+- **Usernames** use the author's colour, or a Twitch default colour picked by a hash of the
+  login, then **readability-adjusted** against the current background: hue and saturation are
+  kept and HSL lightness moves away from the background just enough to reach a WCAG contrast of
+  4.5:1 (unchanged when it already passes), in light and dark themes alike.
+- **Layout cache** per message (by store sequence number) keyed by (width, text-config
+  generation, scale factor). Two levels: the shaped atoms survive a width change, so a resize
+  only re-flows (no shaping); a font family/size, line-height or timestamp change bumps the
+  generation and re-shapes on next use; a replaced message (`Arc` differs, e.g. deleted)
+  re-shapes. Evicted messages' layouts are dropped on the next sync.
+- **Virtualisation** with GPUI `list()` / `ListState` (`ListAlignment::Bottom`,
+  `FollowMode::Tail`). The view keeps a `ListMirror` of the store's sequence range and turns
+  each store notification into at most two `splice`s (evicted at the front, appended at the
+  back) — never a `reset` per batch. Scrolling up stops following (GPUI does it on an upward
+  wheel delta) and shows a "N new messages" pill that jumps back; scrolling to the bottom
+  resumes following. GPUI re-engages following during list layout, so a zero-size probe after
+  the list requests one extra frame when the pill is stale. Settings changes call
+  `ListState::remeasure`; width changes are re-measured by the list itself.
 - **Ingest batching:** events are drained once per frame; a burst of 1 000
-  messages causes one layout pass, not 1 000.
+  messages causes one layout pass, not 1 000. Chat ingest is additionally applied at most
+  once per 16 ms (`BridgeReceiver::with_min_interval`): under steady traffic (200 msg/s) that is
+  ~60 ingest-driven draws per second, each taking everything that arrived meanwhile, instead of
+  a draw per message; an event after a quiet spell is applied on the very next frame. The added
+  latency is at most 16 ms plus one frame — far below the network latency of chat itself and
+  below what reads as a delay — while scrolling still draws at the display's full rate.
 - **Images:** fetched and decoded off the UI thread; de-duplicated in flight;
   disk cache keyed by URL hash; in-memory LRU with a byte budget (default
   256 MB); GPU textures released on eviction.

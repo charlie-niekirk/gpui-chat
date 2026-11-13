@@ -122,6 +122,19 @@ fn start_watcher(
     Ok((watcher, rx))
 }
 
+/// Installs a settings store holding `settings` (no file, no watcher), for headless tests.
+#[cfg(test)]
+pub fn install_for_test(settings: Settings, cx: &mut App) -> Entity<SettingsStore> {
+    let store = cx.new(|_| {
+        SettingsStore::new(LoadOutcome {
+            settings,
+            error: None,
+        })
+    });
+    cx.set_global(SettingsHandle(store.clone()));
+    store
+}
+
 /// Loads `settings.toml`, stores the settings as a global and starts watching the file.
 ///
 /// Returns the receiver the caller must [`bridge::attach`] to the [`store`] once a window

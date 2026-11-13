@@ -12,6 +12,12 @@
 //!   batch, if `apply` reports a change. Events beyond `max_batch` stay queued, in order, and
 //!   the next frame takes the next batch, so a huge queue never costs one huge layout pass.
 //!
+//! - optionally ([`BridgeReceiver::with_min_interval`]) batches are applied **at most once per
+//!   interval**: an event arriving soon after the previous batch waits for the rest of the
+//!   interval (collecting everything else that arrives meanwhile) instead of waking a frame of
+//!   its own. An event after a quiet spell longer than the interval is applied on the very next
+//!   frame, so the delay is bounded by the interval and only paid under sustained traffic.
+//!
 //! A burst of 1 000 events therefore costs one `apply`, one notify and one layout pass. This
 //! is the ingest-batching foundation for the firehose source (PR 1.3) and chat view (PR 1.4);
 //! it is generic over the event type and the entity.
@@ -20,6 +26,8 @@
 //! occluded the queue fills up and senders wait; that is the intended backpressure. When the
 //! window or the entity is gone the attached task ends and the receiver is dropped, so
 //! senders see `Closed`.
+
+use std::time::{Duration, Instant};
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, Task};
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +45,7 @@ pub fn channel<E>(capacity: usize, max_batch: usize) -> (BridgeSender<E>, Bridge
         BridgeReceiver {
             rx,
             max_batch: max_batch.max(1),
+            min_interval: Duration::ZERO,
         },
     )
 }
@@ -86,9 +95,27 @@ impl<E> BridgeSender<E> {
 pub struct BridgeReceiver<E> {
     rx: mpsc::Receiver<E>,
     max_batch: usize,
+    min_interval: Duration,
 }
 
 impl<E> BridgeReceiver<E> {
+    /// Applies batches at most once per `interval` (measured from the start of one apply to the
+    /// start of the next). Without it every frame that follows an event applies one, so a steady
+    /// 200 events/s would draw up to 200 frames/s; with 16 ms it is at most ~60, each taking
+    /// everything that arrived meanwhile. Default: no minimum.
+    pub fn with_min_interval(mut self, interval: Duration) -> Self {
+        self.min_interval = interval;
+        self
+    }
+
+    /// How long to hold a batch that is ready at `now` when the last one was applied at `last`.
+    fn hold(&self, last: Option<Instant>, now: Instant) -> Duration {
+        last.map_or(Duration::ZERO, |last| {
+            self.min_interval
+                .saturating_sub(now.saturating_duration_since(last))
+        })
+    }
+
     /// Waits for the next event; `None` once every sender is gone and the queue is empty.
     pub(crate) async fn first(&mut self) -> Option<E> {
         self.rx.recv().await
@@ -130,10 +157,17 @@ where
         // oneshot, so no shared mutable state is needed. If the window closes, the callback
         // is dropped unrun and the oneshot reports it.
         let mut state = Some((receiver, apply));
+        let mut last_apply: Option<Instant> = None;
         while let Some((mut receiver, mut apply)) = state.take() {
             let Some(first) = receiver.first().await else {
                 break;
             };
+            // The executor's clock (not `Instant::now`), so tests can advance it.
+            let hold = receiver.hold(last_apply, cx.background_executor().now());
+            if !hold.is_zero() {
+                cx.background_executor().timer(hold).await;
+            }
+            last_apply = Some(cx.background_executor().now());
             let (done_tx, done_rx) = oneshot::channel();
             let entity = entity.clone();
             let scheduled = cx.update_window(window, move |_, window, _| {
@@ -347,6 +381,62 @@ mod tests {
         harness.frame(cx);
         assert_eq!(harness.batches(cx).last().unwrap(), &vec![1000]);
         assert_eq!(harness.notifications.get(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn min_interval_coalesces_steady_traffic_but_not_a_lone_event(cx: &mut TestAppContext) {
+        let interval = std::time::Duration::from_millis(16);
+        let window = cx.add_window(|_, _| Root);
+        let sink = cx.new(|_| Sink::default());
+        let (tx, rx) = channel::<u32>(64, 64);
+        let task = cx.update(|cx| {
+            attach(
+                &sink,
+                window.into(),
+                rx.with_min_interval(interval),
+                cx,
+                |sink: &mut Sink, batch, _| {
+                    sink.batches.push(batch);
+                    true
+                },
+            )
+        });
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let batches = |cx: &mut TestAppContext| sink.read_with(cx, |s, _| s.batches.clone());
+
+        // The first event is applied on the next frame: no wait after a quiet spell.
+        tx.try_send(1).unwrap();
+        frame(cx);
+        assert_eq!(batches(cx), vec![vec![1]]);
+
+        // Events right after it are held for the rest of the interval, frames or not.
+        tx.try_send(2).unwrap();
+        frame(cx);
+        tx.try_send(3).unwrap();
+        frame(cx);
+        assert_eq!(batches(cx).len(), 1, "held until the interval has passed");
+        cx.executor().advance_clock(interval);
+        frame(cx);
+        assert_eq!(
+            batches(cx),
+            vec![vec![1], vec![2, 3]],
+            "then applied together"
+        );
+
+        // After a quiet spell longer than the interval, a lone event goes straight through.
+        cx.executor().advance_clock(interval * 4);
+        tx.try_send(4).unwrap();
+        frame(cx);
+        assert_eq!(batches(cx).last().unwrap(), &vec![4]);
+        drop(task);
     }
 
     #[gpui_kit::test]

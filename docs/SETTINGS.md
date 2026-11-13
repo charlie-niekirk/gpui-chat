@@ -96,4 +96,5 @@ theme while `appearance.theme = "system"`.
 
 `appearance.font_family` and `font_fallbacks` are validated against the installed font families
 (first installed entry wins, then the built-in chain) so a missing family never reaches GPUI.
-`line_height` and `chat.*` are not wired to the UI yet.
+`appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
+messages). `chat.scrollback` is read once at startup.

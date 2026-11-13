@@ -7,13 +7,13 @@ mod actions;
 mod assets;
 mod bridge;
 mod channels;
+mod chat;
 mod cli;
 mod config;
 mod diagnostics;
 mod firehose;
 mod fonts;
 mod hud;
-mod placeholder_chat;
 mod platform;
 mod replay;
 mod runtime;
@@ -22,7 +22,7 @@ mod state;
 mod theme;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_chat_core::APP_NAME;
 use gpui_kit::component::TitleBar;
@@ -40,6 +40,10 @@ use crate::state::DisplayInfo;
 const INGEST_QUEUE: usize = 16_384;
 /// Most events one frame applies; the rest stay queued for the next frame.
 const INGEST_BATCH: usize = 4_096;
+/// Chat ingest is applied at most this often (see `bridge::BridgeReceiver::with_min_interval`):
+/// at most ~60 ingest-driven draws per second however fast messages arrive, while a message
+/// arriving after a quiet spell is still applied on the very next frame.
+const INGEST_MIN_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Where to open the main window: the saved bounds on the saved display when that display is
 /// still connected and the rect fits on it, else centred on the primary display.
@@ -94,7 +98,7 @@ fn start_chat(
     bridge::attach(
         &hub,
         window.window_handle(),
-        receiver,
+        receiver.with_min_interval(INGEST_MIN_INTERVAL),
         cx,
         |hub, events, cx| hub.apply_batch(events, cx),
     )
