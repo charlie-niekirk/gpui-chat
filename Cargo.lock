@@ -2343,6 +2343,15 @@ version = "0.0.0"
 [[package]]
 name = "gpui-chat-emotes"
 version = "0.0.0"
+dependencies = [
+ "gpui-chat-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "gpui-chat-media"

@@ -1,0 +1,98 @@
+[
+ {
+  "id": "5e76d338d6581c3724c0f0b2",
+  "code": "cvHazmat",
+  "imageType": "png",
+  "animated": false,
+  "userId": "54ee2465b822020506c52a52",
+  "modifier": false
+ },
+ {
+  "id": "5e76d399d6581c3724c0f0b8",
+  "code": "cvMask",
+  "imageType": "png",
+  "animated": false,
+  "userId": "54ee2465b822020506c52a52",
+  "modifier": false
+ },
+ {
+  "id": "6468f7acaee1f7f47567708e",
+  "code": "c!",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": true
+ },
+ {
+  "id": "6468f845aee1f7f47567709b",
+  "code": "h!",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": true
+ },
+ {
+  "id": "6468f869aee1f7f4756770a8",
+  "code": "l!",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": true
+ },
+ {
+  "id": "54fa8f1401e468494b85b537",
+  "code": ":tf:",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa8fce01e468494b85b53c",
+  "code": "CiGrip",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa903b01e468494b85b53f",
+  "code": "DatSauce",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa909b01e468494b85b542",
+  "code": "ForeverAlone",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa90ba01e468494b85b543",
+  "code": "GabeN",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa90f201e468494b85b545",
+  "code": "HailHelix",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ },
+ {
+  "id": "54fa932201e468494b85b555",
+  "code": "ShoopDaWhoop",
+  "imageType": "png",
+  "animated": false,
+  "userId": "5561169bd6b9d206222a8c19",
+  "modifier": false
+ }
+]

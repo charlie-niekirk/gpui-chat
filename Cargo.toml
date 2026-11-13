@@ -43,6 +43,7 @@ sha2 = "0.10"
 # Platform services, settings and paths
 keyring = "4.2"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.2"
 notify = "8.2"
 dirs = "7.0"
