@@ -1,0 +1,104 @@
+[
+ {
+  "id": 155074,
+  "user": {
+   "id": 60769,
+   "name": "lilguy_",
+   "displayName": "lilguy_"
+  },
+  "code": "pajaGhetti",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/155074/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/155074/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/155074/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 18290,
+  "user": {
+   "id": 2683,
+   "name": "wyattw8",
+   "displayName": "wyattw8"
+  },
+  "code": "TuckMeIn",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/18290/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/18290/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/18290/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 128023,
+  "user": {
+   "id": 60769,
+   "name": "lilguy_",
+   "displayName": "lilguy_"
+  },
+  "code": "miniDank",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/128023/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/128023/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/128023/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 128247,
+  "user": {
+   "id": 30920,
+   "name": "dechiplaysgames",
+   "displayName": "dechiplaysgames"
+  },
+  "code": "4HEad",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/128247/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/128247/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/128247/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 131001,
+  "user": {
+   "id": 63119,
+   "name": "pajaswa",
+   "displayName": "pajaSWA"
+  },
+  "code": "pajaE",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/131001/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/131001/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/131001/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 140139,
+  "user": {
+   "id": 60769,
+   "name": "lilguy_",
+   "displayName": "lilguy_"
+  },
+  "code": "miniW",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/140139/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/140139/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/140139/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ }
+]

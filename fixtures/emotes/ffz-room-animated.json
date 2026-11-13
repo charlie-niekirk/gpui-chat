@@ -1,0 +1,150 @@
+{
+ "room": {
+  "_id": 377091,
+  "twitch_id": 207813352,
+  "youtube_id": null,
+  "id": "hasanabi",
+  "is_group": false,
+  "display_name": "HasanAbi",
+  "set": 377103,
+  "moderator_badge": null,
+  "vip_badge": null,
+  "mod_urls": null,
+  "user_badges": {},
+  "user_badge_ids": {},
+  "css": null
+ },
+ "sets": {
+  "377103": {
+   "id": 377103,
+   "_type": 1,
+   "icon": null,
+   "title": "Channel: HasanAbi",
+   "css": null,
+   "emoticons": [
+    {
+     "id": 724419,
+     "name": "Mhm",
+     "height": 32,
+     "width": 37,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 641596,
+      "name": "raidindawgz",
+      "display_name": "RaidinDawgZ"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/724419/1",
+      "2": "https://cdn.frankerfacez.com/emote/724419/2",
+      "4": "https://cdn.frankerfacez.com/emote/724419/4"
+     },
+     "animated": {
+      "1": "https://cdn.frankerfacez.com/emote/724419/animated/1",
+      "2": "https://cdn.frankerfacez.com/emote/724419/animated/2",
+      "4": "https://cdn.frankerfacez.com/emote/724419/animated/4"
+     },
+     "status": 1,
+     "usage_count": 134,
+     "created_at": "2023-03-31T16:13:52.980Z",
+     "last_updated": "2023-04-01T08:00:57.718Z"
+    },
+    {
+     "id": 736847,
+     "name": "YOUCANT",
+     "height": 32,
+     "width": 32,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1437710,
+      "name": "katieelis",
+      "display_name": "KatieElis"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/736847/1",
+      "2": "https://cdn.frankerfacez.com/emote/736847/2",
+      "4": "https://cdn.frankerfacez.com/emote/736847/4"
+     },
+     "animated": {
+      "1": "https://cdn.frankerfacez.com/emote/736847/animated/1",
+      "2": "https://cdn.frankerfacez.com/emote/736847/animated/2",
+      "4": "https://cdn.frankerfacez.com/emote/736847/animated/4"
+     },
+     "status": 1,
+     "usage_count": 42,
+     "created_at": "2023-09-18T23:26:51.266Z",
+     "last_updated": "2023-09-19T15:11:27.040Z"
+    },
+    {
+     "id": 389908,
+     "name": "KEKebab",
+     "height": 30,
+     "width": 17,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 532123,
+      "name": "aviator024",
+      "display_name": "aviator024"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/389908/1",
+      "2": "https://cdn.frankerfacez.com/emote/389908/2",
+      "4": "https://cdn.frankerfacez.com/emote/389908/4"
+     },
+     "status": 1,
+     "usage_count": 92,
+     "created_at": "2019-09-14T02:28:41.908Z",
+     "last_updated": "2019-09-14T09:35:06.324Z"
+    },
+    {
+     "id": 430362,
+     "name": "hasStand",
+     "height": 27,
+     "width": 8,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 238122,
+      "name": "ososo",
+      "display_name": "Ososo"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/430362/1",
+      "2": "https://cdn.frankerfacez.com/emote/430362/2",
+      "4": "https://cdn.frankerfacez.com/emote/430362/4"
+     },
+     "status": 1,
+     "usage_count": 5,
+     "created_at": "2020-01-25T02:02:09.008Z",
+     "last_updated": "2020-01-28T08:01:16.574Z"
+    }
+   ]
+  }
+ }
+}

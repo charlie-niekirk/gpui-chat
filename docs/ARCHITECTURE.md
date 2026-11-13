@@ -152,6 +152,12 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   Unicode code points, not bytes). Remaining words are looked up: channel 7TV →
   channel BTTV → channel FFZ → global 7TV → global BTTV → global FFZ. Zero-width
   emotes stack on the preceding emote.
+- **Emote providers (`emotes` crate):** `EmoteLoader::load_global()` / `load_channel(twitch_user_id)`
+  query 7TV, BTTV and FFZ concurrently and return one `Result<EmoteSet, EmoteError>` per
+  provider (`ProviderResults`, iterated in precedence order 7TV → BTTV → FFZ); a failing provider
+  never blocks the others and a channel with no account (404) is an empty set. FFZ uses the
+  official API with the BTTV mirror as fallback. All HTTP goes through the `HttpClient` trait so
+  tests run offline against `fixtures/emotes/`.
 - Async I/O runs on a `tokio` runtime on background threads. GPUI has its own
   executor; backends talk to the UI over channels.
 

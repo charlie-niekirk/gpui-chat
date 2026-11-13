@@ -1,0 +1,76 @@
+[
+ {
+  "id": 724419,
+  "user": {
+   "id": 641596,
+   "name": "raidindawgz",
+   "displayName": "RaidinDawgZ"
+  },
+  "code": "Mhm",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/724419/animated/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/724419/animated/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/724419/animated/4",
+   "1x_static": "https://cdn.betterttv.net/frankerfacez_emote/724419/1",
+   "2x_static": "https://cdn.betterttv.net/frankerfacez_emote/724419/2",
+   "4x_static": "https://cdn.betterttv.net/frankerfacez_emote/724419/4"
+  },
+  "imageType": "gif",
+  "animated": true,
+  "modifier": false
+ },
+ {
+  "id": 736847,
+  "user": {
+   "id": 1437710,
+   "name": "katieelis",
+   "displayName": "KatieElis"
+  },
+  "code": "YOUCANT",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/736847/animated/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/736847/animated/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/736847/animated/4",
+   "1x_static": "https://cdn.betterttv.net/frankerfacez_emote/736847/1",
+   "2x_static": "https://cdn.betterttv.net/frankerfacez_emote/736847/2",
+   "4x_static": "https://cdn.betterttv.net/frankerfacez_emote/736847/4"
+  },
+  "imageType": "gif",
+  "animated": true,
+  "modifier": false
+ },
+ {
+  "id": 389908,
+  "user": {
+   "id": 532123,
+   "name": "aviator024",
+   "displayName": "aviator024"
+  },
+  "code": "KEKebab",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/389908/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/389908/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/389908/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ },
+ {
+  "id": 430362,
+  "user": {
+   "id": 238122,
+   "name": "ososo",
+   "displayName": "Ososo"
+  },
+  "code": "hasStand",
+  "images": {
+   "1x": "https://cdn.betterttv.net/frankerfacez_emote/430362/1",
+   "2x": "https://cdn.betterttv.net/frankerfacez_emote/430362/2",
+   "4x": "https://cdn.betterttv.net/frankerfacez_emote/430362/4"
+  },
+  "imageType": "png",
+  "animated": false,
+  "modifier": false
+ }
+]

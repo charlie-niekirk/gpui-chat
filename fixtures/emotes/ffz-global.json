@@ -1,0 +1,490 @@
+{
+ "default_sets": [
+  3,
+  1539687
+ ],
+ "sets": {
+  "3": {
+   "id": 3,
+   "_type": 1,
+   "icon": null,
+   "title": "Global Emotes",
+   "css": null,
+   "emoticons": [
+    {
+     "id": 9,
+     "name": "ZrehplaR",
+     "height": 30,
+     "width": 33,
+     "public": false,
+     "hidden": true,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 2,
+      "name": "dansalvato",
+      "display_name": "dansalvato"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/9/1",
+      "2": "https://cdn.frankerfacez.com/emote/9/2",
+      "4": "https://cdn.frankerfacez.com/emote/9/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2015-02-07T05:33:23.123Z",
+     "last_updated": "2015-05-30T18:32:47.401Z"
+    },
+    {
+     "id": 6,
+     "name": "YooHoo",
+     "height": 34,
+     "width": 28,
+     "public": false,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 2,
+      "name": "dansalvato",
+      "display_name": "dansalvato"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/6/1",
+      "2": "https://cdn.frankerfacez.com/emote/6/2",
+      "4": "https://cdn.frankerfacez.com/emote/6/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2015-04-02T10:24:46.923Z",
+     "last_updated": "2015-04-02T10:24:46.923Z"
+    },
+    {
+     "id": 4,
+     "name": "ManChicken",
+     "height": 29,
+     "width": 30,
+     "public": false,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 2,
+      "name": "dansalvato",
+      "display_name": "dansalvato"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/4/1",
+      "2": "https://cdn.frankerfacez.com/emote/4/2",
+      "4": "https://cdn.frankerfacez.com/emote/4/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2015-04-02T10:24:46.530Z",
+     "last_updated": "2015-04-02T10:24:46.530Z"
+    },
+    {
+     "id": 3,
+     "name": "BeanieHipster",
+     "height": 33,
+     "width": 28,
+     "public": false,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 2,
+      "name": "dansalvato",
+      "display_name": "dansalvato"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/3/1",
+      "2": "https://cdn.frankerfacez.com/emote/3/2",
+      "4": "https://cdn.frankerfacez.com/emote/3/4"
+     },
+     "status": 1,
+     "usage_count": 2,
+     "created_at": "2015-04-02T10:24:46.008Z",
+     "last_updated": "2015-04-02T10:24:46.008Z"
+    },
+    {
+     "id": 25927,
+     "name": "CatBag",
+     "height": 29,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 3,
+      "name": "wolsk",
+      "display_name": "Wolsk"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/25927/1",
+      "2": "https://cdn.frankerfacez.com/emote/25927/2",
+      "4": "https://cdn.frankerfacez.com/emote/25927/4"
+     },
+     "status": 1,
+     "usage_count": 3,
+     "created_at": "2015-05-31T01:11:55.508Z",
+     "last_updated": "2015-05-31T01:12:56.720Z"
+    },
+    {
+     "id": 27081,
+     "name": "ZreknarF",
+     "height": 30,
+     "width": 40,
+     "public": false,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/27081/1",
+      "2": "https://cdn.frankerfacez.com/emote/27081/2",
+      "4": "https://cdn.frankerfacez.com/emote/27081/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2015-06-01T05:52:57.770Z",
+     "last_updated": "2015-06-01T05:53:03.744Z"
+    }
+   ]
+  },
+  "1532818": {
+   "id": 1532818,
+   "_type": 1,
+   "icon": null,
+   "title": "Subwoofer Emote Effects",
+   "css": null,
+   "emoticons": [
+    {
+     "id": 720507,
+     "name": "ffzHyper",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 12289,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720507/1",
+      "2": "https://cdn.frankerfacez.com/emote/720507/2",
+      "4": "https://cdn.frankerfacez.com/emote/720507/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-04T20:17:47.814Z",
+     "last_updated": "2023-03-04T20:17:47.814Z"
+    },
+    {
+     "id": 720510,
+     "name": "ffzRainbow",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 2049,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720510/1",
+      "2": "https://cdn.frankerfacez.com/emote/720510/2",
+      "4": "https://cdn.frankerfacez.com/emote/720510/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-04T20:17:47.861Z",
+     "last_updated": "2023-03-04T20:17:47.861Z"
+    },
+    {
+     "id": 721137,
+     "name": "ffzBounce",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 65537,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/721137/1",
+      "2": "https://cdn.frankerfacez.com/emote/721137/2",
+      "4": "https://cdn.frankerfacez.com/emote/721137/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-06T21:36:58.922Z",
+     "last_updated": "2023-03-06T21:36:58.922Z"
+    },
+    {
+     "id": 720730,
+     "name": "ffzJam",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 32769,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720730/1",
+      "2": "https://cdn.frankerfacez.com/emote/720730/2",
+      "4": "https://cdn.frankerfacez.com/emote/720730/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-05T06:35:25.895Z",
+     "last_updated": "2023-03-05T06:35:25.895Z"
+    },
+    {
+     "id": 723889,
+     "name": "ffzSlide",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 17,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/723889/1",
+      "2": "https://cdn.frankerfacez.com/emote/723889/2",
+      "4": "https://cdn.frankerfacez.com/emote/723889/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-27T22:17:16.443Z",
+     "last_updated": "2023-03-27T22:17:16.443Z"
+    },
+    {
+     "id": 723887,
+     "name": "ffzLeave",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 65,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/723887/1",
+      "2": "https://cdn.frankerfacez.com/emote/723887/2",
+      "4": "https://cdn.frankerfacez.com/emote/723887/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-27T22:17:16.391Z",
+     "last_updated": "2023-03-27T22:17:16.391Z"
+    }
+   ]
+  },
+  "1539687": {
+   "id": 1539687,
+   "_type": 2,
+   "icon": null,
+   "title": "Emote Effects",
+   "css": null,
+   "emoticons": [
+    {
+     "id": 723890,
+     "name": "ffzW",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 9,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/723890/1",
+      "2": "https://cdn.frankerfacez.com/emote/723890/2",
+      "4": "https://cdn.frankerfacez.com/emote/723890/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-27T22:17:16.460Z",
+     "last_updated": "2023-03-27T22:17:16.460Z"
+    },
+    {
+     "id": 720508,
+     "name": "ffzX",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 3,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720508/1",
+      "2": "https://cdn.frankerfacez.com/emote/720508/2",
+      "4": "https://cdn.frankerfacez.com/emote/720508/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-04T20:17:47.845Z",
+     "last_updated": "2023-03-04T20:17:47.845Z"
+    },
+    {
+     "id": 720509,
+     "name": "ffzY",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 5,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720509/1",
+      "2": "https://cdn.frankerfacez.com/emote/720509/2",
+      "4": "https://cdn.frankerfacez.com/emote/720509/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-04T20:17:47.853Z",
+     "last_updated": "2023-03-04T20:17:47.853Z"
+    },
+    {
+     "id": 720729,
+     "name": "ffzCursed",
+     "height": 32,
+     "width": 32,
+     "public": false,
+     "hidden": false,
+     "modifier": true,
+     "modifier_flags": 16385,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 1,
+      "name": "sirstendec",
+      "display_name": "SirStendec"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/720729/1",
+      "2": "https://cdn.frankerfacez.com/emote/720729/2",
+      "4": "https://cdn.frankerfacez.com/emote/720729/4"
+     },
+     "status": 1,
+     "usage_count": 1,
+     "created_at": "2023-03-05T06:35:25.882Z",
+     "last_updated": "2023-03-05T06:35:25.882Z"
+    }
+   ]
+  }
+ },
+ "users": {
+  "1532818": [
+   "wid3__",
+   "deboratestefierro_megaugu",
+   "brin____"
+  ]
+ }
+}
