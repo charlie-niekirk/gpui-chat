@@ -21,9 +21,9 @@ use std::time::Duration;
 use gpui_chat_core::{Emote, Message};
 use gpui_kit::{
     App, AvailableSpace, Bounds, Corners, Element, ElementId, Font, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent, Pixels, Point,
-    ScrollEvent, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
-    underline_y_offset,
+    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseExitEvent,
+    MouseMoveEvent, Pixels, Point, ScrollEvent, StrikethroughStyle, Style, TextRun, UnderlineStyle,
+    Window, fill, point, px, size, underline_y_offset,
 };
 
 use super::colors;
@@ -262,15 +262,20 @@ impl MessageElement {
                         tracing::debug!(%error, "failed to paint an emote");
                     }
                 }
-                Lookup::Loading => {
+                Lookup::Loading | Lookup::Retrying => {
                     window.paint_quad(fill(rect, placeholder).corner_radii(px(3.0)));
                 }
-                // A failed image is re-laid out as text once the image store notices; until
-                // then the box stays empty.
-                Lookup::Ready(_) | Lookup::Failed => {}
+                // Failed for good: the epoch moved, so the next render re-shapes it as text.
+                Lookup::Failed { relayout } => {
+                    if relayout {
+                        window.request_animation_frame();
+                    }
+                }
+                Lookup::Ready(_) => {}
             }
         }
         drop(frame);
+        Images::arm_retry(cx);
 
         let Some(hitbox) = prepainted.hitbox.clone() else {
             return;
@@ -292,14 +297,21 @@ impl MessageElement {
                 .flatten();
             EmoteHover::hover(&hover, seq, over, view, window, cx);
         });
-        let hover = style.hover.clone();
-        window.on_mouse_event(move |_: &ScrollEvent, _, _, cx| {
-            let mut hover = hover.borrow_mut();
-            if hover.target().is_some_and(|target| target.seq == seq) && hover.clear() {
-                drop(hover);
-                cx.notify(view);
+        // Scrolling, or the pointer leaving the window (its position is not updated then, so the
+        // tooltip's own check would still see it over the emote): hide.
+        let hide = {
+            let hover = style.hover.clone();
+            move |cx: &mut App| {
+                let mut hover = hover.borrow_mut();
+                if hover.target().is_some_and(|target| target.seq == seq) && hover.clear() {
+                    drop(hover);
+                    cx.notify(view);
+                }
             }
-        });
+        };
+        let on_exit = hide.clone();
+        window.on_mouse_event(move |_: &ScrollEvent, _, _, cx| hide(cx));
+        window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| on_exit(cx));
     }
 }
 
@@ -384,17 +396,18 @@ impl Element for MessageElement {
         // Normal behaviour: it only answers "is the pointer over this message"; wheel events
         // still reach the list.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let hover = self.style.hover.borrow();
+        let origin = bounds.origin + self.style.padding;
         for inline in &layout.shaped.inlines {
             let target = Target {
                 seq: self.seq,
                 atom: inline.atom,
             };
-            if let Some(tooltip) = hover.tooltip_for(target) {
+            let rect = inline_rect(&layout.flow, &layout.shaped, inline.atom as usize);
+            let rect = Bounds::new(origin + rect.origin, rect.size);
+            if let Some(tooltip) = EmoteHover::tooltip_for(&self.style.hover, target, rect) {
                 window.set_tooltip(tooltip);
             }
         }
-        drop(hover);
         Prepainted {
             layout,
             hitbox: Some(hitbox),

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui_chat_core::ImageUrls;
-use gpui_chat_media::{DecodeLimits, FetchError, FetchFuture, Fetcher, decode};
+use gpui_chat_media::{DecodeError, DecodeLimits, FetchFuture, Fetcher, RetryPolicy, decode};
 use gpui_kit::{
     AppContext as _, Bounds, Context, Corners, IntoElement, ParentElement, Pixels, Render, Styled,
     TestAppContext, WindowHandle, canvas, div,
@@ -107,9 +107,11 @@ fn placeholder_sizes_and_themed_urls() {
     );
 }
 
-/// Serves fixtures by URL and counts requests.
+type Routes = Arc<Mutex<HashMap<&'static str, Result<Vec<u8>, FetchError>>>>;
+
+/// Serves fixtures (or errors) by URL, 404 for anything else, and counts requests.
 struct FakeFetcher {
-    routes: HashMap<&'static str, Vec<u8>>,
+    routes: Routes,
     requests: Arc<AtomicUsize>,
 }
 
@@ -118,16 +120,22 @@ impl Fetcher for FakeFetcher {
         self.requests.fetch_add(1, Ordering::SeqCst);
         let result = self
             .routes
+            .lock()
+            .unwrap()
             .get(url)
             .cloned()
-            .ok_or(FetchError::NotFound(404));
+            .unwrap_or(Err(FetchError::NotFound(404)));
         Box::pin(async move { result })
     }
 }
 
+/// How long the test cache remembers a transient failure.
+const BACKOFF: Duration = Duration::from_millis(50);
+
 struct Harness {
     _runtime: tokio::runtime::Runtime,
     requests: Arc<AtomicUsize>,
+    routes: Routes,
 }
 
 impl Harness {
@@ -139,16 +147,25 @@ impl Harness {
             .build()
             .unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
-        let fetcher = FakeFetcher {
-            routes: routes
+        let routes: Routes = Arc::new(Mutex::new(
+            routes
                 .iter()
-                .map(|(url, file)| (*url, fixture(file)))
+                .map(|(url, file)| (*url, Ok(fixture(file))))
                 .collect(),
+        ));
+        let fetcher = FakeFetcher {
+            routes: routes.clone(),
             requests: requests.clone(),
         };
         let builder = ImageCache::builder(runtime.handle().clone())
             .config(ImageCacheConfig {
                 memory_budget_bytes: budget,
+                // One attempt, and transient failures forgotten quickly, to test retries.
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    ..RetryPolicy::default()
+                },
+                failure_backoff: BACKOFF,
                 ..ImageCacheConfig::default()
             })
             .fetcher(Arc::new(fetcher));
@@ -156,7 +173,13 @@ impl Harness {
         Self {
             _runtime: runtime,
             requests,
+            routes,
         }
+    }
+
+    /// What `url` serves from now on.
+    fn route(&self, url: &'static str, result: Result<Vec<u8>, FetchError>) {
+        self.routes.lock().unwrap().insert(url, result);
     }
 
     fn cache(&self, cx: &mut TestAppContext) -> ImageCache<EmoteImage> {
@@ -247,6 +270,7 @@ impl Render for ImageView {
                             drawn.borrow_mut().push(image);
                         }
                     }
+                    Images::arm_retry(cx);
                 },
             )
             .size_full(),
@@ -453,4 +477,96 @@ fn animation_wake_is_scheduled_and_cancelled(cx: &mut TestAppContext) {
         f.schedule_wake(entity, false, true, cx);
         assert!(!f.wake_pending());
     });
+}
+
+#[test]
+fn only_permanent_failures_become_text() {
+    use gpui_chat_media::MediaError as E;
+    for permanent in [
+        E::Fetch(FetchError::NotFound(404)),
+        E::Fetch(FetchError::NotFound(410)),
+        E::Fetch(FetchError::Request("bad url".into())),
+        E::Fetch(FetchError::TooLarge { limit: 1 }),
+        E::Decode(DecodeError::Malformed("truncated".into())),
+        E::Decode(DecodeError::UnknownFormat),
+    ] {
+        assert!(is_permanent(&permanent), "{permanent:?}");
+    }
+    for transient in [
+        E::Fetch(FetchError::Timeout),
+        E::Fetch(FetchError::Network("reset".into())),
+        E::Fetch(FetchError::Status(503)),
+        E::Fetch(FetchError::Status(429)),
+        E::Fetch(FetchError::Status(403)),
+        E::Cancelled,
+    ] {
+        assert!(!is_permanent(&transient), "{transient:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_transient_failure_keeps_the_placeholder_and_is_retried(cx: &mut TestAppContext) {
+    let h = Harness::new(&[], 1 << 30, cx);
+    h.route("flaky", Err(FetchError::Status(503)));
+    let placeholder = EmoteBox::Image {
+        url: ImageKey::new("flaky"),
+        size: (28.0, 28.0),
+    };
+    let boxed = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.global_mut::<Images>()
+                .emote_box(&emote_at("flaky"), 1.0, 1.0, false)
+        })
+    };
+    assert_eq!(boxed(cx), placeholder);
+    h.load("flaky", cx);
+    let epoch = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().epoch());
+    assert_eq!(epoch(cx), 0, "a 503 does not re-shape");
+    assert_eq!(boxed(cx), placeholder, "still a placeholder, not text");
+
+    // The view paints a placeholder and is woken after RETRY_POLL; by then the CDN recovered
+    // and media's back-off has passed, so the retry loads the image.
+    let w = Window1::open(&["flaky"], cx);
+    assert_eq!(w.drawn(), 0);
+    h.route("flaky", Ok(fixture("static.png")));
+    std::thread::sleep(BACKOFF * 2);
+    cx.executor().advance_clock(RETRY_POLL);
+    cx.run_until_parked();
+    h.load("flaky", cx);
+    assert_eq!(w.drawn(), 1, "retried and drawn");
+    assert_eq!(epoch(cx), 0, "28 px as assumed");
+}
+
+#[gpui_kit::test]
+fn an_evicted_image_that_fails_to_reload_becomes_text(cx: &mut TestAppContext) {
+    let h = Harness::new(&[("gone", "static.png")], 1 << 30, cx);
+    let boxed = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.global_mut::<Images>()
+                .emote_box(&emote_at("gone"), 1.0, 1.0, false)
+        })
+    };
+    boxed(cx);
+    h.load("gone", cx);
+    // Shaped while ready: an image box from the image itself (no load expected any more).
+    assert!(matches!(boxed(cx), EmoteBox::Image { .. }));
+    let epoch = cx.read(|cx| cx.global::<Images>().epoch());
+
+    // Evicted while off screen, and the CDN now answers 404.
+    h.cache(cx).clear_memory();
+    h.pump(cx);
+    h.route("gone", Err(FetchError::NotFound(404)));
+    let w = Window1::open(&["gone"], cx);
+    h.load("gone", cx);
+    w.redraw(cx);
+    assert_eq!(w.drawn(), 0);
+    let after = cx.read(|cx| cx.global::<Images>().epoch());
+    assert_eq!(after, epoch + 1, "the box is re-laid out once");
+    w.redraw(cx);
+    assert_eq!(
+        cx.read(|cx| cx.global::<Images>().epoch()),
+        after,
+        "not on every frame"
+    );
+    assert_eq!(boxed(cx), EmoteBox::Text);
 }

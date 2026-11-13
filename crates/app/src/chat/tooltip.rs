@@ -40,6 +40,11 @@ pub struct Target {
     pub atom: u32,
 }
 
+/// Whether the pointer is still over an emote's box (the tooltip's visibility check).
+pub fn still_over(rect: Bounds<Pixels>, pointer: Point<Pixels>) -> bool {
+    rect.contains(&pointer)
+}
+
 /// The view's hover state, shared with its message elements.
 #[derive(Default)]
 pub struct EmoteHover {
@@ -55,17 +60,42 @@ impl EmoteHover {
         self.target
     }
 
-    /// The tooltip to request for `target`, if it is the one shown.
-    pub fn tooltip_for(&self, target: Target) -> Option<AnyTooltip> {
-        if self.target != Some(target) {
+    /// The tooltip to request for `target`, if it is the one shown. `rect` is the emote's box in
+    /// window coordinates this frame.
+    ///
+    /// GPUI asks `check_visible_and_update` every frame before drawing it. It hides the tooltip
+    /// as soon as the pointer is no longer over the box, also when nothing moved the pointer:
+    /// new rows pushed the emote away, or the list scrolled. Hit-testing cannot be used there:
+    /// GPUI runs it before the frame's hit test is computed, and hitbox ids are not reused
+    /// between frames, so a hitbox from this frame never tests as hovered at that point (its
+    /// div tooltips check bounds for the same reason). Leaving the window is handled by the
+    /// element's `MouseExitEvent` listener, since the pointer position is not updated then.
+    pub fn tooltip_for(
+        this: &Rc<RefCell<Self>>,
+        target: Target,
+        rect: Bounds<Pixels>,
+    ) -> Option<AnyTooltip> {
+        let hover = this.borrow();
+        if hover.target != Some(target) {
             return None;
         }
-        let (view, mouse_position) = self.shown.clone()?;
+        let (view, mouse_position) = hover.shown.clone()?;
+        let weak = Rc::downgrade(this);
         Some(AnyTooltip {
             view,
             mouse_position,
-            // Requested only while shown, so it is always visible when asked.
-            check_visible_and_update: Rc::new(|_, _, _| true),
+            check_visible_and_update: Rc::new(move |_, window, _| {
+                let visible = still_over(rect, window.mouse_position());
+                if !visible
+                    && let Some(this) = weak.upgrade()
+                    && let Ok(mut hover) = this.try_borrow_mut()
+                    && hover.target == Some(target)
+                {
+                    // Coming back to the emote starts the show delay again.
+                    hover.clear();
+                }
+                visible
+            }),
         })
     }
 
@@ -256,10 +286,56 @@ fn paint_preview(
                 tracing::debug!(%error, "failed to paint an emote preview");
             }
         }
-        Lookup::Loading => {
+        Lookup::Loading | Lookup::Retrying => {
             window.paint_quad(fill(bounds, placeholder).corner_radii(px(4.0)));
         }
-        Lookup::Ready(_) | Lookup::Failed => {}
+        Lookup::Ready(_) | Lookup::Failed { .. } => {}
     }
+    Images::arm_retry(cx);
     frame.schedule_wake(entity, animate, window.is_window_active(), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{Modifiers, TestAppContext, point, size};
+
+    use super::*;
+
+    struct Empty;
+
+    impl Render for Empty {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_tooltip_hides_once_the_pointer_is_off_the_emote(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| Empty);
+        let hover = Rc::new(RefCell::new(EmoteHover::default()));
+        let target = Target { seq: 1, atom: 2 };
+        {
+            let mut h = hover.borrow_mut();
+            h.target = Some(target);
+            h.shown = Some((view.into(), point(px(20.0), px(20.0))));
+        }
+        let rect = Bounds::new(point(px(10.0), px(10.0)), size(px(28.0), px(28.0)));
+        // Only the hovered emote asks for it.
+        assert!(EmoteHover::tooltip_for(&hover, Target { seq: 1, atom: 3 }, rect).is_none());
+
+        cx.simulate_mouse_move(point(px(20.0), px(20.0)), None, Modifiers::none());
+        let check = |rect, cx: &mut gpui_kit::VisualTestContext| {
+            let tooltip = EmoteHover::tooltip_for(&hover, target, rect)?;
+            Some(cx.update(|window, cx| {
+                (tooltip.check_visible_and_update)(Bounds::default(), window, cx)
+            }))
+        };
+        assert_eq!(check(rect, cx), Some(true));
+        // New rows pushed the emote 50 px up under a still pointer: hidden, and forgotten so
+        // coming back waits for the show delay again.
+        let moved = Bounds::new(point(px(10.0), px(-40.0)), rect.size);
+        assert_eq!(check(moved, cx), Some(false));
+        assert_eq!(hover.borrow().target(), None);
+        assert_eq!(check(rect, cx), None);
+    }
 }

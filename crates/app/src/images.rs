@@ -18,8 +18,12 @@
 //!   finish, one task on the UI thread notifies every waiter once for the whole batch.
 //! * **Layout stability.** Emote boxes are sized before their image arrives (the provider's
 //!   reported size, or Twitch's 28 px square), so lines do not jump when it does. If a finished
-//!   image turns out to have another size, or fails and falls back to text, [`Images::epoch`]
-//!   moves on and views re-shape their messages.
+//!   image turns out to have another size, or fails for good and falls back to text,
+//!   [`Images::epoch`] moves on and views re-shape their messages.
+//! * **Failures.** Only permanent ones ([`is_permanent`]: 404/410, undecodable, refused) turn an
+//!   emote into its name as text. A transient one (timeout, network error, 5xx) keeps the
+//!   placeholder, and views that painted it are woken every [`RETRY_POLL`] to ask again once
+//!   media's failure back-off has passed.
 //! * **One animation clock.** Every animated image picks its frame from the time since
 //!   [`Images`] was created, so identical emotes animate in sync wherever they are.
 
@@ -30,8 +34,8 @@ use std::time::{Duration, Instant};
 use gpui_chat_core::{Emote, ImageScale};
 use gpui_chat_media::scale::{self, logical_size};
 use gpui_chat_media::{
-    CacheValue, DecodedImage, ImageCache, ImageCacheBuilder, ImageCacheConfig, ImageKey,
-    ImageStatus, Timeline,
+    CacheValue, DecodedImage, FetchError, ImageCache, ImageCacheBuilder, ImageCacheConfig,
+    ImageKey, ImageStatus, MediaError, Timeline,
 };
 use gpui_kit::{App, EntityId, Global, RenderImage, Task, Window};
 use tokio::sync::Notify;
@@ -42,6 +46,10 @@ pub const DEFAULT_EMOTE_SIZE: f32 = 28.0;
 
 /// A size change smaller than this (logical px) does not re-shape anything.
 const SIZE_SLACK: f32 = 0.5;
+
+/// How often a view showing a transiently failed image asks for it again (media remembers the
+/// failure for its back-off, 30 s by default, and answers from memory until then).
+pub const RETRY_POLL: Duration = Duration::from_secs(5);
 
 /// Shortest wait between animation wake-ups, so a frame change due "now" cannot spin.
 const MIN_ANIMATION_WAKE: Duration = Duration::from_millis(4);
@@ -156,7 +164,28 @@ pub enum EmoteBox {
 pub enum Lookup {
     Ready(Arc<EmoteImage>),
     Loading,
-    Failed,
+    /// A transient failure: keep the placeholder; the view is woken to ask again.
+    Retrying,
+    /// A permanent failure. `relayout`: the box was laid out as an image (it was ready when the
+    /// message was shaped, then evicted and failed to reload) and the epoch just moved so it
+    /// becomes text; the caller should make the view render again.
+    Failed {
+        relayout: bool,
+    },
+}
+
+/// Whether a failed load will fail again however often it is retried: the image is gone
+/// (404/410), the request is refused as such, the body is over the size limit, or it does not
+/// decode. Timeouts, network errors and other HTTP statuses (5xx, 429, 403...) may pass.
+pub fn is_permanent(error: &MediaError) -> bool {
+    match error {
+        MediaError::Fetch(
+            FetchError::NotFound(_) | FetchError::Request(_) | FetchError::TooLarge { .. },
+        )
+        | MediaError::Decode(_) => true,
+        MediaError::Fetch(FetchError::Status(_) | FetchError::Timeout | FetchError::Network(_))
+        | MediaError::Cancelled => false,
+    }
 }
 
 /// The images one view painted, so they stay pinned while on screen, plus its animation timer.
@@ -175,7 +204,9 @@ impl FrameImages {
     /// Call when the view renders, before its elements paint: the last frame's images become the
     /// pinned (shown) set and the previous pins are let go.
     pub fn begin_frame(&mut self) {
-        self.shown = std::mem::take(&mut self.painting);
+        // Swap rather than take, so both maps keep their capacity from frame to frame.
+        std::mem::swap(&mut self.shown, &mut self.painting);
+        self.painting.clear();
         self.next_change = None;
     }
 
@@ -267,6 +298,11 @@ pub struct Images {
     epoch: u64,
     /// Evicted images still held by a view (on screen); their textures go once they are not.
     graveyard: Vec<Arc<EmoteImage>>,
+    /// Permanently failed URLs the epoch already moved for, until a re-shape makes them text.
+    to_text: HashSet<ImageKey>,
+    /// Views that painted a transiently failed image, woken by `retry`.
+    retry_waiters: HashSet<EntityId>,
+    retry: Option<Task<()>>,
     _pump: Option<Task<()>>,
 }
 
@@ -282,6 +318,9 @@ impl Images {
             expected: HashMap::new(),
             epoch: 0,
             graveyard: Vec::new(),
+            to_text: HashSet::new(),
+            retry_waiters: HashSet::new(),
+            retry: None,
             _pump: None,
         }
     }
@@ -361,7 +400,13 @@ impl Images {
                 size: logical_size(image.pixel_size(), selected.scale, emote_scale),
                 url,
             },
-            ImageStatus::Failed(_) => EmoteBox::Text,
+            ImageStatus::Failed(error) if is_permanent(&error) => {
+                // Shaped as text now; a later image box for it may need a new epoch.
+                self.to_text.remove(url.url());
+                EmoteBox::Text
+            }
+            // Not ready, or failed for now (media retries once its back-off has passed): a
+            // placeholder of the assumed size.
             status => {
                 if matches!(status, ImageStatus::Absent) {
                     drop(cache.request(url.url()));
@@ -397,7 +442,7 @@ impl Images {
             Some(ImageStatus::Ready(image)) => {
                 logical_size(image.pixel_size(), selected.scale, scale)
             }
-            Some(ImageStatus::Failed(_)) => return None,
+            Some(ImageStatus::Failed(error)) if is_permanent(&error) => return None,
             _ => assumed_size(emote, scale),
         };
         Some((url, size))
@@ -412,7 +457,8 @@ impl Images {
     }
 
     /// The image for `url` to paint now: pinned in `frame` or ready in the cache, else its load
-    /// is started or joined and `waiter` is notified when it finishes. Marks it painted.
+    /// is started or joined and `waiter` is notified when it finishes (or, after a transient
+    /// failure, woken to retry: call [`Self::arm_retry`] after painting). Marks it painted.
     pub fn lookup(&mut self, url: &ImageKey, frame: &mut FrameImages, waiter: EntityId) -> Lookup {
         let Some(cache) = &self.cache else {
             return Lookup::Loading;
@@ -424,7 +470,17 @@ impl Images {
                 Some(image) => image.clone(),
                 None => match cache.request(url.url()).try_get() {
                     Some(Ok(image)) => image,
-                    Some(Err(_)) => return Lookup::Failed,
+                    Some(Err(error)) if is_permanent(&error) => {
+                        let relayout = self.to_text.insert(url.clone());
+                        if relayout {
+                            self.epoch += 1;
+                        }
+                        return Lookup::Failed { relayout };
+                    }
+                    Some(Err(_)) => {
+                        self.retry_waiters.insert(waiter);
+                        return Lookup::Retrying;
+                    }
                     None => {
                         self.waiters.insert(waiter);
                         return Lookup::Loading;
@@ -434,6 +490,28 @@ impl Images {
         };
         frame.record(url, &image);
         Lookup::Ready(image)
+    }
+
+    /// Wakes the views that painted a transiently failed image after [`RETRY_POLL`], so they ask
+    /// for it again. Call after painting; one timer serves every view.
+    pub fn arm_retry(cx: &mut App) {
+        match cx.try_global::<Self>() {
+            Some(images) if !images.retry_waiters.is_empty() && images.retry.is_none() => {}
+            _ => return,
+        }
+        let timer = cx.background_executor().timer(RETRY_POLL);
+        let task = cx.spawn(async move |cx| {
+            timer.await;
+            cx.update(|cx| {
+                let images = cx.global_mut::<Self>();
+                images.retry = None;
+                let waiters: Vec<EntityId> = images.retry_waiters.drain().collect();
+                for entity in waiters {
+                    cx.notify(entity);
+                }
+            });
+        });
+        cx.global_mut::<Self>().retry = Some(task);
     }
 
     /// Releases the textures of evicted images nothing on screen holds any more. Call from a
@@ -486,8 +564,9 @@ impl Images {
         }
     }
 
-    /// A load finished: if its box was laid out with a size it does not have (or it failed and
-    /// becomes text), move the epoch on so views re-shape.
+    /// A load finished: if its box was laid out with a size it does not have (or it failed for
+    /// good and becomes text), move the epoch on so views re-shape. After a transient failure
+    /// the box stays a placeholder and is checked again when a retry finishes.
     fn settle(&mut self, key: &ImageKey) {
         let (Some(expected), Some(cache)) = (self.expected.remove(key), &self.cache) else {
             return;
@@ -498,7 +577,14 @@ impl Images {
                     logical_size(image.pixel_size(), expected.variant, expected.emote_scale);
                 (w - expected.size.0).abs() > SIZE_SLACK || (h - expected.size.1).abs() > SIZE_SLACK
             }
-            ImageStatus::Failed(_) => true,
+            ImageStatus::Failed(error) if is_permanent(&error) => {
+                self.to_text.insert(key.clone());
+                true
+            }
+            ImageStatus::Failed(_) => {
+                self.expected.insert(key.clone(), expected);
+                false
+            }
             // Evicted again already, or a cancelled load: laid out as assumed, nothing to do.
             ImageStatus::Loading | ImageStatus::Absent => false,
         };

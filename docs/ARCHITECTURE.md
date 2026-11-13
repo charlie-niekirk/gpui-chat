@@ -250,10 +250,13 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   so a placeholder box holds the space while loading and lines never jump. Each flowed line is as
   tall as its tallest emote; text and emotes are centred in it. The variant is picked by
   `scale::select(display scale, emotes.scale)`; Twitch URLs switch to `light` on light themes.
-  A failed image falls back to the emote name as text (the store's epoch moves and views
-  re-shape). Hovering an emote shows a tooltip (1:1 preview of the densest variant, name,
+  An image that fails for good (404/410, undecodable) falls back to the emote name as text (the
+  store's epoch moves and views re-shape); a transient failure (timeout, 5xx) keeps the
+  placeholder and is retried. Hovering an emote shows a tooltip (1:1 preview of the densest variant, name,
   provider, "animated") via `Window::set_tooltip` from the message's prepaint; its hitbox is
-  non-blocking so wheel events still reach the list.
+  non-blocking so wheel events still reach the list. GPUI re-checks it every frame against the
+  pointer and the emote's current box, so it hides when rows move under a still pointer;
+  leaving the window hides it via `MouseExitEvent`.
 - **Emoji** are drawn by text shaping with the system colour-emoji font (`paint_emoji`), not an
   image set: CoreText falls back to Apple Color Emoji, so ZWJ sequences, flags and skin tones
   shape correctly and align with the text baseline, with nothing to download or license.
