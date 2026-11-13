@@ -10,7 +10,7 @@
 //! Both are plain data structures with the entity plumbing on top, so the batching logic is
 //! unit-tested without a window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use gpui_chat_core::{
@@ -148,6 +148,9 @@ pub struct ChannelHub {
     /// client, where the channel list decides which stores exist, so a late event for a channel
     /// the user just closed cannot bring it back.
     auto_create: bool,
+    /// Channels the user closed: auto-create skips them, so a source that keeps sending events
+    /// for a closed channel (the firehose) cannot bring it back. [`ChannelHub::ensure`] clears it.
+    closed: HashSet<ChannelId>,
     /// State of the connection as a whole (`Connection { channel: None, .. }` events).
     connection: Option<ConnectionState>,
     /// Other events that named no channel (connection-wide notices); nothing shows them yet.
@@ -166,6 +169,7 @@ impl ChannelHub {
             },
             diagnostics,
             auto_create: true,
+            closed: HashSet::new(),
             connection: None,
             unrouted: 0,
         }
@@ -187,13 +191,16 @@ impl ChannelHub {
         if let Some(store) = self.stores.get(channel) {
             return store.clone();
         }
+        self.closed.remove(channel);
         let store = self.ensure_quiet(channel, cx);
         cx.notify();
         store
     }
 
-    /// Drops the store of `channel` (its messages go with it).
+    /// Drops the store of `channel` (its messages go with it) and keeps it from being created
+    /// again by events, until [`ChannelHub::ensure`] is called for it.
     pub fn remove(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        self.closed.insert(channel.clone());
         if self.stores.remove(channel).is_some() {
             self.order.retain(|c| c != channel);
             cx.notify();
@@ -254,7 +261,7 @@ impl ChannelHub {
         for (channel, events) in groups {
             let store = match self.stores.get(&channel) {
                 Some(store) => store.clone(),
-                None if self.auto_create => {
+                None if self.auto_create && !self.closed.contains(&channel) => {
                     changed = true;
                     self.ensure_quiet(&channel, cx)
                 }
@@ -604,6 +611,30 @@ mod tests {
             assert!(hub.apply_batch(vec![event(ConnectionState::Connected)], cx));
             assert_eq!(hub.connection(), Some(&ConnectionState::Connected));
             assert_eq!(hub.unrouted(), 0, "connection events are not 'unrouted'");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_channel_is_not_recreated_by_events_until_it_is_opened_again(
+        cx: &mut TestAppContext,
+    ) {
+        // Offline sources auto-create stores, and keep sending for a channel after it was closed.
+        let hub = cx.new(|_| ChannelHub::new(10, Diagnostics::new()));
+        let channel = ChannelId::new("busy");
+        hub.update(cx, |hub, cx| {
+            assert!(hub.apply_batch(vec![chat("busy", "1", "u")], cx));
+            assert_eq!(hub.channels().len(), 1);
+            hub.remove(&channel, cx);
+            assert!(!hub.apply_batch(vec![chat("busy", "2", "u")], cx));
+            assert!(hub.channels().is_empty(), "stays closed");
+            // Other channels are unaffected.
+            assert!(hub.apply_batch(vec![chat("other", "3", "u")], cx));
+            assert_eq!(hub.channels().len(), 1);
+            // Opening it again clears the mark.
+            hub.ensure(&channel, cx);
+            hub.apply_batch(vec![chat("busy", "4", "u")], cx);
+            let sizes = hub.sizes(cx);
+            assert_eq!(sizes.iter().find(|s| s.channel == channel).unwrap().len, 1);
         });
     }
 }

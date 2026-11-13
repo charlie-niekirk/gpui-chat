@@ -3,8 +3,8 @@
 //! Accepted forms (case-insensitive, surrounding whitespace ignored):
 //!
 //! * `name`, `#name`, `@name`
-//! * `twitch.tv/name`, `www.twitch.tv/name`, `m.twitch.tv/name`, with or without `http(s)://`,
-//!   a trailing `/`, a query string or a fragment
+//! * `twitch.tv/name`, `www.twitch.tv/name`, `m.twitch.tv/name`, `go.twitch.tv/name`, with or
+//!   without `http(s)://`, a trailing `/`, a query string or a fragment
 //! * `twitch.tv/popout/name/chat`, `twitch.tv/moderator/name` and `twitch.tv/embed/name/chat`
 //!   (the URLs Twitch itself hands out for the chat window)
 //!
@@ -44,6 +44,29 @@ impl std::fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
+
+/// Hosts whose first path segment is a channel. Other `*.twitch.tv` hosts (`clips.`, `dev.`,
+/// `help.`, ...) are different sites.
+const CHANNEL_HOSTS: [&str; 4] = ["twitch.tv", "www.twitch.tv", "m.twitch.tv", "go.twitch.tv"];
+
+/// First path segments of twitch.tv that are pages, not channels.
+const RESERVED_SEGMENTS: [&str; 15] = [
+    "directory",
+    "videos",
+    "settings",
+    "search",
+    "downloads",
+    "p",
+    "jobs",
+    "subscriptions",
+    "inventory",
+    "wallet",
+    "drops",
+    "turbo",
+    "prime",
+    "friends",
+    "messages",
+];
 
 /// Path segments of twitch.tv URLs that come before the channel name.
 const PATH_PREFIXES: [&str; 3] = ["popout", "moderator", "embed"];
@@ -85,7 +108,7 @@ fn name_from_url(input: &str) -> Result<&str, LoginError> {
     let host = segments.next().ok_or(LoginError::Empty)?;
     // `user@host` and `host:port` forms do not occur for twitch.tv links.
     let host = host.to_ascii_lowercase();
-    if host != "twitch.tv" && !host.ends_with(".twitch.tv") {
+    if !CHANNEL_HOSTS.contains(&host.as_str()) {
         return Err(LoginError::NotAChannelUrl);
     }
     let mut segments = segments.peekable();
@@ -95,13 +118,11 @@ fn name_from_url(input: &str) -> Result<&str, LoginError> {
     {
         segments.next();
     }
-    segments.next().ok_or(LoginError::NotAChannelUrl)
-}
-
-/// `true` if `login` could have come out of [`normalise_login`]; used to drop junk from a
-/// hand-edited `state.toml`.
-pub fn is_valid_login(login: &str) -> bool {
-    normalise_login(login).is_ok_and(|channel| channel.login() == login)
+    let name = segments.next().ok_or(LoginError::NotAChannelUrl)?;
+    if RESERVED_SEGMENTS.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(LoginError::NotAChannelUrl);
+    }
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -145,6 +166,8 @@ mod tests {
             "https://www.twitch.tv/moderator/forsen",
             "https://www.twitch.tv/embed/forsen/chat",
             "https://www.twitch.tv/forsen/videos",
+            "https://go.twitch.tv/forsen",
+            "https://m.twitch.tv/Forsen/",
         ] {
             assert_eq!(ok(url), "forsen", "{url}");
         }
@@ -156,6 +179,16 @@ mod tests {
             "https://example.com/forsen",
             "https://nottwitch.tv/forsen",
             "twitch.tv.evil.com/forsen",
+            "https://clips.twitch.tv/SomeClipSlug",
+            "https://dev.twitch.tv/forsen",
+            "https://help.twitch.tv/forsen",
+            "https://twitch.tv/directory",
+            "https://www.twitch.tv/directory/game/Just%20Chatting",
+            "twitch.tv/videos/123456",
+            "https://www.twitch.tv/settings",
+            "twitch.tv/Search?term=x",
+            "https://www.twitch.tv/popout/directory/chat",
+            "twitch.tv/p/en/about",
             "https://www.twitch.tv/",
             "twitch.tv",
             "https://www.twitch.tv/popout",
@@ -186,13 +219,5 @@ mod tests {
         assert_eq!(normalise_login("na-me"), Err(LoginError::Characters));
         assert_eq!(normalise_login("nämé"), Err(LoginError::Characters));
         assert_eq!(normalise_login("#na me"), Err(LoginError::Characters));
-    }
-
-    #[test]
-    fn is_valid_login_only_accepts_normal_form() {
-        assert!(is_valid_login("forsen"));
-        assert!(!is_valid_login("Forsen"));
-        assert!(!is_valid_login("#forsen"));
-        assert!(!is_valid_login(""));
     }
 }

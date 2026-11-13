@@ -105,9 +105,12 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
-  `selected`). Separate from user settings. Each writer reads, changes its own part and writes back
-  under one lock, so window and channel saves do not clobber each other; a missing or unparsable file
-  loads as defaults, and restore drops invalid or duplicate logins and a stale selection.
+  `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
+  leaves `[window]` intact and vice versa) and each writer replaces only its own top-level key in the
+  file's TOML table under one lock, so other sections (even ones this build cannot read) survive; a
+  file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore
+  normalises every saved login (`Forsen`, `#forsen` still restore) and drops invalid or duplicate ones
+  and a stale selection.
 
 ### Domain model (`crates/core`)
 

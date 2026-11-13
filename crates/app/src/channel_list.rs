@@ -6,7 +6,7 @@
 
 use gpui_chat_core::ChannelId;
 
-use crate::login::is_valid_login;
+use crate::login::normalise_login;
 use crate::state::SavedChannels;
 
 /// How far a channel moves in the sidebar.
@@ -23,20 +23,21 @@ pub struct ChannelList {
 }
 
 impl ChannelList {
-    /// The saved list, with anything that is not a plausible login or is a duplicate dropped.
-    /// The saved selection is used only if that channel is still in the list; otherwise the
-    /// first channel is selected.
+    /// The saved list. Every entry goes through [`normalise_login`], so a hand-edited `Forsen` or
+    /// `#forsen` still restores as `forsen`; entries that are still not a login, and duplicates,
+    /// are dropped. The saved selection is used only if that channel is in the list; otherwise
+    /// the first channel is selected.
     pub fn from_saved(saved: &SavedChannels) -> Self {
         let mut list = Self::default();
         for login in &saved.open {
-            if is_valid_login(login) {
-                list.append(ChannelId::new(login));
+            if let Ok(channel) = normalise_login(login) {
+                list.append(channel);
             }
         }
         list.selected = saved
             .selected
             .as_deref()
-            .map(ChannelId::new)
+            .and_then(|login| normalise_login(login).ok())
             .filter(|selected| list.contains(selected))
             .or_else(|| list.channels.first().cloned());
         list
@@ -250,19 +251,25 @@ mod tests {
                 "xqc".into(),
                 "forsen".into(),
                 String::new(),
-                "#hash".into(),
+                "#Hash_Tag".into(),
+                "FORSEN".into(),
+                "https://www.twitch.tv/directory".into(),
             ],
             selected: Some("gone".into()),
         };
         let list = ChannelList::from_saved(&saved);
-        assert_eq!(logins(&list), ["forsen", "xqc"]);
+        assert_eq!(logins(&list), ["forsen", "xqc", "hash_tag"]);
         assert_eq!(list.selected(), Some(&ch("forsen")));
 
         let list = ChannelList::from_saved(&SavedChannels {
-            selected: Some("xqc".into()),
+            selected: Some("XQC".into()),
             ..saved
         });
-        assert_eq!(list.selected(), Some(&ch("xqc")));
+        assert_eq!(
+            list.selected(),
+            Some(&ch("xqc")),
+            "selection is normalised too"
+        );
         assert_eq!(
             ChannelList::from_saved(&SavedChannels::default()),
             ChannelList::default()
