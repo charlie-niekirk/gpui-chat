@@ -32,6 +32,10 @@ theme_name = "default"                     # colour theme (PR 4.4)
 [chat]
 scrollback = 1000                          # 10 to 100000
 timestamps = true
+
+[emotes]
+scale = 1.0                                # 0.5 to 4.0; a Twitch emote is 28 px at 1.0
+animate = true                             # false: animated emotes show their first frame
 ```
 
 ## Compatibility rules

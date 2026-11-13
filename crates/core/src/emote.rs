@@ -100,9 +100,10 @@ pub struct Emote {
     pub name: Arc<str>,
     pub provider: EmoteProvider,
     pub urls: ImageUrls,
-    /// Known to be animated. Twitch emotes parsed from IRC tags cannot say, so
-    /// they are `false`; the `default` CDN format serves the animated version
-    /// when one exists.
+    /// Known to be animated before loading. Twitch emotes parsed from IRC tags
+    /// cannot say, so they are `false`; the `default` CDN format serves the
+    /// animated version when one exists, and the app learns it from the decoded
+    /// image (more than one frame).
     pub animated: bool,
     /// Overlay emote: stacks on the preceding emote instead of taking its own slot.
     pub zero_width: bool,

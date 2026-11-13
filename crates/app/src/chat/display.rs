@@ -8,8 +8,9 @@
 //! system text is covered here).
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use gpui_chat_core::{Author, Fragment, Message, MessageKind};
+use gpui_chat_core::{Author, Emote, Fragment, Message, MessageKind};
 
 /// What a span of the display text is; decides its font weight and colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,7 +28,8 @@ pub enum Role {
     /// `@viewer`: a mention of the local user (bold, highlight colour).
     SelfMention,
     Link,
-    /// An emote's name. PR 2.2 replaces these with inline images.
+    /// An emote's name: drawn as an inline image (its glyphs only if the image failed). Every
+    /// emote is a span of its own, listed in [`DisplayText::emotes`].
     Emote,
     Emoji,
     Cheer,
@@ -52,6 +54,8 @@ pub struct Span {
 pub struct DisplayText {
     pub text: String,
     pub spans: Vec<Span>,
+    /// `(span index, emote)` for every [`Role::Emote`] span, in text order.
+    pub emotes: Vec<(usize, Arc<Emote>)>,
 }
 
 /// Settings that change what is drawn (and therefore the layout).
@@ -78,11 +82,23 @@ impl DisplayText {
             return;
         }
         match self.spans.last_mut() {
-            Some(last) if last.role == role && last.range.end == start => last.range.end = end,
+            // Emotes are never merged: each span is one image.
+            Some(last) if last.role == role && last.range.end == start && role != Role::Emote => {
+                last.range.end = end;
+            }
             _ => self.spans.push(Span {
                 range: start..end,
                 role,
             }),
+        }
+    }
+
+    /// Appends an emote's name as its own [`Role::Emote`] span.
+    fn push_emote(&mut self, emote: &Arc<Emote>) {
+        let spans = self.spans.len();
+        self.push(&emote.name, Role::Emote);
+        if self.spans.len() > spans {
+            self.emotes.push((spans, emote.clone()));
         }
     }
 
@@ -115,10 +131,11 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                 emote,
                 zero_width_overlays,
             } => {
-                out.push(&emote.name, Role::Emote);
+                out.push_emote(emote);
+                // Stacking overlays on their base is PR 2.4; until then they follow it.
                 for overlay in zero_width_overlays {
                     out.push(" ", text_role);
-                    out.push(&overlay.name, Role::Emote);
+                    out.push_emote(overlay);
                 }
             }
             Fragment::Emoji { text } => out.push(text, Role::Emoji),
@@ -280,8 +297,42 @@ mod tests {
         }
         assert_eq!(at, display.text.len());
         assert!(display.text.ends_with("Kappa Kappa👍🏽Cheer100"));
+        // Each emote is its own span, recorded with its emote.
+        assert_eq!(display.emotes.len(), 2);
+        for (span, emote) in &display.emotes {
+            assert_eq!(display.spans[*span].role, Role::Emote);
+            assert_eq!(
+                &display.text[display.spans[*span].range.clone()],
+                &*emote.name
+            );
+        }
         assert_eq!(display.span_at(0), Some(0));
         assert_eq!(display.span_at(display.text.len()), None);
+    }
+
+    #[test]
+    fn adjacent_emotes_stay_separate_spans() {
+        let kappa = Arc::new(Emote::twitch("25", "Kappa"));
+        let lul = Arc::new(Emote::twitch("425618", "LUL"));
+        let message = chat(vec![
+            Fragment::Emote {
+                emote: kappa,
+                zero_width_overlays: vec![],
+            },
+            Fragment::Emote {
+                emote: lul,
+                zero_width_overlays: vec![],
+            },
+        ]);
+        let display = build(&message, DisplayOptions::default());
+        assert_eq!(
+            roles(&display)[2..],
+            [("Kappa", Role::Emote), ("LUL", Role::Emote)]
+        );
+        assert_eq!(
+            display.emotes.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            [2, 3]
+        );
     }
 
     #[test]

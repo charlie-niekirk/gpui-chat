@@ -58,6 +58,11 @@ impl Backend {
         f()
     }
 
+    /// A handle to the runtime, for libraries that spawn their own tasks (the image cache).
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
     #[allow(dead_code)] // used by tests; handy for backends deciding whether to start work
     pub fn is_running(&self) -> bool {
         self.runtime.is_some()

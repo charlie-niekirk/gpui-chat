@@ -7,6 +7,7 @@
 //! * [`colors`] — username fallback colours and readability adjustment (pure).
 //! * [`element`] — the custom GPUI `Element` that measures and paints one message.
 //! * [`list_sync`] — incremental list splices from store sequence numbers (pure).
+//! * [`tooltip`] — emote hover tooltips (preview, name, provider).
 //! * [`view`] — the `ChatView` entity: list, follow-bottom, "new messages" pill, live settings.
 
 pub mod colors;
@@ -15,6 +16,7 @@ pub mod element;
 pub mod flow;
 pub mod layout;
 pub mod list_sync;
+pub mod tooltip;
 pub mod view;
 
 pub use view::ChatView;

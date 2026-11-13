@@ -11,6 +11,11 @@
 //!    over the atoms, no shaping), so a resize re-flows every visible message without touching
 //!    the text system.
 //!
+//! Emotes are decided at shaping time ([`EmoteBox`]): an emote with an image becomes one
+//! [`AtomKind::Inline`] atom of the image's logical size in place of its name's clusters (the name
+//! stays in the display text for copy and hit-testing; its glyphs are not painted), so the box
+//! is the final size before the image arrives. An emote without an image stays text.
+//!
 //! [`LayoutCache`] keeps both per store sequence number, keyed by (width, text-config generation,
 //! scale factor); a changed message (`Arc` pointer differs, e.g. marked deleted) is re-shaped.
 //! Entries for evicted messages are dropped when the view syncs with the store.
@@ -19,12 +24,14 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_chat_core::Message;
+use gpui_chat_core::{Emote, Message};
+use gpui_chat_media::ImageKey;
 use gpui_kit::{FontId, GlyphId, LineLayout, Pixels};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::display::DisplayText;
 use super::flow::{self, Atom, AtomKind, Flow};
+use crate::images::EmoteBox;
 
 /// Slack for comparing glyph positions (logical pixels).
 const RTL_EPSILON: f32 = 0.01;
@@ -41,11 +48,22 @@ pub struct GlyphRef {
     pub is_emoji: bool,
 }
 
+/// An emote drawn as an image: which atom it is and what to draw.
+#[derive(Clone, Debug)]
+pub struct InlineImage {
+    /// Index into [`ShapedMessage::atoms`] (an [`AtomKind::Inline`] atom).
+    pub atom: u32,
+    pub url: ImageKey,
+    pub emote: Arc<Emote>,
+}
+
 /// A message's display text shaped as one line and cut into atoms.
 #[derive(Clone, Debug)]
 pub struct ShapedMessage {
     pub display: DisplayText,
     pub atoms: Vec<Atom>,
+    /// The emotes drawn as images, in atom order.
+    pub inlines: Vec<InlineImage>,
     /// Span index (into `display.spans`) of each atom.
     pub atom_spans: Vec<u32>,
     pub glyphs: Vec<GlyphRef>,
@@ -54,8 +72,9 @@ pub struct ShapedMessage {
 }
 
 impl ShapedMessage {
-    /// Cuts `layout` (the shaped `display.text`) into grapheme-cluster atoms.
-    pub fn from_layout(display: DisplayText, layout: &LineLayout) -> Self {
+    /// Cuts `layout` (the shaped `display.text`) into grapheme-cluster atoms, and each emote of
+    /// `display.emotes` whose box (`boxes`, in the same order) is an image into one inline atom.
+    pub fn from_layout(display: DisplayText, layout: &LineLayout, boxes: &[EmoteBox]) -> Self {
         let line_width = layout.width.as_f32();
         // Every glyph's start offset and x, in text order.
         let mut marks: Vec<(usize, f32)> = layout
@@ -118,6 +137,7 @@ impl ShapedMessage {
                 range: start..end,
                 src_x: left,
                 width: (right - left).max(0.0),
+                height: 0.0,
                 kind: if cluster.chars().all(char::is_whitespace) {
                     AtomKind::Space
                 } else {
@@ -125,6 +145,7 @@ impl ShapedMessage {
                 },
             });
         }
+        let (atoms, inlines) = inline_emotes(atoms, &display, boxes);
         let atom_spans = atoms
             .iter()
             .map(|atom| display.span_at(atom.range.start).unwrap_or(0) as u32)
@@ -146,12 +167,80 @@ impl ShapedMessage {
         Self {
             display,
             atoms,
+            inlines,
             atom_spans,
             glyphs,
             ascent: layout.ascent,
             descent: layout.descent,
         }
     }
+}
+
+/// Replaces the atoms of every image emote with one inline atom of its box size. An emote whose
+/// span does not start and end on atom boundaries (inside a merged right-to-left run) stays text.
+fn inline_emotes(
+    atoms: Vec<Atom>,
+    display: &DisplayText,
+    boxes: &[EmoteBox],
+) -> (Vec<Atom>, Vec<InlineImage>) {
+    let mut images = display
+        .emotes
+        .iter()
+        .zip(boxes)
+        .filter_map(|((span, emote), emote_box)| match emote_box {
+            EmoteBox::Image { url, size } => {
+                Some((display.spans[*span].range.clone(), *size, url, emote))
+            }
+            EmoteBox::Text => None,
+        })
+        .peekable();
+    if images.peek().is_none() {
+        return (atoms, Vec::new());
+    }
+    let mut out = Vec::with_capacity(atoms.len());
+    let mut inlines = Vec::new();
+    let mut i = 0;
+    while i < atoms.len() {
+        while images
+            .peek()
+            .is_some_and(|(range, ..)| range.start < atoms[i].range.start)
+        {
+            images.next();
+        }
+        if let Some((range, size, url, emote)) = images.peek()
+            && range.start == atoms[i].range.start
+        {
+            let last = atoms[i..]
+                .iter()
+                .position(|atom| atom.range.end >= range.end)
+                .map(|n| i + n)
+                .filter(|&j| atoms[j].range.end == range.end);
+            if let Some(last) = last {
+                inlines.push(InlineImage {
+                    atom: out.len() as u32,
+                    url: (*url).clone(),
+                    emote: (*emote).clone(),
+                });
+                out.push(Atom {
+                    range: range.clone(),
+                    src_x: atoms[i..=last]
+                        .iter()
+                        .map(|atom| atom.src_x)
+                        .fold(f32::INFINITY, f32::min),
+                    width: size.0,
+                    height: size.1,
+                    kind: AtomKind::Inline,
+                });
+                i = last + 1;
+                images.next();
+                continue;
+            }
+            images.next();
+        }
+        out.push(atoms[i].clone());
+        i += 1;
+    }
+    (out, inlines)
 }
 
 /// What a shaped layout depends on besides the message itself.
@@ -213,6 +302,7 @@ impl LayoutCache {
         message: &Arc<Message>,
         key: LayoutKey,
         width: f32,
+        line_height: f32,
         shape: impl FnOnce() -> ShapedMessage,
     ) -> MessageLayout {
         let width_bits = width.to_bits();
@@ -221,7 +311,7 @@ impl LayoutCache {
             && Arc::ptr_eq(&entry.message, message)
         {
             if entry.width_bits != width_bits {
-                entry.flow = Rc::new(flow::flow(&entry.shaped.atoms, width));
+                entry.flow = Rc::new(flow::flow(&entry.shaped.atoms, width, line_height));
                 entry.width_bits = width_bits;
                 self.stats.flowed += 1;
             } else {
@@ -233,7 +323,7 @@ impl LayoutCache {
             };
         }
         let shaped = Rc::new(shape());
-        let flow = Rc::new(flow::flow(&shaped.atoms, width));
+        let flow = Rc::new(flow::flow(&shaped.atoms, width, line_height));
         self.stats.shaped += 1;
         self.stats.flowed += 1;
         self.entries.insert(
@@ -320,7 +410,7 @@ mod tests {
         let message = message(text);
         let display = display::build(&message, DisplayOptions::default());
         let layout = fake_layout(&display.text);
-        ShapedMessage::from_layout(display, &layout)
+        ShapedMessage::from_layout(display, &layout, &[])
     }
 
     fn message(text: &str) -> Arc<Message> {
@@ -330,6 +420,87 @@ mod tests {
             Author::new("al", "Al"),
             vec![Fragment::Text(text.into())],
         ))
+    }
+
+    /// "Al: hi Kappa LUL" with the two emotes boxed as `boxes`.
+    fn shaped_with_emotes(boxes: &[EmoteBox]) -> ShapedMessage {
+        let emote = |id: &str, name: &str| Fragment::Emote {
+            emote: Arc::new(gpui_chat_core::Emote::twitch(id, name)),
+            zero_width_overlays: vec![],
+        };
+        let message = Message::chat(
+            "1",
+            Timestamp(0),
+            Author::new("al", "Al"),
+            vec![
+                Fragment::Text("hi ".into()),
+                emote("25", "Kappa"),
+                Fragment::Text(" ".into()),
+                emote("425618", "LUL"),
+            ],
+        );
+        let display = display::build(&message, DisplayOptions::default());
+        let layout = fake_layout(&display.text);
+        ShapedMessage::from_layout(display, &layout, boxes)
+    }
+
+    fn image(url: &str, w: f32, h: f32) -> EmoteBox {
+        EmoteBox::Image {
+            url: ImageKey::new(url),
+            size: (w, h),
+        }
+    }
+
+    #[test]
+    fn image_emotes_become_one_inline_atom_of_their_box_size() {
+        let s = shaped_with_emotes(&[image("k", 28.0, 28.0), image("l", 56.0, 28.0)]);
+        let texts: Vec<(&str, AtomKind)> = s
+            .atoms
+            .iter()
+            .map(|atom| (&s.display.text[atom.range.clone()], atom.kind))
+            .collect();
+        assert_eq!(
+            &texts[7..],
+            [
+                ("Kappa", AtomKind::Inline),
+                (" ", AtomKind::Space),
+                ("LUL", AtomKind::Inline)
+            ]
+        );
+        let kappa = &s.atoms[7];
+        assert_eq!((kappa.src_x, kappa.width, kappa.height), (70.0, 28.0, 28.0));
+        assert_eq!((s.atoms[9].width, s.atoms[9].height), (56.0, 28.0));
+        let inlines: Vec<(u32, &str)> = s.inlines.iter().map(|i| (i.atom, i.url.url())).collect();
+        assert_eq!(inlines, [(7, "k"), (9, "l")]);
+        // The names' glyphs belong to the inline atoms (the painter skips them).
+        let kappa_glyphs = s.glyphs.iter().filter(|g| g.atom == 7).count();
+        assert_eq!(kappa_glyphs, 5);
+
+        // A 28 px box in 20 px lines: the box's line is 28 high and the next word wraps after it.
+        let flow = flow::flow(&s.atoms, 1000.0, 20.0);
+        assert_eq!(flow.height(), 28.0);
+        // "Al: hi " is 70 px: the box starts there and the space after it at 98.
+        assert_eq!(flow.placements[8].x, 98.0);
+        let narrow = flow::flow(&s.atoms, 110.0, 20.0);
+        assert_eq!(narrow.line_count(), 2);
+        assert_eq!(narrow.height(), 28.0 + 28.0);
+    }
+
+    #[test]
+    fn emotes_without_an_image_stay_text() {
+        let s = shaped_with_emotes(&[EmoteBox::Text, image("l", 28.0, 28.0)]);
+        assert_eq!(s.inlines.len(), 1);
+        assert_eq!(s.inlines[0].url.url(), "l");
+        // "Kappa" is five glyph atoms of 10 px.
+        assert!(
+            s.atoms[7..12]
+                .iter()
+                .all(|a| a.kind == AtomKind::Glyphs && a.width == 10.0)
+        );
+        // No boxes at all (shaped before the image store existed): everything is text.
+        let plain = shaped_with_emotes(&[]);
+        assert!(plain.inlines.is_empty());
+        assert!(plain.atoms.iter().all(|a| a.kind != AtomKind::Inline));
     }
 
     #[test]
@@ -368,6 +539,7 @@ mod tests {
                 range: 0..text.len(),
                 role: crate::chat::display::Role::Text,
             }],
+            emotes: Vec::new(),
         };
         assert_eq!(visual.len(), text.chars().count());
         let glyphs = visual
@@ -391,7 +563,7 @@ mod tests {
             }],
             len: text.len(),
         };
-        ShapedMessage::from_layout(display, &layout)
+        ShapedMessage::from_layout(display, &layout, &[])
     }
 
     /// `(text, src_x, width)` per atom.
@@ -404,7 +576,7 @@ mod tests {
 
     /// Flowed on one line, every glyph is painted exactly where the shaper put it.
     fn assert_paints_in_shaped_order(s: &ShapedMessage) {
-        let flow = flow::flow(&s.atoms, 1000.0);
+        let flow = flow::flow(&s.atoms, 1000.0, 10.0);
         assert_eq!(flow.line_count(), 1);
         for glyph in &s.glyphs {
             let atom = &s.atoms[glyph.atom as usize];
@@ -487,6 +659,7 @@ mod tests {
                 range: 0..5,
                 role: crate::chat::display::Role::Text,
             }],
+            emotes: Vec::new(),
         };
         let xs = [0.0, 8.7, 16.1, 25.3, 33.9];
         let glyphs = xs
@@ -510,7 +683,7 @@ mod tests {
             }],
             len: 5,
         };
-        let s = ShapedMessage::from_layout(display, &layout);
+        let s = ShapedMessage::from_layout(display, &layout, &[]);
         assert_eq!(s.atoms.len(), 5);
         assert_paints_in_shaped_order(&s);
     }
@@ -518,9 +691,9 @@ mod tests {
     #[test]
     fn empty_text_shapes_to_nothing() {
         let display = DisplayText::default();
-        let s = ShapedMessage::from_layout(display, &LineLayout::default());
+        let s = ShapedMessage::from_layout(display, &LineLayout::default(), &[]);
         assert!(s.atoms.is_empty() && s.glyphs.is_empty());
-        assert_eq!(flow::flow(&s.atoms, 100.0).line_count(), 1);
+        assert_eq!(flow::flow(&s.atoms, 100.0, 10.0).line_count(), 1);
     }
 
     #[test]
@@ -534,29 +707,33 @@ mod tests {
             shaped(text)
         };
 
-        let first = cache.layout(7, &m, key, 1000.0, || shape("hello world"));
+        let first = cache.layout(7, &m, key, 1000.0, 10.0, || shape("hello world"));
         assert_eq!(first.flow.line_count(), 1);
         // Same width: a hit, nothing recomputed.
-        cache.layout(7, &m, key, 1000.0, || shape("hello world"));
+        cache.layout(7, &m, key, 1000.0, 10.0, || shape("hello world"));
         assert_eq!(shapes.get(), 1);
         assert_eq!(cache.stats().hits, 1);
 
         // Resize: re-flow only, and the result wraps.
-        let narrow = cache.layout(7, &m, key, 80.0, || shape("hello world"));
+        let narrow = cache.layout(7, &m, key, 80.0, 10.0, || shape("hello world"));
         assert_eq!(shapes.get(), 1, "a width change must not re-shape");
         // "Al: hello world" at 10 px a char in 80 px: "Al:" | "hello" | "world".
         assert_eq!(narrow.flow.line_count(), 3);
         assert!(Rc::ptr_eq(&first.shaped, &narrow.shaped));
 
         // Settings change (new generation) or another scale factor: re-shape.
-        cache.layout(7, &m, LayoutKey::new(2, 2.0), 80.0, || shape("hello world"));
+        cache.layout(7, &m, LayoutKey::new(2, 2.0), 80.0, 10.0, || {
+            shape("hello world")
+        });
         assert_eq!(shapes.get(), 2);
-        cache.layout(7, &m, LayoutKey::new(2, 1.0), 80.0, || shape("hello world"));
+        cache.layout(7, &m, LayoutKey::new(2, 1.0), 80.0, 10.0, || {
+            shape("hello world")
+        });
         assert_eq!(shapes.get(), 3);
 
         // The store replaced the message (marked deleted): a new `Arc`, re-shape.
         let deleted = Arc::new(m.with_deleted());
-        cache.layout(7, &deleted, LayoutKey::new(2, 1.0), 80.0, || {
+        cache.layout(7, &deleted, LayoutKey::new(2, 1.0), 80.0, 10.0, || {
             shape("hello world")
         });
         assert_eq!(shapes.get(), 4);
@@ -567,11 +744,11 @@ mod tests {
         let mut cache = LayoutCache::default();
         let m = message("x");
         for seq in 0..10 {
-            cache.layout(seq, &m, LayoutKey::new(1, 1.0), 100.0, || shaped("x"));
+            cache.layout(seq, &m, LayoutKey::new(1, 1.0), 100.0, 10.0, || shaped("x"));
         }
         cache.evict_before(6);
         assert_eq!(cache.len(), 4);
-        cache.layout(9, &m, LayoutKey::new(2, 1.0), 100.0, || shaped("x"));
+        cache.layout(9, &m, LayoutKey::new(2, 1.0), 100.0, 10.0, || shaped("x"));
         cache.retain_key(2);
         assert_eq!(cache.len(), 1);
     }

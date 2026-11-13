@@ -12,13 +12,21 @@
 //!   scrolling back to the bottom, resumes following. GPUI re-engages following during list
 //!   layout, after this view rendered, so a zero-size probe painted after the list requests one
 //!   more frame when the pill's visibility is stale.
-//! * **Settings:** font family/size (via the `FontConfig` global), `appearance.line_height` and
-//!   `chat.timestamps` apply live: a change bumps the layout generation (every cached layout is
-//!   re-shaped on next use) and asks the list to remeasure. Theme changes only re-render: colours
-//!   are resolved at paint time.
+//! * **Settings:** font family/size (via the `FontConfig` global), `appearance.line_height`,
+//!   `chat.timestamps` and `emotes.scale` apply live: a change bumps the layout generation (every
+//!   cached layout is re-shaped on next use) and asks the list to remeasure. So does a change of
+//!   the image store's epoch (an emote box that turned out another size, or fell back to text).
+//!   Theme changes and `emotes.animate` only re-render (colours and frames are chosen at paint),
+//!   except a switch between light and dark, which re-shapes for Twitch's light emote variants.
+//! * **Images:** the view owns the [`FrameImages`] its rows paint into (pinning what is on
+//!   screen) and the emote hover state. After the list has painted, the probe schedules one
+//!   wake-up for the soonest animation frame change, only if an animated emote was painted,
+//!   animation is on and the window is active (GPUI refreshes on (de)activation, so animation
+//!   stops and resumes with focus). Nothing animated on screen means no timers at all.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui_kit::{
     Context, Entity, FollowMode, InteractiveElement, IntoElement, ListAlignment, ListState,
@@ -27,12 +35,14 @@ use gpui_kit::{
 };
 
 use super::display::DisplayOptions;
-use super::element::{MessageElement, MessageStyle, Palette};
+use super::element::{EmoteStyle, MessageElement, MessageStyle, Palette};
 use super::layout::LayoutCache;
 use super::list_sync::ListMirror;
+use super::tooltip::EmoteHover;
 use crate::channels::ChannelStore;
 use crate::config;
 use crate::fonts::FontConfig;
+use crate::images::{FrameImages, Images};
 use crate::theme::Tokens;
 
 /// Rows rendered beyond the viewport, so short scrolls do not pop in.
@@ -47,6 +57,11 @@ struct TextConfig {
     size: Pixels,
     line_height: f32,
     options: DisplayOptions,
+    emote_scale: f32,
+    /// Light theme: Twitch emote URLs (picked when shaping) have light variants.
+    light: bool,
+    /// [`Images::epoch`]: emote boxes laid out with a size they turned out not to have.
+    image_epoch: u64,
 }
 
 pub struct ChatView {
@@ -64,6 +79,8 @@ pub struct ChatView {
     pill_shown: bool,
     /// Line height of the last render.
     line_height: Pixels,
+    images: Rc<RefCell<FrameImages>>,
+    hover: Rc<RefCell<EmoteHover>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -94,6 +111,8 @@ impl ChatView {
             unseen_from: None,
             pill_shown: false,
             line_height: px(0.0),
+            images: Rc::default(),
+            hover: Rc::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -163,6 +182,9 @@ impl ChatView {
             options: DisplayOptions {
                 timestamps: settings.chat.timestamps,
             },
+            emote_scale: settings.emotes.scale,
+            light: cx.global::<Tokens>().main_bg.l > 0.5,
+            image_epoch: cx.try_global::<Images>().map_or(0, Images::epoch),
         };
         if self.text_config.as_ref() != Some(&current) {
             if self.text_config.is_some() {
@@ -186,9 +208,18 @@ pub fn pill_label(unseen: usize) -> String {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let config = self.update_text_config(cx);
+        // What the rows painted last frame is what is on screen: pin it, let older pins go and
+        // release the textures of evicted images nothing shows any more.
+        self.images.borrow_mut().begin_frame();
+        Images::sweep(window, cx);
+        let animate = config::current(cx).emotes.animate;
+        let clock = cx
+            .try_global::<Images>()
+            .filter(|_| animate)
+            .map(|images| images.clock(Instant::now()));
         let following = self.list.is_following_tail();
         if following {
             self.unseen_from = None;
@@ -206,6 +237,13 @@ impl Render for ChatView {
             generation: self.generation,
             padding: point(PADDING_X, PADDING_Y),
             palette: Palette::from_tokens(&tokens),
+            emotes: EmoteStyle {
+                scale: config.emote_scale,
+                clock,
+                light: config.light,
+            },
+            images: self.images.clone(),
+            hover: self.hover.clone(),
         });
         let store = self.store.clone();
         let cache = self.cache.clone();
@@ -223,17 +261,23 @@ impl Render for ChatView {
         .size_full();
 
         // Runs after the list's prepaint (which updates the follow state): if the pill shown
-        // this frame no longer matches, render once more.
+        // this frame no longer matches, render once more. Its paint runs after the rows painted:
+        // schedule the next animation frame, if anything animated was drawn.
         let probe = {
             let list = self.list.clone();
             let pill_shown = self.pill_shown;
+            let images = self.images.clone();
+            let view = cx.entity_id();
             canvas(
                 move |_, window, _| {
                     if list.is_following_tail() == pill_shown {
                         window.request_animation_frame();
                     }
                 },
-                |_, _, _, _| {},
+                move |_, _, window, cx| {
+                    let active = window.is_window_active();
+                    images.borrow_mut().schedule_wake(view, animate, active, cx);
+                },
             )
             .absolute()
             .size_0()
@@ -502,6 +546,63 @@ mod tests {
         cx.simulate_resize(size(px(800.0), px(600.0)));
         cx.run_until_parked();
         assert_eq!(h.last_message_lines(cx).0, 1);
+    }
+
+    /// A fetcher whose downloads never finish: images stay placeholders.
+    struct NeverFetcher;
+
+    impl gpui_chat_media::Fetcher for NeverFetcher {
+        fn fetch<'a>(&'a self, _: &'a str) -> gpui_chat_media::FetchFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[gpui_kit::test]
+    fn emote_rows_take_the_emote_height_before_images_load(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut h, cx) = Harness::new(cx, 100);
+        cx.update(|_, cx| {
+            Images::install(
+                gpui_chat_media::ImageCache::builder(runtime.handle().clone())
+                    .fetcher(Arc::new(NeverFetcher)),
+                cx,
+            );
+        });
+        let message = Message::chat(
+            "e",
+            Timestamp(0),
+            Author::new("al", "Al"),
+            vec![
+                Fragment::Text("hi ".into()),
+                Fragment::Emote {
+                    emote: Arc::new(gpui_chat_core::Emote::twitch("25", "Kappa")),
+                    zero_width_overlays: vec![],
+                },
+            ],
+        );
+        h.store.update(cx, |store, cx| {
+            store.apply_all([ChatEvent::Message {
+                channel: ChannelId::new("test"),
+                message: Arc::new(message),
+            }]);
+            cx.notify();
+        });
+        h.next += 1;
+        cx.run_until_parked();
+        let (flow, line_height) = h.view.read_with(cx, |view, _| {
+            (view.cache.borrow().flow_of(0).unwrap(), view.line_height)
+        });
+        // 20 px text lines; the 28 px placeholder box makes the row's only line 28 px tall.
+        assert_eq!(line_height, px(20.0));
+        assert_eq!((flow.line_count(), flow.height()), (1, 28.0));
+        // Only a placeholder was painted: nothing animated, so no animation timer.
+        assert!(
+            !h.view
+                .read_with(cx, |view, _| view.images.borrow().wake_pending())
+        );
     }
 
     #[gpui_kit::test]

@@ -30,6 +30,8 @@ pub(crate) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 pub(crate) const LINE_HEIGHT_RANGE: (f32, f32) = (1.0, 3.0);
 /// Allowed range for [`ChatSettings::scrollback`] (messages per channel).
 pub(crate) const SCROLLBACK_RANGE: (usize, usize) = (10, 100_000);
+/// Allowed range for [`EmoteSettings::scale`] (multiplier).
+pub(crate) const EMOTE_SCALE_RANGE: (f32, f32) = (0.5, 4.0);
 
 /// Top-level settings, stored as `settings.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,8 +44,9 @@ pub struct Settings {
     pub schema_version: u32,
     pub appearance: AppearanceSettings,
     pub chat: ChatSettings,
+    pub emotes: EmoteSettings,
     // Later phases add sections here, each `#[serde(default)]`:
-    // emotes (2.x: provider switches), streamlink (1.6: binary, player, quality,
+    // streamlink (1.6: binary, player, quality,
     // extra args), account (3.x: non-secret bits only; tokens live in the keychain).
 }
 
@@ -53,6 +56,7 @@ impl Default for Settings {
             schema_version: SCHEMA_VERSION,
             appearance: AppearanceSettings::default(),
             chat: ChatSettings::default(),
+            emotes: EmoteSettings::default(),
         }
     }
 }
@@ -134,6 +138,27 @@ impl Default for ChatSettings {
     }
 }
 
+/// `[emotes]`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmoteSettings {
+    /// Size of emotes relative to their provider's base size (a Twitch emote is
+    /// 28 px at 1.0). Also picks which resolution is downloaded. Valid range
+    /// 0.5 to 4.0.
+    pub scale: f32,
+    /// Play animated emotes. When off they show their first frame.
+    pub animate: bool,
+}
+
+impl Default for EmoteSettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            animate: true,
+        }
+    }
+}
+
 impl Settings {
     /// Check value ranges. Returns `(field, reason)` for the first problem.
     ///
@@ -175,6 +200,16 @@ impl Settings {
                 ),
             ));
         }
+        let e = &self.emotes;
+        if !in_range_f32(e.scale, EMOTE_SCALE_RANGE) {
+            return Err((
+                "emotes.scale",
+                format!(
+                    "{} is outside {} to {}",
+                    e.scale, EMOTE_SCALE_RANGE.0, EMOTE_SCALE_RANGE.1
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -194,6 +229,7 @@ mod tests {
         assert_eq!(s.appearance.font_family, "JetBrainsMono Nerd Font");
         assert_eq!(s.appearance.theme, ThemeMode::System);
         assert_eq!(s.chat.scrollback, 1000);
+        assert_eq!((s.emotes.scale, s.emotes.animate), (1.0, true));
         assert!(s.validate().is_ok());
         let chain: Vec<_> = s.appearance.font_chain().collect();
         assert_eq!(
@@ -217,6 +253,10 @@ mod tests {
         let mut s = Settings::default();
         s.chat.scrollback = 0;
         assert_eq!(s.validate().unwrap_err().0, "chat.scrollback");
+
+        let mut s = Settings::default();
+        s.emotes.scale = 8.0;
+        assert_eq!(s.validate().unwrap_err().0, "emotes.scale");
 
         let mut s = Settings::default();
         s.appearance.font_family = "  ".into();
