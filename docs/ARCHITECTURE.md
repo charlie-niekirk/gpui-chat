@@ -236,12 +236,32 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   a draw per message; an event after a quiet spell is applied on the very next frame. The added
   latency is at most 16 ms plus one frame — far below the network latency of chat itself and
   below what reads as a delay — while scrolling still draws at the display's full rate.
-- **Images:** fetched and decoded off the UI thread; de-duplicated in flight;
-  disk cache keyed by URL hash; in-memory LRU with a byte budget (default
-  256 MB); GPU textures released on eviction.
-- **Animation:** one global clock so identical emotes stay in sync. Animation
-  frames are requested only while an animated emote is visible and the window is
-  active. Setting to disable animation.
+- **Images (`crates/app/src/images.rs`):** fetched and decoded off the UI thread by
+  `gpui-chat-media` (de-duplicated in flight, disk cache keyed by URL hash, LRU with a byte budget,
+  default 256 MB). The cached value is an `EmoteImage`: the decoded BGRA straight-alpha frames
+  moved (no copy) into one GPUI `RenderImage` on the blocking pool, plus the frame `Timeline`;
+  its atlas textures are uploaded lazily by the first `paint_image` of each frame. Each chat view
+  keeps the images it painted last frame (`FrameImages`) and paints from there first, so an image
+  the budget evicts while on screen keeps drawing instead of thrashing. Evicted images wait until
+  no view holds them, then `App::drop_image` releases their textures. Finished loads wake every
+  view that painted a placeholder, once per batch.
+- **Inline emotes:** shaped as one `Inline` atom per emote with its final logical size (the
+  provider's base size, or 28 px for Twitch, × `emotes.scale`; the image's own size once known),
+  so a placeholder box holds the space while loading and lines never jump. Each flowed line is as
+  tall as its tallest emote; text and emotes are centred in it. The variant is picked by
+  `scale::select(display scale, emotes.scale)`; Twitch URLs switch to `light` on light themes.
+  A failed image falls back to the emote name as text (the store's epoch moves and views
+  re-shape). Hovering an emote shows a tooltip (1:1 preview of the densest variant, name,
+  provider, "animated") via `Window::set_tooltip` from the message's prepaint; its hitbox is
+  non-blocking so wheel events still reach the list.
+- **Emoji** are drawn by text shaping with the system colour-emoji font (`paint_emoji`), not an
+  image set: CoreText falls back to Apple Color Emoji, so ZWJ sequences, flags and skin tones
+  shape correctly and align with the text baseline, with nothing to download or license.
+- **Animation:** one global clock (time since the image store started) picks every animated
+  image's frame, so identical emotes stay in sync. After the rows paint, the view schedules one
+  timer for the soonest frame change, only if an animated emote was painted, `emotes.animate`
+  is on and the window is active; otherwise no timers run (idle 0 % CPU). GPUI refreshes the
+  window on (de)activation, which stops and resumes animation.
 - **Fallback** if the custom element is blocked by an API gap: wrap-flex of
   per-word elements to keep the phase moving, with a backlog item to return.
 

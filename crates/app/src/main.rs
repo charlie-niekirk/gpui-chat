@@ -16,6 +16,7 @@ mod diagnostics;
 mod firehose;
 mod fonts;
 mod hud;
+mod images;
 mod live;
 mod login;
 mod pane;
@@ -188,6 +189,7 @@ fn main() {
             // The backend runtime exists before any window and stops when the app quits.
             runtime::init(cx)
                 .unwrap_or_else(|error| panic!("failed to start the backend runtime: {error}"));
+            images::init(cx);
             // Settings (a bad file falls back to defaults and is shown in the window), then
             // the font and theme they ask for.
             let settings_events = config::init(cx);

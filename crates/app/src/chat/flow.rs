@@ -11,10 +11,13 @@
 //!   an emoji ZWJ sequence, a flag or a base letter with its combining marks never splits.
 //! * An atom wider than the line on its own (a huge emoji in a very narrow pane) gets a line to
 //!   itself and overflows rather than looping.
+//! * Every line is at least the text line height tall, and as tall as its tallest
+//!   [`AtomKind::Inline`] box (an emote taller than the text), so tall emotes never overlap the
+//!   lines around them. Lines are stacked top to bottom; text and boxes are centred vertically
+//!   in their line by the painter.
 //!
-//! **Seams for later PRs.** PR 2.2 adds [`AtomKind::Inline`] atoms (emote images with a known
-//! logical width) to the same stream; flow treats them like glyph atoms, and the painter draws
-//! an image instead of glyphs. PR 5.6 (selection across messages) hit-tests with
+//! [`AtomKind::Inline`] atoms (emote images with a known logical size, PR 2.2) wrap like glyph
+//! clusters; the painter draws an image instead of glyphs. **Seam for later PRs:** PR 5.6 (selection across messages) hit-tests with
 //! [`Flow::index_at`] / [`Flow::position_of`], which map between a point in the message and a
 //! byte offset in its display text.
 
@@ -27,8 +30,7 @@ pub enum AtomKind {
     Space,
     /// A grapheme cluster drawn with glyphs.
     Glyphs,
-    /// An inline box of known size (an emote image, PR 2.2). Unbreakable, like a glyph cluster.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// An inline box of known size (an emote image). Unbreakable, like a glyph cluster.
     Inline,
 }
 
@@ -41,6 +43,8 @@ pub struct Atom {
     pub src_x: f32,
     /// Advance width.
     pub width: f32,
+    /// Height of an [`AtomKind::Inline`] box; 0 for text (which uses the line height).
+    pub height: f32,
     pub kind: AtomKind,
 }
 
@@ -58,6 +62,10 @@ pub struct Line {
     pub atoms: Range<usize>,
     /// Width of the line's content, without hanging spaces.
     pub width: f32,
+    /// Top edge relative to the content origin.
+    pub top: f32,
+    /// The text line height, or the tallest inline box on the line if that is taller.
+    pub height: f32,
 }
 
 /// The result of flowing atoms into lines. Always has at least one line.
@@ -71,8 +79,14 @@ pub struct Flow {
 }
 
 impl Flow {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Total height of all lines.
+    pub fn height(&self) -> f32 {
+        self.lines.last().map_or(0.0, |line| line.top + line.height)
     }
 
     /// The widest line's content width.
@@ -134,25 +148,51 @@ struct Cursor {
     /// Right edge of the last non-space atom on the line.
     content_end: f32,
     has_content: bool,
+    /// Top of the current line.
+    top: f32,
+    /// Height of the current line so far.
+    height: f32,
+    line_height: f32,
 }
 
 impl Cursor {
     /// Ends the current line before atom `at`.
     fn break_before(&mut self, at: usize, lines: &mut Vec<Line>) {
-        lines.push(Line {
-            atoms: self.line_start..at,
-            width: self.content_end,
-        });
+        self.end_line(at, lines);
         self.line += 1;
         self.line_start = at;
         self.x = 0.0;
         self.content_end = 0.0;
         self.has_content = false;
+        self.top += self.height;
+        self.height = self.line_height;
+    }
+
+    fn end_line(&self, at: usize, lines: &mut Vec<Line>) {
+        lines.push(Line {
+            atoms: self.line_start..at,
+            width: self.content_end,
+            top: self.top,
+            height: self.height,
+        });
+    }
+
+    fn place(&mut self, atom: &Atom) -> Placement {
+        let placement = Placement {
+            line: self.line,
+            x: self.x,
+        };
+        self.x += atom.width;
+        if atom.kind == AtomKind::Inline {
+            self.height = self.height.max(atom.height);
+        }
+        placement
     }
 }
 
-/// Flows `atoms` into lines no wider than `max_width` (non-positive or NaN means unconstrained).
-pub fn flow(atoms: &[Atom], max_width: f32) -> Flow {
+/// Flows `atoms` into lines no wider than `max_width` (non-positive or NaN means unconstrained),
+/// each at least `line_height` tall.
+pub fn flow(atoms: &[Atom], max_width: f32, line_height: f32) -> Flow {
     let max = if max_width > 0.0 {
         max_width
     } else {
@@ -166,17 +206,16 @@ pub fn flow(atoms: &[Atom], max_width: f32) -> Flow {
         x: 0.0,
         content_end: 0.0,
         has_content: false,
+        top: 0.0,
+        height: line_height,
+        line_height,
     };
     let mut i = 0;
     while i < atoms.len() {
         if atoms[i].kind == AtomKind::Space {
             // Spaces always follow content (or open the message), so they stay on this line and
             // hang past its edge if the next word wraps.
-            placements[i] = Placement {
-                line: at.line,
-                x: at.x,
-            };
-            at.x += atoms[i].width;
+            placements[i] = at.place(&atoms[i]);
             i += 1;
             continue;
         }
@@ -200,20 +239,13 @@ pub fn flow(atoms: &[Atom], max_width: f32) -> Flow {
             if at.has_content && overflows(at.x + atom.width) {
                 at.break_before(j, &mut lines);
             }
-            placements[j] = Placement {
-                line: at.line,
-                x: at.x,
-            };
-            at.x += atom.width;
+            placements[j] = at.place(atom);
             at.content_end = at.x;
             at.has_content = true;
         }
         i = word_end;
     }
-    lines.push(Line {
-        atoms: at.line_start..atoms.len(),
-        width: at.content_end,
-    });
+    at.end_line(atoms.len(), &mut lines);
     Flow {
         placements,
         lines,
@@ -225,20 +257,23 @@ pub fn flow(atoms: &[Atom], max_width: f32) -> Flow {
 mod tests {
     use super::*;
 
-    /// Atoms for `text`, one per char, each `w` wide (`#` is 3 wide, an inline box).
+    /// Atoms for `text`, one per char, each `w` wide (`#` is a 3 wide, 2 high inline box; `%` a
+    /// 1 wide, half-line-high one).
     fn atoms(text: &str, w: f32) -> Vec<Atom> {
         let mut x = 0.0;
         text.char_indices()
             .map(|(i, c)| {
-                let (width, kind) = match c {
-                    ' ' => (w, AtomKind::Space),
-                    '#' => (3.0 * w, AtomKind::Inline),
-                    _ => (w, AtomKind::Glyphs),
+                let (width, height, kind) = match c {
+                    ' ' => (w, 0.0, AtomKind::Space),
+                    '#' => (3.0 * w, 2.0, AtomKind::Inline),
+                    '%' => (w, 0.5, AtomKind::Inline),
+                    _ => (w, 0.0, AtomKind::Glyphs),
                 };
                 let atom = Atom {
                     range: i..i + c.len_utf8(),
                     src_x: x,
                     width,
+                    height,
                     kind,
                 };
                 x += width;
@@ -265,7 +300,7 @@ mod tests {
 
     fn wrap(text: &str, max: f32) -> Vec<String> {
         let atoms = atoms(text, 1.0);
-        lines(text, &flow(&atoms, max), &atoms)
+        lines(text, &flow(&atoms, max, 1.0), &atoms)
     }
 
     #[test]
@@ -279,7 +314,7 @@ mod tests {
         assert_eq!(wrap("hello world", 10.0), ["hello", "world"]);
         assert_eq!(wrap("aa bb cc dd", 5.0), ["aa bb", "cc dd"]);
         let a = atoms("aa bb cc", 1.0);
-        let f = flow(&a, 5.0);
+        let f = flow(&a, 5.0, 1.0);
         // "aa bb" fits exactly; the space after it hangs and does not count.
         assert_eq!(f.lines[0].width, 5.0);
         assert_eq!(f.placements[6], Placement { line: 1, x: 0.0 });
@@ -289,7 +324,7 @@ mod tests {
     fn runs_of_spaces_hang_at_the_break() {
         let text = "aaaa    bbbb";
         let a = atoms(text, 1.0);
-        let f = flow(&a, 6.0);
+        let f = flow(&a, 6.0, 1.0);
         assert_eq!(lines(text, &f, &a), ["aaaa", "bbbb"]);
         assert_eq!(f.lines[0].width, 4.0);
         assert_eq!(f.placements[8], Placement { line: 1, x: 0.0 });
@@ -319,13 +354,14 @@ mod tests {
                     range: range.clone(),
                     src_x: x,
                     width,
+                    height: 0.0,
                     kind: AtomKind::Glyphs,
                 };
                 x += width;
                 atom
             })
             .collect();
-        let f = flow(&a, 3.0);
+        let f = flow(&a, 3.0, 1.0);
         assert_eq!(lines(text, &f, &a), ["ab", "🇩🇪", "👨‍👩‍👧c", "d"]);
     }
 
@@ -347,6 +383,7 @@ mod tests {
                     range: i..i + 1,
                     src_x: x,
                     width: width(c),
+                    height: 0.0,
                     kind: if c == ' ' {
                         AtomKind::Space
                     } else {
@@ -362,16 +399,16 @@ mod tests {
             (x + a[2].width) + a[3].width > 1.4 && x + (a[2].width + a[3].width) <= 1.4,
             "the rounding this test relies on"
         );
-        assert_eq!(lines("a bc", &flow(&a, 1.4), &a), ["a bc"]);
+        assert_eq!(lines("a bc", &flow(&a, 1.4, 1.0), &a), ["a bc"]);
         // Slightly narrower than the content: the whole word moves, it is never hard-broken.
-        assert_eq!(lines("a bc", &flow(&a, 1.3), &a), ["a", "bc"]);
+        assert_eq!(lines("a bc", &flow(&a, 1.3, 1.0), &a), ["a", "bc"]);
     }
 
     #[test]
     fn an_atom_wider_than_the_line_overflows_on_its_own_line() {
         let text = "a#b";
         let a = atoms(text, 1.0);
-        let f = flow(&a, 2.0);
+        let f = flow(&a, 2.0, 1.0);
         assert_eq!(lines(text, &f, &a), ["a", "#", "b"]);
         assert_eq!(f.lines[1].width, 3.0);
     }
@@ -380,25 +417,58 @@ mod tests {
     fn inline_boxes_flow_like_glyphs() {
         let text = "x # y";
         let a = atoms(text, 1.0);
-        assert_eq!(lines(text, &flow(&a, 5.0), &a), ["x #", "y"]);
+        assert_eq!(lines(text, &flow(&a, 5.0, 1.0), &a), ["x #", "y"]);
+    }
+
+    #[test]
+    fn lines_are_as_tall_as_their_tallest_inline_box() {
+        // "a # b" at width 3: "a" | "#" (3 wide, 2 high) | "b %" (box shorter than the text).
+        let text = "a # b %";
+        let a = atoms(text, 1.0);
+        let f = flow(&a, 3.0, 1.0);
+        assert_eq!(lines(text, &f, &a), ["a", "#", "b %"]);
+        let geometry: Vec<(f32, f32)> = f.lines.iter().map(|l| (l.top, l.height)).collect();
+        assert_eq!(geometry, [(0.0, 1.0), (1.0, 2.0), (3.0, 1.0)]);
+        assert_eq!(f.height(), 4.0);
+        // On one line, the box makes the single line 2 high.
+        let wide = flow(&a, 100.0, 1.0);
+        assert_eq!(wide.line_count(), 1);
+        assert_eq!(wide.height(), 2.0);
+        // Text-only lines are exactly the line height; a taller line height wins over boxes.
+        assert_eq!(flow(&atoms("ab cd", 1.0), 2.0, 1.5).height(), 3.0);
+        assert_eq!(flow(&a, 100.0, 2.5).height(), 2.5);
+    }
+
+    #[test]
+    fn a_hanging_space_does_not_carry_box_height_to_the_next_line() {
+        // The inline box is on line 0; the wrapped word starts line 1 at the line height.
+        let text = "# bb";
+        let a = atoms(text, 1.0);
+        let f = flow(&a, 4.0, 1.0);
+        assert_eq!(lines(text, &f, &a), ["#", "bb"]);
+        assert_eq!(
+            (f.lines[0].height, f.lines[1].top, f.lines[1].height),
+            (2.0, 2.0, 1.0)
+        );
     }
 
     #[test]
     fn unconstrained_and_empty() {
         let a = atoms("a b c", 1.0);
-        assert_eq!(flow(&a, 0.0).line_count(), 1);
-        assert_eq!(flow(&a, f32::NAN).line_count(), 1);
-        let empty = flow(&[], 10.0);
+        assert_eq!(flow(&a, 0.0, 1.0).line_count(), 1);
+        assert_eq!(flow(&a, f32::NAN, 1.0).line_count(), 1);
+        let empty = flow(&[], 10.0, 1.0);
         assert_eq!(empty.line_count(), 1);
         assert_eq!(empty.content_width(), 0.0);
+        assert_eq!(empty.height(), 1.0);
     }
 
     #[test]
     fn rewrapping_the_same_atoms_at_another_width() {
         let text = "the quick brown fox jumps over the lazy dog";
         let a = atoms(text, 1.0);
-        let narrow = flow(&a, 10.0);
-        let wide = flow(&a, 100.0);
+        let narrow = flow(&a, 10.0, 1.0);
+        let wide = flow(&a, 100.0, 1.0);
         assert_eq!(wide.line_count(), 1);
         assert_eq!(
             lines(text, &narrow, &a),
@@ -411,7 +481,7 @@ mod tests {
     fn hit_testing_round_trips_between_points_and_offsets() {
         let text = "hello world foo";
         let a = atoms(text, 2.0);
-        let f = flow(&a, 22.0); // "hello world" (22) | "foo"
+        let f = flow(&a, 22.0, 1.0); // "hello world" (22) | "foo"
         assert_eq!(lines(text, &f, &a), ["hello world", "foo"]);
         // Start, middle of a glyph (rounds to nearer edge), past the end of a line.
         assert_eq!(f.index_at(&a, 0, 0.0), 0);

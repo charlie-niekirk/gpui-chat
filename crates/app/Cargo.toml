@@ -13,10 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-chat-core = { workspace = true }
+gpui-chat-media = { workspace = true }
 gpui-chat-settings = { workspace = true }
 gpui-chat-twitch = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }
+# Only for the frame types GPUI's `RenderImage` is built from (no codecs used here).
+image = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
