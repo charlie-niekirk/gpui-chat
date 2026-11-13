@@ -53,9 +53,8 @@ pub struct ShapedMessage {
 impl ShapedMessage {
     /// Cuts `layout` (the shaped `display.text`) into grapheme-cluster atoms.
     pub fn from_layout(display: DisplayText, layout: &LineLayout) -> Self {
-        // Glyph start offsets and x positions, by text offset. Clusters with several glyphs
-        // (combining marks) or none (the tail of a ligature) are handled by taking the x of the
-        // first glyph at or after a boundary.
+        let line_width = layout.width.as_f32();
+        // Every glyph's start offset and x, in text order.
         let mut marks: Vec<(usize, f32)> = layout
             .runs
             .iter()
@@ -63,32 +62,62 @@ impl ShapedMessage {
             .map(|glyph| (glyph.index, glyph.position.x.as_f32()))
             .collect();
         marks.sort_by_key(|&(index, _)| index);
-        let line_width = layout.width.as_f32();
+        // A glyph's visual right edge is the next greater glyph x (or the line end). Combining
+        // marks share their base's x, so they do not cut its advance short.
+        let mut edges: Vec<f32> = marks.iter().map(|&(_, x)| x).collect();
+        edges.sort_by(f32::total_cmp);
+        edges.dedup();
+        let right_of = |x: f32| {
+            let i = edges.partition_point(|&edge| edge <= x);
+            edges.get(i).copied().unwrap_or(line_width)
+        };
+        // For a cluster without glyphs of its own (the tail of a ligature): where the next
+        // glyph starts.
         let x_at = |offset: usize| {
             let i = marks.partition_point(|&(index, _)| index < offset);
             marks.get(i).map_or(line_width, |&(_, x)| x)
         };
 
-        let text = display.text.as_str();
-        let atoms: Vec<Atom> = text
-            .grapheme_indices(true)
-            .map(|(start, cluster)| {
-                let end = start + cluster.len();
-                let src_x = x_at(start);
-                Atom {
-                    range: start..end,
-                    src_x,
-                    // Right-to-left runs can make this negative; such text keeps its order and
-                    // does not wrap well yet (see BACKLOG "bidi").
-                    width: (x_at(end) - src_x).max(0.0),
-                    kind: if cluster.chars().all(char::is_whitespace) {
-                        AtomKind::Space
-                    } else {
-                        AtomKind::Glyphs
-                    },
-                }
-            })
-            .collect();
+        let mut atoms: Vec<Atom> = Vec::new();
+        for (start, cluster) in display.text.grapheme_indices(true) {
+            let end = start + cluster.len();
+            let glyphs = &marks[marks.partition_point(|&(index, _)| index < start)
+                ..marks.partition_point(|&(index, _)| index < end)];
+            let (left, right) = if glyphs.is_empty() {
+                let x = x_at(start);
+                (x, x)
+            } else {
+                glyphs
+                    .iter()
+                    .fold((f32::INFINITY, 0.0f32), |(left, right), &(_, x)| {
+                        (left.min(x), right.max(right_of(x)))
+                    })
+            };
+            // A cluster drawn left of the previous one is inside a right-to-left run (glyph x
+            // falls while the text offset grows). Keep such a run as one unbreakable atom so its
+            // visual order survives; wrapping inside it is left to proper bidi support.
+            if let Some(previous) = atoms.last_mut()
+                && !glyphs.is_empty()
+                && left < previous.src_x - 0.01
+            {
+                let previous_right = previous.src_x + previous.width;
+                previous.range.end = end;
+                previous.src_x = left;
+                previous.width = previous_right.max(right) - left;
+                previous.kind = AtomKind::Glyphs;
+                continue;
+            }
+            atoms.push(Atom {
+                range: start..end,
+                src_x: left,
+                width: (right - left).max(0.0),
+                kind: if cluster.chars().all(char::is_whitespace) {
+                    AtomKind::Space
+                } else {
+                    AtomKind::Glyphs
+                },
+            });
+        }
         let atom_spans = atoms
             .iter()
             .map(|atom| display.span_at(atom.range.start).unwrap_or(0) as u32)
@@ -321,6 +350,77 @@ mod tests {
             *s.atom_spans.last().unwrap() as usize,
             s.display.spans.len() - 1
         );
+    }
+
+    #[test]
+    fn right_to_left_runs_stay_whole_and_in_visual_order() {
+        // "ab שלום cd": the shaper lays the Hebrew word out right to left, so its letters'
+        // x positions fall while their text offsets grow.
+        let display = DisplayText {
+            text: "ab שלום cd".into(),
+            spans: vec![crate::chat::display::Span {
+                range: 0..14,
+                role: crate::chat::display::Role::Text,
+            }],
+        };
+        // Visual: a b ␠ ם ו ל ש ␠ c d, 10 px each.
+        let order = [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 6),
+            (5, 5),
+            (7, 4),
+            (9, 3),
+            (11, 7),
+            (12, 8),
+            (13, 9),
+        ];
+        let glyphs = order
+            .iter()
+            .map(|&(index, slot)| ShapedGlyph {
+                id: GlyphId(index as u32),
+                position: point(px(slot as f32 * 10.0), px(0.0)),
+                index,
+                is_emoji: false,
+            })
+            .collect();
+        let layout = LineLayout {
+            font_size: px(10.0),
+            width: px(100.0),
+            ascent: px(8.0),
+            descent: px(2.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs,
+            }],
+            len: 14,
+        };
+        let s = ShapedMessage::from_layout(display, &layout);
+        let atoms: Vec<_> = s
+            .atoms
+            .iter()
+            .map(|a| (&s.display.text[a.range.clone()], a.src_x, a.width))
+            .collect();
+        assert_eq!(
+            atoms,
+            [
+                ("a", 0.0, 10.0),
+                ("b", 10.0, 10.0),
+                (" ", 20.0, 10.0),
+                ("שלום", 30.0, 40.0),
+                (" ", 70.0, 10.0),
+                ("c", 80.0, 10.0),
+                ("d", 90.0, 10.0),
+            ]
+        );
+        // Flowed on one line, every glyph keeps its shaped x: the word is not mirrored.
+        let flow = flow::flow(&s.atoms, 1000.0);
+        for glyph in &s.glyphs {
+            let atom = &s.atoms[glyph.atom as usize];
+            let x = flow.placements[glyph.atom as usize].x + glyph.x - atom.src_x;
+            assert_eq!(x, glyph.x);
+        }
     }
 
     #[test]

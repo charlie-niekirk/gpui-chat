@@ -460,6 +460,23 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn scrolling_to_the_bottom_resumes_even_while_messages_arrive(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        h.scroll(300.0, cx);
+        for _ in 0..5 {
+            h.push(4, "hello", cx);
+        }
+        assert!(!h.following(cx));
+        for _ in 0..10 {
+            h.scroll(-200.0, cx);
+            h.push(4, "hello", cx);
+        }
+        h.next_frame(cx);
+        assert!(h.following(cx));
+    }
+
+    #[gpui_kit::test]
     fn resize_rewraps_without_reshaping(cx: &mut TestAppContext) {
         let (mut h, cx) = Harness::new(cx, 100);
         // About 90 characters: one line at 800 px, several at 200 px.
