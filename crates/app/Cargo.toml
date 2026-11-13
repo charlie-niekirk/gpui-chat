@@ -21,6 +21,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 # Headless GPUI windows and `TestAppContext` for the bridge tests: the same pinned GPUI snapshot

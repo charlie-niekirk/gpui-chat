@@ -20,11 +20,11 @@ use crate::actions::{
     About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleDebugHud, ToggleSidebar,
 };
 use crate::channels::ChannelHub;
+use crate::chat::ChatView;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
-use crate::placeholder_chat::PlaceholderChat;
 use crate::platform;
 use crate::state::{self, Mode, WindowPlacement};
 use crate::theme::{self, Tokens};
@@ -94,8 +94,8 @@ pub struct AppShell {
     diagnostics: Diagnostics,
     hub: Entity<ChannelHub>,
     hud: Entity<DebugHud>,
-    /// The placeholder list over the first channel that has appeared (PR 1.5 adds selection).
-    chat: Option<Entity<PlaceholderChat>>,
+    /// The chat view of the first channel that has appeared (PR 1.5 adds selection).
+    chat: Option<Entity<ChatView>>,
     save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -158,7 +158,7 @@ impl AppShell {
                 .cloned()
         };
         if let Some(store) = first {
-            self.chat = Some(cx.new(|cx| PlaceholderChat::new(store, cx)));
+            self.chat = Some(cx.new(|cx| ChatView::new(store, cx)));
             cx.notify();
         }
     }

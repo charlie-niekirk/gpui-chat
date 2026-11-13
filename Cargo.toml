@@ -51,6 +51,9 @@ dirs = "7.0"
 tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
+# Text
+unicode-segmentation = "1.13"
+
 # Errors and logging
 thiserror = "2.0"
 anyhow = "1.0"
