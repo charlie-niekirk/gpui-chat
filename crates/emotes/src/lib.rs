@@ -20,6 +20,7 @@ pub mod bttv;
 mod error;
 pub mod ffz;
 mod http;
+mod lenient;
 mod loader;
 mod set;
 pub mod seventv;

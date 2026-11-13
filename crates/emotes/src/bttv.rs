@@ -10,17 +10,23 @@
 //! served for animated emotes too.
 //!
 //! Zero-width: the API has no such flag. Overlay emotes are the hard-coded
-//! [`GLOBAL_ZERO_WIDTH`] names (global set only), matching what other clients do. The API's
-//! `modifier` flag (the `w!`, `c!`, ... chat-effect pseudo-emotes) is also treated as
-//! zero-width so those never take a slot of their own.
+//! [`GLOBAL_ZERO_WIDTH`] names (global set only), matching what other clients do.
+//!
+//! Text effects: entries the API flags `modifier` (`w!`, `c!`, `h!`, ... — they change how
+//! the *next* emote is drawn) are **dropped** (logged at debug level) until effects are
+//! implemented; as plain or overlay emotes they would draw their placeholder image.
+//!
+//! Parsing is per entry: a malformed emote is skipped with a warning, the rest load.
 
 use std::sync::Arc;
 
 use gpui_chat_core::{Emote, EmoteProvider, ImageScale, ImageUrls};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::EmoteError;
 use crate::http::{HttpClient, get_ok};
+use crate::lenient::{null_default, parse_entries};
 use crate::set::{EmoteScope, EmoteSet, SetEmote};
 use crate::validate_user_id;
 
@@ -81,9 +87,9 @@ impl BttvClient {
 struct RawEmote {
     id: String,
     code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     animated: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     modifier: bool,
     width: Option<u16>,
     height: Option<u16>,
@@ -100,46 +106,58 @@ struct RawUser {
 
 #[derive(Deserialize)]
 struct RawChannel {
-    #[serde(rename = "channelEmotes", default)]
-    channel_emotes: Vec<RawEmote>,
-    #[serde(rename = "sharedEmotes", default)]
-    shared_emotes: Vec<RawEmote>,
+    #[serde(rename = "channelEmotes", default, deserialize_with = "null_default")]
+    channel_emotes: Vec<Value>,
+    #[serde(rename = "sharedEmotes", default, deserialize_with = "null_default")]
+    shared_emotes: Vec<Value>,
 }
 
 pub(crate) fn parse_global(body: &[u8]) -> Result<EmoteSet, EmoteError> {
-    let raw: Vec<RawEmote> = serde_json::from_slice(body).map_err(EmoteError::parse)?;
-    Ok(EmoteSet {
-        provider: EmoteProvider::Bttv,
-        scope: EmoteScope::Global,
-        emotes: raw.into_iter().map(|e| convert(e, true)).collect(),
-    })
+    let values: Vec<Value> = serde_json::from_slice(body).map_err(EmoteError::parse)?;
+    let emotes = parse_entries::<RawEmote>("BTTV global emote", values)
+        .into_iter()
+        .filter_map(|e| convert(e, true))
+        .collect();
+    Ok(EmoteSet::new(
+        EmoteProvider::Bttv,
+        EmoteScope::Global,
+        emotes,
+    ))
 }
 
 pub(crate) fn parse_channel(body: &[u8]) -> Result<EmoteSet, EmoteError> {
     let raw: RawChannel = serde_json::from_slice(body).map_err(EmoteError::parse)?;
-    Ok(EmoteSet {
-        provider: EmoteProvider::Bttv,
-        scope: EmoteScope::Channel,
-        emotes: raw
-            .channel_emotes
-            .into_iter()
-            .chain(raw.shared_emotes)
-            .map(|e| convert(e, false))
-            .collect(),
-    })
+    let emotes = parse_entries::<RawEmote>("BTTV channel emote", raw.channel_emotes)
+        .into_iter()
+        .chain(parse_entries::<RawEmote>(
+            "BTTV shared emote",
+            raw.shared_emotes,
+        ))
+        .filter_map(|e| convert(e, false))
+        .collect();
+    Ok(EmoteSet::new(
+        EmoteProvider::Bttv,
+        EmoteScope::Channel,
+        emotes,
+    ))
 }
 
-fn convert(raw: RawEmote, global: bool) -> SetEmote {
+/// `None` for text-effect modifiers (see the module docs).
+fn convert(raw: RawEmote, global: bool) -> Option<SetEmote> {
+    if raw.modifier {
+        tracing::debug!(code = %raw.code, "dropping BTTV effect modifier");
+        return None;
+    }
     let urls = ImageUrls::new()
         .with(ImageScale::X1, format!("{CDN}/{}/1x.webp", raw.id))
         .with(ImageScale::X2, format!("{CDN}/{}/2x.webp", raw.id))
         .with(ImageScale::X4, format!("{CDN}/{}/3x.webp", raw.id));
-    let zero_width = raw.modifier || (global && GLOBAL_ZERO_WIDTH.contains(&raw.code.as_str()));
+    let zero_width = global && GLOBAL_ZERO_WIDTH.contains(&raw.code.as_str());
     let owner = raw
         .user
         .and_then(|u| u.display_name.or(u.name))
         .map(Arc::<str>::from);
-    SetEmote {
+    Some(SetEmote {
         emote: Arc::new(Emote {
             id: raw.id.into(),
             name: raw.code.into(),
@@ -152,7 +170,7 @@ fn convert(raw: RawEmote, global: bool) -> SetEmote {
         }),
         original_name: None,
         owner,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -166,11 +184,16 @@ mod tests {
         let set = parse_global(&fixture("bttv-global.json")).unwrap();
         assert_eq!(set.provider, EmoteProvider::Bttv);
         assert_eq!(set.scope, EmoteScope::Global);
-        assert_eq!(set.len(), 12);
+        // 12 captured entries, 3 of them text-effect modifiers (c!, h!, l!) that are dropped.
+        assert_eq!(set.len(), 9);
         let mask = set.get("cvMask").unwrap();
         assert!(mask.emote.zero_width, "known overlay list");
-        let fx = set.get("c!").unwrap();
-        assert!(fx.emote.zero_width, "API modifier flag");
+        for effect in ["c!", "h!", "l!"] {
+            assert!(
+                set.get(effect).is_none(),
+                "{effect} is an effect, not an emote"
+            );
+        }
         let plain = set.get(":tf:").unwrap();
         assert!(!plain.emote.zero_width);
         assert_eq!(
@@ -190,9 +213,9 @@ mod tests {
         assert_eq!(set.scope, EmoteScope::Channel);
         assert_eq!(set.len(), 6 + 3);
         // Channel emotes first, no owner; shared after with their uploader.
-        assert_eq!(&*set.emotes[0].emote.name, "pajaDank");
-        assert_eq!(set.emotes[0].owner, None);
-        assert!(!set.emotes[0].emote.animated);
+        assert_eq!(&*set.emotes()[0].emote.name, "pajaDank");
+        assert_eq!(set.emotes()[0].owner, None);
+        assert!(!set.emotes()[0].emote.animated);
         let shared = set.get("BBoomer").unwrap();
         assert!(shared.emote.animated);
         assert_eq!(shared.owner.as_deref(), Some("Leit69"));
@@ -204,12 +227,32 @@ mod tests {
     fn zero_width_list_only_applies_to_global() {
         let body = br#"{"channelEmotes":[{"id":"1","code":"SantaHat","animated":false}],"sharedEmotes":[]}"#;
         let set = parse_channel(body).unwrap();
-        assert!(!set.emotes[0].emote.zero_width);
+        assert!(!set.emotes()[0].emote.zero_width);
     }
 
     #[test]
-    fn bad_json_is_a_parse_error() {
+    fn one_bad_entry_is_skipped_and_the_rest_load() {
+        let global = br#"[
+            {"id":"1","code":"Good","animated":null},
+            {"id":2,"code":"BadId"},
+            "not an object",
+            {"id":"3"},
+            {"id":"4","code":"AlsoGood","modifier":null,"width":null}]"#;
+        let set = parse_global(global).unwrap();
+        let names: Vec<_> = set.iter().map(|e| &*e.name).collect();
+        assert_eq!(names, ["Good", "AlsoGood"]);
+        assert!(!set.get("Good").unwrap().emote.animated, "null = default");
+
+        let channel = br#"{"channelEmotes":[{"id":"1","code":"A"},{"code":"NoId"}],
+                           "sharedEmotes":null}"#;
+        let set = parse_channel(channel).unwrap();
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn non_json_body_is_a_parse_error() {
         assert!(matches!(parse_global(b"<html>"), Err(EmoteError::Parse(_))));
+        assert!(matches!(parse_global(b"{}"), Err(EmoteError::Parse(_))));
         assert!(matches!(
             parse_channel(b"\"nope\""),
             Err(EmoteError::Parse(_))
@@ -266,7 +309,7 @@ mod tests {
                     "bttv-channel-pajlada.json",
                 ),
         );
-        assert_eq!(c.global().await.unwrap().len(), 12);
+        assert_eq!(c.global().await.unwrap().len(), 9);
         assert_eq!(c.channel("11148817").await.unwrap().len(), 9);
     }
 }

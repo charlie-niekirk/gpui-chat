@@ -13,17 +13,23 @@
 //!   `.webp`, then `.gif`, then `.png`; AVIF files are ignored (the media crate has no
 //!   AVIF decoder). Width/height are those of the 1x file.
 //! * `data.animated` → `animated`.
-//! * **Zero-width**: the set entry's `flags` bit 0 (`ActiveEmoteFlag::ZeroWidth`) *or* the
-//!   emote's `data.flags` bit 8 (`EmoteFlag::ZeroWidth`, 256).
+//! * **Zero-width**: the set entry's `flags` bit 0 (`ActiveEmoteFlag::ZeroWidth`) decides
+//!   when the entry carries `flags`; only an entry without them falls back to the emote's
+//!   own `data.flags` bit 8 (`EmoteFlag::ZeroWidth`, 256).
 //! * Owner: `data.owner.display_name` (else `username`).
+//!
+//! Parsing is per entry: a malformed emote is skipped with a warning, the rest load;
+//! `null` is treated like a missing field.
 
 use std::sync::Arc;
 
 use gpui_chat_core::{Emote, EmoteProvider, ImageScale, ImageUrls};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::EmoteError;
 use crate::http::{HttpClient, get_ok};
+use crate::lenient::{null_default, parse_entries};
 use crate::set::{EmoteScope, EmoteSet, SetEmote};
 use crate::{absolute_url, validate_user_id};
 
@@ -74,8 +80,8 @@ impl SevenTvClient {
 
 #[derive(Deserialize)]
 struct RawSet {
-    #[serde(default)]
-    emotes: Vec<RawActive>,
+    #[serde(default, deserialize_with = "null_default")]
+    emotes: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -87,8 +93,8 @@ struct RawUser {
 struct RawActive {
     id: String,
     name: String,
-    #[serde(default)]
-    flags: u32,
+    /// Set-entry flags; `None` when absent or `null`.
+    flags: Option<u32>,
     /// Missing when the emote was deleted; such entries are skipped.
     data: Option<RawData>,
 }
@@ -96,9 +102,9 @@ struct RawActive {
 #[derive(Deserialize)]
 struct RawData {
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     flags: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     animated: bool,
     owner: Option<RawOwner>,
     host: Option<RawHost>,
@@ -113,7 +119,7 @@ struct RawOwner {
 #[derive(Deserialize)]
 struct RawHost {
     url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     files: Vec<RawFile>,
 }
 
@@ -121,9 +127,9 @@ struct RawHost {
 struct RawFile {
     /// `2x.webp`
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     width: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     height: u32,
     /// `WEBP`, `GIF`, `PNG`, `AVIF`
     format: String,
@@ -143,11 +149,11 @@ pub(crate) fn parse_channel(body: &[u8]) -> Result<EmoteSet, EmoteError> {
 }
 
 fn convert_set(raw: RawSet, scope: EmoteScope) -> EmoteSet {
-    EmoteSet {
-        provider: EmoteProvider::SevenTv,
-        scope,
-        emotes: raw.emotes.into_iter().filter_map(convert).collect(),
-    }
+    let emotes = parse_entries::<RawActive>("7TV emote", raw.emotes)
+        .into_iter()
+        .filter_map(convert)
+        .collect();
+    EmoteSet::new(EmoteProvider::SevenTv, scope, emotes)
 }
 
 fn convert(raw: RawActive) -> Option<SetEmote> {
@@ -190,7 +196,10 @@ fn convert(raw: RawActive) -> Option<SetEmote> {
             provider: EmoteProvider::SevenTv,
             urls,
             animated: data.animated,
-            zero_width: raw.flags & ACTIVE_ZERO_WIDTH != 0 || data.flags & EMOTE_ZERO_WIDTH != 0,
+            zero_width: match raw.flags {
+                Some(flags) => flags & ACTIVE_ZERO_WIDTH != 0,
+                None => data.flags & EMOTE_ZERO_WIDTH != 0,
+            },
             width: dim(size.map(|f| f.width)),
             height: dim(size.map(|f| f.height)),
         }),
@@ -233,7 +242,7 @@ mod tests {
         assert_eq!(set.provider, EmoteProvider::SevenTv);
         assert_eq!(set.scope, EmoteScope::Global);
         assert!(set.len() >= 6);
-        // Both zero-width flag locations are honoured (RainTime/PETPET carry data bit 8).
+        // RainTime/PETPET carry both the entry flag and data bit 8.
         let zw: Vec<_> = set
             .iter()
             .filter(|e| e.zero_width)
@@ -262,7 +271,7 @@ mod tests {
         assert!(set.get("pepeS").is_none());
         // Unrenamed emotes carry no original name.
         assert!(
-            set.emotes
+            set.emotes()
                 .iter()
                 .any(|e| e.original_name.is_none() && !e.emote.zero_width)
         );
@@ -306,7 +315,7 @@ mod tests {
             {"id":"C","name":"NoFiles","flags":0,"data":{"name":"NoFiles","host":{"url":"//x","files":[]}}}]}"#;
         let set = parse_global(body).unwrap();
         assert_eq!(set.len(), 1, "deleted and file-less emotes are skipped");
-        let e = &set.emotes[0];
+        let e = &set.emotes()[0];
         assert_eq!(e.original_name.as_deref(), Some("Orig"));
         assert!(e.emote.zero_width);
         assert_eq!(
@@ -333,13 +342,70 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_is_a_parse_error() {
+    fn set_entry_flags_win_over_emote_flags() {
+        let emote = |name: &str, entry_flags: &str, data_flags: u32| {
+            format!(
+                r#"{{"id":"{name}","name":"{name}"{entry_flags},"data":{{"name":"{name}","flags":{data_flags},
+                "host":{{"url":"//c/{name}","files":[{{"name":"1x.webp","format":"WEBP"}}]}}}}}}"#
+            )
+        };
+        let body = format!(
+            r#"{{"emotes":[{}]}}"#,
+            [
+                emote("EntryOn", r#","flags":1"#, 0),
+                emote("EntryOffWins", r#","flags":0"#, 256),
+                emote("NoEntryFlags", "", 256),
+                emote("NullEntryFlags", r#","flags":null"#, 256),
+                emote("Neither", "", 0),
+            ]
+            .join(",")
+        );
+        let set = parse_global(body.as_bytes()).unwrap();
+        let zw = |n: &str| set.get(n).unwrap().emote.zero_width;
+        assert!(zw("EntryOn"));
+        assert!(!zw("EntryOffWins"));
+        assert!(zw("NoEntryFlags"));
+        assert!(zw("NullEntryFlags"));
+        assert!(!zw("Neither"));
+    }
+
+    #[test]
+    fn one_bad_entry_is_skipped_and_the_rest_load() {
+        let host = r#""host":{"url":"//c/x","files":[{"name":"1x.webp","width":null,"height":null,"format":"WEBP"}]}"#;
+        let body = format!(
+            r#"{{"emotes":[
+              {{"id":"1","name":"Good","flags":null,"data":{{"name":"Good","flags":null,"animated":null,"owner":null,{host}}}}},
+              {{"id":7,"name":"NumericId","data":null}},
+              {{"name":"NoId"}},
+              "garbage",
+              {{"id":"2","name":"AlsoGood","data":{{"name":"AlsoGood",{host}}}}}]}}"#
+        );
+        let set = parse_global(body.as_bytes()).unwrap();
+        let names: Vec<_> = set.iter().map(|e| &*e.name).collect();
+        assert_eq!(names, ["Good", "AlsoGood"]);
+        assert_eq!(
+            set.get("Good").unwrap().emote.width,
+            None,
+            "null size = unknown"
+        );
+
+        // `emotes: null` is an empty set.
+        let set = parse_channel(br#"{"emote_set":{"emotes":null}}"#).unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn non_json_body_is_a_parse_error() {
         assert!(matches!(
             parse_global(b"not json"),
             Err(EmoteError::Parse(_))
         ));
         assert!(matches!(
-            parse_channel(br#"{"emote_set":{"emotes":[{"id":1}]}}"#),
+            parse_channel(b"<html>"),
+            Err(EmoteError::Parse(_))
+        ));
+        assert!(matches!(
+            parse_channel(br#"{"emote_set":"oops"}"#),
             Err(EmoteError::Parse(_))
         ));
     }

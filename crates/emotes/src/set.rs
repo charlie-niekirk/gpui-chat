@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui_chat_core::{Emote, EmoteProvider};
@@ -23,25 +24,43 @@ pub struct SetEmote {
     pub owner: Option<Arc<str>>,
 }
 
-/// All emotes one provider offers for one scope, in the provider's order.
+/// All emotes one provider offers for one scope, in the provider's order, with O(1)
+/// lookup by name.
 ///
 /// Within a BTTV channel set the channel's own emotes come before its shared emotes.
-/// Names are not de-duplicated; the resolver keeps the first.
+/// Names are not de-duplicated in [`EmoteSet::emotes`], but [`EmoteSet::get`] returns the
+/// first emote of a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmoteSet {
     pub provider: EmoteProvider,
     pub scope: EmoteScope,
-    pub emotes: Vec<SetEmote>,
+    emotes: Vec<SetEmote>,
+    /// Name → index of the first emote with that name.
+    index: HashMap<Arc<str>, usize>,
 }
 
 impl EmoteSet {
-    /// An empty set (e.g. a channel without an account at the provider).
-    pub fn empty(provider: EmoteProvider, scope: EmoteScope) -> Self {
+    pub fn new(provider: EmoteProvider, scope: EmoteScope, emotes: Vec<SetEmote>) -> Self {
+        let mut index = HashMap::with_capacity(emotes.len());
+        for (i, e) in emotes.iter().enumerate() {
+            index.entry(e.emote.name.clone()).or_insert(i);
+        }
         Self {
             provider,
             scope,
-            emotes: Vec::new(),
+            emotes,
+            index,
         }
+    }
+
+    /// An empty set (e.g. a channel without an account at the provider).
+    pub fn empty(provider: EmoteProvider, scope: EmoteScope) -> Self {
+        Self::new(provider, scope, Vec::new())
+    }
+
+    /// All entries, in the provider's order.
+    pub fn emotes(&self) -> &[SetEmote] {
+        &self.emotes
     }
 
     pub fn len(&self) -> usize {
@@ -57,8 +76,49 @@ impl EmoteSet {
         self.emotes.iter().map(|e| &e.emote)
     }
 
-    /// First emote typed as `name` (case-sensitive).
+    /// The first emote typed as `name` (case-sensitive), in O(1).
     pub fn get(&self, name: &str) -> Option<&SetEmote> {
-        self.emotes.iter().find(|e| &*e.emote.name == name)
+        self.index.get(name).map(|&i| &self.emotes[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_chat_core::ImageUrls;
+
+    fn entry(id: &str, name: &str) -> SetEmote {
+        SetEmote {
+            emote: Arc::new(Emote {
+                id: id.into(),
+                name: name.into(),
+                provider: EmoteProvider::Bttv,
+                urls: ImageUrls::new(),
+                animated: false,
+                zero_width: false,
+                width: None,
+                height: None,
+            }),
+            original_name: None,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn lookup_keeps_the_first_of_duplicate_names() {
+        let set = EmoteSet::new(
+            EmoteProvider::Bttv,
+            EmoteScope::Channel,
+            vec![entry("1", "A"), entry("2", "B"), entry("3", "A")],
+        );
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.get("A").unwrap().emote.id.as_str(), "1");
+        assert_eq!(set.get("B").unwrap().emote.id.as_str(), "2");
+        assert!(set.get("a").is_none());
+        assert!(
+            EmoteSet::empty(EmoteProvider::Ffz, EmoteScope::Global)
+                .get("A")
+                .is_none()
+        );
     }
 }

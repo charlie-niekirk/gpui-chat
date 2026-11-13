@@ -95,7 +95,7 @@ fn print_set(name: &str, set: &EmoteSet) {
         "\n{name}: {} emotes ({animated} animated, {zero_width} zero-width)",
         set.len()
     );
-    for entry in &set.emotes {
+    for entry in set.emotes() {
         let e = &entry.emote;
         let flags = format!(
             "{}{}",
