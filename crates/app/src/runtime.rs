@@ -51,6 +51,13 @@ impl Backend {
         self.handle.spawn(future)
     }
 
+    /// Runs `f` with this runtime as the current one, for constructors that call `tokio::spawn`
+    /// themselves (such as `TwitchClient::spawn`) and so need to be inside a runtime.
+    pub fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.handle.enter();
+        f()
+    }
+
     #[allow(dead_code)] // used by tests; handy for backends deciding whether to start work
     pub fn is_running(&self) -> bool {
         self.runtime.is_some()
@@ -75,6 +82,11 @@ pub fn init(cx: &mut App) -> io::Result<()> {
     })
     .detach();
     Ok(())
+}
+
+/// Runs `f` inside the app's tokio runtime context (see [`Backend::enter`]).
+pub fn enter<R>(cx: &App, f: impl FnOnce() -> R) -> R {
+    cx.global::<Backend>().enter(f)
 }
 
 /// Runs async backend work on the app's tokio runtime. The future may use tokio I/O and

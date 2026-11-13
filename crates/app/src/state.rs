@@ -1,4 +1,4 @@
-//! Persisted window placement (`state.toml`).
+//! Persisted UI state (`state.toml`): window placement and the open channels.
 //!
 //! This is machine-written UI state, deliberately separate from user settings
 //! (`crates/settings`). It lives next to them in the platform config dir, in a directory
@@ -40,11 +40,23 @@ pub struct WindowPlacement {
     pub display: Option<String>,
 }
 
+/// The open channels, in sidebar order, and which one is selected (logins, lowercase, no `#`).
+/// Entries are validated when restored, see [`crate::channel_list::ChannelList::from_saved`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedChannels {
+    #[serde(default)]
+    pub open: Vec<String>,
+    #[serde(default)]
+    pub selected: Option<String>,
+}
+
 /// Contents of `state.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     #[serde(default)]
     pub window: Option<WindowPlacement>,
+    #[serde(default)]
+    pub channels: Option<SavedChannels>,
 }
 
 /// A connected display as far as restore logic cares.
@@ -144,17 +156,30 @@ pub fn load() -> AppState {
 /// Serialises writers (the debounced background save and the synchronous quit flush).
 static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Best-effort save of the window placement; failures are logged, never fatal. Safe to call
-/// from any thread.
-pub fn save_window(placement: WindowPlacement) {
-    let Some(path) = state_path() else { return };
+/// Reads `path`, applies `change` and writes it back, under the save lock. Failures are logged.
+fn update_at(path: &Path, change: impl FnOnce(&mut AppState)) {
     let _guard = SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = load_from(&path);
-    state.window = Some(placement);
-    if let Err(error) = save_to(&path, &state) {
-        tracing::warn!(%error, path = %path.display(), "could not save window state");
+    let mut state = load_from(path);
+    change(&mut state);
+    if let Err(error) = save_to(path, &state) {
+        tracing::warn!(%error, path = %path.display(), "could not save state");
+    }
+}
+
+/// Best-effort save of the window placement; failures are logged, never fatal. Safe to call
+/// from any thread. Leaves the rest of the file as it is.
+pub fn save_window(placement: WindowPlacement) {
+    if let Some(path) = state_path() {
+        update_at(&path, |state| state.window = Some(placement));
+    }
+}
+
+/// Best-effort save of the open channels and selection; same rules as [`save_window`].
+pub fn save_channels(channels: SavedChannels) {
+    if let Some(path) = state_path() {
+        update_at(&path, |state| state.channels = Some(channels));
     }
 }
 
@@ -173,6 +198,13 @@ mod tests {
             height: 600.0,
             mode: Mode::Windowed,
             display: Some(EXTERNAL.to_string()),
+        }
+    }
+
+    fn channels() -> SavedChannels {
+        SavedChannels {
+            open: vec!["forsen".into(), "xqc".into(), "a_b".into()],
+            selected: Some("xqc".into()),
         }
     }
 
@@ -200,6 +232,7 @@ mod tests {
                 mode: Mode::Maximized,
                 ..placement()
             }),
+            channels: Some(channels()),
         };
         assert_eq!(AppState::parse(&state.render()).unwrap(), state);
     }
@@ -217,10 +250,57 @@ mod tests {
         assert_eq!(load_from(&path), AppState::default());
         let state = AppState {
             window: Some(placement()),
+            channels: Some(channels()),
         };
         save_to(&path, &state).unwrap();
         assert_eq!(load_from(&path), state);
         std::fs::write(&path, "window = 3 ???").unwrap();
+        assert_eq!(load_from(&path), AppState::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn channels_are_written_as_a_toml_table_in_order() {
+        let text = AppState {
+            window: None,
+            channels: Some(channels()),
+        }
+        .render();
+        assert!(text.contains("[channels]"), "{text}");
+        assert!(text.contains(r#"selected = "xqc""#), "{text}");
+        let parsed = AppState::parse(&text).unwrap();
+        assert_eq!(parsed.channels.unwrap().open, ["forsen", "xqc", "a_b"]);
+    }
+
+    #[test]
+    fn files_from_before_channels_existed_still_load() {
+        let old = "[window]\nx = 1.0\ny = 2.0\nwidth = 900.0\nheight = 600.0\n";
+        let state = AppState::parse(old).unwrap();
+        assert!(state.window.is_some());
+        assert_eq!(state.channels, None);
+        // A table with only one of the keys is fine too.
+        let partial = AppState::parse("[channels]\nopen = [\"a_b\"]\n").unwrap();
+        assert_eq!(partial.channels.unwrap().selected, None);
+    }
+
+    #[test]
+    fn updating_one_part_keeps_the_other_and_recovers_from_corruption() {
+        let dir =
+            std::env::temp_dir().join(format!("{APP_NAME}-state-update-{}", std::process::id()));
+        let path = dir.join(FILE_NAME);
+        update_at(&path, |s| s.window = Some(placement()));
+        update_at(&path, |s| s.channels = Some(channels()));
+        let state = load_from(&path);
+        assert_eq!(state.window, Some(placement()));
+        assert_eq!(state.channels, Some(channels()));
+        // A corrupt file is replaced by a fresh one holding the new data.
+        std::fs::write(&path, "\u{0}\u{0} not toml [[").unwrap();
+        update_at(&path, |s| s.channels = Some(channels()));
+        let state = load_from(&path);
+        assert_eq!(state.window, None);
+        assert_eq!(state.channels, Some(channels()));
+        // A wrongly typed channels table is corruption too: defaults, not a crash.
+        std::fs::write(&path, "channels = 7\n").unwrap();
         assert_eq!(load_from(&path), AppState::default());
         let _ = std::fs::remove_dir_all(&dir);
     }

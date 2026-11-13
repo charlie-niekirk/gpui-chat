@@ -263,31 +263,16 @@ impl Render for ChatView {
                 )
         });
 
-        let channel = self.store.read(cx).channel().clone();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_none()
-                    .px(PADDING_X)
-                    .py_1()
-                    .text_sm()
-                    .text_color(tokens.text_muted)
-                    .border_b_1()
-                    .border_color(tokens.border)
-                    .child(format!("#{channel}")),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(messages)
-                    .child(probe)
-                    .children(pill),
-            )
+        // The channel name and state are shown by the pane header (`crate::pane`).
+        div().size_full().flex().flex_col().child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(messages)
+                .child(probe)
+                .children(pill),
+        )
     }
 }
 

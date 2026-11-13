@@ -44,8 +44,11 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 
 ### App shell (`crates/app`)
 
-- `shell.rs` — root view: Kit `TitleBar`, collapsible Kit `Sidebar`, main area. Handles the
-  window actions (`ToggleSidebar`, `CloseWindow`, `MinimizeWindow`, `About`); `Quit` is global.
+- `shell.rs` — root view: Kit `TitleBar`, collapsible Kit `Sidebar` (the channel list), main area
+  (one `ChannelPane`, PR 1.5; splits come in 4.1). Owns the `ChannelList` and the live source; every
+  list edit ends in `list_changed` (make sure the selected channel has a pane, schedule the
+  `state.toml` write). Handles the window actions (`ToggleSidebar`, `CloseWindow`, `MinimizeWindow`,
+  `About`, and the channel actions below); `Quit` is global.
 - `theme.rs` — our own `Tokens` (dark/light), chosen from the system appearance (live, via
   `observe_window_appearance`) and mirrored into Kit's `Theme` so Kit components match.
   Theme packs (PR 4.4) extend `Tokens`.
@@ -55,9 +58,31 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 - `actions.rs` + `platform/` — action definitions; key bindings and the native menu bar are
   per-platform and live only under `platform/`. The Kit `native_menu` is a popup context menu;
   the application menu bar uses GPUI `cx.set_menus`.
+- `channel_list.rs` / `login.rs` / `add_channel.rs` (PR 1.5) — `ChannelList` is the plain-data list of
+  open channels plus the selection (add appends and selects, remove selects the next/previous, move
+  swaps with the neighbour, restore drops invalid or duplicate logins); `login::normalise_login`
+  turns `Forsen`, `#forsen`, `@forsen` or any `twitch.tv/…` URL form (popout, moderator, embed,
+  query strings) into a channel, or says why not (3–25 chars of `a-z0-9_`); `add_channel` is the ⌘N
+  dialog (Kit `Dialog` + `Input`, the rejection reason under the field). Reorder is by actions
+  (⌘⌥↑/↓ and the row's context menu): Kit's `SidebarMenuItem` has no drag hooks.
+- `live.rs` (PR 1.5) — `LiveSource`: one anonymous `TwitchClient` started inside the backend runtime
+  (`runtime::enter`), its events forwarded with `send().await` into the bridge. The channel list is the
+  only thing that decides what is joined: the shell calls `join`/`part` on add/remove and for every
+  restored channel at launch (the client paces the JOINs). **`--firehose` / `--replay` replace it**: no
+  client, no joins, and the channel list is neither read from nor written to `state.toml`; the sidebar
+  just lists channels as the offline source creates them.
+- `pane.rs` (PR 1.5) — `ChannelPane`: pane header (channel name, connection state, room-mode chips, an
+  empty slot for PR 1.6's streamlink button) over the `ChatView`. `link_status` combines the state of
+  the whole connection (`Connection { channel: None }`, kept by the hub) with the channel's own join
+  state; `room_chips` formats `RoomState` (emote-only, followers-only with duration, slow N s,
+  subs-only, unique). Panes are created on first selection and kept (scroll position survives
+  switching) until the channel is closed.
 - `channels.rs` — `ChannelStore` (GPUI entity: core `MessageStore` + room/connection state, one per
   channel) and `ChannelHub` (owns the stores; its `apply_batch` is the bridge's `apply`: it splits a
-  frame's batch by channel, applies each run in order and notifies each touched store once).
+  frame's batch by channel, applies each run in order and notifies each touched store once; it also
+  keeps the whole-connection state). With the live client the hub does **not** create stores from
+  events (`set_auto_create(false)`): the shell creates one per open channel (`ensure`) and drops it on
+  close (`remove`), so the client's `Disconnected` event after a part cannot resurrect a closed channel.
 - `firehose.rs` / `cli.rs` — `--firehose <msgs/sec>`: a seeded synthetic `ChatEvent` source on the
   tokio runtime (messages are due at `i / rate`; each wake-up sends everything due in one batch;
   `try_send`, so a UI that falls behind makes it drop and count rather than stall). `cli.rs` is a
@@ -79,7 +104,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
   (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
-  (validated against connected displays on restore). Separate from user settings.
+  (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
+  `selected`). Separate from user settings. Each writer reads, changes its own part and writes back
+  under one lock, so window and channel saves do not clobber each other; a missing or unparsable file
+  loads as defaults, and restore drops invalid or duplicate logins and a stale selection.
 
 ### Domain model (`crates/core`)
 
