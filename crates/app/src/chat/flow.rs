@@ -122,6 +122,10 @@ impl Flow {
     }
 }
 
+/// Slack when checking whether content fits a line (logical pixels), so float rounding in the
+/// summed advances never decides a break.
+const FIT_EPSILON: f32 = 0.01;
+
 /// Line-in-progress state of [`flow`].
 struct Cursor {
     line: u32,
@@ -180,14 +184,20 @@ pub fn flow(atoms: &[Atom], max_width: f32) -> Flow {
             .iter()
             .position(|atom| atom.kind == AtomKind::Space)
             .map_or(atoms.len(), |n| i + n);
-        let word_width: f32 = atoms[i..word_end].iter().map(|atom| atom.width).sum();
+        // Both fit checks add the word's atoms one by one, exactly as placement advances `x`
+        // (from the current x, or from 0 after a break), and allow a hair of slack: a word that
+        // fits can never pass the whole-word check and then hard-break its last atom on rounding.
+        let overflows = |end: f32| end > max + FIT_EPSILON;
+        let word = &atoms[i..word_end];
+        let word_end_x = word.iter().fold(at.x, |x, atom| x + atom.width);
+        let word_width = word.iter().fold(0.0, |x, atom| x + atom.width);
         // A word that fits on a line of its own moves to the next line whole.
-        if at.has_content && at.x + word_width > max && word_width <= max {
+        if at.has_content && overflows(word_end_x) && !overflows(word_width) {
             at.break_before(i, &mut lines);
         }
         for (j, atom) in atoms.iter().enumerate().take(word_end).skip(i) {
             // Hard break inside a word wider than a line, wherever the next atom overflows.
-            if at.has_content && at.x + atom.width > max {
+            if at.has_content && overflows(at.x + atom.width) {
                 at.break_before(j, &mut lines);
             }
             placements[j] = Placement {
@@ -317,6 +327,44 @@ mod tests {
             .collect();
         let f = flow(&a, 3.0);
         assert_eq!(lines(text, &f, &a), ["ab", "🇩🇪", "👨‍👩‍👧c", "d"]);
+    }
+
+    #[test]
+    fn a_word_that_fits_exactly_is_not_split_by_float_rounding() {
+        // 0.3 + 0.7 = 1.0, then 1.0 + (0.1 + 0.3) rounds to 1.4 (fits) while (1.0 + 0.1) + 0.3
+        // rounds just above 1.4: the two ways of summing must not disagree about "bc".
+        let width = |c| match c {
+            'a' => 0.3,
+            ' ' => 0.7,
+            'b' => 0.1,
+            _ => 0.3,
+        };
+        let mut x = 0.0f32;
+        let a: Vec<Atom> = "a bc"
+            .char_indices()
+            .map(|(i, c)| {
+                let atom = Atom {
+                    range: i..i + 1,
+                    src_x: x,
+                    width: width(c),
+                    kind: if c == ' ' {
+                        AtomKind::Space
+                    } else {
+                        AtomKind::Glyphs
+                    },
+                };
+                x += atom.width;
+                atom
+            })
+            .collect();
+        let x = a[0].width + a[1].width;
+        assert!(
+            (x + a[2].width) + a[3].width > 1.4 && x + (a[2].width + a[3].width) <= 1.4,
+            "the rounding this test relies on"
+        );
+        assert_eq!(lines("a bc", &flow(&a, 1.4), &a), ["a bc"]);
+        // Slightly narrower than the content: the whole word moves, it is never hard-broken.
+        assert_eq!(lines("a bc", &flow(&a, 1.3), &a), ["a", "bc"]);
     }
 
     #[test]

@@ -39,6 +39,11 @@ impl ListMirror {
         self.first_seq
     }
 
+    /// Sequence number after the last item.
+    pub fn next_seq(self) -> u64 {
+        self.next_seq
+    }
+
     pub fn len(self) -> usize {
         (self.next_seq - self.first_seq) as usize
     }

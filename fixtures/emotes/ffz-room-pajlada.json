@@ -1,0 +1,214 @@
+{
+ "room": {
+  "_id": 64515,
+  "twitch_id": 11148817,
+  "youtube_id": null,
+  "id": "pajlada",
+  "is_group": false,
+  "display_name": "pajlada",
+  "set": 64515,
+  "moderator_badge": "https://cdn.frankerfacez.com/room-badge/mod/id/11148817/v/e47297b4/1",
+  "vip_badge": {
+   "1": "https://cdn.frankerfacez.com/room-badge/vip/id/11148817/v/bc2bbe0d/1",
+   "2": "https://cdn.frankerfacez.com/room-badge/vip/id/11148817/v/bc2bbe0d/2",
+   "4": "https://cdn.frankerfacez.com/room-badge/vip/id/11148817/v/bc2bbe0d/4"
+  },
+  "mod_urls": {
+   "1": "https://cdn.frankerfacez.com/room-badge/mod/id/11148817/v/e47297b4/1",
+   "2": "https://cdn.frankerfacez.com/room-badge/mod/id/11148817/v/e47297b4/2",
+   "4": "https://cdn.frankerfacez.com/room-badge/mod/id/11148817/v/e47297b4/4"
+  },
+  "user_badges": {
+   "2": [
+    "pajbot",
+    "supibot"
+   ]
+  },
+  "user_badge_ids": {
+   "2": [
+    82008718,
+    68136884
+   ]
+  },
+  "css": null
+ },
+ "sets": {
+  "64515": {
+   "id": 64515,
+   "_type": 1,
+   "icon": null,
+   "title": "Channel: pajlada",
+   "css": null,
+   "emoticons": [
+    {
+     "id": 155074,
+     "name": "pajaGhetti",
+     "height": 20,
+     "width": 41,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 60769,
+      "name": "lilguy_",
+      "display_name": "lilguy_"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/155074/1",
+      "2": "https://cdn.frankerfacez.com/emote/155074/2",
+      "4": "https://cdn.frankerfacez.com/emote/155074/4"
+     },
+     "status": 1,
+     "usage_count": 6,
+     "created_at": "2017-01-20T17:17:43.819Z",
+     "last_updated": "2017-01-20T19:41:38.004Z"
+    },
+    {
+     "id": 18290,
+     "name": "TuckMeIn",
+     "height": 28,
+     "width": 28,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 2683,
+      "name": "wyattw8",
+      "display_name": "wyattw8"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/18290/1",
+      "2": "https://cdn.frankerfacez.com/emote/18290/2",
+      "4": "https://cdn.frankerfacez.com/emote/18290/4"
+     },
+     "status": 1,
+     "usage_count": 109,
+     "created_at": "2014-11-09T01:13:21.086Z",
+     "last_updated": "2015-05-30T22:25:50.799Z"
+    },
+    {
+     "id": 128023,
+     "name": "miniDank",
+     "height": 16,
+     "width": 16,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 60769,
+      "name": "lilguy_",
+      "display_name": "lilguy_"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/128023/1",
+      "2": "https://cdn.frankerfacez.com/emote/128023/2",
+      "4": "https://cdn.frankerfacez.com/emote/128023/4"
+     },
+     "status": 1,
+     "usage_count": 310,
+     "created_at": "2016-09-10T19:08:08.244Z",
+     "last_updated": "2016-09-10T19:57:53.048Z"
+    },
+    {
+     "id": 128247,
+     "name": "4HEad",
+     "height": 22,
+     "width": 32,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 30920,
+      "name": "dechiplaysgames",
+      "display_name": "dechiplaysgames"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/128247/1",
+      "2": "https://cdn.frankerfacez.com/emote/128247/2",
+      "4": "https://cdn.frankerfacez.com/emote/128247/4"
+     },
+     "status": 1,
+     "usage_count": 39865,
+     "created_at": "2016-09-11T20:37:12.539Z",
+     "last_updated": "2016-09-11T22:04:24.585Z"
+    },
+    {
+     "id": 131001,
+     "name": "pajaE",
+     "height": 21,
+     "width": 32,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 63119,
+      "name": "pajaswa",
+      "display_name": "pajaSWA"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/131001/1",
+      "2": "https://cdn.frankerfacez.com/emote/131001/2",
+      "4": "https://cdn.frankerfacez.com/emote/131001/4"
+     },
+     "status": 1,
+     "usage_count": 11,
+     "created_at": "2016-09-25T12:30:30.313Z",
+     "last_updated": "2016-09-25T14:25:01.408Z"
+    },
+    {
+     "id": 140139,
+     "name": "miniW",
+     "height": 32,
+     "width": 16,
+     "public": true,
+     "hidden": false,
+     "modifier": false,
+     "modifier_flags": 0,
+     "offset": null,
+     "margins": null,
+     "css": null,
+     "owner": {
+      "_id": 60769,
+      "name": "lilguy_",
+      "display_name": "lilguy_"
+     },
+     "artist": null,
+     "urls": {
+      "1": "https://cdn.frankerfacez.com/emote/140139/1",
+      "2": "https://cdn.frankerfacez.com/emote/140139/2",
+      "4": "https://cdn.frankerfacez.com/emote/140139/4"
+     },
+     "status": 1,
+     "usage_count": 12,
+     "created_at": "2016-11-06T18:02:48.514Z",
+     "last_updated": "2016-11-06T22:32:12.655Z"
+    }
+   ]
+  }
+ }
+}

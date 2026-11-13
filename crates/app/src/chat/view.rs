@@ -56,8 +56,10 @@ pub struct ChatView {
     cache: Rc<RefCell<LayoutCache>>,
     text_config: Option<TextConfig>,
     generation: u64,
-    /// Messages that arrived while not following.
-    unseen: usize,
+    /// Sequence number of the first message that arrived while not following. The pill counts
+    /// from there to the newest message, skipping any the scrollback cap already evicted, so it
+    /// never claims more new messages than the list still holds.
+    unseen_from: Option<u64>,
     /// Whether the last render showed the pill.
     pill_shown: bool,
     /// Line height of the last render.
@@ -89,7 +91,7 @@ impl ChatView {
             cache: Rc::new(RefCell::new(LayoutCache::default())),
             text_config: None,
             generation: 0,
-            unseen: 0,
+            unseen_from: None,
             pill_shown: false,
             line_height: px(0.0),
             _subscriptions: subscriptions,
@@ -102,6 +104,7 @@ impl ChatView {
             let messages = self.store.read(cx).messages();
             (messages.first_seq(), messages.next_seq())
         };
+        let previous_next = self.mirror.next_seq();
         let change = self.mirror.sync(first, next);
         if !change.is_empty() {
             if change.removed > 0 {
@@ -112,8 +115,8 @@ impl ChatView {
                 self.list.splice(end..end, change.appended);
             }
             self.cache.borrow_mut().evict_before(first);
-            if !self.list.is_following_tail() {
-                self.unseen += change.appended;
+            if change.appended > 0 && !self.list.is_following_tail() {
+                self.unseen_from.get_or_insert(previous_next);
             }
         }
         debug_assert_eq!(self.list.item_count(), self.mirror.len());
@@ -123,7 +126,7 @@ impl ChatView {
 
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
         self.list.set_follow_mode(FollowMode::Tail);
-        self.unseen = 0;
+        self.unseen_from = None;
         cx.notify();
     }
 
@@ -132,9 +135,11 @@ impl ChatView {
         &self.list
     }
 
-    #[cfg(test)]
+    /// New messages below the paused view that are still in the store.
     pub fn unseen(&self) -> usize {
-        self.unseen
+        self.unseen_from.map_or(0, |from| {
+            (self.mirror.next_seq() - from.max(self.mirror.first_seq())) as usize
+        })
     }
 
     #[cfg(test)]
@@ -186,7 +191,7 @@ impl Render for ChatView {
         let config = self.update_text_config(cx);
         let following = self.list.is_following_tail();
         if following {
-            self.unseen = 0;
+            self.unseen_from = None;
         }
         self.pill_shown = !following;
 
@@ -254,7 +259,7 @@ impl Render for ChatView {
                         .shadow_md()
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.jump_to_latest(cx)))
-                        .child(format!("↓ {}", pill_label(self.unseen))),
+                        .child(format!("↓ {}", pill_label(self.unseen()))),
                 )
         });
 
@@ -441,6 +446,20 @@ mod tests {
         assert!(h.following(cx));
         assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
         assert!(!h.view.read_with(cx, |v, _| v.pill_shown()));
+    }
+
+    #[gpui_kit::test]
+    fn the_pill_never_counts_more_than_the_store_still_holds(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(100, "hello", cx);
+        h.scroll(300.0, cx);
+        assert!(!h.following(cx));
+        h.push(30, "hello", cx);
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 30);
+        // 500 more with a cap of 100: only the newest 100 exist, and all of them are new.
+        h.push(500, "hello", cx);
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 100);
+        assert_eq!(h.items(cx), 100);
     }
 
     #[gpui_kit::test]

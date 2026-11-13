@@ -26,6 +26,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::display::DisplayText;
 use super::flow::{self, Atom, AtomKind, Flow};
 
+/// Slack for comparing glyph positions (logical pixels).
+const RTL_EPSILON: f32 = 0.01;
+
 /// One shaped glyph, attached to the atom (grapheme cluster) it belongs to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphRef {
@@ -93,12 +96,16 @@ impl ShapedMessage {
                         (left.min(x), right.max(right_of(x)))
                     })
             };
-            // A cluster drawn left of the previous one is inside a right-to-left run (glyph x
-            // falls while the text offset grows). Keep such a run as one unbreakable atom so its
-            // visual order survives; wrapping inside it is left to proper bidi support.
+            // A cluster that starts before the previous atom's right edge does not follow it
+            // visually: it is inside a right-to-left run (glyph x falls while the text offset
+            // grows), possibly with a left-to-right run such as digits nested in it, which jumps
+            // back within the run's span. Keep the whole run as one unbreakable atom so its
+            // visual order survives; wrapping inside it is left to proper bidi support. Plain
+            // left-to-right text never merges: each cluster starts exactly where the previous
+            // glyph's advance (kerning included) ends.
             if let Some(previous) = atoms.last_mut()
                 && !glyphs.is_empty()
-                && left < previous.src_x - 0.01
+                && left < previous.src_x + previous.width - RTL_EPSILON
             {
                 let previous_right = previous.src_x + previous.width;
                 previous.range.end = end;
@@ -352,33 +359,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn right_to_left_runs_stay_whole_and_in_visual_order() {
-        // "ab שלום cd": the shaper lays the Hebrew word out right to left, so its letters'
-        // x positions fall while their text offsets grow.
+    /// Shapes `text` as the platform would draw it: every char 10 px wide, placed left to right
+    /// in `visual` order (byte offsets of the chars, leftmost first).
+    fn shape_visual(text: &str, visual: &[usize]) -> ShapedMessage {
         let display = DisplayText {
-            text: "ab שלום cd".into(),
+            text: text.into(),
             spans: vec![crate::chat::display::Span {
-                range: 0..14,
+                range: 0..text.len(),
                 role: crate::chat::display::Role::Text,
             }],
         };
-        // Visual: a b ␠ ם ו ל ש ␠ c d, 10 px each.
-        let order = [
-            (0, 0),
-            (1, 1),
-            (2, 2),
-            (3, 6),
-            (5, 5),
-            (7, 4),
-            (9, 3),
-            (11, 7),
-            (12, 8),
-            (13, 9),
-        ];
-        let glyphs = order
+        assert_eq!(visual.len(), text.chars().count());
+        let glyphs = visual
             .iter()
-            .map(|&(index, slot)| ShapedGlyph {
+            .enumerate()
+            .map(|(slot, &index)| ShapedGlyph {
                 id: GlyphId(index as u32),
                 position: point(px(slot as f32 * 10.0), px(0.0)),
                 index,
@@ -387,23 +382,54 @@ mod tests {
             .collect();
         let layout = LineLayout {
             font_size: px(10.0),
-            width: px(100.0),
+            width: px(visual.len() as f32 * 10.0),
             ascent: px(8.0),
             descent: px(2.0),
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 glyphs,
             }],
-            len: 14,
+            len: text.len(),
         };
-        let s = ShapedMessage::from_layout(display, &layout);
-        let atoms: Vec<_> = s
-            .atoms
+        ShapedMessage::from_layout(display, &layout)
+    }
+
+    /// `(text, src_x, width)` per atom.
+    fn atom_summary(s: &ShapedMessage) -> Vec<(&str, f32, f32)> {
+        s.atoms
             .iter()
             .map(|a| (&s.display.text[a.range.clone()], a.src_x, a.width))
-            .collect();
+            .collect()
+    }
+
+    /// Flowed on one line, every glyph is painted exactly where the shaper put it.
+    fn assert_paints_in_shaped_order(s: &ShapedMessage) {
+        let flow = flow::flow(&s.atoms, 1000.0);
+        assert_eq!(flow.line_count(), 1);
+        for glyph in &s.glyphs {
+            let atom = &s.atoms[glyph.atom as usize];
+            let x = flow.placements[glyph.atom as usize].x + glyph.x - atom.src_x;
+            assert_eq!(x, glyph.x, "glyph at text offset {}", glyph.id.0);
+        }
+    }
+
+    /// Byte offsets of `text`'s chars, in text order.
+    fn offsets(text: &str) -> Vec<usize> {
+        text.char_indices().map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn right_to_left_runs_stay_whole_and_in_visual_order() {
+        // "ab שלום cd": the Hebrew word is drawn right to left.
+        let text = "ab שלום cd";
+        let o = offsets(text);
+        // Visual: a b ␠ ם ו ל ש ␠ c d
+        let s = shape_visual(
+            text,
+            &[o[0], o[1], o[2], o[6], o[5], o[4], o[3], o[7], o[8], o[9]],
+        );
         assert_eq!(
-            atoms,
+            atom_summary(&s),
             [
                 ("a", 0.0, 10.0),
                 ("b", 10.0, 10.0),
@@ -414,13 +440,79 @@ mod tests {
                 ("d", 90.0, 10.0),
             ]
         );
-        // Flowed on one line, every glyph keeps its shaped x: the word is not mirrored.
-        let flow = flow::flow(&s.atoms, 1000.0);
-        for glyph in &s.glyphs {
-            let atom = &s.atoms[glyph.atom as usize];
-            let x = flow.placements[glyph.atom as usize].x + glyph.x - atom.src_x;
-            assert_eq!(x, glyph.x);
-        }
+        assert_paints_in_shaped_order(&s);
+    }
+
+    #[test]
+    fn digits_nested_in_hebrew_stay_in_the_run() {
+        // Logical "אב 12 גד" draws as "דג 12 בא": the digits are a left-to-right run inside the
+        // right-to-left one, so their x jumps back up within the run's span.
+        let text = "אב 12 גד";
+        let o = offsets(text);
+        let s = shape_visual(text, &[o[7], o[6], o[5], o[3], o[4], o[2], o[1], o[0]]);
+        assert_eq!(atom_summary(&s), [("אב 12 גד", 0.0, 80.0)]);
+        assert_paints_in_shaped_order(&s);
+    }
+
+    #[test]
+    fn arabic_with_digits_between_latin_words() {
+        // Logical "x سلام 2024 عليكم y"; visual: x ␠ [م ك ي ل ع ␠ 2 0 2 4 ␠ م ا ل س] ␠ y.
+        let text = "x سلام 2024 عليكم y";
+        let o = offsets(text);
+        let visual = [
+            o[0], o[1], o[16], o[15], o[14], o[13], o[12], o[11], o[7], o[8], o[9], o[10], o[6],
+            o[5], o[4], o[3], o[2], o[17], o[18],
+        ];
+        let s = shape_visual(text, &visual);
+        assert_eq!(
+            atom_summary(&s),
+            [
+                ("x", 0.0, 10.0),
+                (" ", 10.0, 10.0),
+                ("سلام 2024 عليكم", 20.0, 150.0),
+                (" ", 170.0, 10.0),
+                ("y", 180.0, 10.0),
+            ]
+        );
+        assert_paints_in_shaped_order(&s);
+    }
+
+    #[test]
+    fn left_to_right_text_with_kerning_is_never_merged() {
+        // Uneven advances (kerning pairs) still start each glyph at the previous one's end.
+        let text = "AVAWa";
+        let display = DisplayText {
+            text: text.into(),
+            spans: vec![crate::chat::display::Span {
+                range: 0..5,
+                role: crate::chat::display::Role::Text,
+            }],
+        };
+        let xs = [0.0, 8.7, 16.1, 25.3, 33.9];
+        let glyphs = xs
+            .iter()
+            .enumerate()
+            .map(|(index, &x)| ShapedGlyph {
+                id: GlyphId(index as u32),
+                position: point(px(x), px(0.0)),
+                index,
+                is_emoji: false,
+            })
+            .collect();
+        let layout = LineLayout {
+            font_size: px(10.0),
+            width: px(42.3),
+            ascent: px(8.0),
+            descent: px(2.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs,
+            }],
+            len: 5,
+        };
+        let s = ShapedMessage::from_layout(display, &layout);
+        assert_eq!(s.atoms.len(), 5);
+        assert_paints_in_shaped_order(&s);
     }
 
     #[test]
