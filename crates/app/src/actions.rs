@@ -11,7 +11,13 @@ actions!(
         CloseWindow,
         MinimizeWindow,
         ToggleSidebar,
-        ToggleDebugHud
+        ToggleDebugHud,
+        AddChannel,
+        RemoveChannel,
+        MoveChannelUp,
+        MoveChannelDown,
+        SelectNextChannel,
+        SelectPreviousChannel
     ]
 );
 

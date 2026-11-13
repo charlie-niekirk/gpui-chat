@@ -1,37 +1,50 @@
-//! The root view: custom title bar, collapsible channel sidebar and the main area.
+//! The root view: custom title bar, collapsible channel sidebar and the main area (one pane).
 //!
-//! Everything inside is a placeholder until the chat phases land; this PR owns the frame.
+//! The shell owns the [`ChannelList`] (what is open, in which order, which is selected). Every
+//! change to it goes through [`AppShell::list_changed`], which makes sure the selected channel
+//! has a pane, joins/parts on the live client and schedules a write of `state.toml`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui_chat_core::{APP_ID, APP_NAME};
+use gpui_chat_core::{APP_ID, APP_NAME, ChannelId};
 use gpui_chat_settings::SettingsError;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
 };
-use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Task,
-    Window, WindowBounds, div, px, size,
+    WeakEntity, Window, WindowBounds, div, px, size,
 };
 
 use crate::actions::{
-    About, CloseWindow, MinimizeWindow, SHELL_CONTEXT, ToggleDebugHud, ToggleSidebar,
+    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, RemoveChannel,
+    SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
 };
+use crate::add_channel;
+use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
-use crate::chat::ChatView;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
+use crate::live::LiveSource;
+use crate::pane::ChannelPane;
 use crate::platform;
-use crate::state::{self, Mode, WindowPlacement};
+use crate::state::{self, Mode, SavedChannels, WindowPlacement};
 use crate::theme::{self, Tokens};
 
 const SIDEBAR_WIDTH: Pixels = px(240.0);
 /// Disk writes while dragging/resizing are coalesced into one write after this pause.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
+/// Channel list edits are rare, so they are written almost at once.
+const CHANNELS_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 pub const DEFAULT_SIZE: (f32, f32) = (1100.0, 700.0);
 pub const MIN_SIZE: (f32, f32) = (640.0, 400.0);
@@ -73,17 +86,30 @@ pub fn bounds_from_placement(placement: &WindowPlacement) -> WindowBounds {
     }
 }
 
-/// Writes the most recent placement to disk, if there is one.
-pub fn flush_placement(cx: &App) {
+/// Latest channel list, flushed to disk on quit. Only set when the list is persisted.
+#[derive(Clone)]
+struct LatestChannels(SavedChannels);
+impl gpui_kit::Global for LatestChannels {}
+
+/// Writes the most recent placement and channel list to disk, if there are any.
+pub fn flush_state(cx: &App) {
     if let Some(LatestPlacement(placement)) = cx.try_global::<LatestPlacement>() {
         state::save_window(placement.clone());
     }
+    if let Some(LatestChannels(channels)) = cx.try_global::<LatestChannels>() {
+        state::save_channels(channels.clone());
+    }
 }
 
-/// What the shell shows besides its own chrome: the channel stores (fed by the bridge) and the
-/// measurements behind the debug HUD.
+/// What the shell shows besides its own chrome: the channel stores (fed by the bridge), the
+/// source that feeds them and the measurements behind the debug HUD.
 pub struct ShellParts {
     pub hub: Entity<ChannelHub>,
+    /// The channels to open at launch (from `state.toml`); empty for the offline sources.
+    pub channels: ChannelList,
+    /// The live client; `None` with `--firehose` / `--replay`, which then also keep the channel
+    /// list out of `state.toml`.
+    pub live: Option<LiveSource>,
     pub diagnostics: Diagnostics,
     pub hud_visible: bool,
 }
@@ -94,9 +120,13 @@ pub struct AppShell {
     diagnostics: Diagnostics,
     hub: Entity<ChannelHub>,
     hud: Entity<DebugHud>,
-    /// The chat view of the first channel that has appeared (PR 1.5 adds selection).
-    chat: Option<Entity<ChatView>>,
+    list: ChannelList,
+    live: Option<LiveSource>,
+    /// Panes are created when a channel is first selected and kept (with their scroll position)
+    /// until it is closed.
+    panes: HashMap<ChannelId, Entity<ChannelPane>>,
     save_task: Option<Task<()>>,
+    channels_save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -104,12 +134,14 @@ impl AppShell {
     pub fn new(window: &mut Window, parts: ShellParts, cx: &mut Context<Self>) -> Self {
         let ShellParts {
             hub,
+            channels,
+            live,
             diagnostics,
             hud_visible,
         } = parts;
         let hud = cx.new(|cx| DebugHud::new(diagnostics.clone(), hub.clone(), hud_visible, cx));
         let subscriptions = vec![
-            // A channel appearing in the hub gives the main area something to show.
+            // With an offline source, channels appear through their events.
             cx.observe(&hub, |this, _, cx| this.hub_changed(cx)),
             // Follow the system light/dark setting live, but only when `theme = "system"`.
             cx.observe_window_appearance(window, |_, window, cx| {
@@ -137,30 +169,140 @@ impl AppShell {
             diagnostics,
             hub,
             hud,
-            chat: None,
+            list: channels,
+            live,
+            panes: HashMap::new(),
             save_task: None,
+            channels_save_task: None,
             _subscriptions: subscriptions,
         };
+        // Restored channels get their stores and are joined in sidebar order.
+        for channel in shell.list.channels().to_vec() {
+            shell.hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
+            if let Some(live) = &shell.live {
+                live.join(&channel);
+            }
+        }
         shell.hub_changed(cx);
+        shell.ensure_selected_pane(cx);
         shell
     }
 
-    /// Shows the first channel's store in the main area once there is one.
+    /// Whether the channel list is the user's (live source) and so persisted.
+    fn persists(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Offline sources create channels through their events: list each as it appears.
     fn hub_changed(&mut self, cx: &mut Context<Self>) {
-        if self.chat.is_some() {
+        if self.live.is_some() {
             return;
         }
-        let first = {
-            let hub = self.hub.read(cx);
-            hub.channels()
-                .first()
-                .and_then(|channel| hub.store(channel))
-                .cloned()
-        };
-        if let Some(store) = first {
-            self.chat = Some(cx.new(|cx| ChatView::new(store, cx)));
-            cx.notify();
+        let appeared: Vec<ChannelId> = self
+            .hub
+            .read(cx)
+            .channels()
+            .iter()
+            .filter(|channel| !self.list.contains(channel))
+            .cloned()
+            .collect();
+        if appeared.is_empty() {
+            return;
         }
+        for channel in appeared {
+            self.list.append(channel);
+        }
+        if self.list.selected().is_none() {
+            self.list.select_first();
+        }
+        self.ensure_selected_pane(cx);
+        cx.notify();
+    }
+
+    /// Creates the pane of the selected channel if it has none yet.
+    fn ensure_selected_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.list.selected().cloned() else {
+            return;
+        };
+        if self.panes.contains_key(&channel) {
+            return;
+        }
+        let hub = self.hub.clone();
+        let store = hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
+        let live = self.live.is_some();
+        let pane = cx.new(|cx| ChannelPane::new(hub, store, live, cx));
+        self.panes.insert(channel, pane);
+    }
+
+    /// Every edit of the channel list ends here.
+    fn list_changed(&mut self, cx: &mut Context<Self>) {
+        self.ensure_selected_pane(cx);
+        if self.persists() {
+            let saved = self.list.to_saved();
+            cx.set_global(LatestChannels(saved.clone()));
+            // Replacing the task drops (cancels) a write that has not started yet.
+            self.channels_save_task = Some(cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(CHANNELS_SAVE_DEBOUNCE).await;
+                cx.background_executor()
+                    .spawn(async move { state::save_channels(saved) })
+                    .await;
+            }));
+        }
+        cx.notify();
+    }
+
+    fn add_channel(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        let newly_added = self.list.add(channel.clone());
+        if newly_added {
+            self.hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
+            if let Some(live) = &self.live {
+                live.join(&channel);
+            }
+        }
+        self.list_changed(cx);
+    }
+
+    fn remove_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if !self.list.remove(channel) {
+            return;
+        }
+        self.panes.remove(channel);
+        if let Some(live) = &self.live {
+            live.part(channel);
+        }
+        self.hub.update(cx, |hub, cx| hub.remove(channel, cx));
+        self.list_changed(cx);
+    }
+
+    fn select_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if self.list.selected() != Some(channel) && self.list.select(channel) {
+            self.list_changed(cx);
+        }
+    }
+
+    fn move_channel(&mut self, channel: &ChannelId, direction: Move, cx: &mut Context<Self>) {
+        if self.list.move_channel(channel, direction) {
+            self.list_changed(cx);
+        }
+    }
+
+    fn select_neighbour(&mut self, steps: isize, cx: &mut Context<Self>) {
+        if let Some(channel) = self.list.neighbour(steps).cloned() {
+            self.select_channel(&channel, cx);
+        }
+    }
+
+    fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = cx.entity().downgrade();
+        add_channel::open(
+            move |channel, _, cx| {
+                shell
+                    .update(cx, |shell, cx| shell.add_channel(channel, cx))
+                    .ok();
+            },
+            window,
+            cx,
+        );
     }
 
     fn placement_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -206,20 +348,59 @@ impl AppShell {
         });
     }
 
-    fn sidebar(&self, tokens: &Tokens) -> impl IntoElement {
+    fn sidebar(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let shell = cx.entity().downgrade();
+        let count = self.list.channels().len();
+        let items: Vec<SidebarMenuItem> = if self.list.is_empty() {
+            vec![
+                SidebarMenuItem::new(format!("No channels yet: {}", platform::ADD_CHANNEL_LABEL))
+                    .disable(true),
+            ]
+        } else {
+            self.list
+                .channels()
+                .iter()
+                .enumerate()
+                .map(|(index, channel)| {
+                    channel_item(
+                        channel,
+                        self.list.selected() == Some(channel),
+                        index > 0,
+                        index + 1 < count,
+                        &shell,
+                    )
+                })
+                .collect()
+        };
         Sidebar::<SidebarMenu>::new("channel-sidebar")
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(self.sidebar_collapsed)
             .w(SIDEBAR_WIDTH)
             .header(
                 SidebarHeader::new().child(
-                    div()
-                        .text_sm()
-                        .text_color(tokens.text_muted)
-                        .child("Channels"),
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(tokens.text_muted)
+                                .child("Channels"),
+                        )
+                        .child(
+                            Button::new("add-channel")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::Plus).size_4())
+                                .accessibility_label("Add channel")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_add_dialog(window, cx);
+                                })),
+                        ),
                 ),
             )
-            .child(SidebarMenu::new().child(SidebarMenuItem::new("No channels yet")))
+            .child(SidebarMenu::new().children(items))
     }
 
     /// A non-blocking strip above the content while `settings.toml` fails to load. The
@@ -248,21 +429,75 @@ impl AppShell {
 
     fn main_area(&self, tokens: &Tokens) -> impl IntoElement {
         let area = div().flex_1().min_h_0().w_full().bg(tokens.main_bg);
-        match &self.chat {
-            Some(chat) => area.child(chat.clone()),
+        let pane = self
+            .list
+            .selected()
+            .and_then(|channel| self.panes.get(channel));
+        match pane {
+            Some(pane) => area.child(pane.clone()),
             None => area.flex().items_center().justify_center().child(
                 v_flex()
                     .items_center()
                     .gap_2()
                     .child(div().text_xl().child(APP_NAME))
                     .child(div().text_sm().text_color(tokens.text_muted).child(format!(
-                        "Chat will appear here. Press {} to toggle the sidebar, {} for the debug HUD.",
+                        "Press {} to add a channel, {} to toggle the sidebar, {} for the debug HUD.",
+                        platform::ADD_CHANNEL_LABEL,
                         platform::TOGGLE_SIDEBAR_LABEL,
                         platform::TOGGLE_HUD_LABEL
                     ))),
             ),
         }
     }
+}
+
+/// One sidebar row: click selects, the context menu removes and reorders.
+fn channel_item(
+    channel: &ChannelId,
+    selected: bool,
+    can_move_up: bool,
+    can_move_down: bool,
+    shell: &WeakEntity<AppShell>,
+) -> SidebarMenuItem {
+    let act = |shell: &WeakEntity<AppShell>,
+               channel: &ChannelId,
+               f: fn(&mut AppShell, &ChannelId, &mut Context<AppShell>)| {
+        let (shell, channel) = (shell.clone(), channel.clone());
+        move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+            shell.update(cx, |shell, cx| f(shell, &channel, cx)).ok();
+        }
+    };
+    let (click_shell, menu_shell, menu_channel) = (shell.clone(), shell.clone(), channel.clone());
+    let click_channel = channel.clone();
+    SidebarMenuItem::new(channel.login().to_owned())
+        .active(selected)
+        .on_click(act(&click_shell, &click_channel, |shell, channel, cx| {
+            shell.select_channel(channel, cx);
+        }))
+        .context_menu(move |menu: PopupMenu, _, _| {
+            menu.item(
+                PopupMenuItem::new("Move Up")
+                    .disabled(!can_move_up)
+                    .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
+                        shell.move_channel(channel, Move::Up, cx);
+                    })),
+            )
+            .item(
+                PopupMenuItem::new("Move Down")
+                    .disabled(!can_move_down)
+                    .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
+                        shell.move_channel(channel, Move::Down, cx);
+                    })),
+            )
+            .separator()
+            .item(PopupMenuItem::new("Remove").on_click(act(
+                &menu_shell,
+                &menu_channel,
+                |shell, channel, cx| {
+                    shell.remove_channel(channel, cx);
+                },
+            )))
+        })
 }
 
 impl Focusable for AppShell {
@@ -286,6 +521,30 @@ impl Render for AppShell {
             .on_action(cx.listener(|_, _: &About, window, cx| Self::show_about(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleDebugHud, _, cx| {
                 this.hud.update(cx, |hud, cx| hud.toggle(cx));
+            }))
+            .on_action(cx.listener(|this, _: &AddChannel, window, cx| {
+                this.open_add_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RemoveChannel, _, cx| {
+                if let Some(channel) = this.list.selected().cloned() {
+                    this.remove_channel(&channel, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveChannelUp, _, cx| {
+                if let Some(channel) = this.list.selected().cloned() {
+                    this.move_channel(&channel, Move::Up, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveChannelDown, _, cx| {
+                if let Some(channel) = this.list.selected().cloned() {
+                    this.move_channel(&channel, Move::Down, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextChannel, _, cx| {
+                this.select_neighbour(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousChannel, _, cx| {
+                this.select_neighbour(-1, cx);
             }))
             .size_full()
             .bg(tokens.window_bg)
@@ -311,7 +570,7 @@ impl Render for AppShell {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.sidebar(&tokens))
+                    .child(self.sidebar(&tokens, cx))
                     .child(
                         v_flex()
                             .relative()

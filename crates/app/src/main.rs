@@ -4,8 +4,10 @@
 //! (`gpui-kit 0.9.1`, `gpui-component 0.9.1`, `gpui-pre 0.3.12`); see the PR 0.2 description.
 
 mod actions;
+mod add_channel;
 mod assets;
 mod bridge;
+mod channel_list;
 mod channels;
 mod chat;
 mod cli;
@@ -14,6 +16,9 @@ mod diagnostics;
 mod firehose;
 mod fonts;
 mod hud;
+mod live;
+mod login;
+mod pane;
 mod platform;
 mod replay;
 mod runtime;
@@ -29,10 +34,12 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::actions::Quit;
+use crate::channel_list::ChannelList;
 use crate::channels::ChannelHub;
 use crate::cli::{Cli, Parsed};
 use crate::diagnostics::Diagnostics;
 use crate::firehose::FirehoseConfig;
+use crate::live::LiveSource;
 use crate::shell::{AppShell, DEFAULT_SIZE, MIN_SIZE, ShellParts};
 use crate::state::DisplayInfo;
 
@@ -84,7 +91,10 @@ fn initial_placement(cx: &App) -> (WindowBounds, Option<DisplayId>) {
 }
 
 /// Hooks the chat backends up to the UI: a hub of per-channel stores fed through the bridge, and
-/// (with `--firehose`) the synthetic source on the backend runtime.
+/// one source on the backend runtime. By default that is the live anonymous Twitch client, which
+/// joins the channels saved in `state.toml`. `--firehose` and `--replay` *replace* it: nothing is
+/// joined (and the channel list is neither read from nor written to `state.toml`), so an offline
+/// run never touches the user's saved channels.
 fn start_chat(
     cli: &Cli,
     replay_log: Option<Arc<str>>,
@@ -93,7 +103,13 @@ fn start_chat(
 ) -> ShellParts {
     let diagnostics = Diagnostics::new();
     let scrollback = config::current(cx).chat.scrollback;
-    let hub = cx.new(|_| ChannelHub::new(scrollback, diagnostics.clone()));
+    let offline = cli.firehose.is_some() || replay_log.is_some();
+    let hub = cx.new(|_| {
+        let mut hub = ChannelHub::new(scrollback, diagnostics.clone());
+        // Live channels exist because the user opened them; offline ones through their events.
+        hub.set_auto_create(offline);
+        hub
+    });
     let (sender, receiver) = bridge::channel(INGEST_QUEUE, INGEST_BATCH);
     bridge::attach(
         &hub,
@@ -103,6 +119,15 @@ fn start_chat(
         |hub, events, cx| hub.apply_batch(events, cx),
     )
     .detach();
+    let (channels, live) = if offline {
+        (ChannelList::default(), None)
+    } else {
+        let saved = state::load().channels.unwrap_or_default();
+        (
+            ChannelList::from_saved(&saved),
+            Some(LiveSource::start(sender.clone(), cx)),
+        )
+    };
     if let Some(rate) = cli.firehose {
         let start_ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -128,6 +153,8 @@ fn start_chat(
     }
     ShellParts {
         hub,
+        channels,
+        live,
         diagnostics,
         hud_visible: cli.hud,
     }
@@ -172,9 +199,9 @@ fn main() {
             cx.set_menus(platform::menus());
             cx.on_action(|_: &Quit, cx| cx.quit());
 
-            // Persist the last window placement on the way out (⌘Q and last-window close).
+            // Persist the last window placement and channel list on the way out (⌘Q and last-window close).
             cx.on_app_quit(|cx| {
-                shell::flush_placement(cx);
+                shell::flush_state(cx);
                 async {}
             })
             .detach();

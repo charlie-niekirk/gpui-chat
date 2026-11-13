@@ -1,4 +1,4 @@
-//! Persisted window placement (`state.toml`).
+//! Persisted UI state (`state.toml`): window placement and the open channels.
 //!
 //! This is machine-written UI state, deliberately separate from user settings
 //! (`crates/settings`). It lives next to them in the platform config dir, in a directory
@@ -40,11 +40,23 @@ pub struct WindowPlacement {
     pub display: Option<String>,
 }
 
+/// The open channels, in sidebar order, and which one is selected (logins, lowercase, no `#`).
+/// Entries are validated when restored, see [`crate::channel_list::ChannelList::from_saved`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedChannels {
+    #[serde(default)]
+    pub open: Vec<String>,
+    #[serde(default)]
+    pub selected: Option<String>,
+}
+
 /// Contents of `state.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     #[serde(default)]
     pub window: Option<WindowPlacement>,
+    #[serde(default)]
+    pub channels: Option<SavedChannels>,
 }
 
 /// A connected display as far as restore logic cares.
@@ -94,6 +106,9 @@ impl WindowPlacement {
     }
 }
 
+/// Whole-file (de)serialisation, used by the tests; the app reads section by section ([`load_from`])
+/// and writes one section at a time ([`update_at`]).
+#[cfg(test)]
 impl AppState {
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
@@ -109,30 +124,58 @@ pub fn state_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join(APP_NAME).join(FILE_NAME))
 }
 
-/// Loads state from `path`. Missing or unreadable/corrupt files yield defaults.
+/// One section of the file, or `None` if it is absent or does not have the expected shape (a typo
+/// in one section must not cost the others).
+fn section<T: serde::de::DeserializeOwned>(table: &toml::Table, key: &str) -> Option<T> {
+    let value = table.get(key)?.clone();
+    match value.try_into() {
+        Ok(section) => Some(section),
+        Err(error) => {
+            tracing::warn!(%error, section = key, "ignoring malformed section of the state file");
+            None
+        }
+    }
+}
+
+/// Loads state from `path`. A missing or unreadable file yields defaults, and so does a file that
+/// is not TOML at all; otherwise each section is read on its own, so a malformed `[channels]`
+/// leaves `[window]` intact and vice versa.
 pub fn load_from(path: &Path) -> AppState {
-    match std::fs::read_to_string(path) {
-        Ok(text) => AppState::parse(&text).unwrap_or_else(|error| {
-            tracing::warn!(%error, path = %path.display(), "ignoring corrupt state file");
-            AppState::default()
-        }),
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(%error, path = %path.display(), "could not read state file");
             }
+            return AppState::default();
+        }
+    };
+    match text.parse::<toml::Table>() {
+        Ok(table) => AppState {
+            window: section(&table, "window"),
+            channels: section(&table, "channels"),
+        },
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "ignoring corrupt state file");
             AppState::default()
         }
     }
 }
 
-/// Writes state to `path`, creating its directory. Written atomically via a temp file.
-pub fn save_to(path: &Path, state: &AppState) -> std::io::Result<()> {
+/// Writes `text` to `path`, creating its directory. Written atomically via a temp file.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, state.render())?;
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Writes the whole state to `path` (used by tests; the app updates one section at a time).
+#[cfg(test)]
+pub fn save_to(path: &Path, state: &AppState) -> std::io::Result<()> {
+    write_atomic(path, &state.render())
 }
 
 pub fn load() -> AppState {
@@ -144,18 +187,55 @@ pub fn load() -> AppState {
 /// Serialises writers (the debounced background save and the synchronous quit flush).
 static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Best-effort save of the window placement; failures are logged, never fatal. Safe to call
-/// from any thread.
-pub fn save_window(placement: WindowPlacement) {
-    let Some(path) = state_path() else { return };
+/// Replaces the top-level `key` of the file at `path` with `value`, under the save lock, leaving
+/// every other key (and any section this build cannot read) exactly as it is. Failures are logged.
+///
+/// A file that is not TOML at all is moved to `state.toml.bad` first (so nothing is silently
+/// destroyed) and a fresh file is started; a file that cannot be read is left alone.
+fn update_at(path: &Path, key: &str, value: toml::Value) {
     let _guard = SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = load_from(&path);
-    state.window = Some(placement);
-    if let Err(error) = save_to(&path, &state) {
-        tracing::warn!(%error, path = %path.display(), "could not save window state");
+    let mut table = match std::fs::read_to_string(path) {
+        Ok(text) => text.parse::<toml::Table>().unwrap_or_else(|error| {
+            let backup = path.with_extension("toml.bad");
+            tracing::warn!(%error, path = %path.display(), backup = %backup.display(),
+                "state file is not valid TOML; keeping a copy and starting a new one");
+            if let Err(error) = std::fs::rename(path, &backup) {
+                tracing::warn!(%error, "could not back up the corrupt state file");
+            }
+            toml::Table::new()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "could not read state file; not saving");
+            return;
+        }
+    };
+    table.insert(key.to_owned(), value);
+    let text = toml::to_string_pretty(&table).expect("a TOML table serialises");
+    if let Err(error) = write_atomic(path, &text) {
+        tracing::warn!(%error, path = %path.display(), "could not save state");
     }
+}
+
+fn update_section<T: Serialize>(key: &str, section: &T) {
+    let Some(path) = state_path() else { return };
+    match toml::Value::try_from(section) {
+        Ok(value) => update_at(&path, key, value),
+        Err(error) => tracing::warn!(%error, section = key, "could not serialise state"),
+    }
+}
+
+/// Best-effort save of the window placement; failures are logged, never fatal. Safe to call
+/// from any thread. Leaves the rest of the file as it is.
+pub fn save_window(placement: WindowPlacement) {
+    update_section("window", &placement);
+}
+
+/// Best-effort save of the open channels and selection; same rules as [`save_window`].
+pub fn save_channels(channels: SavedChannels) {
+    update_section("channels", &channels);
 }
 
 #[cfg(test)]
@@ -173,6 +253,13 @@ mod tests {
             height: 600.0,
             mode: Mode::Windowed,
             display: Some(EXTERNAL.to_string()),
+        }
+    }
+
+    fn channels() -> SavedChannels {
+        SavedChannels {
+            open: vec!["forsen".into(), "xqc".into(), "a_b".into()],
+            selected: Some("xqc".into()),
         }
     }
 
@@ -200,6 +287,7 @@ mod tests {
                 mode: Mode::Maximized,
                 ..placement()
             }),
+            channels: Some(channels()),
         };
         assert_eq!(AppState::parse(&state.render()).unwrap(), state);
     }
@@ -217,10 +305,118 @@ mod tests {
         assert_eq!(load_from(&path), AppState::default());
         let state = AppState {
             window: Some(placement()),
+            channels: Some(channels()),
         };
         save_to(&path, &state).unwrap();
         assert_eq!(load_from(&path), state);
         std::fs::write(&path, "window = 3 ???").unwrap();
+        assert_eq!(load_from(&path), AppState::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn channels_are_written_as_a_toml_table_in_order() {
+        let text = AppState {
+            window: None,
+            channels: Some(channels()),
+        }
+        .render();
+        assert!(text.contains("[channels]"), "{text}");
+        assert!(text.contains(r#"selected = "xqc""#), "{text}");
+        let parsed = AppState::parse(&text).unwrap();
+        assert_eq!(parsed.channels.unwrap().open, ["forsen", "xqc", "a_b"]);
+    }
+
+    #[test]
+    fn files_from_before_channels_existed_still_load() {
+        let old = "[window]\nx = 1.0\ny = 2.0\nwidth = 900.0\nheight = 600.0\n";
+        let state = AppState::parse(old).unwrap();
+        assert!(state.window.is_some());
+        assert_eq!(state.channels, None);
+        // A table with only one of the keys is fine too.
+        let partial = AppState::parse("[channels]\nopen = [\"a_b\"]\n").unwrap();
+        assert_eq!(partial.channels.unwrap().selected, None);
+    }
+
+    fn value<T: Serialize>(section: &T) -> toml::Value {
+        toml::Value::try_from(section).unwrap()
+    }
+
+    fn temp_state(tag: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("{APP_NAME}-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (dir.join(FILE_NAME), dir)
+    }
+
+    #[test]
+    fn updating_one_section_keeps_the_other() {
+        let (path, dir) = temp_state("update");
+        update_at(&path, "window", value(&placement()));
+        update_at(&path, "channels", value(&channels()));
+        let state = load_from(&path);
+        assert_eq!(state.window, Some(placement()));
+        assert_eq!(state.channels, Some(channels()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_section_does_not_cost_the_other_on_load_or_save() {
+        let (path, dir) = temp_state("malformed");
+        let window = toml::to_string_pretty(&toml::Table::from_iter([(
+            "window".to_owned(),
+            value(&placement()),
+        )]))
+        .unwrap();
+
+        // Broken [channels] (wrong type): the window still loads, and saving the window
+        // keeps the broken text for the user to fix instead of discarding it.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, format!("{window}\n[channels]\nopen = 7\n")).unwrap();
+        let state = load_from(&path);
+        assert_eq!(state.window, Some(placement()));
+        assert_eq!(state.channels, None);
+        let moved = WindowPlacement {
+            x: 5.0,
+            ..placement()
+        };
+        update_at(&path, "window", value(&moved));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("open = 7"), "{text}");
+        assert_eq!(load_from(&path).window, Some(moved));
+
+        // Broken [window]: channels load, and saving channels keeps the window text.
+        std::fs::write(
+            &path,
+            "[window]\nx = \"left\"\n\n[channels]\nopen = [\"a_b\"]\n",
+        )
+        .unwrap();
+        let state = load_from(&path);
+        assert_eq!(state.window, None);
+        assert_eq!(state.channels.unwrap().open, ["a_b"]);
+        update_at(&path, "channels", value(&channels()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"x = "left""#), "{text}");
+        assert_eq!(load_from(&path).channels, Some(channels()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_is_backed_up_before_a_new_one_is_started() {
+        let (path, dir) = temp_state("garbage");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "\u{0}\u{0} not toml [[").unwrap();
+        assert_eq!(load_from(&path), AppState::default());
+        update_at(&path, "channels", value(&channels()));
+        let state = load_from(&path);
+        assert_eq!(state.window, None);
+        assert_eq!(state.channels, Some(channels()));
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("toml.bad")).unwrap(),
+            "\u{0}\u{0} not toml [["
+        );
+        // A wrongly typed top-level value is a malformed section, not a crash.
+        std::fs::write(&path, "channels = 7\n").unwrap();
         assert_eq!(load_from(&path), AppState::default());
         let _ = std::fs::remove_dir_all(&dir);
     }

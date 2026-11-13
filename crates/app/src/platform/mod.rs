@@ -4,7 +4,10 @@
 
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
-use crate::actions::{About, CloseWindow, MinimizeWindow, Quit, ToggleDebugHud, ToggleSidebar};
+use crate::actions::{
+    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
+    RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -17,7 +20,7 @@ use macos as imp;
 use other as imp;
 
 /// Human-readable label of the Toggle Sidebar shortcut (kept in sync with `bindings()`).
-pub use imp::{TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
+pub use imp::{ADD_CHANNEL_LABEL, TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
 
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
@@ -34,6 +37,19 @@ fn view_menu() -> Menu {
     Menu::new("View").items([
         MenuItem::action("Toggle Sidebar", ToggleSidebar),
         MenuItem::action("Toggle Debug HUD", ToggleDebugHud),
+    ])
+}
+
+fn channel_menu() -> Menu {
+    Menu::new("Channel").items([
+        MenuItem::action("Add Channel…", AddChannel),
+        MenuItem::action("Remove Channel", RemoveChannel),
+        MenuItem::separator(),
+        MenuItem::action("Move Up", MoveChannelUp),
+        MenuItem::action("Move Down", MoveChannelDown),
+        MenuItem::separator(),
+        MenuItem::action("Next Channel", SelectNextChannel),
+        MenuItem::action("Previous Channel", SelectPreviousChannel),
     ])
 }
 

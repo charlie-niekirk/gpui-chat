@@ -10,7 +10,7 @@
 //! Both are plain data structures with the entity plumbing on top, so the batching logic is
 //! unit-tested without a window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use gpui_chat_core::{
@@ -49,17 +49,17 @@ impl ChannelStore {
         &self.messages
     }
 
-    // The room/connection/notice getters are first read by the pane header (PR 1.5).
-    #[allow(dead_code)]
     pub fn room(&self) -> &RoomState {
         &self.room
     }
 
-    #[allow(dead_code)]
+    /// The join state of this channel (not the connection as a whole, see
+    /// [`ChannelHub::connection`]).
     pub fn connection(&self) -> Option<&ConnectionState> {
         self.connection.as_ref()
     }
 
+    // Shown by the notices UI later; asserted in tests.
     #[allow(dead_code)]
     pub fn notices(&self) -> u64 {
         self.notices
@@ -139,11 +139,21 @@ pub struct StoreSize {
 /// All channel stores. Events reach it through [`crate::bridge::attach`].
 pub struct ChannelHub {
     stores: HashMap<ChannelId, Entity<ChannelStore>>,
-    /// Channels in the order they first appeared (the sidebar order until PR 1.5).
+    /// Channels in the order their stores were created (the sidebar keeps its own order).
     order: Vec<ChannelId>,
     capacity: usize,
     diagnostics: Diagnostics,
-    /// Events that named no channel (connection-wide notices); nothing shows them yet.
+    /// Whether an event for an unknown channel creates its store. On for the offline sources
+    /// (firehose, replay), whose channels exist only through their events; off for the live
+    /// client, where the channel list decides which stores exist, so a late event for a channel
+    /// the user just closed cannot bring it back.
+    auto_create: bool,
+    /// Channels the user closed: auto-create skips them, so a source that keeps sending events
+    /// for a closed channel (the firehose) cannot bring it back. [`ChannelHub::ensure`] clears it.
+    closed: HashSet<ChannelId>,
+    /// State of the connection as a whole (`Connection { channel: None, .. }` events).
+    connection: Option<ConnectionState>,
+    /// Other events that named no channel (connection-wide notices); nothing shows them yet.
     unrouted: u64,
 }
 
@@ -158,7 +168,42 @@ impl ChannelHub {
                 capacity
             },
             diagnostics,
+            auto_create: true,
+            closed: HashSet::new(),
+            connection: None,
             unrouted: 0,
+        }
+    }
+
+    /// See the `auto_create` field.
+    pub fn set_auto_create(&mut self, auto_create: bool) {
+        self.auto_create = auto_create;
+    }
+
+    /// State of the connection as a whole; `None` until the first event (and always for the
+    /// offline sources).
+    pub fn connection(&self) -> Option<&ConnectionState> {
+        self.connection.as_ref()
+    }
+
+    /// The store of `channel`, created empty if there is none yet.
+    pub fn ensure(&mut self, channel: &ChannelId, cx: &mut Context<Self>) -> Entity<ChannelStore> {
+        if let Some(store) = self.stores.get(channel) {
+            return store.clone();
+        }
+        self.closed.remove(channel);
+        let store = self.ensure_quiet(channel, cx);
+        cx.notify();
+        store
+    }
+
+    /// Drops the store of `channel` (its messages go with it) and keeps it from being created
+    /// again by events, until [`ChannelHub::ensure`] is called for it.
+    pub fn remove(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        self.closed.insert(channel.clone());
+        if self.stores.remove(channel).is_some() {
+            self.order.retain(|c| c != channel);
+            cx.notify();
         }
     }
 
@@ -166,6 +211,8 @@ impl ChannelHub {
         &self.order
     }
 
+    // Only the tests look a store up by name; the shell goes through `ensure`.
+    #[cfg(test)]
     pub fn store(&self, channel: &ChannelId) -> Option<&Entity<ChannelStore>> {
         self.stores.get(channel)
     }
@@ -192,24 +239,33 @@ impl ChannelHub {
     }
 
     /// The `apply` of the bridge: one frame's events. Each touched store is updated and
-    /// notified once. Returns `true` when a channel appeared (the hub's own observers have
-    /// something new to show).
+    /// notified once. Returns `true` when the hub itself changed (a channel appeared or the
+    /// connection state did), so its observers have something new to show.
     pub fn apply_batch(&mut self, events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let count = events.len();
         let (groups, unrouted) = split_by_channel(events);
-        self.unrouted += unrouted.len() as u64;
-        let mut appeared = false;
+        let mut changed = false;
+        for event in unrouted {
+            match event {
+                ChatEvent::Connection {
+                    channel: None,
+                    state,
+                } => {
+                    changed |= self.connection.as_ref() != Some(&state);
+                    self.connection = Some(state);
+                }
+                _ => self.unrouted += 1,
+            }
+        }
         for (channel, events) in groups {
             let store = match self.stores.get(&channel) {
                 Some(store) => store.clone(),
-                None => {
-                    let store = cx.new(|_| ChannelStore::new(channel.clone(), self.capacity));
-                    self.stores.insert(channel.clone(), store.clone());
-                    self.order.push(channel);
-                    appeared = true;
-                    store
+                None if self.auto_create && !self.closed.contains(&channel) => {
+                    changed = true;
+                    self.ensure_quiet(&channel, cx)
                 }
+                None => continue,
             };
             store.update(cx, |store, cx| {
                 if store.apply_all(events) {
@@ -220,7 +276,19 @@ impl ChannelHub {
         // The bridge runs this before the frame's draw starts, so the draw probe cannot see it.
         self.diagnostics
             .record_batch(started, count, started.elapsed());
-        appeared
+        changed
+    }
+
+    fn ensure_quiet(
+        &mut self,
+        channel: &ChannelId,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChannelStore> {
+        let capacity = self.capacity;
+        let store = cx.new(|_| ChannelStore::new(channel.clone(), capacity));
+        self.stores.insert(channel.clone(), store.clone());
+        self.order.push(channel.clone());
+        store
     }
 }
 
@@ -493,5 +561,80 @@ mod tests {
             assert!(!appeared);
         });
         assert_eq!(hub.read_with(cx, |hub, _| hub.unrouted()), 1);
+    }
+
+    #[gpui_kit::test]
+    fn live_hubs_only_keep_stores_the_shell_created(cx: &mut TestAppContext) {
+        let hub = cx.new(|_| {
+            let mut hub = ChannelHub::new(10, Diagnostics::new());
+            hub.set_auto_create(false);
+            hub
+        });
+        let channel = ChannelId::new("open");
+        hub.update(cx, |hub, cx| {
+            // Events for a channel nobody opened are dropped, not turned into a store.
+            assert!(!hub.apply_batch(vec![chat("ghost", "1", "u")], cx));
+            assert!(hub.channels().is_empty());
+            hub.ensure(&channel, cx);
+            hub.ensure(&channel, cx);
+            assert_eq!(hub.channels().len(), 1, "ensure is idempotent");
+            hub.apply_batch(vec![chat("open", "2", "u")], cx);
+            assert_eq!(hub.sizes(cx)[0].len, 1);
+            // A closed channel stays closed even if the client's last event for it arrives.
+            hub.remove(&channel, cx);
+            assert!(hub.channels().is_empty());
+            hub.apply_batch(
+                vec![ChatEvent::Connection {
+                    channel: Some(channel.clone()),
+                    state: ConnectionState::Disconnected { reason: None },
+                }],
+                cx,
+            );
+            assert!(hub.channels().is_empty() && hub.store(&channel).is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn connection_wide_state_is_kept_and_reported_as_a_change(cx: &mut TestAppContext) {
+        let hub = cx.new(|_| ChannelHub::new(10, Diagnostics::new()));
+        let event = |state| ChatEvent::Connection {
+            channel: None,
+            state,
+        };
+        hub.update(cx, |hub, cx| {
+            assert_eq!(hub.connection(), None);
+            assert!(hub.apply_batch(vec![event(ConnectionState::Connecting)], cx));
+            assert!(
+                !hub.apply_batch(vec![event(ConnectionState::Connecting)], cx),
+                "same state again"
+            );
+            assert!(hub.apply_batch(vec![event(ConnectionState::Connected)], cx));
+            assert_eq!(hub.connection(), Some(&ConnectionState::Connected));
+            assert_eq!(hub.unrouted(), 0, "connection events are not 'unrouted'");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_channel_is_not_recreated_by_events_until_it_is_opened_again(
+        cx: &mut TestAppContext,
+    ) {
+        // Offline sources auto-create stores, and keep sending for a channel after it was closed.
+        let hub = cx.new(|_| ChannelHub::new(10, Diagnostics::new()));
+        let channel = ChannelId::new("busy");
+        hub.update(cx, |hub, cx| {
+            assert!(hub.apply_batch(vec![chat("busy", "1", "u")], cx));
+            assert_eq!(hub.channels().len(), 1);
+            hub.remove(&channel, cx);
+            assert!(!hub.apply_batch(vec![chat("busy", "2", "u")], cx));
+            assert!(hub.channels().is_empty(), "stays closed");
+            // Other channels are unaffected.
+            assert!(hub.apply_batch(vec![chat("other", "3", "u")], cx));
+            assert_eq!(hub.channels().len(), 1);
+            // Opening it again clears the mark.
+            hub.ensure(&channel, cx);
+            hub.apply_batch(vec![chat("busy", "4", "u")], cx);
+            let sizes = hub.sizes(cx);
+            assert_eq!(sizes.iter().find(|s| s.channel == channel).unwrap().len, 1);
+        });
     }
 }
