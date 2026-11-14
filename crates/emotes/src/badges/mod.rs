@@ -7,8 +7,9 @@
 //!
 //! * [`BadgeSource`] is the seam: [`BadgeSource::global`] and [`BadgeSource::channel`] return a
 //!   [`BadgeSet`]. [`AnonymousBadgeSource`] needs no login: the global set is a bundled snapshot
-//!   ([`snapshot`]) and a channel's comes from `api.ivr.fi` ([`ivr`]). A Helix-backed source
-//!   (PR 3.1) implements the same trait once the user is logged in.
+//!   ([`snapshot`]) and a channel's comes from `api.ivr.fi` ([`ivr`]). [`HelixBadgeSource`]
+//!   ([`helix`]) is the logged-in one: Twitch's own `chat/badges` endpoints, through an
+//!   authenticating [`crate::HttpClient`] the app supplies.
 //! * [`BadgeRegistry`] holds the loaded sets: a channel's first, then the global ones, looked up
 //!   by `(set, version)` without allocating. Each store bumps a version number so a view can tell
 //!   that the badges of a channel it already laid out may now resolve.
@@ -17,6 +18,7 @@
 //! have supplied are simply not shown.
 
 mod anonymous;
+pub mod helix;
 pub mod ivr;
 pub mod snapshot;
 
@@ -30,6 +32,7 @@ use gpui_chat_core::{Badge, BadgeId, ChannelId};
 use thiserror::Error;
 
 pub use anonymous::AnonymousBadgeSource;
+pub use helix::HelixBadgeSource;
 
 use crate::http::HttpError;
 
