@@ -12,13 +12,15 @@ bundled**; the app loads them from Twitch's CDN at run time through its image st
 
 ## Where it comes from and licence
 
-Generated from `https://api.ivr.fi/v2/twitch/badges/global`, a public, unauthenticated API that republishes
-Twitch's (Helix-shaped) badge data. The facts in the file (identifiers, titles, URLs of Twitch-hosted images)
-are Twitch's public data; the file contains none of Twitch's artwork. We found no licence or terms of use
-published for the IVR API (its documentation page states none), so this is a best-effort reading, not a
-grant: if that changes or the data has to be sourced differently, the equivalent anonymous endpoint
-`https://badges.twitch.tv/v1/badges/global/display` or Helix `GET /helix/chat/badges/global` (needs a token)
-carry the same information, and `badges_snapshot` is the only place that knows the source.
+Generated from `https://api.ivr.fi/v2/twitch/badges/global`, a public, unauthenticated API that returns the
+same items as Twitch's Helix `chat/badges/global` (as a bare list rather than Helix's `{"data": [...]}`).
+The facts in the file (identifiers, titles, URLs of Twitch-hosted images) are Twitch's public data; the file
+contains none of Twitch's artwork. We found no licence or terms of use published for the IVR API (its
+documentation page states none), so this is a best-effort reading, not a grant. If the data has to be sourced
+differently, Helix `GET /helix/chat/badges/global` carries the same information (it needs a token, so it
+arrives with login in PR 3.1; `ivr::parse` already accepts its response shape). The old anonymous
+`badges.twitch.tv` endpoint is not an option: it has been shut down. `badges_snapshot` is the only place that
+knows the source.
 
 ## Regenerating
 

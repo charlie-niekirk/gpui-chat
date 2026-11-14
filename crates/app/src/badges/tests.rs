@@ -13,6 +13,9 @@ use super::*;
 struct FakeSource {
     requests: Mutex<Vec<String>>,
     down: AtomicBool,
+    /// What `global()` answers (an error if `None`).
+    global: Mutex<Option<BadgeSet>>,
+    global_calls: std::sync::atomic::AtomicUsize,
     /// Holds channel answers back until released (to catch a channel closed mid-load).
     hold: AtomicBool,
 }
@@ -25,7 +28,10 @@ impl FakeSource {
 
 impl BadgeSource for FakeSource {
     fn global(&self) -> BadgeFuture<'_> {
-        Box::pin(async { Ok(BadgeSet::new()) })
+        self.global_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let set = self.global.lock().unwrap().clone();
+        Box::pin(async move { set.ok_or(BadgeError::Status(503)) })
     }
 
     fn channel<'a>(&'a self, room_id: &'a str) -> BadgeFuture<'a> {
@@ -218,4 +224,55 @@ fn install_stores_the_bundled_global_badges_and_a_change_bumps_the_epoch(cx: &mu
     changed.notify_one();
     cx.run_until_parked();
     assert_eq!(cx.update(|cx| cx.global::<Badges>().epoch), 1);
+}
+
+fn global_set(title: &str) -> BadgeSet {
+    let mut set = BadgeSet::new();
+    set.insert(Badge {
+        id: BadgeId::new("moderator", "1"),
+        title: title.to_owned(),
+        urls: ImageUrls::new(),
+    });
+    set
+}
+
+fn moderator(registry: &BadgeRegistry) -> Option<String> {
+    registry
+        .lookup_str(&ChannelId::new("any"), "moderator", "1")
+        .map(|badge| badge.title.clone())
+}
+
+#[tokio::test]
+async fn the_sources_global_badges_replace_the_bundled_ones_and_wake_the_ui() {
+    let f = fixture();
+    // The bundled snapshot was installed first.
+    f.registry.store_global(snapshot::bundled().unwrap());
+    assert_eq!(moderator(&f.registry).as_deref(), Some("Moderator"));
+    let before = f.registry.version(&ChannelId::new("any"));
+
+    *f.source.global.lock().unwrap() = Some(global_set("Source Mod"));
+    f.service.load_global();
+    eventually(|| moderator(&f.registry).as_deref() == Some("Source Mod")).await;
+    assert_eq!(
+        f.source.global_calls.load(Ordering::SeqCst),
+        1,
+        "asked once"
+    );
+    assert!(f.registry.version(&ChannelId::new("any")) > before);
+    tokio::time::timeout(Duration::from_secs(1), f.changed.notified())
+        .await
+        .expect("the UI is woken");
+}
+
+#[tokio::test]
+async fn a_failing_global_load_keeps_the_bundled_badges() {
+    let f = fixture();
+    f.registry.store_global(snapshot::bundled().unwrap());
+    let before = f.registry.version(&ChannelId::new("any"));
+    // `global` is `None`: the source answers with an error.
+    f.service.load_global();
+    eventually(|| f.source.global_calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(moderator(&f.registry).as_deref(), Some("Moderator"));
+    assert_eq!(f.registry.version(&ChannelId::new("any")), before);
 }

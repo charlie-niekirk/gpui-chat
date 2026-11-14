@@ -5,9 +5,10 @@
 //!   `404` when the channel does not exist (an empty set here);
 //! * `GET https://api.ivr.fi/v2/twitch/badges/global` → the global badges.
 //!
-//! Both answer with the shape of Helix's `chat/badges` endpoints, flattened to
+//! Both answer with a bare list of the items Helix's `chat/badges` endpoints return,
 //! `[{ "set_id", "versions": [{ "id", "title", "image_url_1x", "image_url_2x", "image_url_4x" }] }]`
-//! (the `4x` URL is Twitch's `/3` size, 72 px). Entries that do not fit are skipped with a
+//! (the `4x` URL is Twitch's `/3` size, 72 px). Helix itself wraps that list in `{"data": [...]}`;
+//! [`parse`] accepts both, so a Helix source can reuse it. Entries that do not fit are skipped with a
 //! warning; a version without a `1x` image is skipped too, since it could not be drawn.
 
 use gpui_chat_core::{Badge, BadgeId, ImageScale, ImageUrls};
@@ -45,10 +46,19 @@ struct RawVersion {
     image_url_4x: Option<String>,
 }
 
-/// Parses an IVR (or Helix-shaped) badge list.
+/// Parses a badge list: IVR's bare array, or Helix's `{"data": [...]}` wrapper around the same
+/// items.
 pub fn parse(body: &[u8]) -> Result<BadgeSet, BadgeError> {
-    let sets: Vec<Value> =
+    let value: Value =
         serde_json::from_slice(body).map_err(|e| BadgeError::Parse(e.to_string()))?;
+    let sets = match value {
+        Value::Array(sets) => sets,
+        Value::Object(mut object) => match object.remove("data") {
+            Some(Value::Array(sets)) => sets,
+            _ => return Err(BadgeError::Parse("no badge list".to_owned())),
+        },
+        _ => return Err(BadgeError::Parse("no badge list".to_owned())),
+    };
     let mut out = BadgeSet::new();
     for set in parse_entries::<RawSet>("badge set", sets) {
         for version in parse_entries::<RawVersion>("badge version", set.versions) {
@@ -116,7 +126,18 @@ mod tests {
     fn not_json_or_not_a_list_is_a_parse_error() {
         assert!(matches!(parse(b"nope"), Err(BadgeError::Parse(_))));
         assert!(matches!(parse(b"{}"), Err(BadgeError::Parse(_))));
+        assert!(matches!(parse(b"{\"data\": 1}"), Err(BadgeError::Parse(_))));
+        assert!(matches!(parse(b"3"), Err(BadgeError::Parse(_))));
         assert!(parse(b"[]").unwrap().is_empty());
+        assert!(parse(b"{\"data\": []}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn helixs_data_wrapper_gives_the_same_set_as_the_bare_list() {
+        let bare = badge_fixture("ivr-global-sample.json");
+        let list: serde_json::Value = serde_json::from_slice(&bare).unwrap();
+        let wrapped = serde_json::to_vec(&serde_json::json!({ "data": list })).unwrap();
+        assert_eq!(parse(&wrapped).unwrap(), parse(&bare).unwrap());
     }
 
     #[test]

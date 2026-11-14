@@ -9,7 +9,10 @@
 //!   UI thread bumps an epoch on the global, and views that observe it re-render; a view lays its
 //!   messages out again only if *its channel's* registry version moved
 //!   ([`BadgeRegistry::version`]).
-//! * **[`BadgeService`]** loads a channel's badges when its `ROOMSTATE` supplies the room id,
+//! * **[`BadgeService`]** asks its source for the global badges once at start (off the UI thread,
+//!   through [`BadgeSource::global`]) and keeps the bundled snapshot if that fails; the anonymous
+//!   source simply returns the snapshot again, a Helix source (PR 3.1) fetches the real set. It
+//!   loads a channel's badges when its `ROOMSTATE` supplies the room id,
 //!   exactly like [`crate::emote_service::EmoteService`] does for emote sets: once per room id, a
 //!   load that failed is requested again when `ROOMSTATE` repeats (a reconnect re-joins and so
 //!   repeats it), a load in flight is never duplicated, and a closed channel is forgotten (its
@@ -170,12 +173,31 @@ impl BadgeService {
             }
         };
         let source = Arc::new(AnonymousBadgeSource::new(Arc::new(http)));
-        Some(Self::new(
+        let service = Self::new(
             source,
             registry,
             changed,
             cx.global::<runtime::Backend>().handle(),
-        ))
+        );
+        service.load_global();
+        Some(service)
+    }
+
+    /// Asks the source for the global badges (once, at start) and stores them over the bundled
+    /// snapshot. A failure is a warning and leaves the snapshot in place.
+    fn load_global(&self) {
+        let inner = self.inner.clone();
+        drop(self.inner.handle.spawn(async move {
+            match inner.source.global().await {
+                Ok(set) => {
+                    inner.registry.store_global(set);
+                    inner.changed.notify_one();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "global badges unavailable; keeping the bundled ones");
+                }
+            }
+        }));
     }
 
     /// Fetches `channel`'s badges for `room_id` now, whatever their state.

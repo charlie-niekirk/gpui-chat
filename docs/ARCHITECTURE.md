@@ -119,7 +119,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   off is not requested; turning one on reloads). `--firehose` / `--replay` have none: no network.
 - `badges.rs` (PR 2.5) — `Badges`, a GPUI global holding the `BadgeRegistry` (installed in `main` for every
   source, with the bundled global snapshot already stored, so `--firehose` / `--replay` show moderator,
-  VIP, ... without a network), and `BadgeService`, the live source's channel-badge loader. It follows
+  VIP, ... without a network), and `BadgeService`, the live source's badge loader. At start it asks its
+  source for the global badges once (`BadgeSource::global`, off the UI thread) and stores the result over the
+  snapshot, keeping the snapshot with a warn if that fails (the anonymous source returns the snapshot itself;
+  Helix, PR 3.1, will fetch the real set). Channel badges follow
   `EmoteService`: a channel's badges load when its ROOMSTATE supplies the room id (once per id; a failed load
   is requested again when ROOMSTATE repeats; a load in flight is never duplicated), `forget` on part drops
   the channel's set and discards a load still running. Unlike emotes, nothing is rewritten in the message:
