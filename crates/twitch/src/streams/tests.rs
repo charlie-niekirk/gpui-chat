@@ -149,10 +149,10 @@ fn uptime_needs_a_known_start() {
     assert_eq!(info.channel, ChannelId::new("a"));
     assert_eq!(info.display_name, "a");
     assert_eq!(info.title, "t");
-    assert_eq!(info.uptime(160), Duration::from_secs(60));
-    assert_eq!(info.uptime(10), Duration::ZERO);
+    assert_eq!(info.uptime(160), Some(Duration::from_secs(60)));
+    assert_eq!(info.uptime(10), Some(Duration::ZERO));
     info.started_at = 0;
-    assert_eq!(info.uptime(160), Duration::ZERO);
+    assert_eq!(info.uptime(160), None);
 }
 
 #[tokio::test]
@@ -256,26 +256,30 @@ async fn a_repeating_cursor_ends_the_walk() {
         .mount(&server)
         .await;
     let followed = helix.get_followed_streams("42").await.unwrap();
-    // First page, then the page for "same", which repeats it.
-    assert_eq!(followed.len(), 2);
+    // First page, then the page for "same", which repeats it: the channel is listed once.
+    assert_eq!(followed.len(), 1);
 }
 
 #[tokio::test]
-async fn reruns_and_errors_are_not_live() {
+async fn only_streams_twitch_calls_live_or_cannot_tell_are_live() {
     let server = MockServer::start().await;
     let helix = client(&server, Some(token("tok", "ref", &[FOLLOWS]))).await;
     let mut rerun = raw("rerun", 1);
-    rerun["type"] = json!("");
+    rerun["type"] = json!("vodcast");
+    let mut unsure = raw("unsure", 1);
+    unsure["type"] = json!("");
     Mock::given(method("GET"))
         .and(path("/helix/streams"))
-        .respond_with(data(&[raw("on", 1), rerun]))
+        .respond_with(data(&[raw("on", 1), rerun, unsure]))
         .mount(&server)
         .await;
     let live = helix
-        .get_streams(&channels(&["on", "rerun"]))
+        .get_streams(&channels(&["on", "rerun", "unsure"]))
         .await
         .unwrap();
-    assert_eq!(live.len(), 1);
+    let mut names: Vec<&str> = live.iter().map(|s| s.channel.login()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["on", "unsure"]);
 }
 
 #[tokio::test]
@@ -522,4 +526,103 @@ async fn a_login_without_the_follows_scope_still_polls_open_channels() {
         .filter(|r| r.url.path() == "/helix/streams/followed")
         .count();
     assert_eq!(followed_calls, 0);
+}
+
+#[tokio::test]
+async fn reordering_the_open_channels_does_not_poll() {
+    let server = MockServer::start().await;
+    let helix = client(&server, Some(token("tok", "ref", &[FOLLOWS]))).await;
+    Mock::given(method("GET"))
+        .and(path("/helix/streams"))
+        .respond_with(data(&[]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/helix/streams/followed"))
+        .respond_with(data(&[]))
+        .mount(&server)
+        .await;
+    let poller = StreamPoller::spawn(
+        helix,
+        PollConfig {
+            interval: Duration::from_secs(3600),
+            ..fast()
+        },
+    );
+    let mut rx = poller.subscribe();
+    poller.set_channels(channels(&["a", "b", "c"]));
+    wait_for(&mut rx, |s| s.checked.len() == 3).await;
+    let count = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/helix/streams")
+            .count()
+    };
+    let before = count().await;
+    poller.set_channels(channels(&["c", "a", "b"]));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(count().await, before, "a reorder is not a change");
+    poller.set_channels(channels(&["c", "a"]));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(count().await, before + 1, "closing a channel polls once");
+}
+
+#[tokio::test]
+async fn a_failing_followed_call_does_not_slow_the_open_channels() {
+    let server = MockServer::start().await;
+    let helix = client(&server, Some(token("tok", "ref", &[FOLLOWS]))).await;
+    Mock::given(method("GET"))
+        .and(path("/helix/streams"))
+        .respond_with(data(&[raw("pepe", 9)]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/helix/streams/followed"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let poller = StreamPoller::spawn(helix, fast());
+    let mut rx = poller.subscribe();
+    let pepe = ChannelId::new("pepe");
+    poller.set_channels(vec![pepe.clone()]);
+    let failed = wait_for(&mut rx, |s| s.error.is_some()).await;
+    assert!(failed.error.as_ref().unwrap().contains("500"));
+    assert!(matches!(failed.state(&pepe), Some(Some(_))));
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let requests = server.received_requests().await.unwrap();
+    let calls = |endpoint: &str| requests.iter().filter(|r| r.url.path() == endpoint).count();
+    // Followed backs off (40, 80, 160, 160 ms...); the open channel keeps its 40 ms interval.
+    assert!(
+        calls("/helix/streams/followed") <= 8,
+        "followed: no backoff?"
+    );
+    assert!(
+        calls("/helix/streams") >= 9,
+        "{} Get Streams calls: slowed down by the followed failure",
+        calls("/helix/streams")
+    );
+}
+
+#[tokio::test]
+async fn logins_are_percent_encoded_in_the_query() {
+    let server = MockServer::start().await;
+    let helix = client(&server, Some(token("tok", "ref", &[FOLLOWS]))).await;
+    Mock::given(method("GET"))
+        .and(path("/helix/streams"))
+        .respond_with(data(&[]))
+        .mount(&server)
+        .await;
+    helix.get_streams(&channels(&["a b&c"])).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let query = requests
+        .iter()
+        .find(|r| r.url.path() == "/helix/streams")
+        .and_then(|r| r.url.query().map(str::to_owned))
+        .unwrap();
+    assert!(query.contains("user_login=a%20b%26c"), "{query}");
 }

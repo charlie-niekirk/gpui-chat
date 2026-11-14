@@ -696,7 +696,7 @@ fn channel_item(
                 channel.login(),
                 stream_info::format_viewers(info.viewers)
             ))
-            .suffix(move |_, _| live_suffix(&info, false));
+            .suffix(move |_, cx| live_suffix(&info, false, cx));
     }
     item.context_menu(move |menu: PopupMenu, _, _| {
         menu.item(
@@ -726,8 +726,10 @@ fn channel_item(
 
 /// The right end of a live row: the live dot, the category (followed rows) and the viewers. The
 /// tooltip carries the title, which has no room in the row.
-fn live_suffix(info: &StreamInfo, with_category: bool) -> AnyElement {
-    let uptime = stream_info::format_uptime(info.uptime(stream_info::unix_now()));
+fn live_suffix(info: &StreamInfo, with_category: bool, cx: &App) -> AnyElement {
+    let uptime = info
+        .uptime(stream_info::unix_now())
+        .map(stream_info::format_uptime);
     let tooltip = {
         let mut lines = vec![info.title.clone()];
         let mut facts = Vec::new();
@@ -738,7 +740,9 @@ fn live_suffix(info: &StreamInfo, with_category: bool) -> AnyElement {
             "{} viewers",
             stream_info::format_viewers(info.viewers)
         ));
-        facts.push(format!("live for {uptime}"));
+        if let Some(uptime) = uptime {
+            facts.push(format!("live for {uptime}"));
+        }
         lines.push(facts.join(" · "));
         lines.retain(|line| !line.is_empty());
         lines.join("\n")
@@ -755,7 +759,7 @@ fn live_suffix(info: &StreamInfo, with_category: bool) -> AnyElement {
             div()
                 .max_w(px(60.0))
                 .truncate()
-                .text_color(gpui_kit::hsla(0.0, 0.0, 0.5, 1.0))
+                .text_color(cx.theme().muted_foreground)
                 .child(category)
         }))
         .child(
@@ -790,7 +794,7 @@ fn followed_item(
             info.category,
             stream_info::format_viewers(info.viewers)
         ))
-        .suffix(move |_, _| live_suffix(&shown, true))
+        .suffix(move |_, cx| live_suffix(&shown, true, cx))
         .on_click(move |_, _, cx| {
             shell
                 .update(cx, |shell, cx| shell.add_channel(channel.clone(), cx))

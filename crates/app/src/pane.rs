@@ -155,7 +155,9 @@ fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
 
 /// The second header line of a live channel: title, category, viewers and uptime.
 fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
-    let uptime = stream_info::format_uptime(info.uptime(stream_info::unix_now()));
+    let uptime = info
+        .uptime(stream_info::unix_now())
+        .map(stream_info::format_uptime);
     let viewers = stream_info::format_viewers(info.viewers);
     let title = if info.title.is_empty() {
         "(no title)".to_owned()
@@ -202,7 +204,7 @@ fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
                 .child(info.category.clone())
         }))
         .child(fact(format!("{viewers} viewers")))
-        .child(fact(format!("up {uptime}")))
+        .children(uptime.map(|uptime| fact(format!("up {uptime}"))))
 }
 
 /// The quality menu: the standard list, plus the channel's current choice when it is not in it

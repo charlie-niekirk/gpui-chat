@@ -427,13 +427,13 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   until it ends (a repeated or empty cursor also ends it; `max_pages` bounds it). Non-2xx is
   `HelixListError::Status` with Twitch's `message` (`is_missing_scope()` for a 401 about a scope).
 - **`streams::get_streams`** — `Get Streams` for any number of logins, `user_login=` ×100 per request (Helix's
-  limit), duplicates dropped; offline channels are simply absent, reruns (`type != "live"`) are ignored.
+  limit), duplicates dropped; offline channels are simply absent, other types are ignored (an empty `type` counts as live); the followed list is de-duplicated by channel.
   **`get_followed_streams`** — `Get Followed Streams` for the logged-in user, 100 per page, up to 10 pages.
 - **`streams::StreamPoller`** — one task on the backend runtime. Each cycle polls the watched channels (the open
   ones) and, when the login has `user:read:follows`, the followed list, and publishes a `StreamSnapshot` (`live`,
   `checked` — to tell "offline" from "not polled yet" —, `followed`, `error`) on a `watch` channel. Interval 60 s
-  (Helix caches stream data about that long); while polls fail it doubles to a 5 min cap and keeps the last good
-  data with `error` set; a change of the watched set polls after a 500 ms settle, a login change polls at once,
+  (Helix caches stream data about that long); each of the two calls has its own schedule, so one that keeps
+  failing doubles to a 5 min cap alone (the last good data stays, `error` set) while the other keeps its interval; a change of the watched set (compared as a set: reordering is none) polls the open channels after a 500 ms settle, a login change polls at once,
   logged out it publishes an empty snapshot and sleeps. A 401 refreshes through `Auth` (the HelixClient's
   retry), so an expired token costs no poll. Dropping the poller stops it.
 

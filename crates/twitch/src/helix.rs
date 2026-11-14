@@ -277,7 +277,7 @@ struct Pagination {
 
 /// Percent-encodes everything but the RFC 3986 unreserved characters (cursors are base64 and may
 /// hold `=`, `+` or `/`).
-fn encode_query_value(value: &str) -> String {
+pub(crate) fn encode_query_value(value: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {

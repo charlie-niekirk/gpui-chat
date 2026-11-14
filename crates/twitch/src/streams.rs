@@ -21,7 +21,7 @@ use serde::Deserialize;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
-use crate::helix::{HelixClient, HelixListError};
+use crate::helix::{HelixClient, HelixListError, encode_query_value};
 
 /// Helix accepts at most 100 `user_login` values per `Get Streams` call.
 pub const MAX_LOGINS_PER_REQUEST: usize = 100;
@@ -45,13 +45,9 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
-    /// How long the stream has been live at `now` (Unix seconds); zero when the start is unknown.
-    pub fn uptime(&self, now: u64) -> Duration {
-        if self.started_at == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(now.saturating_sub(self.started_at))
-        }
+    /// How long the stream has been live at `now` (Unix seconds); `None` when the start is unknown.
+    pub fn uptime(&self, now: u64) -> Option<Duration> {
+        (self.started_at != 0).then(|| Duration::from_secs(now.saturating_sub(self.started_at)))
     }
 }
 
@@ -64,7 +60,7 @@ struct RawStream {
     user_name: String,
     #[serde(default)]
     game_name: String,
-    /// `live`, or empty when Twitch could not tell.
+    /// `live`, or empty when Twitch could not tell (both count as live).
     #[serde(default = "live")]
     r#type: String,
     #[serde(default)]
@@ -81,7 +77,8 @@ fn live() -> String {
 
 impl RawStream {
     fn into_info(self) -> Option<StreamInfo> {
-        if self.r#type != "live" {
+        // Empty means Twitch could not tell; the stream is in the response, so it is live.
+        if !self.r#type.is_empty() && self.r#type != "live" {
             return None;
         }
         let channel = ChannelId::new(&self.user_login);
@@ -148,7 +145,7 @@ impl HelixClient {
             let mut path = format!("streams?first={MAX_LOGINS_PER_REQUEST}");
             for login in batch {
                 path.push_str("&user_login=");
-                path.push_str(login);
+                path.push_str(&encode_query_value(login));
             }
             let raw: Vec<RawStream> = self.get_all(&path, 1).await?;
             live.extend(raw.into_iter().filter_map(RawStream::into_info));
@@ -164,7 +161,14 @@ impl HelixClient {
     ) -> Result<Vec<StreamInfo>, HelixListError> {
         let path = format!("streams/followed?first=100&user_id={user_id}");
         let raw: Vec<RawStream> = self.get_all(&path, MAX_FOLLOWED_PAGES).await?;
-        Ok(raw.into_iter().filter_map(RawStream::into_info).collect())
+        // The viewer-ordered list shifts between page requests, so a channel can come twice:
+        // keep its first (freshest-page) entry.
+        let mut seen = HashSet::new();
+        Ok(raw
+            .into_iter()
+            .filter_map(RawStream::into_info)
+            .filter(|info| seen.insert(info.channel.clone()))
+            .collect())
     }
 }
 
@@ -261,8 +265,12 @@ impl StreamPoller {
 
     /// Sets the channels whose live state is polled (the open ones). A change polls soon.
     pub fn set_channels(&self, channels: Vec<ChannelId>) {
+        // The order (Move Up / Down in the sidebar) does not matter: compare as sets.
         self.watched.send_if_modified(|current| {
-            if *current == channels {
+            let same = current.len() == channels.len()
+                && current.iter().collect::<HashSet<_>>()
+                    == channels.iter().collect::<HashSet<_>>();
+            if same {
                 false
             } else {
                 *current = channels;
@@ -282,6 +290,43 @@ impl StreamPoller {
     }
 }
 
+/// The schedule of one of the two calls: its own failure count, so a call that keeps failing
+/// backs off alone while the other keeps its normal interval.
+struct Call {
+    failures: u32,
+    due: tokio::time::Instant,
+    /// Why the last attempt failed; cleared by a success.
+    error: Option<String>,
+}
+
+impl Call {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            due: tokio::time::Instant::now(),
+            error: None,
+        }
+    }
+
+    fn is_due(&self, force: bool) -> bool {
+        force || self.due <= tokio::time::Instant::now()
+    }
+
+    /// Records an attempt's outcome and schedules the next one.
+    fn finish(&mut self, config: &PollConfig, error: Option<String>, what: &str) {
+        self.failures = if error.is_some() {
+            self.failures.saturating_add(1)
+        } else {
+            0
+        };
+        if let Some(error) = &error {
+            tracing::warn!(%error, failures = self.failures, "{what} poll failed");
+        }
+        self.error = error;
+        self.due = tokio::time::Instant::now() + config.delay(self.failures);
+    }
+}
+
 async fn run(
     helix: HelixClient,
     config: PollConfig,
@@ -290,7 +335,11 @@ async fn run(
     snapshot: watch::Sender<StreamSnapshot>,
 ) {
     let mut auth = helix.auth().subscribe();
-    let mut failures = 0u32;
+    let mut streams_call = Call::new();
+    let mut followed_call = Call::new();
+    // Set by what woke the loop: a new login or a manual refresh polls both calls, a change of
+    // the open channels polls the watched channels only.
+    let (mut force_streams, mut force_followed) = (true, true);
     loop {
         let account = auth.borrow_and_update().account().cloned();
         let Some(account) = account else {
@@ -299,7 +348,8 @@ async fn run(
                 *current = StreamSnapshot::default();
                 changed
             });
-            failures = 0;
+            (streams_call, followed_call) = (Call::new(), Call::new());
+            (force_streams, force_followed) = (true, true);
             tokio::select! {
                 result = auth.changed() => if result.is_err() { return },
                 () = refresh.notified() => {}
@@ -307,24 +357,42 @@ async fn run(
             continue;
         };
         let channels = watched.borrow_and_update().clone();
-        let can_follow = !account.missing_scopes.iter().any(|s| s == FOLLOWS_SCOPE);
-        let current = snapshot.borrow().clone();
-        let next = poll(&helix, &account.user_id, &channels, can_follow, current).await;
-        failures = if next.error.is_some() {
-            failures.saturating_add(1)
-        } else {
-            0
-        };
-        if let Some(error) = &next.error {
-            tracing::warn!(%error, failures, "stream state poll failed");
-        }
-        snapshot.send_replace(next);
+        let mut next = snapshot.borrow().clone();
+        // Channels closed since stop being tracked straight away.
+        let watching: HashSet<&ChannelId> = channels.iter().collect();
+        next.live.retain(|channel, _| watching.contains(channel));
+        next.checked.retain(|channel| watching.contains(channel));
 
-        let delay = config.delay(failures);
+        if streams_call.is_due(force_streams) {
+            let error = poll_watched(&helix, &channels, &mut next).await;
+            streams_call.finish(&config, error, "stream state");
+        }
+        let can_follow = !account.missing_scopes.iter().any(|s| s == FOLLOWS_SCOPE);
+        if !can_follow {
+            next.followed = None;
+        } else if followed_call.is_due(force_followed) {
+            let error = poll_followed(&helix, &account.user_id, &mut next).await;
+            followed_call.finish(&config, error, "followed streams");
+        }
+        next.error = streams_call
+            .error
+            .clone()
+            .or_else(|| followed_call.error.clone());
+        snapshot.send_replace(next);
+        (force_streams, force_followed) = (false, false);
+
+        let next_due = if can_follow {
+            streams_call.due.min(followed_call.due)
+        } else {
+            streams_call.due
+        };
         tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            () = refresh.notified() => {}
-            result = auth.changed() => if result.is_err() { return },
+            () = tokio::time::sleep_until(next_due) => {}
+            () = refresh.notified() => (force_streams, force_followed) = (true, true),
+            result = auth.changed() => {
+                if result.is_err() { return }
+                (force_streams, force_followed) = (true, true);
+            }
             result = watched.changed() => {
                 if result.is_err() { return }
                 // Let a burst of changes finish.
@@ -334,59 +402,56 @@ async fn run(
                         result = watched.changed() => if result.is_err() { return },
                     }
                 }
+                force_streams = true;
             }
         }
     }
 }
 
-/// One poll: the watched channels and the followed list, each independently. What failed keeps
-/// its old value; `error` says the first failure.
-async fn poll(
+/// Polls the watched channels into `next`; the failure message, if any (the old data stays).
+async fn poll_watched(
+    helix: &HelixClient,
+    channels: &[ChannelId],
+    next: &mut StreamSnapshot,
+) -> Option<String> {
+    if channels.is_empty() {
+        return None;
+    }
+    match helix.get_streams(channels).await {
+        Ok(streams) => {
+            let watching: HashSet<&ChannelId> = channels.iter().collect();
+            next.live = streams
+                .into_iter()
+                .filter(|info| watching.contains(&info.channel))
+                .map(|info| (info.channel.clone(), info))
+                .collect();
+            next.checked = channels.iter().cloned().collect();
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+/// Polls the followed list into `next`; the failure message, if any (the old list stays).
+async fn poll_followed(
     helix: &HelixClient,
     user_id: &str,
-    channels: &[ChannelId],
-    can_follow: bool,
-    previous: StreamSnapshot,
-) -> StreamSnapshot {
-    let mut next = StreamSnapshot {
-        error: None,
-        ..previous
-    };
-    // Channels that were closed since stop being tracked straight away.
-    let watching: HashSet<&ChannelId> = channels.iter().collect();
-    next.live.retain(|channel, _| watching.contains(channel));
-    next.checked.retain(|channel| watching.contains(channel));
-
-    if !channels.is_empty() {
-        match helix.get_streams(channels).await {
-            Ok(streams) => {
-                next.live = streams
-                    .into_iter()
-                    .filter(|info| watching.contains(&info.channel))
-                    .map(|info| (info.channel.clone(), info))
-                    .collect();
-                next.checked = channels.iter().cloned().collect();
-            }
-            Err(error) => next.error = Some(error.to_string()),
+    next: &mut StreamSnapshot,
+) -> Option<String> {
+    match helix.get_followed_streams(user_id).await {
+        Ok(mut streams) => {
+            streams.sort_by_key(|stream| std::cmp::Reverse(stream.viewers));
+            next.followed = Some(streams);
+            None
         }
-    }
-    if can_follow {
-        match helix.get_followed_streams(user_id).await {
-            Ok(mut streams) => {
-                streams.sort_by_key(|stream| std::cmp::Reverse(stream.viewers));
-                next.followed = Some(streams);
-            }
-            // The login predates the scope (the banner already asks for a new one): not an error
-            // worth retrying with backoff.
-            Err(error) if error.is_missing_scope() => next.followed = None,
-            Err(error) => {
-                next.error.get_or_insert_with(|| error.to_string());
-            }
+        // The login predates the scope (the banner already asks for a new one): not an error
+        // worth retrying with backoff.
+        Err(error) if error.is_missing_scope() => {
+            next.followed = None;
+            None
         }
-    } else {
-        next.followed = None;
+        Err(error) => Some(error.to_string()),
     }
-    next
 }
 
 #[cfg(test)]
