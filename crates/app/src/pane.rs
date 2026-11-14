@@ -8,16 +8,20 @@ use std::time::Duration;
 
 use gpui_chat_core::{ChannelId, ConnectionState, FollowersOnly, RoomState};
 use gpui_chat_streamlink::QUALITIES;
+use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, Window, div, px, rgb,
+    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
+    rgb,
 };
 
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
+use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
 use crate::theme::Tokens;
 
@@ -123,6 +127,86 @@ fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
     }
 }
 
+/// The "LIVE" / "Offline" marker next to the channel name.
+fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
+    let (color, label) = if live {
+        (stream_info::live_color(), "LIVE")
+    } else {
+        (tokens.text_muted.opacity(0.6), "Offline")
+    };
+    h_flex()
+        .id("pane-live")
+        .flex_none()
+        .gap_1p5()
+        .items_center()
+        .child(div().size(px(8.0)).rounded_full().bg(color))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(if live {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if live { color } else { tokens.text_muted })
+                .child(label),
+        )
+}
+
+/// The second header line of a live channel: title, category, viewers and uptime.
+fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
+    let uptime = info
+        .uptime(stream_info::unix_now())
+        .map(stream_info::format_uptime);
+    let viewers = stream_info::format_viewers(info.viewers);
+    let title = if info.title.is_empty() {
+        "(no title)".to_owned()
+    } else {
+        info.title.clone()
+    };
+    let full = if info.category.is_empty() {
+        title.clone()
+    } else {
+        format!("{title}\n{}", info.category)
+    };
+    let fact = |text: String| {
+        div()
+            .flex_none()
+            .text_xs()
+            .text_color(tokens.text_muted)
+            .child(text)
+    };
+    h_flex()
+        .id("pane-stream-info")
+        .w_full()
+        .flex_none()
+        .h(px(26.0))
+        .px_3()
+        .gap_3()
+        .items_center()
+        .child(
+            div()
+                .id("pane-stream-title")
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .child(title)
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
+        )
+        .children((!info.category.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .max_w(px(220.0))
+                .truncate()
+                .text_xs()
+                .text_color(tokens.accent)
+                .child(info.category.clone())
+        }))
+        .child(fact(format!("{viewers} viewers")))
+        .children(uptime.map(|uptime| fact(format!("up {uptime}"))))
+}
+
 /// The quality menu: the standard list, plus the channel's current choice when it is not in it
 /// (a custom `default_quality` such as `720p60,720p,best`).
 pub fn quality_choices(current: &str) -> Vec<String> {
@@ -147,6 +231,8 @@ pub fn play_label(state: Option<&StreamState>, quality: &str) -> String {
 pub struct ChannelPane {
     hub: Entity<ChannelHub>,
     streams: Entity<StreamHub>,
+    /// Live state from Helix; `None` for the offline sources.
+    stream_info: Option<Entity<StreamInfoHub>>,
     store: Entity<ChannelStore>,
     chat: Entity<ChatView>,
     /// `false` for the offline sources, which have no connection to report.
@@ -159,19 +245,24 @@ impl ChannelPane {
         hub: Entity<ChannelHub>,
         store: Entity<ChannelStore>,
         streams: Entity<StreamHub>,
+        stream_info: Option<Entity<StreamInfoHub>>,
         live: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let chat = cx.new(|cx| ChatView::new(store.clone(), cx));
         // Room and connection state arrive as store / hub changes; redraw the header with them.
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&hub, |_, _, cx| cx.notify()),
             cx.observe(&streams, |_, _, cx| cx.notify()),
         ];
+        if let Some(stream_info) = &stream_info {
+            subscriptions.push(cx.observe(stream_info, |_, _, cx| cx.notify()));
+        }
         Self {
             hub,
             streams,
+            stream_info,
             store,
             chat,
             live,
@@ -211,22 +302,35 @@ impl ChannelPane {
                 .into_any_element(),
         };
 
-        h_flex()
-            .id("pane-header")
+        let liveness = self
+            .stream_info
+            .as_ref()
+            .map(|hub| hub.read(cx).liveness(store.channel()));
+        let live_badge = match liveness {
+            Some(Liveness::Live(_)) => Some(live_badge(true, tokens)),
+            Some(Liveness::Offline) => Some(live_badge(false, tokens)),
+            _ => None,
+        };
+        let stream_row = match liveness {
+            Some(Liveness::Live(info)) => Some(stream_row(info, tokens)),
+            _ => None,
+        };
+
+        let main_row = h_flex()
+            .id("pane-header-main")
             .w_full()
             .flex_none()
             .h(px(36.0))
             .px_3()
             .gap_3()
             .items_center()
-            .border_b_1()
-            .border_color(tokens.border)
             .child(
                 div()
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
                     .child(store.channel().login().to_owned()),
             )
+            .children(live_badge)
             .child(status_view)
             .child(
                 h_flex()
@@ -248,7 +352,15 @@ impl ChannelPane {
                             .child(chip)
                     })),
             )
-            .child(self.stream_actions(tokens, cx))
+            .child(self.stream_actions(tokens, cx));
+        v_flex()
+            .id("pane-header")
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(tokens.border)
+            .child(main_row)
+            .children(stream_row)
     }
 
     /// Streamlink error (when there is one) and the play / stop button with its quality menu.

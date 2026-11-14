@@ -132,7 +132,6 @@ impl AccountHub {
         })
     }
 
-    #[allow(dead_code)] // the Helix client for the features after 3.1 (sending, stream info)
     pub fn helix(&self) -> &HelixClient {
         &self.helix
     }
