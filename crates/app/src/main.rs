@@ -6,6 +6,7 @@
 mod actions;
 mod add_channel;
 mod assets;
+mod badges;
 mod bridge;
 mod channel_list;
 mod channels;
@@ -192,6 +193,7 @@ fn main() {
             runtime::init(cx)
                 .unwrap_or_else(|error| panic!("failed to start the backend runtime: {error}"));
             images::init(cx);
+            badges::Badges::install(cx);
             // Settings (a bad file falls back to defaults and is shown in the window), then
             // the font and theme they ask for.
             let settings_events = config::init(cx);

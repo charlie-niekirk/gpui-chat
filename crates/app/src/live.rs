@@ -14,6 +14,7 @@ use gpui_chat_twitch::{ClientConfig, TwitchClient};
 use gpui_kit::App;
 use tokio::sync::mpsc;
 
+use crate::badges::BadgeService;
 use crate::bridge::BridgeSender;
 use crate::config;
 use crate::emote_service::{self, EmoteService};
@@ -25,6 +26,9 @@ pub struct LiveSource {
     client: TwitchClient,
     /// BTTV / FFZ / 7TV sets and their resolution in messages; `None` if it could not start.
     emotes: Option<EmoteService>,
+    /// Channel badges (the global ones are bundled and need no service); `None` if it could not
+    /// start.
+    badges: Option<BadgeService>,
 }
 
 impl LiveSource {
@@ -33,13 +37,18 @@ impl LiveSource {
         let (client, events) = runtime::enter(cx, || TwitchClient::spawn(ClientConfig::default()));
         let enabled = emote_service::providers(&config::current(cx).emotes);
         let emotes = EmoteService::start(enabled, cx);
+        let badges = BadgeService::start(cx);
         // Dropped on purpose: the task ends when the client's event channel closes or the UI
         // side of the bridge is gone, and the runtime stops on quit.
         drop(runtime::spawn_backend(
             cx,
-            forward(events, sender, emotes.clone()),
+            forward(events, sender, emotes.clone(), badges.clone()),
         ));
-        Self { client, emotes }
+        Self {
+            client,
+            emotes,
+            badges,
+        }
     }
 
     pub fn join(&self, channel: &ChannelId) {
@@ -50,6 +59,9 @@ impl LiveSource {
         self.client.part(channel);
         if let Some(emotes) = &self.emotes {
             emotes.forget(channel);
+        }
+        if let Some(badges) = &self.badges {
+            badges.forget(channel);
         }
     }
 
@@ -69,15 +81,19 @@ impl LiveSource {
 }
 
 /// Moves events from the client into the bridge, resolving third-party emotes on the way (and
-/// starting a channel's emote load when its room id shows up). `send().await` is the
+/// starting a channel's emote and badge loads when its room id shows up). `send().await` is the
 /// backpressure: while the UI is behind, the client's own buffers fill and it sheds chat
 /// messages, never state changes.
 async fn forward(
     mut events: mpsc::Receiver<ChatEvent>,
     sender: BridgeSender<ChatEvent>,
     emotes: Option<EmoteService>,
+    badges: Option<BadgeService>,
 ) {
     while let Some(event) = events.recv().await {
+        if let Some(badges) = &badges {
+            badges.observe(&event);
+        }
         let event = match &emotes {
             Some(emotes) => emotes.process(event),
             None => event,
@@ -100,7 +116,7 @@ mod tests {
     async fn forward_passes_events_in_order_and_stops_when_the_ui_is_gone() {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (sender, mut receiver) = bridge::channel(8, 8);
-        let task = tokio::spawn(forward(events_rx, sender, None));
+        let task = tokio::spawn(forward(events_rx, sender, None, None));
         let connection = |state| ChatEvent::Connection {
             channel: None,
             state,

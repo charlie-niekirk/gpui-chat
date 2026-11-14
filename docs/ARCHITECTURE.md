@@ -14,11 +14,11 @@ crates/
   app/         bin `gpui-chat` — the only crate that depends on GPUI. Views, actions, keymap, theme, platform/
   core/        domain types, message store, tokenizer. No I/O
   twitch/      IRC transport, Helix client, auth (device flow), later EventSub
-  emotes/      providers: Twitch, BTTV, FFZ, 7TV; emote sets; resolution order; live updates
+  emotes/      providers: Twitch, BTTV, FFZ, 7TV; emote sets; resolution order; live updates; badges (`BadgeSource`, registry)
   media/       image fetch, disk cache, decode (static + animated), memory budget
   settings/    typed settings, load/save/watch, paths
   streamlink/  locate binary, launch, track child processes
-assets/        fonts, icons, bundled themes, bundled global-badge snapshot   (added by later PRs)
+assets/        fonts, icons, bundled themes; badges/global.json = bundled global-badge snapshot (PR 2.5)
 fixtures/      recorded raw IRC lines, API JSON samples                      (added by later PRs)
 docs/          ARCHITECTURE.md, BACKLOG.md
 ```
@@ -117,6 +117,17 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   their text runs re-scanned with the channel's `EmoteResolver`. `Reload Emotes` (Channel menu)
   refetches everything; `emotes.seventv` / `bttv` / `ffz` switch providers live (a provider that is
   off is not requested; turning one on reloads). `--firehose` / `--replay` have none: no network.
+- `badges.rs` (PR 2.5) — `Badges`, a GPUI global holding the `BadgeRegistry` (installed in `main` for every
+  source, with the bundled global snapshot already stored, so `--firehose` / `--replay` show moderator,
+  VIP, ... without a network), and `BadgeService`, the live source's channel-badge loader. It follows
+  `EmoteService`: a channel's badges load when its ROOMSTATE supplies the room id (once per id; a failed load
+  is requested again when ROOMSTATE repeats; a load in flight is never duplicated), `forget` on part drops
+  the channel's set and discards a load still running. Unlike emotes, nothing is rewritten in the message:
+  views look badges up at shape time. After a store the loader pokes a `Notify`; a UI task bumps an epoch on
+  the global (`observe_global`), and a `ChatView` lays its messages out again only when
+  `BadgeRegistry::version(channel)` moved, so subscriber badges that arrive a few hundred ms after a join
+  appear without a new message having to push them. A source failing is a `warn` and no badge (global ones
+  still show). Not wired to `Reload Emotes`.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -209,6 +220,16 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   never blocks the others and a channel with no account (404) is an empty set. FFZ uses the
   official API with the BTTV mirror as fallback. All HTTP goes through the `HttpClient` trait so
   tests run offline against `fixtures/emotes/`.
+- **Badges (`emotes` crate, `badges` module):** `BadgeSource` (`global()` / `channel(room_id)` → `BadgeSet`, boxed
+  futures like `HttpClient`) is the seam; `BadgeSet` is `set → version → Arc<Badge>` so a lookup is two hash probes
+  with no allocation, and `BadgeRegistry` layers a channel's set over the global one and numbers each store.
+  `AnonymousBadgeSource` is the logged-out source: global = `assets/badges/global.json` (`include_str!`,
+  574 definitions, 47 KB), channel = `GET api.ivr.fi/v2/twitch/badges/channel?id=<room id>` (404 = no badges of
+  its own). The snapshot stores set, version, title and the Twitch CDN image id (`…/badges/v1/<id>/{1,2,3}`
+  = 1x/2x/4x; an entry whose URLs do not fit is refused when encoding); regenerate with
+  `cargo run -p gpui-chat-emotes --example badges_snapshot` (`-- --check` says whether it is stale). Only
+  metadata is bundled: the images always load from Twitch's CDN through the image store. The Helix source
+  (PR 3.1) implements the same trait and replaces the anonymous one when logged in.
 - Async I/O runs on a `tokio` runtime on background threads. GPUI has its own
   executor; backends talk to the UI over channels.
 
@@ -282,6 +303,16 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   non-blocking so wheel events still reach the list. GPUI re-checks it every frame against the
   pointer and the emote's current box, so it hides when rows move under a still pointer;
   leaving the window hides it via `MouseExitEvent`.
+- **Badges** are drawn before the name (after the timestamp) as inline boxes through the same path as emotes: the
+  display text has one `Role::Badge` span per drawable badge (its title, never painted as text) followed by a
+  space, and shaping turns each into one `Inline` atom of a fixed square size (`1.3 × font size`, 18 px at the
+  default 14 px; 1x–4x variant chosen from display scale × box size). `shape` looks each `BadgeId` of the
+  author up in the channel's registry (O(1)) and asks `Images::badge_box`; a badge with no definition, no URLs
+  or an image that failed for good gets no slot, so there is nothing to draw and no gap. The box does not
+  depend on the image's own size, so a finished load never re-lays out a message; a permanent failure after
+  shaping goes through the per-URL change log like an emote's. The placeholder is the faint quad. Hovering one
+  shows the tooltip (preview, title, "Twitch badge"; `chat/tooltip.rs`, shared with emotes via
+  `InlineContent`).
 - **Emoji** are drawn by text shaping with the system colour-emoji font (`paint_emoji`), not an
   image set: CoreText falls back to Apple Color Emoji, so ZWJ sequences, flags and skin tones
   shape correctly and align with the text baseline, with nothing to download or license.

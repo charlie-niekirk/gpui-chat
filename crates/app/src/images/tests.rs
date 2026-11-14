@@ -549,6 +549,86 @@ fn a_transient_failure_keeps_the_placeholder_and_is_retried(cx: &mut TestAppCont
     assert_eq!(epoch(cx), 0, "28 px as assumed");
 }
 
+fn badge_at(url: &'static str) -> gpui_chat_core::Badge {
+    gpui_chat_core::Badge {
+        id: gpui_chat_core::BadgeId::new("subscriber", "0"),
+        title: "Subscriber".into(),
+        urls: ImageUrls::new().with(ImageScale::X1, url),
+    }
+}
+
+#[gpui_kit::test]
+fn badges_have_a_fixed_box_and_only_a_permanent_failure_changes_the_layout(
+    cx: &mut TestAppContext,
+) {
+    // `big` is 112 px, far from the 18 px badge box.
+    let h = Harness::new(&[("big", "animated-112.gif")], 1 << 30, cx);
+    let boxed = |url: &'static str, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.global_mut::<Images>()
+                .badge_box(&badge_at(url), 18.0, 1.0)
+        })
+    };
+    let version = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().layout_version());
+
+    assert_eq!(boxed("big", cx), Some(ImageKey::new("big")));
+    h.load("big", cx);
+    // The image's own size does not matter: nothing to lay out again, unlike an emote.
+    assert_eq!(version(cx), 0);
+    assert_eq!(boxed("big", cx), Some(ImageKey::new("big")));
+
+    // A 404 drops the badge: the URL is logged once, and shaping again leaves the badge out.
+    assert_eq!(boxed("missing", cx), Some(ImageKey::new("missing")));
+    h.load("missing", cx);
+    assert_eq!(version(cx), 1);
+    assert_eq!(
+        cx.read(|cx| cx.global::<Images>().changes_since(0)),
+        LayoutChanges::Urls(vec![ImageKey::new("missing")])
+    );
+    assert_eq!(boxed("missing", cx), None);
+
+    // No URLs at all: no badge.
+    let none = gpui_chat_core::Badge {
+        urls: ImageUrls::new(),
+        ..badge_at("x")
+    };
+    assert_eq!(
+        cx.update(|cx| cx.global_mut::<Images>().badge_box(&none, 18.0, 1.0)),
+        None
+    );
+}
+
+#[gpui_kit::test]
+fn the_badge_variant_follows_the_box_and_display_scale_and_the_preview_is_the_densest(
+    cx: &mut TestAppContext,
+) {
+    let _h = Harness::new(&[], 1 << 30, cx);
+    let badge = gpui_chat_core::Badge {
+        urls: ImageUrls::new()
+            .with(ImageScale::X1, "b/1")
+            .with(ImageScale::X2, "b/2")
+            .with(ImageScale::X4, "b/3"),
+        ..badge_at("x")
+    };
+    // The tooltip preview: the 72 px variant, one image pixel per device pixel.
+    let preview = |scale: f32, cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global_mut::<Images>().badge_preview(&badge, scale))
+    };
+    assert_eq!(preview(2.0, cx), Some((ImageKey::new("b/3"), (36.0, 36.0))));
+    assert_eq!(preview(1.0, cx), Some((ImageKey::new("b/3"), (72.0, 72.0))));
+    let url = |size: f32, scale: f32, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.global_mut::<Images>()
+                .badge_box(&badge, size, scale)
+                .map(|key| key.url().to_owned())
+        })
+    };
+    assert_eq!(url(18.0, 1.0, cx).as_deref(), Some("b/1"));
+    assert_eq!(url(18.0, 2.0, cx).as_deref(), Some("b/2"));
+    // A bigger box (bigger font) wants a denser image.
+    assert_eq!(url(36.0, 2.0, cx).as_deref(), Some("b/3"));
+}
+
 #[gpui_kit::test]
 fn an_evicted_image_that_fails_to_reload_becomes_text(cx: &mut TestAppContext) {
     let h = Harness::new(&[("gone", "static.png")], 1 << 30, cx);

@@ -37,10 +37,11 @@ use gpui_kit::{
 };
 
 use super::display::DisplayOptions;
-use super::element::{EmoteStyle, MessageElement, MessageStyle, Palette};
+use super::element::{BadgeStyle, EmoteStyle, MessageElement, MessageStyle, Palette};
 use super::layout::LayoutCache;
 use super::list_sync::ListMirror;
 use super::tooltip::EmoteHover;
+use crate::badges::Badges;
 use crate::channels::ChannelStore;
 use crate::config;
 use crate::fonts::FontConfig;
@@ -64,6 +65,12 @@ struct TextConfig {
     light: bool,
 }
 
+/// Badges are drawn as squares a bit taller than the text's x-height: 18 px at the default
+/// 14 px font (Twitch's own badge size), growing and shrinking with the font.
+fn badge_size(font_size: Pixels) -> f32 {
+    (font_size.as_f32() * 1.3).round().clamp(12.0, 36.0)
+}
+
 pub struct ChatView {
     store: Entity<ChannelStore>,
     list: ListState,
@@ -74,6 +81,11 @@ pub struct ChatView {
     /// How far into the image store's layout change log this view has applied
     /// ([`Images::layout_version`]); `None` before the first render.
     image_version: Option<u64>,
+    /// The badge registry's version for this channel at the last render
+    /// ([`gpui_chat_emotes::BadgeRegistry::version`]); `None` before the first render. A change
+    /// means badge definitions arrived (a channel's subscriber badges, a few hundred ms after it
+    /// was joined): messages already laid out may now resolve more badges.
+    badge_version: Option<u64>,
     /// Sequence number of the first message that arrived while not following. The pill counts
     /// from there to the newest message, skipping any the scrollback cap already evicted, so it
     /// never claims more new messages than the list still holds.
@@ -103,6 +115,8 @@ impl ChatView {
             cx.observe(&config::store(cx), |_, _, cx| cx.notify()),
             cx.observe_global::<FontConfig>(|_, cx| cx.notify()),
             cx.observe_global::<Tokens>(|_, cx| cx.notify()),
+            // Loaders store badge sets off the UI thread; this is how a view hears about it.
+            cx.observe_global::<Badges>(|_, cx| cx.notify()),
         ];
         Self {
             store,
@@ -112,6 +126,7 @@ impl ChatView {
             text_config: None,
             generation: 0,
             image_version: None,
+            badge_version: None,
             unseen_from: None,
             pill_shown: false,
             line_height: px(0.0),
@@ -229,6 +244,24 @@ impl ChatView {
         }
     }
 
+    /// Lays every message out again if badge definitions for this channel arrived since the last
+    /// render. (Only the rows on screen are shaped again, lazily; and a registry that did not
+    /// change for this channel costs one lock-free-ish read.)
+    fn apply_badge_changes(&mut self, cx: &Context<Self>) {
+        let Some(badges) = cx.try_global::<Badges>() else {
+            return;
+        };
+        let version = badges.registry().version(self.store.read(cx).channel());
+        let Some(seen) = self.badge_version.replace(version) else {
+            return;
+        };
+        if seen != version {
+            self.generation += 1;
+            self.list.remeasure();
+            self.cache.borrow_mut().retain_key(self.generation);
+        }
+    }
+
     /// Asks the list to measure the rows of the messages `seqs` again.
     fn remeasure_seqs(&self, seqs: &[u64]) {
         let first = self.mirror.first_seq();
@@ -271,6 +304,7 @@ impl Render for ChatView {
         let tokens = *cx.global::<Tokens>();
         let config = self.update_text_config(cx);
         self.apply_image_changes(cx);
+        self.apply_badge_changes(cx);
         // What the rows painted last frame is what is on screen: pin it, let older pins go and
         // release the textures of evicted images nothing shows any more.
         self.images.borrow_mut().begin_frame();
@@ -302,6 +336,10 @@ impl Render for ChatView {
                 clock,
                 light: config.light,
             },
+            badges: BadgeStyle {
+                size: badge_size(config.size),
+            },
+            channel: self.store.read(cx).channel().clone(),
             images: self.images.clone(),
             hover: self.hover.clone(),
         });
@@ -777,5 +815,47 @@ mod tests {
         assert_eq!((before, after), (px(20.0), px(35.0)));
         assert!(h.view.read_with(cx, |v, _| v.cache_stats().shaped) > shaped);
         assert_eq!(h.view.read_with(cx, |v, _| v.generation), 1);
+    }
+    #[gpui_kit::test]
+    fn badge_definitions_arriving_for_this_channel_lay_messages_out_again(cx: &mut TestAppContext) {
+        use gpui_chat_core::{Badge, BadgeId, ImageUrls};
+        use gpui_chat_emotes::BadgeSet;
+
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(3, "hello", cx);
+        cx.update(|_, cx| Badges::install(cx));
+        // The first render with a registry only notes its version.
+        h.push(1, "again", cx);
+        let generation =
+            |h: &Harness, cx: &mut VisualTestContext| h.view.read_with(cx, |v, _| v.generation);
+        assert_eq!(generation(&h, cx), 0);
+
+        let (registry, changed) = cx.update(|_, cx| {
+            let badges = cx.global::<Badges>();
+            (badges.registry().clone(), badges.changed_handle())
+        });
+        let set = |title: &str| {
+            let mut set = BadgeSet::new();
+            set.insert(Badge {
+                id: BadgeId::new("subscriber", "42"),
+                title: title.to_owned(),
+                urls: ImageUrls::new(),
+            });
+            set
+        };
+        // Another channel's badges are none of this view's business: it renders, shapes nothing.
+        let shaped = h.view.read_with(cx, |v, _| v.cache_stats().shaped);
+        registry.store_channel(&ChannelId::new("elsewhere"), set("Other"));
+        changed.notify_one();
+        cx.run_until_parked();
+        assert_eq!(generation(&h, cx), 0);
+        assert_eq!(h.view.read_with(cx, |v, _| v.cache_stats().shaped), shaped);
+
+        // This channel's arrive (a moment after the join): everything is shaped again.
+        registry.store_channel(&ChannelId::new("test"), set("Mine"));
+        changed.notify_one();
+        cx.run_until_parked();
+        assert_eq!(generation(&h, cx), 1);
+        assert!(h.view.read_with(cx, |v, _| v.cache_stats().shaped) > shaped);
     }
 }

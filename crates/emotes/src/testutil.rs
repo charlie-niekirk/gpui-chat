@@ -13,6 +13,14 @@ pub(crate) fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
 }
 
+/// Reads `fixtures/badges/<name>` at the repo root.
+pub(crate) fn badge_fixture(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/badges")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
+}
+
 /// What the fake answers for a URL.
 #[derive(Clone)]
 pub(crate) enum Reply {
@@ -37,6 +45,11 @@ impl FakeHttp {
     pub(crate) fn json(mut self, url: &str, fixture_name: &str) -> Self {
         self.replies
             .insert(url.to_owned(), Reply::Ok(200, fixture(fixture_name)));
+        self
+    }
+
+    pub(crate) fn body(mut self, url: &str, status: u16, body: Vec<u8>) -> Self {
+        self.replies.insert(url.to_owned(), Reply::Ok(status, body));
         self
     }
 

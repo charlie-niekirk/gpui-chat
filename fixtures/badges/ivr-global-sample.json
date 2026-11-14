@@ -1,0 +1,172 @@
+[
+ {
+  "set_id": "bits",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/73b5c3fb-24f9-4a82-a852-2f475b59411c/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/73b5c3fb-24f9-4a82-a852-2f475b59411c/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/73b5c3fb-24f9-4a82-a852-2f475b59411c/3",
+    "title": "cheer 1",
+    "description": " ",
+    "click_action": "visit_url",
+    "click_url": "https://bits.twitch.tv"
+   },
+   {
+    "id": "100",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/09d93036-e7ce-431c-9a9e-7044297133f2/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/09d93036-e7ce-431c-9a9e-7044297133f2/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/09d93036-e7ce-431c-9a9e-7044297133f2/3",
+    "title": "cheer 100",
+    "description": " ",
+    "click_action": "visit_url",
+    "click_url": "https://bits.twitch.tv"
+   },
+   {
+    "id": "1000",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/0d85a29e-79ad-4c63-a285-3acd2c66f2ba/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/0d85a29e-79ad-4c63-a285-3acd2c66f2ba/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/0d85a29e-79ad-4c63-a285-3acd2c66f2ba/3",
+    "title": "cheer 1000",
+    "description": " ",
+    "click_action": "visit_url",
+    "click_url": "https://bits.twitch.tv"
+   }
+  ]
+ },
+ {
+  "set_id": "broadcaster",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/5527c58c-fb7d-422d-b71b-f309dcb85cc1/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/5527c58c-fb7d-422d-b71b-f309dcb85cc1/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/5527c58c-fb7d-422d-b71b-f309dcb85cc1/3",
+    "title": "Broadcaster",
+    "description": "Broadcaster",
+    "click_action": null,
+    "click_url": null
+   }
+  ]
+ },
+ {
+  "set_id": "moderator",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/3267646d-33f0-4b17-b3df-f923a41db1d0/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/3267646d-33f0-4b17-b3df-f923a41db1d0/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/3267646d-33f0-4b17-b3df-f923a41db1d0/3",
+    "title": "Moderator",
+    "description": "Moderator",
+    "click_action": null,
+    "click_url": null
+   }
+  ]
+ },
+ {
+  "set_id": "premium",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/bbbe0db0-a598-423e-86d0-f9fb98ca1933/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/bbbe0db0-a598-423e-86d0-f9fb98ca1933/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/bbbe0db0-a598-423e-86d0-f9fb98ca1933/3",
+    "title": "Prime Gaming",
+    "description": "Prime Gaming",
+    "click_action": "visit_url",
+    "click_url": "https://gaming.amazon.com"
+   }
+  ]
+ },
+ {
+  "set_id": "subscriber",
+  "versions": [
+   {
+    "id": "0",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    "title": "Subscriber",
+    "description": "Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    "title": "Subscriber",
+    "description": "Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "2",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/25a03e36-2bb2-4625-bd37-d6d9d406238d/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/25a03e36-2bb2-4625-bd37-d6d9d406238d/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/25a03e36-2bb2-4625-bd37-d6d9d406238d/3",
+    "title": "2-Month Subscriber",
+    "description": "2-Month Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "3",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/e8984705-d091-4e54-8241-e53b30a84b0e/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/e8984705-d091-4e54-8241-e53b30a84b0e/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/e8984705-d091-4e54-8241-e53b30a84b0e/3",
+    "title": "3-Month Subscriber",
+    "description": "3-Month Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "4",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/2d2485f6-d19b-4daa-8393-9493b019156b/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/2d2485f6-d19b-4daa-8393-9493b019156b/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/2d2485f6-d19b-4daa-8393-9493b019156b/3",
+    "title": "6-Month Subscriber",
+    "description": "6-Month Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "5",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/b4e6b13a-a76f-4c56-87e1-9375a7aaa610/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/b4e6b13a-a76f-4c56-87e1-9375a7aaa610/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/b4e6b13a-a76f-4c56-87e1-9375a7aaa610/3",
+    "title": "9-Month Subscriber",
+    "description": "9-Month Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "6",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/ed51a614-2c44-4a60-80b6-62908436b43a/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/ed51a614-2c44-4a60-80b6-62908436b43a/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/ed51a614-2c44-4a60-80b6-62908436b43a/3",
+    "title": "6-Month Subscriber",
+    "description": "1-Year Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   }
+  ]
+ },
+ {
+  "set_id": "vip",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/b817aba4-fad8-49e2-b88a-7cc744dfa6ec/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/b817aba4-fad8-49e2-b88a-7cc744dfa6ec/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/b817aba4-fad8-49e2-b88a-7cc744dfa6ec/3",
+    "title": "VIP",
+    "description": "VIP",
+    "click_action": "visit_url",
+    "click_url": "https://help.twitch.tv/customer/en/portal/articles/659115-twitch-chat-badges-guide"
+   }
+  ]
+ }
+]

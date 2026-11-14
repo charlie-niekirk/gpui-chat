@@ -1,11 +1,11 @@
-//! Emote hover tooltips: a larger preview, the emote's name and its provider. A zero-width stack
-//! lists every emote in it side by side, base first.
+//! Emote and badge hover tooltips: a larger preview, the emote's name and its provider (a badge's
+//! title and "Twitch badge"). A zero-width stack lists every emote in it side by side, base first.
 //!
 //! GPUI's own tooltip machinery (`div().tooltip(..)`) hangs off a stateful element's hitbox and
 //! is crate-private, while emotes are regions inside one [`super::element::MessageElement`]. So
 //! the chat view keeps one [`EmoteHover`] shared with its elements:
 //!
-//! * each message with emotes inserts a non-blocking hitbox (scroll wheel events still reach the
+//! * each message with emotes or badges inserts a non-blocking hitbox (scroll wheel events still reach the
 //!   list) and, on mouse move, tells the hover which of its emotes is under the pointer;
 //! * after [`SHOW_DELAY`] over the same emote the tooltip view is built and the view re-renders;
 //!   the message that owns the emote then requests it with `Window::set_tooltip` in its
@@ -16,16 +16,15 @@
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_chat_core::Emote;
 use gpui_chat_media::ImageKey;
 use gpui_kit::{
     AnyTooltip, AnyView, App, AppContext as _, Bounds, Context, Corners, EntityId, FontWeight,
     IntoElement, ParentElement, Pixels, Point, Render, Styled, Task, Window, canvas, div, fill, px,
 };
 
+use super::layout::InlineContent;
 use crate::fonts::FontConfig;
 use crate::images::{FrameImages, Images, Lookup};
 use crate::theme::Tokens;
@@ -106,14 +105,14 @@ impl EmoteHover {
     pub fn hover(
         this: &Rc<RefCell<Self>>,
         seq: u64,
-        over: Option<(u32, Vec<Arc<Emote>>)>,
+        over: Option<(u32, InlineContent)>,
         view: EntityId,
         window: &mut Window,
         cx: &mut App,
     ) {
         let mut hover = this.borrow_mut();
         match over {
-            Some((atom, emotes)) => {
+            Some((atom, content)) => {
                 let target = Target { seq, atom };
                 if hover.target == Some(target) {
                     return;
@@ -123,7 +122,7 @@ impl EmoteHover {
                 hover._show = Some(Self::show_later(
                     Rc::downgrade(this),
                     target,
-                    emotes,
+                    content,
                     view,
                     window,
                     cx,
@@ -155,7 +154,7 @@ impl EmoteHover {
     fn show_later(
         this: Weak<RefCell<Self>>,
         target: Target,
-        emotes: Vec<Arc<Emote>>,
+        content: InlineContent,
         view: EntityId,
         window: &Window,
         cx: &App,
@@ -170,7 +169,7 @@ impl EmoteHover {
                 if this.borrow().target != Some(target) {
                     return;
                 }
-                let tooltip = cx.new(|_| EmoteTooltip::new(emotes));
+                let tooltip = cx.new(|_| EmoteTooltip::new(content));
                 this.borrow_mut().shown = Some((tooltip.into(), window.mouse_position()));
                 cx.notify(view);
             });
@@ -178,18 +177,72 @@ impl EmoteHover {
     }
 }
 
+/// One column of the tooltip: preview, bold name and a muted line under it.
+struct Column {
+    preview: Option<(ImageKey, (f32, f32))>,
+    name: String,
+    kind: String,
+}
+
 /// The tooltip view: for each emote of the box (one, or a zero-width stack), preview, name and
-/// provider.
+/// provider; for a badge, preview, title and "Twitch badge".
 pub struct EmoteTooltip {
-    emotes: Vec<Arc<Emote>>,
+    content: InlineContent,
     frame: Rc<RefCell<FrameImages>>,
 }
 
 impl EmoteTooltip {
-    pub fn new(emotes: Vec<Arc<Emote>>) -> Self {
+    pub fn new(content: InlineContent) -> Self {
         Self {
-            emotes,
+            content,
             frame: Rc::default(),
+        }
+    }
+
+    fn columns(&self, scale: f32, light: bool, cx: &mut Context<Self>) -> Vec<Column> {
+        let has_images = cx.try_global::<Images>().is_some();
+        match &self.content {
+            InlineContent::Emotes(emotes) => {
+                // A stack's columns are narrow: "7TV · zero-width", not "7TV emote · zero-width".
+                let noun = if emotes.len() > 1 { "" } else { " emote" };
+                emotes
+                    .iter()
+                    .map(|emote| {
+                        let preview = has_images
+                            .then(|| cx.global_mut::<Images>().preview(emote, scale, light))
+                            .flatten();
+                        let animated = preview.as_ref().is_some_and(|(url, _)| {
+                            cx.try_global::<Images>()
+                                .is_some_and(|images| images.is_animated(url))
+                        });
+                        let kind = format!(
+                            "{}{noun}{}{}",
+                            emote.provider.name(),
+                            if emote.zero_width {
+                                " · zero-width"
+                            } else {
+                                ""
+                            },
+                            if animated { " · animated" } else { "" }
+                        );
+                        Column {
+                            preview,
+                            name: emote.name.to_string(),
+                            kind,
+                        }
+                    })
+                    .collect()
+            }
+            InlineContent::Badge(badge) => {
+                let preview = has_images
+                    .then(|| cx.global_mut::<Images>().badge_preview(badge, scale))
+                    .flatten();
+                vec![Column {
+                    preview,
+                    name: badge.title.clone(),
+                    kind: "Twitch badge".to_owned(),
+                }]
+            }
         }
     }
 }
@@ -203,58 +256,44 @@ impl Render for EmoteTooltip {
         Images::sweep(window, cx);
         let entity = cx.entity_id();
         let placeholder = tokens.text_muted.opacity(0.15);
-        // A stack's columns are narrow: "7TV · zero-width", not "7TV emote · zero-width".
-        let noun = if self.emotes.len() > 1 { "" } else { " emote" };
         let layers: Vec<_> = self
-            .emotes
-            .iter()
-            .map(|emote| {
-                let preview: Option<(ImageKey, (f32, f32))> = cx
-                    .try_global::<Images>()
-                    .is_some()
-                    .then(|| {
-                        cx.global_mut::<Images>()
-                            .preview(emote, window.scale_factor(), light)
-                    })
-                    .flatten();
-                let animated = preview.as_ref().is_some_and(|(url, _)| {
-                    cx.try_global::<Images>()
-                        .is_some_and(|images| images.is_animated(url))
-                });
-                let frame = self.frame.clone();
-                let preview = preview.map(|(url, (w, h))| {
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds: Bounds<Pixels>, (), window, cx| {
-                            paint_preview(&url, bounds, &frame, entity, placeholder, window, cx);
-                        },
-                    )
-                    .w(px(w))
-                    .h(px(h))
-                });
-                let kind = format!(
-                    "{}{noun}{}{}",
-                    emote.provider.name(),
-                    if emote.zero_width {
-                        " · zero-width"
-                    } else {
-                        ""
-                    },
-                    if animated { " · animated" } else { "" }
-                );
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .children(preview)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .child(emote.name.to_string()),
-                    )
-                    .child(div().text_xs().text_color(tokens.text_muted).child(kind))
-            })
+            .columns(window.scale_factor(), light, cx)
+            .into_iter()
+            .map(
+                |Column {
+                     preview,
+                     name,
+                     kind,
+                 }| {
+                    let frame = self.frame.clone();
+                    let preview = preview.map(|(url, (w, h))| {
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds: Bounds<Pixels>, (), window, cx| {
+                                paint_preview(
+                                    &url,
+                                    bounds,
+                                    &frame,
+                                    entity,
+                                    placeholder,
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )
+                        .w(px(w))
+                        .h(px(h))
+                    });
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .children(preview)
+                        .child(div().font_weight(FontWeight::BOLD).child(name))
+                        .child(div().text_xs().text_color(tokens.text_muted).child(kind))
+                },
+            )
             .collect();
         div()
             .flex()
