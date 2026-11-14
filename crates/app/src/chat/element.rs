@@ -10,15 +10,17 @@
 //! **Lines.** Each flowed line is as tall as the text line height or its tallest emote; text and
 //! emotes are centred vertically in it. **Emotes** are boxes of their final size from the moment
 //! the message is shaped: a faint placeholder while the image loads, then the image at the frame
-//! the global animation clock selects (greyscale in a deleted message). Hovering one shows a
-//! tooltip ([`super::tooltip`]).
+//! the global animation clock selects (greyscale in a deleted message). **Zero-width stacks**
+//! (7TV overlays) share one box, as wide and tall as the widest and tallest layer; each layer
+//! is drawn centred in it, the base first and the overlays on top. Hovering a box shows a
+//! tooltip listing every emote in it ([`super::tooltip`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_chat_core::{Emote, Message};
+use gpui_chat_core::Message;
 use gpui_kit::{
     App, AvailableSpace, Bounds, Corners, Element, ElementId, Font, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseExitEvent,
@@ -27,7 +29,7 @@ use gpui_kit::{
 };
 
 use super::colors;
-use super::display::{self, DisplayOptions, Role};
+use super::display::{self, DisplayEmote, DisplayOptions, Role};
 use super::flow::{AtomKind, Flow};
 use super::layout::{LayoutCache, LayoutKey, MessageLayout, ShapedMessage};
 use super::tooltip::{EmoteHover, Target};
@@ -136,7 +138,7 @@ impl MessageElement {
 /// Decides each emote's box (starting its image load). Without an image store every emote is
 /// text.
 fn emote_boxes(
-    emotes: &[(usize, Arc<Emote>)],
+    emotes: &[DisplayEmote],
     style: &MessageStyle,
     window: &Window,
     cx: &mut App,
@@ -148,7 +150,7 @@ fn emote_boxes(
     let scale = window.scale_factor();
     emotes
         .iter()
-        .map(|(_, emote)| images.emote_box(emote, scale, style.emotes.scale, style.emotes.light))
+        .map(|entry| images.emote_box(&entry.emote, scale, style.emotes.scale, style.emotes.light))
         .collect()
 }
 
@@ -211,6 +213,18 @@ fn inline_rect(flow: &Flow, shaped: &ShapedMessage, atom: usize) -> Bounds<Pixel
     )
 }
 
+/// `size` centred in `outer`.
+fn centred(outer: Bounds<Pixels>, size_: (f32, f32)) -> Bounds<Pixels> {
+    let (w, h) = (px(size_.0), px(size_.1));
+    Bounds::new(
+        point(
+            outer.origin.x + (outer.size.width - w) / 2.0,
+            outer.origin.y + (outer.size.height - h) / 2.0,
+        ),
+        size(w, h),
+    )
+}
+
 /// What prepaint hands to paint.
 pub struct Prepainted {
     layout: MessageLayout,
@@ -240,38 +254,46 @@ impl MessageElement {
         for inline in &shaped.inlines {
             let rect = inline_rect(flow, shaped, inline.atom as usize);
             let rect = Bounds::new(origin + rect.origin, rect.size);
-            regions.push((rect, inline.atom, inline.emote.clone()));
-            match cx
-                .global_mut::<Images>()
-                .lookup(&inline.url, &mut frame, view)
-            {
-                Lookup::Ready(image) if image.is_drawable() => {
-                    let (index, next) = image.frame(style.emotes.clock);
-                    if let Some(next) = next {
-                        frame.animate_in(next);
+            regions.push((rect, inline.atom, inline.emotes.clone()));
+            // Base first, overlays on top, each centred in the stack's box.
+            for (n, layer) in inline.layers.iter().enumerate() {
+                let layer_rect = centred(rect, layer.size);
+                match cx
+                    .global_mut::<Images>()
+                    .lookup(&layer.url, &mut frame, view)
+                {
+                    Lookup::Ready(image) if image.is_drawable() => {
+                        let (index, next) = image.frame(style.emotes.clock);
+                        if let Some(next) = next {
+                            frame.animate_in(next);
+                        }
+                        let result = window.paint_image(
+                            layer_rect,
+                            layer_rect,
+                            Corners::default(),
+                            image.render_image().clone(),
+                            index,
+                            grayscale,
+                        );
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "failed to paint an emote");
+                        }
                     }
-                    let result = window.paint_image(
-                        rect,
-                        rect,
-                        Corners::default(),
-                        image.render_image().clone(),
-                        index,
-                        grayscale,
-                    );
-                    if let Err(error) = result {
-                        tracing::debug!(%error, "failed to paint an emote");
+                    // One placeholder per stack: the base's, an overlay still loading shows
+                    // nothing yet.
+                    Lookup::Loading | Lookup::Retrying => {
+                        if n == 0 {
+                            window.paint_quad(fill(layer_rect, placeholder).corner_radii(px(3.0)));
+                        }
                     }
-                }
-                Lookup::Loading | Lookup::Retrying => {
-                    window.paint_quad(fill(rect, placeholder).corner_radii(px(3.0)));
-                }
-                // Failed for good: the epoch moved, so the next render re-shapes it as text.
-                Lookup::Failed { relayout } => {
-                    if relayout {
-                        window.request_animation_frame();
+                    // Failed for good: its URL was logged, so the view re-shapes it as text.
+                    Lookup::Failed { relayout } => {
+                        if relayout {
+                            window.request_animation_frame();
+                        }
                     }
+                    Lookup::Ready(_) => {}
                 }
-                Lookup::Ready(_) => {}
             }
         }
         drop(frame);
@@ -292,7 +314,7 @@ impl MessageElement {
                     regions
                         .iter()
                         .find(|(rect, ..)| rect.contains(&event.position))
-                        .map(|(_, atom, emote)| (*atom, emote.clone()))
+                        .map(|(_, atom, emotes)| (*atom, emotes.clone()))
                 })
                 .flatten();
             EmoteHover::hover(&hover, seq, over, view, window, cx);

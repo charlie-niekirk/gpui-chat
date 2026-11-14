@@ -6,7 +6,8 @@ use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
     About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
-    RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
+    ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
+    ToggleSidebar,
 };
 
 #[cfg(target_os = "macos")]
@@ -50,6 +51,8 @@ fn channel_menu() -> Menu {
         MenuItem::separator(),
         MenuItem::action("Next Channel", SelectNextChannel),
         MenuItem::action("Previous Channel", SelectPreviousChannel),
+        MenuItem::separator(),
+        MenuItem::action("Reload Emotes", ReloadEmotes),
     ])
 }
 

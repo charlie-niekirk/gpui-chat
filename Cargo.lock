@@ -2325,6 +2325,7 @@ version = "0.0.0"
 dependencies = [
  "dirs 7.0.0",
  "gpui-chat-core",
+ "gpui-chat-emotes",
  "gpui-chat-media",
  "gpui-chat-settings",
  "gpui-chat-twitch",

@@ -23,7 +23,7 @@ pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef
 pub use store::{DEFAULT_CAPACITY, MessageStore};
 pub use tokenizer::{
     DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,
-    WordResolver, parse_emotes_tag, twitch_emote_ranges,
+    WordResolver, parse_emotes_tag, resolve_fragments, twitch_emote_ranges,
 };
 
 /// Name of this crate, used by the placeholder test below.

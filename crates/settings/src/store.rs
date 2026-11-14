@@ -252,6 +252,23 @@ mod tests {
     }
 
     #[test]
+    fn emote_provider_switches_default_on_and_old_files_still_load() {
+        // A file from before the switches existed: `[emotes]` without them.
+        let s =
+            Settings::parse("[emotes]\nscale = 1.5\nanimate = false\n", Path::new("x")).unwrap();
+        assert_eq!(s.emotes.scale, 1.5);
+        assert!(s.emotes.seventv && s.emotes.bttv && s.emotes.ffz);
+
+        let s =
+            Settings::parse("[emotes]\nseventv = false\nffz = false\n", Path::new("x")).unwrap();
+        assert!(!s.emotes.seventv && s.emotes.bttv && !s.emotes.ffz);
+        assert_eq!(s.emotes.scale, Settings::default().emotes.scale);
+        // And they survive a save.
+        let back = Settings::parse(&s.to_toml().unwrap(), Path::new("x")).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
     fn integers_are_accepted_for_float_fields() {
         let s = Settings::parse(
             "[appearance]\nfont_size = 14\nline_height = 2\n",

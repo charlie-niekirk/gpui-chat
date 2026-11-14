@@ -17,7 +17,8 @@ actions!(
         MoveChannelUp,
         MoveChannelDown,
         SelectNextChannel,
-        SelectPreviousChannel
+        SelectPreviousChannel,
+        ReloadEmotes
     ]
 );
 

@@ -1,4 +1,5 @@
-//! Emote hover tooltips: a larger preview, the emote's name and its provider.
+//! Emote hover tooltips: a larger preview, the emote's name and its provider. A zero-width stack
+//! lists every emote in it side by side, base first.
 //!
 //! GPUI's own tooltip machinery (`div().tooltip(..)`) hangs off a stateful element's hitbox and
 //! is crate-private, while emotes are regions inside one [`super::element::MessageElement`]. So
@@ -105,14 +106,14 @@ impl EmoteHover {
     pub fn hover(
         this: &Rc<RefCell<Self>>,
         seq: u64,
-        over: Option<(u32, Arc<Emote>)>,
+        over: Option<(u32, Vec<Arc<Emote>>)>,
         view: EntityId,
         window: &mut Window,
         cx: &mut App,
     ) {
         let mut hover = this.borrow_mut();
         match over {
-            Some((atom, emote)) => {
+            Some((atom, emotes)) => {
                 let target = Target { seq, atom };
                 if hover.target == Some(target) {
                     return;
@@ -122,7 +123,7 @@ impl EmoteHover {
                 hover._show = Some(Self::show_later(
                     Rc::downgrade(this),
                     target,
-                    emote,
+                    emotes,
                     view,
                     window,
                     cx,
@@ -154,7 +155,7 @@ impl EmoteHover {
     fn show_later(
         this: Weak<RefCell<Self>>,
         target: Target,
-        emote: Arc<Emote>,
+        emotes: Vec<Arc<Emote>>,
         view: EntityId,
         window: &Window,
         cx: &App,
@@ -169,7 +170,7 @@ impl EmoteHover {
                 if this.borrow().target != Some(target) {
                     return;
                 }
-                let tooltip = cx.new(|_| EmoteTooltip::new(emote));
+                let tooltip = cx.new(|_| EmoteTooltip::new(emotes));
                 this.borrow_mut().shown = Some((tooltip.into(), window.mouse_position()));
                 cx.notify(view);
             });
@@ -177,16 +178,17 @@ impl EmoteHover {
     }
 }
 
-/// The tooltip view: preview, name, provider.
+/// The tooltip view: for each emote of the box (one, or a zero-width stack), preview, name and
+/// provider.
 pub struct EmoteTooltip {
-    emote: Arc<Emote>,
+    emotes: Vec<Arc<Emote>>,
     frame: Rc<RefCell<FrameImages>>,
 }
 
 impl EmoteTooltip {
-    pub fn new(emote: Arc<Emote>) -> Self {
+    pub fn new(emotes: Vec<Arc<Emote>>) -> Self {
         Self {
-            emote,
+            emotes,
             frame: Rc::default(),
         }
     }
@@ -199,41 +201,66 @@ impl Render for EmoteTooltip {
         let light = tokens.main_bg.l > 0.5;
         self.frame.borrow_mut().begin_frame();
         Images::sweep(window, cx);
-        let preview: Option<(ImageKey, (f32, f32))> = cx
-            .try_global::<Images>()
-            .is_some()
-            .then(|| {
-                cx.global_mut::<Images>()
-                    .preview(&self.emote, window.scale_factor(), light)
-            })
-            .flatten();
-        let animated = preview.as_ref().is_some_and(|(url, _)| {
-            cx.try_global::<Images>()
-                .is_some_and(|images| images.is_animated(url))
-        });
         let entity = cx.entity_id();
-        let frame = self.frame.clone();
         let placeholder = tokens.text_muted.opacity(0.15);
-        let preview = preview.map(|(url, (w, h))| {
-            canvas(
-                |_, _, _| {},
-                move |bounds: Bounds<Pixels>, (), window, cx| {
-                    paint_preview(&url, bounds, &frame, entity, placeholder, window, cx);
-                },
-            )
-            .w(px(w))
-            .h(px(h))
-        });
-        let kind = format!(
-            "{} emote{}",
-            self.emote.provider.name(),
-            if animated { " · animated" } else { "" }
-        );
+        // A stack's columns are narrow: "7TV · zero-width", not "7TV emote · zero-width".
+        let noun = if self.emotes.len() > 1 { "" } else { " emote" };
+        let layers: Vec<_> = self
+            .emotes
+            .iter()
+            .map(|emote| {
+                let preview: Option<(ImageKey, (f32, f32))> = cx
+                    .try_global::<Images>()
+                    .is_some()
+                    .then(|| {
+                        cx.global_mut::<Images>()
+                            .preview(emote, window.scale_factor(), light)
+                    })
+                    .flatten();
+                let animated = preview.as_ref().is_some_and(|(url, _)| {
+                    cx.try_global::<Images>()
+                        .is_some_and(|images| images.is_animated(url))
+                });
+                let frame = self.frame.clone();
+                let preview = preview.map(|(url, (w, h))| {
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds: Bounds<Pixels>, (), window, cx| {
+                            paint_preview(&url, bounds, &frame, entity, placeholder, window, cx);
+                        },
+                    )
+                    .w(px(w))
+                    .h(px(h))
+                });
+                let kind = format!(
+                    "{}{noun}{}{}",
+                    emote.provider.name(),
+                    if emote.zero_width {
+                        " · zero-width"
+                    } else {
+                        ""
+                    },
+                    if animated { " · animated" } else { "" }
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .children(preview)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child(emote.name.to_string()),
+                    )
+                    .child(div().text_xs().text_color(tokens.text_muted).child(kind))
+            })
+            .collect();
         div()
             .flex()
-            .flex_col()
-            .items_center()
-            .gap_1()
+            .flex_row()
+            .items_start()
+            .gap_5()
             .p_2()
             .rounded_md()
             .border_1()
@@ -243,13 +270,7 @@ impl Render for EmoteTooltip {
             .font_family(family)
             .text_sm()
             .text_color(tokens.text)
-            .children(preview)
-            .child(
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .child(self.emote.name.to_string()),
-            )
-            .child(div().text_xs().text_color(tokens.text_muted).child(kind))
+            .children(layers)
     }
 }
 

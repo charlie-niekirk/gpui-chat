@@ -403,7 +403,7 @@ fn emote_at(url: &'static str) -> Emote {
 }
 
 #[gpui_kit::test]
-fn boxes_keep_their_size_and_the_epoch_moves_only_when_it_was_wrong(cx: &mut TestAppContext) {
+fn boxes_keep_their_size_and_only_wrong_ones_are_logged_by_url(cx: &mut TestAppContext) {
     let h = Harness::new(
         &[("ok", "static.png"), ("big", "animated-112.gif")],
         1 << 30,
@@ -415,7 +415,12 @@ fn boxes_keep_their_size_and_the_epoch_moves_only_when_it_was_wrong(cx: &mut Tes
                 .emote_box(&emote_at(url), 1.0, 1.0, false)
         })
     };
-    let epoch = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().epoch());
+    let version = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().layout_version());
+    let changes = |since: u64, cx: &mut TestAppContext| {
+        cx.read(|cx| cx.global::<Images>().changes_since(since))
+    };
+    let urls =
+        |names: &[&str]| LayoutChanges::Urls(names.iter().map(|n| ImageKey::new(*n)).collect());
 
     // Unknown size before loading: Twitch's 28 px square.
     let placeholder = EmoteBox::Image {
@@ -424,13 +429,16 @@ fn boxes_keep_their_size_and_the_epoch_moves_only_when_it_was_wrong(cx: &mut Tes
     };
     assert_eq!(boxed("ok", cx), placeholder);
     h.load("ok", cx);
-    assert_eq!(epoch(cx), 0, "28 px as assumed: nothing to re-shape");
+    assert_eq!(version(cx), 0, "28 px as assumed: nothing to re-shape");
+    assert_eq!(changes(0, cx), LayoutChanges::None);
     assert_eq!(boxed("ok", cx), placeholder);
 
     // A 112 px image laid out as 28 px: re-shape, and from now on it is 112 px.
     boxed("big", cx);
     h.load("big", cx);
-    assert_eq!(epoch(cx), 1);
+    assert_eq!(version(cx), 1);
+    // Only that URL: "ok" (right as assumed) is not named, so its messages are left alone.
+    assert_eq!(changes(0, cx), urls(&["big"]));
     assert_eq!(
         boxed("big", cx),
         EmoteBox::Image {
@@ -442,7 +450,11 @@ fn boxes_keep_their_size_and_the_epoch_moves_only_when_it_was_wrong(cx: &mut Tes
     // A 404 falls back to text.
     boxed("missing", cx);
     h.load("missing", cx);
-    assert_eq!(epoch(cx), 2);
+    assert_eq!(version(cx), 2);
+    assert_eq!(changes(0, cx), urls(&["big", "missing"]));
+    // A view that already saw "big" is told about "missing" only.
+    assert_eq!(changes(1, cx), urls(&["missing"]));
+    assert_eq!(changes(2, cx), LayoutChanges::None);
     assert_eq!(boxed("missing", cx), EmoteBox::Text);
     // An emote without URLs is text from the start.
     let none = Emote {
@@ -520,7 +532,7 @@ fn a_transient_failure_keeps_the_placeholder_and_is_retried(cx: &mut TestAppCont
     };
     assert_eq!(boxed(cx), placeholder);
     h.load("flaky", cx);
-    let epoch = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().epoch());
+    let epoch = |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Images>().layout_version());
     assert_eq!(epoch(cx), 0, "a 503 does not re-shape");
     assert_eq!(boxed(cx), placeholder, "still a placeholder, not text");
 
@@ -550,7 +562,7 @@ fn an_evicted_image_that_fails_to_reload_becomes_text(cx: &mut TestAppContext) {
     h.load("gone", cx);
     // Shaped while ready: an image box from the image itself (no load expected any more).
     assert!(matches!(boxed(cx), EmoteBox::Image { .. }));
-    let epoch = cx.read(|cx| cx.global::<Images>().epoch());
+    let epoch = cx.read(|cx| cx.global::<Images>().layout_version());
 
     // Evicted while off screen, and the CDN now answers 404.
     h.cache(cx).clear_memory();
@@ -560,13 +572,47 @@ fn an_evicted_image_that_fails_to_reload_becomes_text(cx: &mut TestAppContext) {
     h.load("gone", cx);
     w.redraw(cx);
     assert_eq!(w.drawn(), 0);
-    let after = cx.read(|cx| cx.global::<Images>().epoch());
+    let after = cx.read(|cx| cx.global::<Images>().layout_version());
     assert_eq!(after, epoch + 1, "the box is re-laid out once");
     w.redraw(cx);
     assert_eq!(
-        cx.read(|cx| cx.global::<Images>().epoch()),
+        cx.read(|cx| cx.global::<Images>().layout_version()),
         after,
         "not on every frame"
     );
     assert_eq!(boxed(cx), EmoteBox::Text);
+}
+
+#[test]
+fn the_change_log_names_urls_once_and_gives_up_when_a_view_is_too_far_behind() {
+    let mut log = ChangeLog::default();
+    assert_eq!(log.since(0), LayoutChanges::None);
+    for url in ["a", "b", "a", "c"] {
+        log.push(&ImageKey::new(url));
+    }
+    let keys =
+        |names: &[&str]| LayoutChanges::Urls(names.iter().map(|n| ImageKey::new(*n)).collect());
+    // Repeats are listed once.
+    assert_eq!(log.since(0), keys(&["a", "b", "c"]));
+    assert_eq!(log.since(2), keys(&["a", "c"]));
+    assert_eq!(log.since(4), LayoutChanges::None);
+    // A view cannot be ahead of the log (a fresh app with an older view is a no-op, not a panic).
+    assert_eq!(log.since(99), LayoutChanges::None);
+
+    // Past the capacity the oldest entries go; whoever still needed them re-shapes everything.
+    for n in 0..CHANGE_LOG_CAPACITY {
+        log.push(&ImageKey::new(format!("u{n}")));
+    }
+    assert_eq!(log.entries.len(), CHANGE_LOG_CAPACITY);
+    assert_eq!(log.since(0), LayoutChanges::Everything);
+    assert_eq!(log.since(3), LayoutChanges::Everything, "entry 4 is gone");
+    // A view that saw all but the newest two entries is still served exactly.
+    let caught_up = log.version - 2;
+    assert_eq!(
+        log.since(caught_up),
+        keys(&[
+            &format!("u{}", CHANGE_LOG_CAPACITY - 2),
+            &format!("u{}", CHANGE_LOG_CAPACITY - 1)
+        ])
+    );
 }

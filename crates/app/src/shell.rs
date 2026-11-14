@@ -24,14 +24,16 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, RemoveChannel,
-    SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
+    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, ReloadEmotes,
+    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
+    ToggleSidebar,
 };
 use crate::add_channel;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
+use crate::emote_service;
 use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
 use crate::live::LiveSource;
@@ -151,9 +153,14 @@ impl AppShell {
             // size and theme are pushed into the global font config and Kit theme, which
             // refreshes every window, but only when the appearance section actually changed;
             // the notify re-renders the banner.
-            cx.observe_in(&config::store(cx), window, |_, store, window, cx| {
-                let appearance = store.read(cx).settings().appearance.clone();
+            cx.observe_in(&config::store(cx), window, |this, store, window, cx| {
+                let settings = store.read(cx).settings();
+                let (appearance, emotes) = (settings.appearance.clone(), settings.emotes.clone());
                 theme::apply_settings_if_changed(&appearance, Some(window), cx);
+                // The provider switches are idempotent: nothing happens unless one changed.
+                if let Some(live) = &this.live {
+                    live.set_emote_providers(emote_service::providers(&emotes));
+                }
                 cx.notify();
             }),
             cx.observe_window_bounds(window, |this, window, cx| {
@@ -545,6 +552,11 @@ impl Render for AppShell {
             }))
             .on_action(cx.listener(|this, _: &SelectPreviousChannel, _, cx| {
                 this.select_neighbour(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReloadEmotes, _, _| {
+                if let Some(live) = &this.live {
+                    live.reload_emotes();
+                }
             }))
             .size_full()
             .bg(tokens.window_bg)

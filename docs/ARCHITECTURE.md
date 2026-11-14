@@ -103,6 +103,12 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   grapheme atoms, per-message layout cache), `colors` (fallback and readability-adjusted username
   colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
   (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
+- `emote_service.rs` (PR 2.4) — `EmoteService`: the live source's third-party emotes. The global BTTV /
+  FFZ / 7TV sets load at startup, a channel's when its ROOMSTATE supplies the room id (once per id).
+  Every event passes `process` on the way to the bridge (on the backend thread): chat messages get
+  their text runs re-scanned with the channel's `EmoteResolver`. `Reload Emotes` (Channel menu)
+  refetches everything; `emotes.seventv` / `bttv` / `ffz` switch providers live (a provider that is
+  off is not requested; turning one on reloads). `--firehose` / `--replay` have none: no network.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -185,7 +191,10 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
 - **Emote resolution:** Twitch emotes come from IRC tag ranges (ranges count
   Unicode code points, not bytes). Remaining words are looked up: channel 7TV →
   channel BTTV → channel FFZ → global 7TV → global BTTV → global FFZ. Zero-width
-  emotes stack on the preceding emote.
+  emotes stack on the preceding emote. IRC lines are tokenized (in `crates/twitch`) before a
+  channel's sets are known, so the app resolves third-party emotes in a second pass
+  (`core::resolve_fragments`, called by `EmoteService`), on whole words only, with the same
+  stacking rules as the tokenizer. Messages shown before the sets arrive keep plain text.
 - **Emote providers (`emotes` crate):** `EmoteLoader::load_global()` / `load_channel(twitch_user_id)`
   query 7TV, BTTV and FFZ concurrently and return one `Result<EmoteSet, EmoteError>` per
   provider (`ProviderResults`, iterated in precedence order 7TV → BTTV → FFZ); a failing provider
@@ -250,10 +259,18 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   so a placeholder box holds the space while loading and lines never jump. Each flowed line is as
   tall as its tallest emote; text and emotes are centred in it. The variant is picked by
   `scale::select(display scale, emotes.scale)`; Twitch URLs switch to `light` on light themes.
-  An image that fails for good (404/410, undecodable) falls back to the emote name as text (the
-  store's epoch moves and views re-shape); a transient failure (timeout, 5xx) keeps the
-  placeholder and is retried. Hovering an emote shows a tooltip (1:1 preview of the densest variant, name,
-  provider, "animated") via `Window::set_tooltip` from the message's prepaint; its hitbox is
+  An image that fails for good (404/410, undecodable) falls back to the emote name as text, and one
+  that finishes at another size than its placeholder (BTTV often omits sizes) gets a new box: either
+  way the image store appends its URL to a bounded change log (`Images::changes_since`), and each view
+  drops only the cached layouts that draw that URL and remeasures only those rows
+  (`LayoutCache::invalidate_urls`, `ListState::remeasure_items`); a view that fell further behind than
+  the log reaches re-shapes everything. A transient failure (timeout, 5xx) keeps the
+  placeholder and is retried.
+  **Zero-width stacks** (7TV overlays) are one inline atom covering the base's name, each overlay's
+  name and the spaces between; the box is as wide and tall as the biggest layer, layers without an
+  image are left out (a stack with none stays text) and the painter draws each layer centred in the
+  box, base first. Hovering an emote shows a tooltip (1:1 preview of the densest variant, name,
+  provider, "animated"; one column per emote of a stack, base first) via `Window::set_tooltip` from the message's prepaint; its hitbox is
   non-blocking so wheel events still reach the list. GPUI re-checks it every frame against the
   pointer and the emote's current box, so it hides when rows move under a still pointer;
   leaving the window hides it via `MouseExitEvent`.

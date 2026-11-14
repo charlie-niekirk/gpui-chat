@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-chat-core = { workspace = true }
+gpui-chat-emotes = { workspace = true }
 gpui-chat-media = { workspace = true }
 gpui-chat-settings = { workspace = true }
 gpui-chat-twitch = { workspace = true }

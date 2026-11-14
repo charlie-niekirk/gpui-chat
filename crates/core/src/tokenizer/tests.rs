@@ -684,3 +684,72 @@ fn arbitrary_unicode_does_not_panic() {
         let _ = t.tokenize(s, &[range("X", 0, 0), range("Y", 0, 99)]);
     }
 }
+
+#[test]
+fn resolving_fragments_matches_tokenizing_with_a_resolver() {
+    let known = resolver(&["RainbowPuke"], &["monkaS", "Kappa"]);
+    for s in [
+        "hello monkaS world",
+        "monkaS",
+        "monkaS RainbowPuke",
+        "monkaS    RainbowPuke   RainbowPuke done",
+        "RainbowPuke alone",
+        "text RainbowPuke monkaS RainbowPuke",
+        "a  monkaS\tb\nmonkaS",
+        "monkaS, monkaS! (monkaS)",
+        "no emotes here",
+        "",
+    ] {
+        let plain = Tokenizer::new().tokenize(s, &[]).fragments;
+        let wanted = Tokenizer::new()
+            .with_resolver(&known)
+            .tokenize(s, &[])
+            .fragments;
+        let got = resolve_fragments(&plain, &known).unwrap_or_else(|| plain.clone());
+        assert_eq!(shape(&got), shape(&wanted), "{s:?}");
+    }
+}
+
+#[test]
+fn resolving_fragments_returns_none_when_nothing_matches() {
+    let known = resolver(&[], &["monkaS"]);
+    let plain = tok("hi there @bob https://x.com 😀 monkaSS");
+    assert!(resolve_fragments(&plain, &known).is_none());
+    assert!(resolve_fragments(&[], &known).is_none());
+}
+
+#[test]
+fn zero_width_stacks_onto_a_twitch_emote_from_the_tag() {
+    let known = resolver(&["RainbowPuke"], &[]);
+    let kappa = Arc::new(Emote::twitch("25", "Kappa"));
+    let ranges = [EmoteRange {
+        emote: kappa,
+        start: 0,
+        end: 4,
+    }];
+    let plain = Tokenizer::new()
+        .tokenize("Kappa RainbowPuke", &ranges)
+        .fragments;
+    let got = resolve_fragments(&plain, &known).expect("matched");
+    assert_eq!(shape(&got), ["E:Kappa+RainbowPuke"]);
+}
+
+#[test]
+fn a_word_glued_to_an_emoji_mention_or_link_is_not_a_whole_word() {
+    let known = resolver(&[], &["abc", "bob", "x"]);
+    // "abc👍" and "@bob," are single words; only the lone "abc" matches.
+    let plain = tok("abc👍 @bob, (x.com) abc");
+    let got = resolve_fragments(&plain, &known).expect("the last word matches");
+    let emotes: Vec<&str> = got
+        .iter()
+        .filter_map(|f| match f {
+            Fragment::Emote { emote, .. } => Some(&*emote.name as &str),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(emotes, ["abc"]);
+    // The emoji, mention and link survive.
+    assert!(got.iter().any(|f| matches!(f, Fragment::Emoji { .. })));
+    assert!(got.iter().any(|f| matches!(f, Fragment::Mention { .. })));
+    assert!(got.iter().any(|f| matches!(f, Fragment::Link { .. })));
+}

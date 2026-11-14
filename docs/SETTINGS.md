@@ -36,6 +36,9 @@ timestamps = true
 [emotes]
 scale = 1.0                                # 0.5 to 4.0; a Twitch emote is 28 px at 1.0
 animate = true                             # false: animated emotes show their first frame
+seventv = true                             # 7TV emotes (channel + global, zero-width included)
+bttv = true                                # BetterTTV emotes (channel + global)
+ffz = true                                 # FrankerFaceZ emotes (channel + global)
 ```
 
 ## Compatibility rules
@@ -100,5 +103,11 @@ theme while `appearance.theme = "system"`.
 
 `appearance.font_family` and `font_fallbacks` are validated against the installed font families
 (first installed entry wins, then the built-in chain) so a missing family never reaches GPUI.
+`emotes.seventv`, `emotes.bttv` and `emotes.ffz` (PR 2.4) switch a third-party provider off or on
+without a restart: a provider that is off is not requested, and its emotes are not resolved in
+messages that arrive afterwards (messages already on screen keep what they were resolved with).
+Turning a provider on reloads the emote sets, since it may never have been fetched; Twitch's
+own emotes are always on. Files without these keys read as all on.
+
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
 messages). `chat.scrollback` is read once at startup.

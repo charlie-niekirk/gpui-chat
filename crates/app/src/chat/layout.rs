@@ -16,6 +16,11 @@
 //! stays in the display text for copy and hit-testing; its glyphs are not painted), so the box
 //! is the final size before the image arrives. An emote without an image stays text.
 //!
+//! A zero-width emote stacked on a base (7TV overlays) shares the base's atom: the stack is one
+//! inline atom covering the base's name, the overlays' names and the spaces between them, as wide
+//! and as tall as its widest and tallest layer. Layers without an image are left out of the stack
+//! (an overlay that failed to load simply is not drawn); a stack with no image at all stays text.
+//!
 //! [`LayoutCache`] keeps both per store sequence number, keyed by (width, text-config generation,
 //! scale factor); a changed message (`Arc` pointer differs, e.g. marked deleted) is re-shaped.
 //! Entries for evicted messages are dropped when the view syncs with the store.
@@ -29,7 +34,7 @@ use gpui_chat_media::ImageKey;
 use gpui_kit::{FontId, GlyphId, LineLayout, Pixels};
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::display::DisplayText;
+use super::display::{DisplayEmote, DisplayText};
 use super::flow::{self, Atom, AtomKind, Flow};
 use crate::images::EmoteBox;
 
@@ -48,13 +53,86 @@ pub struct GlyphRef {
     pub is_emoji: bool,
 }
 
-/// An emote drawn as an image: which atom it is and what to draw.
+/// One image of an inline box, drawn centred in the box.
+#[derive(Clone, Debug)]
+pub struct InlineLayer {
+    pub url: ImageKey,
+    /// Logical size of this layer's image.
+    pub size: (f32, f32),
+}
+
+/// An emote (with the zero-width overlays stacked on it) drawn as images: which atom it is and
+/// what to draw.
 #[derive(Clone, Debug)]
 pub struct InlineImage {
     /// Index into [`ShapedMessage::atoms`] (an [`AtomKind::Inline`] atom).
     pub atom: u32,
-    pub url: ImageKey,
-    pub emote: Arc<Emote>,
+    /// The images to draw, bottom first (the base, then each overlay).
+    pub layers: Vec<InlineLayer>,
+    /// Every emote in the stack, drawn or not, for the tooltip.
+    pub emotes: Vec<Arc<Emote>>,
+}
+
+impl InlineImage {
+    /// Whether one of the layers draws the image at `url`.
+    pub fn uses_url(&self, url: &str) -> bool {
+        self.layers.iter().any(|layer| layer.url.url() == url)
+    }
+}
+
+/// A stack of emotes about to become one inline atom.
+struct Stack {
+    /// Display-text range from the base's name to the last overlay's name.
+    range: std::ops::Range<usize>,
+    layers: Vec<InlineLayer>,
+    emotes: Vec<Arc<Emote>>,
+}
+
+impl Stack {
+    /// The box: as wide as the widest layer and as tall as the tallest.
+    fn size(&self) -> (f32, f32) {
+        self.layers.iter().fold((0.0, 0.0), |(w, h), layer| {
+            (w.max(layer.size.0), h.max(layer.size.1))
+        })
+    }
+}
+
+/// Groups the display emotes into stacks (a base and the overlays after it). `boxes` has one
+/// entry per display emote (or none at all); a stack without any image layer is dropped.
+fn stacks(display: &DisplayText, boxes: &[EmoteBox]) -> Vec<Stack> {
+    let mut stacks: Vec<Stack> = Vec::new();
+    for (
+        DisplayEmote {
+            span,
+            emote,
+            overlay,
+        },
+        emote_box,
+    ) in display.emotes.iter().zip(boxes)
+    {
+        let range = display.spans[*span].range.clone();
+        let layer = match emote_box {
+            EmoteBox::Image { url, size } => Some(InlineLayer {
+                url: url.clone(),
+                size: *size,
+            }),
+            EmoteBox::Text => None,
+        };
+        match stacks.last_mut() {
+            Some(stack) if *overlay => {
+                stack.range.end = range.end;
+                stack.emotes.push(emote.clone());
+                stack.layers.extend(layer);
+            }
+            _ => stacks.push(Stack {
+                range,
+                layers: layer.into_iter().collect(),
+                emotes: vec![emote.clone()],
+            }),
+        }
+    }
+    stacks.retain(|stack| !stack.layers.is_empty());
+    stacks
 }
 
 /// A message's display text shaped as one line and cut into atoms.
@@ -176,66 +254,58 @@ impl ShapedMessage {
     }
 }
 
-/// Replaces the atoms of every image emote with one inline atom of its box size. An emote whose
-/// span does not start and end on atom boundaries (inside a merged right-to-left run) stays text.
+/// Replaces the atoms of every emote stack that has an image with one inline atom of its box
+/// size. A stack whose span does not start and end on atom boundaries (inside a merged
+/// right-to-left run) stays text.
 fn inline_emotes(
     atoms: Vec<Atom>,
     display: &DisplayText,
     boxes: &[EmoteBox],
 ) -> (Vec<Atom>, Vec<InlineImage>) {
-    let mut images = display
-        .emotes
-        .iter()
-        .zip(boxes)
-        .filter_map(|((span, emote), emote_box)| match emote_box {
-            EmoteBox::Image { url, size } => {
-                Some((display.spans[*span].range.clone(), *size, url, emote))
-            }
-            EmoteBox::Text => None,
-        })
-        .peekable();
-    if images.peek().is_none() {
+    let mut stacks = stacks(display, boxes).into_iter().peekable();
+    if stacks.peek().is_none() {
         return (atoms, Vec::new());
     }
     let mut out = Vec::with_capacity(atoms.len());
     let mut inlines = Vec::new();
     let mut i = 0;
     while i < atoms.len() {
-        while images
+        while stacks
             .peek()
-            .is_some_and(|(range, ..)| range.start < atoms[i].range.start)
+            .is_some_and(|stack| stack.range.start < atoms[i].range.start)
         {
-            images.next();
+            stacks.next();
         }
-        if let Some((range, size, url, emote)) = images.peek()
-            && range.start == atoms[i].range.start
+        if let Some(stack) = stacks.peek()
+            && stack.range.start == atoms[i].range.start
         {
             let last = atoms[i..]
                 .iter()
-                .position(|atom| atom.range.end >= range.end)
+                .position(|atom| atom.range.end >= stack.range.end)
                 .map(|n| i + n)
-                .filter(|&j| atoms[j].range.end == range.end);
+                .filter(|&j| atoms[j].range.end == stack.range.end);
             if let Some(last) = last {
-                inlines.push(InlineImage {
-                    atom: out.len() as u32,
-                    url: (*url).clone(),
-                    emote: (*emote).clone(),
-                });
+                let (width, height) = stack.size();
                 out.push(Atom {
-                    range: range.clone(),
+                    range: stack.range.clone(),
                     src_x: atoms[i..=last]
                         .iter()
                         .map(|atom| atom.src_x)
                         .fold(f32::INFINITY, f32::min),
-                    width: size.0,
-                    height: size.1,
+                    width,
+                    height,
                     kind: AtomKind::Inline,
                 });
+                let stack = stacks.next().expect("peeked");
+                inlines.push(InlineImage {
+                    atom: (out.len() - 1) as u32,
+                    layers: stack.layers,
+                    emotes: stack.emotes,
+                });
                 i = last + 1;
-                images.next();
                 continue;
             }
-            images.next();
+            stacks.next();
         }
         out.push(atoms[i].clone());
         i += 1;
@@ -337,6 +407,29 @@ impl LayoutCache {
             },
         );
         MessageLayout { shaped, flow }
+    }
+
+    /// Drops the layouts that draw any of `urls`, so they are shaped again (with the boxes the
+    /// image store knows by now) the next time they are used. Returns the store sequence
+    /// numbers of the dropped layouts; the caller asks its list to measure those rows again.
+    /// Layouts without these URLs, and messages without emotes, are untouched.
+    pub fn invalidate_urls(&mut self, urls: &[ImageKey]) -> Vec<u64> {
+        if urls.is_empty() {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        self.entries.retain(|seq, entry| {
+            let affected = entry
+                .shaped
+                .inlines
+                .iter()
+                .any(|inline| urls.iter().any(|url| inline.uses_url(url.url())));
+            if affected {
+                dropped.push(*seq);
+            }
+            !affected
+        });
+        dropped
     }
 
     /// Drops the layouts of messages before `first_seq` (evicted from the store).
@@ -470,7 +563,11 @@ mod tests {
         let kappa = &s.atoms[7];
         assert_eq!((kappa.src_x, kappa.width, kappa.height), (70.0, 28.0, 28.0));
         assert_eq!((s.atoms[9].width, s.atoms[9].height), (56.0, 28.0));
-        let inlines: Vec<(u32, &str)> = s.inlines.iter().map(|i| (i.atom, i.url.url())).collect();
+        let inlines: Vec<(u32, &str)> = s
+            .inlines
+            .iter()
+            .map(|i| (i.atom, i.layers[0].url.url()))
+            .collect();
         assert_eq!(inlines, [(7, "k"), (9, "l")]);
         // The names' glyphs belong to the inline atoms (the painter skips them).
         let kappa_glyphs = s.glyphs.iter().filter(|g| g.atom == 7).count();
@@ -490,7 +587,7 @@ mod tests {
     fn emotes_without_an_image_stay_text() {
         let s = shaped_with_emotes(&[EmoteBox::Text, image("l", 28.0, 28.0)]);
         assert_eq!(s.inlines.len(), 1);
-        assert_eq!(s.inlines[0].url.url(), "l");
+        assert_eq!(s.inlines[0].layers[0].url.url(), "l");
         // "Kappa" is five glyph atoms of 10 px.
         assert!(
             s.atoms[7..12]
@@ -501,6 +598,159 @@ mod tests {
         let plain = shaped_with_emotes(&[]);
         assert!(plain.inlines.is_empty());
         assert!(plain.atoms.iter().all(|a| a.kind != AtomKind::Inline));
+    }
+
+    /// "Al: hi Base Over1 Over2 end": a base with two zero-width overlays stacked on it.
+    fn shaped_stack(boxes: &[EmoteBox]) -> ShapedMessage {
+        let emote = |name: &str, zero_width: bool| {
+            let mut e = gpui_chat_core::Emote::twitch(name, name);
+            e.zero_width = zero_width;
+            Arc::new(e)
+        };
+        let message = Message::chat(
+            "1",
+            Timestamp(0),
+            Author::new("al", "Al"),
+            vec![
+                Fragment::Text("hi ".into()),
+                Fragment::Emote {
+                    emote: emote("Base", false),
+                    zero_width_overlays: vec![emote("Over1", true), emote("Over2", true)],
+                },
+                Fragment::Text(" end".into()),
+            ],
+        );
+        let display = display::build(&message, DisplayOptions::default());
+        assert_eq!(display.text, "Al: hi Base Over1 Over2 end");
+        let layout = fake_layout(&display.text);
+        ShapedMessage::from_layout(display, &layout, boxes)
+    }
+
+    #[test]
+    fn an_emote_and_its_overlays_are_one_box_as_big_as_the_biggest_layer() {
+        let s = shaped_stack(&[
+            image("base", 28.0, 28.0),
+            image("o1", 56.0, 20.0),
+            image("o2", 24.0, 40.0),
+        ]);
+        let texts: Vec<(&str, AtomKind)> = s
+            .atoms
+            .iter()
+            .map(|atom| (&s.display.text[atom.range.clone()], atom.kind))
+            .collect();
+        // One inline atom covers "Base Over1 Over2"; the space before "end" stays.
+        assert_eq!(
+            &texts[7..],
+            [
+                ("Base Over1 Over2", AtomKind::Inline),
+                (" ", AtomKind::Space),
+                ("e", AtomKind::Glyphs),
+                ("n", AtomKind::Glyphs),
+                ("d", AtomKind::Glyphs)
+            ]
+        );
+        let stack = &s.atoms[7];
+        assert_eq!(
+            (stack.width, stack.height),
+            (56.0, 40.0),
+            "widest x tallest"
+        );
+        assert_eq!(s.inlines.len(), 1);
+        let layers: Vec<(&str, (f32, f32))> = s.inlines[0]
+            .layers
+            .iter()
+            .map(|l| (l.url.url(), l.size))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                ("base", (28.0, 28.0)),
+                ("o1", (56.0, 20.0)),
+                ("o2", (24.0, 40.0))
+            ]
+        );
+        let names: Vec<&str> = s.inlines[0]
+            .emotes
+            .iter()
+            .map(|e| &*e.name as &str)
+            .collect();
+        assert_eq!(names, ["Base", "Over1", "Over2"]);
+        // The box is one unbreakable unit in the flow, and it takes one slot, not three.
+        let flow = flow::flow(&s.atoms, 1000.0, 20.0);
+        assert_eq!(flow.height(), 40.0);
+        assert_eq!(
+            flow.placements[8].x,
+            70.0 + 56.0,
+            "the space follows the box"
+        );
+    }
+
+    #[test]
+    fn layers_without_an_image_are_left_out_of_the_stack() {
+        // A failed overlay: not drawn, but still listed for the tooltip.
+        let s = shaped_stack(&[
+            image("base", 28.0, 28.0),
+            EmoteBox::Text,
+            image("o2", 40.0, 28.0),
+        ]);
+        assert_eq!(s.inlines.len(), 1);
+        let urls: Vec<&str> = s.inlines[0].layers.iter().map(|l| l.url.url()).collect();
+        assert_eq!(urls, ["base", "o2"]);
+        assert_eq!(s.inlines[0].emotes.len(), 3);
+        assert_eq!(s.atoms[7].width, 40.0);
+
+        // A failed base with a drawable overlay: the overlay is the stack.
+        let s = shaped_stack(&[EmoteBox::Text, image("o1", 30.0, 30.0), EmoteBox::Text]);
+        assert_eq!(s.inlines.len(), 1);
+        assert_eq!(s.inlines[0].layers.len(), 1);
+        assert_eq!(s.atoms[7].kind, AtomKind::Inline);
+
+        // No image anywhere: all text, "Base Over1 Over2" as glyphs.
+        let s = shaped_stack(&[EmoteBox::Text, EmoteBox::Text, EmoteBox::Text]);
+        assert!(s.inlines.is_empty());
+        assert!(s.atoms.iter().all(|a| a.kind != AtomKind::Inline));
+    }
+
+    #[test]
+    fn invalidating_urls_drops_only_the_layouts_that_draw_them() {
+        let mut cache = LayoutCache::default();
+        let key = LayoutKey::new(1, 1.0);
+        let plain = message("hello");
+        let with = |boxes: &[EmoteBox]| shaped_with_emotes(boxes);
+        // seq 0: text only; 1: draws "k" and "l"; 2: draws only "l"; 3: draws "k" as an overlay.
+        cache.layout(0, &plain, key, 1000.0, 20.0, || shaped("hello"));
+        cache.layout(1, &plain, key, 1000.0, 20.0, || {
+            with(&[image("k", 28.0, 28.0), image("l", 28.0, 28.0)])
+        });
+        cache.layout(2, &plain, key, 1000.0, 20.0, || {
+            with(&[EmoteBox::Text, image("l", 28.0, 28.0)])
+        });
+        cache.layout(3, &plain, key, 1000.0, 20.0, || {
+            shaped_stack(&[
+                image("base", 28.0, 28.0),
+                image("k", 28.0, 28.0),
+                EmoteBox::Text,
+            ])
+        });
+        let shaped_before = cache.stats().shaped;
+
+        assert!(cache.invalidate_urls(&[]).is_empty());
+        assert!(cache.invalidate_urls(&[ImageKey::new("nope")]).is_empty());
+        assert_eq!(cache.len(), 4);
+
+        assert_eq!(cache.invalidate_urls(&[ImageKey::new("k")]), [1, 3]);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.flow_of(0).is_some() && cache.flow_of(2).is_some());
+        assert!(cache.flow_of(1).is_none() && cache.flow_of(3).is_none());
+        // Untouched layouts are hits, the dropped ones are shaped again.
+        cache.layout(0, &plain, key, 1000.0, 20.0, || {
+            panic!("text row re-shaped")
+        });
+        cache.layout(2, &plain, key, 1000.0, 20.0, || {
+            panic!("other emote re-shaped")
+        });
+        cache.layout(1, &plain, key, 1000.0, 20.0, || shaped("hello"));
+        assert_eq!(cache.stats().shaped, shaped_before + 1);
     }
 
     #[test]

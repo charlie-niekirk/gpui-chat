@@ -13,6 +13,7 @@ mod chat;
 mod cli;
 mod config;
 mod diagnostics;
+mod emote_service;
 mod firehose;
 mod fonts;
 mod hud;

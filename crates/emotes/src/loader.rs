@@ -6,7 +6,8 @@ use crate::bttv::BttvClient;
 use crate::error::EmoteError;
 use crate::ffz::FfzClient;
 use crate::http::{HttpClient, HttpError, ReqwestHttp};
-use crate::set::EmoteSet;
+use crate::resolver::Providers;
+use crate::set::{EmoteScope, EmoteSet};
 use crate::seventv::SevenTvClient;
 
 /// One result per provider for one scope. Each is independent: a failing provider only
@@ -72,10 +73,27 @@ impl EmoteLoader {
 
     /// Global sets of all providers.
     pub async fn load_global(&self) -> ProviderResults {
+        self.load_global_with(Providers::ALL).await
+    }
+
+    /// Global sets of the `providers` that are on; the others are not requested and come back
+    /// as empty sets.
+    pub async fn load_global_with(&self, providers: Providers) -> ProviderResults {
+        let scope = EmoteScope::Global;
         let (seven_tv, bttv, ffz) = tokio::join!(
-            self.seven_tv.global(),
-            self.bttv.global(),
-            self.ffz.global()
+            gated(
+                providers.seven_tv,
+                EmoteProvider::SevenTv,
+                scope,
+                self.seven_tv.global()
+            ),
+            gated(
+                providers.bttv,
+                EmoteProvider::Bttv,
+                scope,
+                self.bttv.global()
+            ),
+            gated(providers.ffz, EmoteProvider::Ffz, scope, self.ffz.global())
         );
         log_failures(
             "global",
@@ -90,10 +108,36 @@ impl EmoteLoader {
     /// Channel sets for a Twitch user id (the `room-id` of ROOMSTATE). A provider the
     /// channel has no account at yields an empty set.
     pub async fn load_channel(&self, twitch_user_id: &str) -> ProviderResults {
+        self.load_channel_with(twitch_user_id, Providers::ALL).await
+    }
+
+    /// [`EmoteLoader::load_channel`] for the `providers` that are on only; the others are not
+    /// requested and come back as empty sets.
+    pub async fn load_channel_with(
+        &self,
+        twitch_user_id: &str,
+        providers: Providers,
+    ) -> ProviderResults {
+        let scope = EmoteScope::Channel;
         let (seven_tv, bttv, ffz) = tokio::join!(
-            self.seven_tv.channel(twitch_user_id),
-            self.bttv.channel(twitch_user_id),
-            self.ffz.room(twitch_user_id)
+            gated(
+                providers.seven_tv,
+                EmoteProvider::SevenTv,
+                scope,
+                self.seven_tv.channel(twitch_user_id)
+            ),
+            gated(
+                providers.bttv,
+                EmoteProvider::Bttv,
+                scope,
+                self.bttv.channel(twitch_user_id)
+            ),
+            gated(
+                providers.ffz,
+                EmoteProvider::Ffz,
+                scope,
+                self.ffz.room(twitch_user_id)
+            )
         );
         log_failures(
             "channel",
@@ -103,6 +147,20 @@ impl EmoteLoader {
                 ffz,
             },
         )
+    }
+}
+
+/// Runs `request` only if `enabled`; a provider that is off is an empty set, not an error.
+async fn gated(
+    enabled: bool,
+    provider: EmoteProvider,
+    scope: EmoteScope,
+    request: impl std::future::Future<Output = Result<EmoteSet, EmoteError>>,
+) -> Result<EmoteSet, EmoteError> {
+    if enabled {
+        request.await
+    } else {
+        Ok(EmoteSet::empty(provider, scope))
     }
 }
 
@@ -205,6 +263,28 @@ mod tests {
         assert!(results.all_ok());
         assert!(results.sets().all(EmoteSet::is_empty));
         assert_eq!(results.sets().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn providers_that_are_off_are_not_requested() {
+        let fake = Arc::new(all_fixtures());
+        let loader = EmoteLoader::new(fake.clone());
+        let only_bttv = Providers {
+            seven_tv: false,
+            bttv: true,
+            ffz: false,
+        };
+        let global = loader.load_global_with(only_bttv).await;
+        let channel = loader.load_channel_with(ID, only_bttv).await;
+        for results in [&global, &channel] {
+            assert!(results.all_ok());
+            assert!(results.seven_tv.as_ref().unwrap().is_empty());
+            assert!(results.ffz.as_ref().unwrap().is_empty());
+            assert!(!results.bttv.as_ref().unwrap().is_empty());
+        }
+        let requested = fake.requested();
+        assert_eq!(requested.len(), 2, "{requested:?}");
+        assert!(requested.iter().all(|url| url.contains("betterttv")));
     }
 
     #[tokio::test]
