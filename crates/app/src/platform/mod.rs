@@ -5,11 +5,12 @@
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
-    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
-    ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
+    About, AddChannel, CloseWindow, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    Quit, ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
     ToggleSidebar,
 };
 
+pub mod keychain;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(not(target_os = "macos"))]
@@ -61,6 +62,14 @@ fn window_menu() -> Menu {
         MenuItem::action("Minimize", MinimizeWindow),
         MenuItem::action("Close Window", CloseWindow),
     ])
+}
+
+/// Log in / log out (the application menu).
+fn account_items() -> [MenuItem; 2] {
+    [
+        MenuItem::action("Log In to Twitch…", LogIn),
+        MenuItem::action("Log Out", LogOut),
+    ]
 }
 
 fn about_item() -> MenuItem {

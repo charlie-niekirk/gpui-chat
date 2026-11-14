@@ -13,6 +13,10 @@ workspace = true
 [dependencies]
 gpui-chat-core = { workspace = true }
 futures-util = { workspace = true }
+# `form` for the OAuth endpoints' urlencoded bodies.
+reqwest = { workspace = true, features = ["form"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -21,3 +25,4 @@ twitch-irc = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+wiremock = { workspace = true }

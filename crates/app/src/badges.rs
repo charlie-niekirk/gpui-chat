@@ -21,14 +21,17 @@
 //!
 //! Failures degrade silently: the source's error is logged as a warning, the badges it would have
 //! supplied are not shown, and the global ones (and the global subscriber badge) still are.
-//! A Helix source (PR 3.1) plugs in as another [`BadgeSource`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gpui_chat_core::{ChannelId, ChatEvent};
 use gpui_chat_emotes::badges::snapshot;
-use gpui_chat_emotes::{AnonymousBadgeSource, BadgeRegistry, BadgeSource, HttpError, ReqwestHttp};
+use gpui_chat_emotes::{
+    AnonymousBadgeSource, BadgeFuture, BadgeRegistry, BadgeSource, HelixBadgeSource, HttpClient,
+    HttpError, HttpFuture, HttpResponse, ReqwestHttp,
+};
+use gpui_chat_twitch::{Auth, HelixClient, HelixError};
 use gpui_kit::{App, Global, Task};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -161,9 +164,10 @@ impl BadgeService {
         }
     }
 
-    /// Starts the anonymous service on the backend runtime. `None` if the global is not
-    /// installed or the HTTP client cannot be built (channel badges are then not shown).
-    pub fn start(cx: &App) -> Option<Self> {
+    /// Starts the service on the backend runtime: anonymous, or [`AccountBadgeSource`] when an
+    /// account is given (Helix while logged in). `None` if the global is not installed or the HTTP
+    /// client cannot be built (channel badges are then not shown).
+    pub fn start(account: Option<(Auth, HelixClient)>, cx: &App) -> Option<Self> {
         let (registry, changed) = cx.try_global::<Badges>()?.handles();
         let http = match runtime::enter(cx, ReqwestHttp::new) {
             Ok(http) => http,
@@ -172,7 +176,15 @@ impl BadgeService {
                 return None;
             }
         };
-        let source = Arc::new(AnonymousBadgeSource::new(Arc::new(http)));
+        let anonymous = AnonymousBadgeSource::new(Arc::new(http));
+        let source: Arc<dyn BadgeSource> = match &account {
+            Some((auth, helix)) => Arc::new(AccountBadgeSource::new(
+                anonymous,
+                auth.clone(),
+                helix.clone(),
+            )),
+            None => Arc::new(anonymous),
+        };
         let service = Self::new(
             source,
             registry,
@@ -180,7 +192,47 @@ impl BadgeService {
             cx.global::<runtime::Backend>().handle(),
         );
         service.load_global();
+        if let Some((auth, _)) = account {
+            service.follow_login(auth);
+        }
         Some(service)
+    }
+
+    /// Reloads everything whenever the user logs in or out, so the source in use (Helix or
+    /// anonymous) supplies every set. Runs until the runtime stops.
+    pub fn follow_login(&self, auth: Auth) {
+        let service = self.clone();
+        // Subscribed here, not in the task, so a login restored before the task runs is not missed.
+        let mut states = auth.subscribe();
+        drop(self.inner.handle.spawn(async move {
+            // The first loads went out before the login was restored, so they were anonymous.
+            let mut logged_in = false;
+            loop {
+                let now = states.borrow_and_update().account().is_some();
+                if now != logged_in {
+                    logged_in = now;
+                    service.reload();
+                }
+                if states.changed().await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Loads the global set and every known channel's set again.
+    pub fn reload(&self) {
+        self.load_global();
+        let rooms: Vec<(ChannelId, String)> = self
+            .inner
+            .state()
+            .rooms
+            .iter()
+            .map(|(channel, room)| (channel.clone(), room.room_id.clone()))
+            .collect();
+        for (channel, room_id) in rooms {
+            self.load_channel(channel, room_id);
+        }
     }
 
     /// Asks the source for the global badges (once, at start) and stores them over the bundled
@@ -263,6 +315,82 @@ impl BadgeService {
         if needed {
             self.load_channel(channel.clone(), room_id.clone());
         }
+    }
+}
+
+/// Badges for the live source: Helix while logged in, else (and when Helix fails) anonymous.
+pub struct AccountBadgeSource {
+    anonymous: AnonymousBadgeSource,
+    helix: HelixBadgeSource,
+    auth: Auth,
+}
+
+impl AccountBadgeSource {
+    pub fn new(anonymous: AnonymousBadgeSource, auth: Auth, helix: HelixClient) -> Self {
+        let base = helix.base().to_owned();
+        Self {
+            anonymous,
+            helix: HelixBadgeSource::new(Arc::new(HelixHttp(helix)), base),
+            auth,
+        }
+    }
+}
+
+impl BadgeSource for AccountBadgeSource {
+    fn global(&self) -> BadgeFuture<'_> {
+        Box::pin(async move {
+            if self.auth.is_logged_in() {
+                match self.helix.global().await {
+                    Ok(set) => return Ok(set),
+                    Err(error) => {
+                        tracing::warn!(%error, "Helix global badges failed; using the anonymous source");
+                    }
+                }
+            }
+            self.anonymous.global().await
+        })
+    }
+
+    fn channel<'a>(&'a self, room_id: &'a str) -> BadgeFuture<'a> {
+        Box::pin(async move {
+            if self.auth.is_logged_in() {
+                match self.helix.channel(room_id).await {
+                    Ok(set) => return Ok(set),
+                    Err(error) => {
+                        tracing::warn!(%error, room_id, "Helix channel badges failed; using the anonymous source");
+                    }
+                }
+            }
+            self.anonymous.channel(room_id).await
+        })
+    }
+}
+
+/// The emotes crate's [`HttpClient`] over [`HelixClient`]: adds `Client-Id` and the user token
+/// (refreshing it on a 401). Only URLs below the Helix base are fetched, so the token never goes
+/// anywhere else.
+struct HelixHttp(HelixClient);
+
+impl HelixHttp {
+    async fn fetch(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        let path = url
+            .strip_prefix(self.0.base())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .ok_or_else(|| HttpError::Request(format!("not a Helix URL: {url}")))?;
+        match self.0.get(path).await {
+            Ok(response) => Ok(HttpResponse {
+                status: response.status,
+                body: response.body,
+            }),
+            Err(HelixError::Network(message)) => Err(HttpError::Network(message)),
+            Err(HelixError::Auth(error)) => Err(HttpError::Request(error.to_string())),
+        }
+    }
+}
+
+impl HttpClient for HelixHttp {
+    fn get<'a>(&'a self, url: &'a str) -> HttpFuture<'a> {
+        Box::pin(self.fetch(url))
     }
 }
 

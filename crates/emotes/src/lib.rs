@@ -16,7 +16,8 @@
 //! BTTV → FFZ, with per-provider switches ([`Providers`]).
 //!
 //! Twitch badges live in [`badges`]: the [`BadgeSource`] trait, the anonymous source (bundled global
-//! snapshot + `api.ivr.fi` for a channel's) and the [`BadgeRegistry`] the chat view reads.
+//! snapshot + `api.ivr.fi` for a channel's), the Helix source used when logged in, and the
+//! [`BadgeRegistry`] the chat view reads.
 //!
 //! See the module docs of [`bttv`], [`ffz`] and [`seventv`] for endpoint and mapping details.
 
@@ -35,6 +36,7 @@ mod testutil;
 
 pub use badges::{
     AnonymousBadgeSource, BadgeError, BadgeFuture, BadgeRegistry, BadgeSet, BadgeSource,
+    HelixBadgeSource,
 };
 pub use bttv::BttvClient;
 pub use error::EmoteError;

@@ -20,6 +20,8 @@ gpui-chat-streamlink = { workspace = true }
 gpui-chat-twitch = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }
+# The Twitch login in the system keychain (`platform::keychain`).
+keyring = { workspace = true }
 # Only for the frame types GPUI's `RenderImage` is built from (no codecs used here).
 image = { workspace = true }
 serde = { workspace = true }

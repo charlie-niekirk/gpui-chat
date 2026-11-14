@@ -3,14 +3,19 @@
 //! The shell owns the [`ChannelList`] (what is open, in which order, which is selected). Every
 //! change to it goes through [`AppShell::list_changed`], which makes sure the selected channel
 //! has a pane, joins/parts on the live client and schedules a write of `state.toml`.
+//!
+//! The title bar's right end is the account control (PR 3.1): "Log in" when logged out, the user's
+//! name with a menu (log in again, log out) when logged in. A strip above the content says why the
+//! user was logged out, or that the login needs new permissions.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui_chat_core::{APP_ID, APP_NAME, ChannelId};
 use gpui_chat_settings::SettingsError;
+use gpui_chat_twitch::auth::AuthState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
 };
@@ -18,15 +23,16 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Task,
-    WeakEntity, Window, WindowBounds, div, px, size,
+    Anchor, AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled,
+    Subscription, Task, WeakEntity, Window, WindowBounds, div, px, size,
 };
 
+use crate::account::AccountHub;
 use crate::actions::{
-    About, AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, ReloadEmotes,
-    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
-    ToggleSidebar,
+    About, AddChannel, CloseWindow, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    ReloadEmotes, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel,
+    ToggleDebugHud, ToggleSidebar,
 };
 use crate::add_channel;
 use crate::channel_list::{ChannelList, Move};
@@ -39,6 +45,7 @@ use crate::hud::DebugHud;
 use crate::live::LiveSource;
 use crate::pane::ChannelPane;
 use crate::platform;
+use crate::sign_in;
 use crate::state::{self, Mode, SavedChannels, WindowPlacement};
 use crate::streams::StreamHub;
 use crate::theme::{self, Tokens};
@@ -113,6 +120,8 @@ pub struct ShellParts {
     /// The live client; `None` with `--firehose` / `--replay`, which then also keep the channel
     /// list out of `state.toml`.
     pub live: Option<LiveSource>,
+    /// The Twitch account; `None` with the offline sources (they never touch the keychain).
+    pub account: Option<Entity<AccountHub>>,
     pub diagnostics: Diagnostics,
     pub hud_visible: bool,
 }
@@ -125,6 +134,7 @@ pub struct AppShell {
     hud: Entity<DebugHud>,
     list: ChannelList,
     live: Option<LiveSource>,
+    account: Option<Entity<AccountHub>>,
     /// Streamlink processes and their play state; ended on quit and when a channel is closed.
     streams: Entity<StreamHub>,
     /// Panes are created when a channel is first selected and kept (with their scroll position)
@@ -141,11 +151,12 @@ impl AppShell {
             hub,
             channels,
             live,
+            account,
             diagnostics,
             hud_visible,
         } = parts;
         let hud = cx.new(|cx| DebugHud::new(diagnostics.clone(), hub.clone(), hud_visible, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             // With an offline source, channels appear through their events.
             cx.observe(&hub, |this, _, cx| this.hub_changed(cx)),
             // Follow the system light/dark setting live, but only when `theme = "system"`.
@@ -170,6 +181,9 @@ impl AppShell {
                 this.placement_changed(window, cx);
             }),
         ];
+        if let Some(account) = &account {
+            subscriptions.push(cx.observe(account, |_, _, cx| cx.notify()));
+        }
         window.set_window_title(APP_NAME);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
@@ -181,6 +195,7 @@ impl AppShell {
             hud,
             list: channels,
             live,
+            account,
             streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
             save_task: None,
@@ -317,6 +332,120 @@ impl AppShell {
             window,
             cx,
         );
+    }
+
+    fn log_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(account) = self.account.clone() {
+            sign_in::open(account, window, cx);
+        }
+    }
+
+    fn log_out(&mut self, cx: &mut Context<Self>) {
+        if let Some(account) = &self.account {
+            account.update(cx, |account, cx| account.log_out(cx));
+        }
+    }
+
+    /// The right end of the title bar: "Log in", or the account's name with its menu.
+    fn account_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let account = self.account.as_ref()?;
+        let shell = cx.entity().downgrade();
+        let control = match account.read(cx).state() {
+            AuthState::Restoring => return None,
+            AuthState::LoggedOut { .. } => Button::new("account-log-in")
+                .ghost()
+                .small()
+                .icon(Icon::new(IconName::CircleUser))
+                .label("Log in")
+                .tooltip("Log in to Twitch")
+                .on_click(cx.listener(|this, _, window, cx| this.log_in(window, cx)))
+                .into_any_element(),
+            AuthState::LoggedIn(user) => {
+                let login = user.login.clone();
+                let needs_relogin = user.needs_relogin();
+                Button::new("account-menu")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(if needs_relogin {
+                        IconName::TriangleAlert
+                    } else {
+                        IconName::CircleUser
+                    }))
+                    .label(login.clone())
+                    .dropdown_caret(true)
+                    .accessibility_label("Account")
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, _, _| {
+                        let (again, out) = (shell.clone(), shell.clone());
+                        menu.label(format!("Logged in to Twitch as {login}"))
+                            .separator()
+                            .item(PopupMenuItem::new("Log In Again…").on_click(
+                                move |_, window, cx| {
+                                    again.update(cx, |shell, cx| shell.log_in(window, cx)).ok();
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Log Out").on_click(move |_, _, cx| {
+                                out.update(cx, |shell, cx| shell.log_out(cx)).ok();
+                            }))
+                    })
+                    .into_any_element()
+            }
+        };
+        Some(div().pr_2().child(control).into_any_element())
+    }
+
+    /// A strip above the content when the user was logged out without asking (with why), or the
+    /// login lacks scopes the app now asks for.
+    fn account_banner(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let account = self.account.as_ref()?.read(cx);
+        let (message, action, colour) = if let Some(notice) = account.notice() {
+            (notice.to_owned(), "Log in", tokens.danger)
+        } else if let AuthState::LoggedIn(user) = account.state()
+            && user.needs_relogin()
+        {
+            (
+                format!(
+                    "Log in again to grant the new Twitch permissions ({}).",
+                    user.missing_scopes.join(", ")
+                ),
+                "Log in again",
+                tokens.accent,
+            )
+        } else {
+            return None;
+        };
+        let dismissable = account.notice().is_some();
+        Some(
+            h_flex()
+                .id("account-banner")
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .bg(colour.opacity(0.14))
+                .border_b_1()
+                .border_color(colour)
+                .child(div().flex_1().min_w_0().text_sm().child(message))
+                .child(
+                    Button::new("account-banner-log-in")
+                        .small()
+                        .label(action)
+                        .on_click(cx.listener(|this, _, window, cx| this.log_in(window, cx))),
+                )
+                .children(dismissable.then(|| {
+                    Button::new("account-banner-dismiss")
+                        .small()
+                        .ghost()
+                        .label("Dismiss")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(account) = &this.account {
+                                account.update(cx, |account, cx| account.dismiss_notice(cx));
+                            }
+                        }))
+                }))
+                .into_any_element(),
+        )
     }
 
     fn placement_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -560,6 +689,8 @@ impl Render for AppShell {
             .on_action(cx.listener(|this, _: &SelectPreviousChannel, _, cx| {
                 this.select_neighbour(-1, cx);
             }))
+            .on_action(cx.listener(|this, _: &LogIn, window, cx| this.log_in(window, cx)))
+            .on_action(cx.listener(|this, _: &LogOut, _, cx| this.log_out(cx)))
             .on_action(cx.listener(|this, _: &ReloadEmotes, _, _| {
                 if let Some(live) = &this.live {
                     live.reload_emotes();
@@ -571,18 +702,22 @@ impl Render for AppShell {
             .font_family(font.family)
             .text_size(font.size)
             .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            SidebarToggleButton::new()
-                                .collapsed(self.sidebar_collapsed)
-                                .accessibility_label("Toggle sidebar")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                        )
-                        .child(div().text_sm().child(APP_NAME)),
-                ),
+                TitleBar::new()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                SidebarToggleButton::new()
+                                    .collapsed(self.sidebar_collapsed)
+                                    .accessibility_label("Toggle sidebar")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
+                                    ),
+                            )
+                            .child(div().text_sm().child(APP_NAME)),
+                    )
+                    .children(self.account_control(cx)),
             )
             .child(
                 h_flex()
@@ -601,6 +736,7 @@ impl Render for AppShell {
                                     .as_ref()
                                     .map(|error| Self::settings_error_banner(error, &tokens)),
                             )
+                            .children(self.account_banner(&tokens, cx))
                             .child(self.main_area(&tokens))
                             .child(self.hud.clone()),
                     ),
