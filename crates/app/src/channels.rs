@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageStore, RoomState,
+    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageKind,
+    MessageStore, RoomState,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
 
@@ -69,6 +70,14 @@ impl ChannelStore {
     pub fn apply(&mut self, event: ChatEvent) -> bool {
         match event {
             ChatEvent::Message { message, .. } => {
+                // The user's own message can arrive twice: as the echo made when Twitch accepted
+                // it (PR 3.2) and, if Twitch also delivers it over IRC, as a chat line with the
+                // same id. Whichever comes first stays; the other is dropped.
+                if matches!(message.kind, MessageKind::Chat | MessageKind::Action)
+                    && self.messages.contains(message.id.as_str())
+                {
+                    return false;
+                }
                 self.messages.push(message);
                 true
             }
@@ -316,6 +325,34 @@ mod tests {
                 ))],
             )),
         }
+    }
+
+    #[test]
+    fn a_chat_line_with_an_id_already_shown_is_not_shown_twice() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        // The echo of the user's own message, then Twitch's IRC copy of it.
+        assert!(store.apply(chat("a", "same-id", "me")));
+        assert!(!store.apply(chat("a", "same-id", "me")), "nothing changed");
+        assert_eq!(store.messages().len(), 1);
+        // The other way round: the IRC copy first, the echo second.
+        assert!(store.apply(chat("a", "other-id", "me")));
+        assert!(!store.apply(chat("a", "other-id", "me")));
+        assert_eq!(store.messages().len(), 2);
+        // Different ids are different messages.
+        assert!(store.apply(chat("a", "third", "me")));
+        assert_eq!(store.messages().len(), 3);
+    }
+
+    #[test]
+    fn local_lines_that_share_an_id_are_not_deduplicated() {
+        let notice = |id: &str| ChatEvent::Message {
+            channel: ChannelId::new("a"),
+            message: Arc::new(Message::plain(id, Timestamp(0), MessageKind::System, "x")),
+        };
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        assert!(store.apply(notice("n")));
+        assert!(store.apply(notice("n")));
+        assert_eq!(store.messages().len(), 2);
     }
 
     #[test]

@@ -432,6 +432,134 @@ async fn set_credentials_reconnects_immediately_with_the_token() {
     }
 }
 
+/// A provider that hands out `Some(login, token)` from a shared cell (`None`: anonymous), so a test
+/// can change who is logged in between connections.
+fn provider_from(cell: &Arc<Mutex<Option<(&'static str, &'static str)>>>) -> CredentialsProvider {
+    let cell = Arc::clone(cell);
+    CredentialsProvider::new(move || {
+        let cell = Arc::clone(&cell);
+        async move {
+            match *cell.lock().unwrap() {
+                Some((login, token)) => Credentials::user(login, token),
+                None => Credentials::anonymous(),
+            }
+        }
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_provider_decides_the_credentials_of_every_connection() {
+    let login = Arc::new(Mutex::new(Some(("me", "first-token"))));
+    let mut rig = rig_with(ClientConfig {
+        credentials_provider: Some(provider_from(&login)),
+        ..config()
+    });
+    rig.client.join(&chan("chan"));
+    rig.expect_connection(None, ConnectionState::Connecting)
+        .await;
+    let mut server = rig.net.accept();
+    let (nick, pass) = server.handshake().await;
+    assert_eq!(
+        (nick.as_str(), pass.as_deref()),
+        ("me", Some("oauth:first-token"))
+    );
+    server.welcome("me");
+    rig.expect_connection(None, ConnectionState::Connected)
+        .await;
+    assert_eq!(server.line().await, "JOIN #chan");
+    rig.expect_connection(Some("chan"), ConnectionState::Connecting)
+        .await;
+
+    // The connection drops, and by then the access token was refreshed: the next attempt uses it.
+    *login.lock().unwrap() = Some(("me", "second-token"));
+    drop(server);
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 1 })
+        .await;
+    let mut server = rig.net.accept();
+    let (_, pass) = server.handshake().await;
+    assert_eq!(pass.as_deref(), Some("oauth:second-token"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_swaps_the_login_at_once_and_rejoins() {
+    let login = Arc::new(Mutex::new(None));
+    let mut rig = rig_with(ClientConfig {
+        credentials_provider: Some(provider_from(&login)),
+        ..config()
+    });
+    rig.client.join(&chan("chan"));
+    rig.expect_connection(None, ConnectionState::Connecting)
+        .await;
+    let mut server = rig.net.accept();
+    let (nick, pass) = server.handshake().await;
+    assert!(nick.starts_with("justinfan"), "{nick}");
+    assert_eq!(pass, None, "logged out: anonymous, no PASS");
+    server.welcome(&nick);
+    rig.expect_connection(None, ConnectionState::Connected)
+        .await;
+    assert_eq!(server.line().await, "JOIN #chan");
+    rig.expect_connection(Some("chan"), ConnectionState::Connecting)
+        .await;
+
+    // The user logs in.
+    *login.lock().unwrap() = Some(("me", "token"));
+    let at = Instant::now();
+    rig.client.reconnect();
+    assert!(server.client_hung_up().await);
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 1 })
+        .await;
+    let mut server = rig.net.accept();
+    let (nick, pass) = server.handshake().await;
+    assert_eq!(
+        (nick.as_str(), pass.as_deref()),
+        ("me", Some("oauth:token"))
+    );
+    assert_eq!(rig.net.attempts()[1], at, "no backoff for a login change");
+    server.welcome("me");
+    rig.expect_connection(None, ConnectionState::Connected)
+        .await;
+    assert_eq!(
+        server.line().await,
+        "JOIN #chan",
+        "wanted channels come back"
+    );
+    rig.expect_connection(Some("chan"), ConnectionState::Connecting)
+        .await;
+
+    // And logs out again.
+    *login.lock().unwrap() = None;
+    rig.client.reconnect();
+    assert!(server.client_hung_up().await);
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 1 })
+        .await;
+    let mut server = rig.net.accept();
+    let (nick, pass) = server.handshake().await;
+    assert!(nick.starts_with("justinfan"), "{nick}");
+    assert_eq!(pass, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_while_connecting_restarts_with_fresh_credentials() {
+    let login = Arc::new(Mutex::new(None));
+    let mut rig = rig_with(ClientConfig {
+        credentials_provider: Some(provider_from(&login)),
+        ..config()
+    });
+    rig.expect_connection(None, ConnectionState::Connecting)
+        .await;
+    // The first attempt is waiting for a connection that never comes; the user logs in meanwhile.
+    *login.lock().unwrap() = Some(("me", "token"));
+    rig.client.reconnect();
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 1 })
+        .await;
+    let mut server = rig.net.accept();
+    let (nick, pass) = server.handshake().await;
+    assert_eq!(
+        (nick.as_str(), pass.as_deref()),
+        ("me", Some("oauth:token"))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn credentials_do_not_leak_into_debug_output() {
     let c = Credentials::user("me", "secret");

@@ -25,7 +25,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
-use std::pin::pin;
+use std::pin::{Pin, pin};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -37,14 +38,21 @@ use twitch_irc::irc;
 use twitch_irc::message::{AsRawIRC, IRCMessage, IRCPrefix};
 use twitch_irc::transport::Transport;
 
+use crate::auth::{Auth, AuthState};
 use crate::limits::{Backoff, JoinLimiter, JoinRateLimit};
 use crate::parse::{ParseOptions, map_message};
 
+/// The scope that lets the IRC connection read chat while logged in.
+const READ_SCOPE: &str = "chat:read";
+
+/// How long [`Credentials::from_auth`] waits for the stored login to be read.
+const RESTORE_WAIT: Duration = Duration::from_secs(5);
+
 /// What the client logs in as.
 ///
-/// This is the hook for authentication: PR 3.2 calls [`TwitchClient::set_credentials`]
-/// with the user's login and OAuth token (no `oauth:` prefix) and the client
-/// reconnects with them. Nothing here fetches or refreshes tokens.
+/// The login and OAuth token (no `oauth:` prefix, `chat:read` scope) the client logs in with.
+/// Nothing here fetches or refreshes tokens: the app does, through a [`CredentialsProvider`]
+/// (or, for a fixed login, [`TwitchClient::set_credentials`], which reconnects with them).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub login: String,
@@ -69,6 +77,37 @@ impl Credentials {
         }
     }
 
+    /// The credentials for `auth`'s current login: the user's login and a fresh access token
+    /// (refreshed first when it is about to expire), or anonymous when nobody is logged in, the
+    /// login lacks `chat:read` (it predates the scope: the UI asks the user to log in again) or the
+    /// token cannot be had. Waits briefly for the stored login to be read at start-up, so the first
+    /// connection already uses it.
+    pub async fn from_auth(auth: &Auth) -> Self {
+        let mut states = auth.subscribe();
+        // Elapsed or closed: whatever the state is now decides.
+        let _ = timeout(
+            RESTORE_WAIT,
+            states.wait_for(|state| !matches!(state, AuthState::Restoring)),
+        )
+        .await;
+        let state = auth.state();
+        let Some(login) = irc_login(&state) else {
+            if let AuthState::LoggedIn(_) = state {
+                tracing::info!(
+                    "the login lacks `{READ_SCOPE}`: chat stays anonymous until it is renewed"
+                );
+            }
+            return Self::anonymous();
+        };
+        match auth.access_token().await {
+            Ok(lease) => Self::user(login, lease.token.expose()),
+            Err(error) => {
+                tracing::warn!(%error, "no access token for chat: connecting anonymously");
+                Self::anonymous()
+            }
+        }
+    }
+
     /// `true` for `justinfan` logins without a token.
     pub fn is_anonymous(&self) -> bool {
         self.token.is_none()
@@ -82,6 +121,47 @@ impl std::fmt::Debug for Credentials {
             .field("token", &self.token.as_ref().map(|_| "[redacted]"))
             .finish()
     }
+}
+
+/// Supplies the credentials for **each** connection attempt (PR 3.2): the app asks its login owner,
+/// which refreshes an access token that has expired in the meantime, so a reconnect hours after the
+/// login never presents a stale token. Set it on [`ClientConfig::credentials_provider`]; while it is
+/// set it decides the credentials of every attempt (and [`TwitchClient::set_credentials`] has no
+/// lasting effect). Anything but a [`Credentials::user`] is a read-only anonymous connection.
+#[derive(Clone)]
+pub struct CredentialsProvider(
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Credentials> + Send>> + Send + Sync>,
+);
+
+impl CredentialsProvider {
+    pub fn new<F, Fut>(provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Credentials> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(provider())))
+    }
+
+    async fn credentials(&self) -> Credentials {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for CredentialsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialsProvider")
+    }
+}
+
+/// The login IRC authenticates as in `state`: the logged-in account, unless its login predates
+/// `chat:read` (then chat stays anonymous until the user logs in again). `None`: anonymous.
+pub fn irc_login(state: &AuthState) -> Option<&str> {
+    let account = state.account()?;
+    (!account
+        .missing_scopes
+        .iter()
+        .any(|scope| scope == READ_SCOPE))
+    .then_some(account.login.as_str())
 }
 
 fn anonymous_login(seed: u64) -> String {
@@ -98,6 +178,8 @@ fn clock_seed() -> u64 {
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub credentials: Credentials,
+    /// Asked for the credentials before every connection attempt; see [`CredentialsProvider`].
+    pub credentials_provider: Option<CredentialsProvider>,
     /// Capacity of the event channel.
     pub event_capacity: usize,
     /// Reconnect backoff.
@@ -121,6 +203,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             credentials: Credentials::anonymous(),
+            credentials_provider: None,
             event_capacity: 4096,
             backoff: Backoff::default(),
             stable_after: Duration::from_secs(30),
@@ -139,6 +222,7 @@ enum Command {
     Join(ChannelId),
     Part(ChannelId),
     SetCredentials(Credentials),
+    Reconnect,
     Shutdown,
 }
 
@@ -201,6 +285,13 @@ impl TwitchClient {
     /// `set_credentials(Credentials::anonymous())`.
     pub fn set_credentials(&self, credentials: Credentials) {
         self.send(Command::SetCredentials(credentials));
+    }
+
+    /// Drops the connection and connects again at once (no backoff), asking the
+    /// [`CredentialsProvider`] for fresh credentials; wanted channels are rejoined. This is what
+    /// the app calls when the user logs in or out.
+    pub fn reconnect(&self) {
+        self.send(Command::Reconnect);
     }
 
     /// Closes the connection and ends the task. A final
@@ -341,6 +432,14 @@ impl<C: Connector> Supervisor<C> {
             }
             skip_delay = false;
 
+            if let Some(provider) = self.config.credentials_provider.clone() {
+                self.credentials = provider.credentials().await;
+                tracing::debug!(
+                    login = %self.credentials.login,
+                    anonymous = self.credentials.is_anonymous(),
+                    "connecting"
+                );
+            }
             let conn = match self.connect_while_serving_commands().await {
                 ConnectOutcome::Connected(conn) => conn,
                 ConnectOutcome::Failed(reason) => {
@@ -511,6 +610,9 @@ impl<C: Connector> Supervisor<C> {
                     Some(Command::SetCredentials(credentials)) => {
                         self.credentials = credentials;
                         return lost("credentials changed".into(), state.connected_for(), true);
+                    }
+                    Some(Command::Reconnect) => {
+                        return lost("reconnect requested".into(), state.connected_for(), true);
                     }
                     Some(Command::Join(channel)) => {
                         if !self.wanted.contains(&channel) {
@@ -763,6 +865,7 @@ async fn offline_command(
             *credentials = new;
             Offline::Credentials
         }
+        Some(Command::Reconnect) => Offline::Credentials,
     }
 }
 
