@@ -6,8 +6,11 @@
 
 use std::time::Duration;
 
-use gpui_chat_core::{ConnectionState, FollowersOnly, RoomState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_chat_core::{ChannelId, ConnectionState, FollowersOnly, RoomState};
+use gpui_chat_streamlink::QUALITIES;
+use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
+use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
     ParentElement, Render, Styled, Subscription, Window, div, px, rgb,
@@ -15,6 +18,7 @@ use gpui_kit::{
 
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
+use crate::streams::{Phase, StreamHub, StreamState};
 use crate::theme::Tokens;
 
 /// What the header says about the connection to one channel.
@@ -119,9 +123,30 @@ fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
     }
 }
 
+/// The quality menu: the standard list, plus the channel's current choice when it is not in it
+/// (a custom `default_quality` such as `720p60,720p,best`).
+pub fn quality_choices(current: &str) -> Vec<String> {
+    let mut choices: Vec<String> = QUALITIES.iter().map(|q| (*q).to_owned()).collect();
+    if !choices.iter().any(|q| q == current) {
+        choices.insert(0, current.to_owned());
+    }
+    choices
+}
+
+/// What the play button says for a stream state (`None`: idle).
+pub fn play_label(state: Option<&StreamState>, quality: &str) -> String {
+    match state.map(|s| s.phase) {
+        Some(Phase::Starting) => "Starting…".to_owned(),
+        Some(Phase::Running) => "Stop".to_owned(),
+        Some(Phase::Stopping) => "Stopping…".to_owned(),
+        Some(Phase::Ended) | None => format!("Play {quality}"),
+    }
+}
+
 /// The header and chat of one channel.
 pub struct ChannelPane {
     hub: Entity<ChannelHub>,
+    streams: Entity<StreamHub>,
     store: Entity<ChannelStore>,
     chat: Entity<ChatView>,
     /// `false` for the offline sources, which have no connection to report.
@@ -133,6 +158,7 @@ impl ChannelPane {
     pub fn new(
         hub: Entity<ChannelHub>,
         store: Entity<ChannelStore>,
+        streams: Entity<StreamHub>,
         live: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -141,9 +167,11 @@ impl ChannelPane {
         let subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&hub, |_, _, cx| cx.notify()),
+            cx.observe(&streams, |_, _, cx| cx.notify()),
         ];
         Self {
             hub,
+            streams,
             store,
             chat,
             live,
@@ -220,8 +248,107 @@ impl ChannelPane {
                             .child(chip)
                     })),
             )
-            // Reserved for the streamlink play button and quality menu (PR 1.6).
-            .child(h_flex().id("pane-actions").flex_none().gap_1())
+            .child(self.stream_actions(tokens, cx))
+    }
+
+    /// Streamlink error (when there is one) and the play / stop button with its quality menu.
+    /// Offline sources have no real channels, so they get nothing.
+    fn stream_actions(&self, tokens: &Tokens, cx: &App) -> impl IntoElement {
+        let actions = h_flex()
+            .id("pane-actions")
+            .flex_none()
+            .min_w_0()
+            .gap_1p5()
+            .items_center();
+        if !self.live {
+            return actions;
+        }
+        let channel = self.store.read(cx).channel().clone();
+        let hub = self.streams.read(cx);
+        let state = hub.state(&channel);
+        let quality = hub.quality(&channel, cx);
+        let active = state.is_some_and(StreamState::is_active);
+        let stopping = state.is_some_and(|s| s.phase == Phase::Stopping);
+
+        let notice = state.and_then(|s| s.error.as_ref()).map(|error| {
+            let message = error.to_string();
+            let streams = self.streams.clone();
+            let target = channel.clone();
+            h_flex()
+                .id("stream-error")
+                .gap_1()
+                .items_center()
+                .min_w_0()
+                .max_w(px(420.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(tokens.danger)
+                        .child(message),
+                )
+                .child(
+                    Button::new("stream-error-dismiss")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::Close))
+                        .accessibility_label("Dismiss streamlink error")
+                        .on_click(move |_, _, cx| {
+                            streams.update(cx, |hub, cx| hub.dismiss(&target, cx));
+                        }),
+                )
+        });
+
+        let toggle = {
+            let streams = self.streams.clone();
+            let target = channel.clone();
+            Button::new("stream-toggle")
+                .small()
+                .icon(Icon::new(if active {
+                    IconName::Square
+                } else {
+                    IconName::Play
+                }))
+                .label(play_label(state, &quality))
+                .tooltip(if active {
+                    "Stop the stream"
+                } else {
+                    "Watch with streamlink"
+                })
+                .disabled(stopping)
+                .on_click(move |_, _, cx| {
+                    streams.update(cx, |hub, cx| hub.toggle(&target, cx));
+                })
+        };
+        let menu = {
+            let streams = self.streams.clone();
+            let target = channel;
+            let current = quality;
+            move |mut menu: gpui_kit::component::menu::PopupMenu,
+                  _: &mut Window,
+                  _: &mut Context<_>| {
+                for choice in quality_choices(&current) {
+                    let streams = streams.clone();
+                    let target: ChannelId = target.clone();
+                    let picked = choice.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.clone())
+                            .checked(choice == current)
+                            .on_click(move |_, _, cx| {
+                                streams.update(cx, |hub, cx| hub.play(&target, &picked, cx));
+                            }),
+                    );
+                }
+                menu
+            }
+        };
+        actions.children(notice).child(
+            DropdownButton::new("stream-play")
+                .button(toggle)
+                .dropdown_menu(menu)
+                .menu_accessibility_label("Stream quality"),
+        )
     }
 }
 
@@ -351,6 +478,37 @@ mod tests {
             ),
             LinkStatus::Error { reason: None }
         );
+    }
+
+    #[test]
+    fn the_quality_menu_lists_a_custom_default_first() {
+        let standard = quality_choices("720p60");
+        assert_eq!(standard.first().map(String::as_str), Some("best"));
+        assert_eq!(standard.len(), QUALITIES.len());
+        let custom = quality_choices("720p60,720p,best");
+        assert_eq!(custom[0], "720p60,720p,best");
+        assert_eq!(custom.len(), QUALITIES.len() + 1);
+    }
+
+    #[test]
+    fn the_play_button_follows_the_stream_phase() {
+        let state = |phase| StreamState {
+            session: 1,
+            phase,
+            error: None,
+        };
+        assert_eq!(play_label(None, "best"), "Play best");
+        assert_eq!(
+            play_label(Some(&state(Phase::Starting)), "best"),
+            "Starting…"
+        );
+        assert_eq!(play_label(Some(&state(Phase::Running)), "best"), "Stop");
+        assert_eq!(
+            play_label(Some(&state(Phase::Stopping)), "best"),
+            "Stopping…"
+        );
+        // An ended stream (error showing) can be played again.
+        assert_eq!(play_label(Some(&state(Phase::Ended)), "720p"), "Play 720p");
     }
 
     #[test]

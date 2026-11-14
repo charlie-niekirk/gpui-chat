@@ -25,6 +25,7 @@ mod replay;
 mod runtime;
 mod shell;
 mod state;
+mod streams;
 mod theme;
 
 use std::sync::Arc;
