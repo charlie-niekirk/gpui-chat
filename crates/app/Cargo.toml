@@ -15,6 +15,7 @@ path = "src/main.rs"
 gpui-chat-core = { workspace = true }
 gpui-chat-media = { workspace = true }
 gpui-chat-settings = { workspace = true }
+gpui-chat-streamlink = { workspace = true }
 gpui-chat-twitch = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }

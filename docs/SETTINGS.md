@@ -36,6 +36,12 @@ timestamps = true
 [emotes]
 scale = 1.0                                # 0.5 to 4.0; a Twitch emote is 28 px at 1.0
 animate = true                             # false: animated emotes show their first frame
+
+[streamlink]
+# path = "/opt/homebrew/bin/streamlink"   # unset: found automatically (see below)
+# player = "mpv"                          # --player; unset: streamlink's default player
+extra_args = []                            # one argument per entry, e.g. ["--twitch-low-latency"]
+default_quality = "best"                   # best, 1080p60, 720p, audio_only, "720p60,720p,best", ...
 ```
 
 ## Compatibility rules
@@ -102,3 +108,24 @@ theme while `appearance.theme = "system"`.
 (first installed entry wins, then the built-in chain) so a missing family never reaches GPUI.
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
 messages). `chat.scrollback` is read once at startup.
+
+## Streamlink (PR 1.6)
+
+The play button in a pane header runs
+`streamlink [--player <player>] <extra_args…> twitch.tv/<channel> <quality>`.
+
+- **Finding the binary.** `streamlink.path` if set (`~/` is expanded). A set path that is not
+  an executable file is an error shown in the pane header; it never falls back to another
+  binary. Unset: `command -v streamlink` in the login shell (`$SHELL -l -c`, 3 s limit; a GUI
+  app does not inherit the shell's `PATH`), then `/opt/homebrew/bin`, `/usr/local/bin`,
+  `~/.local/bin`. Nothing found shows the hint `brew install streamlink`. The result is
+  remembered until the binary disappears or `path` changes, so installing streamlink needs no
+  restart.
+- **`player`** goes to `--player` as one argument (spaces are fine); it is a program, not a
+  command line. Player arguments go in `extra_args` as `--player-args` plus its value.
+- **`extra_args`** is a list, so no shell quoting is involved. Blank entries are dropped.
+- **`default_quality`** is the quality a pane starts with. The quality menu in the header
+  chooses another one for that pane (not saved); the value must not be empty, contain
+  whitespace or start with `-`, otherwise the whole file is rejected like any other bad value.
+- Changes apply the next time play is pressed; a running stream is not restarted.
+- The `[streamlink]` section is new: a file without it loads with the defaults above.

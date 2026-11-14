@@ -35,8 +35,8 @@ pub use paths::{
     THEMES_DIR_NAME,
 };
 pub use schema::{
-    AppearanceSettings, ChatSettings, EmoteSettings, SCHEMA_VERSION, Settings, ThemeMode,
-    UNVERSIONED_SCHEMA_VERSION,
+    AppearanceSettings, ChatSettings, EmoteSettings, SCHEMA_VERSION, Settings, StreamlinkSettings,
+    ThemeMode, UNVERSIONED_SCHEMA_VERSION,
 };
 pub use store::LoadOutcome;
 pub use watch::{
