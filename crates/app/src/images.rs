@@ -22,6 +22,8 @@
 //!   into the layout change log ([`Images::changes_since`]) and each view re-shapes only the
 //!   cached messages that contain that URL. BTTV often omits sizes, so this happens for many
 //!   third-party emotes; one URL must never re-shape the whole list.
+//! * **Badges** use the same store ([`Images::badge_box`]): a fixed square box, so only a permanent
+//!   failure (the badge is then left out of messages) goes through the change log, never a size.
 //! * **Failures.** Only permanent ones ([`is_permanent`]: 404/410, undecodable, refused) turn an
 //!   emote into its name as text. A transient one (timeout, network error, 5xx) keeps the
 //!   placeholder, and views that painted it are woken every [`RETRY_POLL`] to ask again once
@@ -33,7 +35,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use gpui_chat_core::{Emote, ImageScale};
+use gpui_chat_core::{Badge, Emote, ImageScale};
 use gpui_chat_media::scale::{self, logical_size};
 use gpui_chat_media::{
     CacheValue, DecodedImage, FetchError, ImageCache, ImageCacheBuilder, ImageCacheConfig,
@@ -45,6 +47,10 @@ use tokio::sync::Notify;
 /// Base size (logical px at emote scale 1) of an emote whose provider does not report one:
 /// Twitch emotes are 28 × 28 at 1x.
 pub const DEFAULT_EMOTE_SIZE: f32 = 28.0;
+
+/// Twitch's 1x badge is this many pixels square; a badge drawn at another logical size wants a
+/// proportionally denser variant.
+pub const BADGE_BASE_SIZE: f32 = 18.0;
 
 /// A size change smaller than this (logical px) does not re-shape anything.
 const SIZE_SLACK: f32 = 0.5;
@@ -322,6 +328,9 @@ struct Expected {
     size: (f32, f32),
     variant: ImageScale,
     emote_scale: f32,
+    /// The box does not depend on the image's own size (a badge is always square), so only a
+    /// failure for good changes the layout, never a size.
+    fixed: bool,
 }
 
 /// Events from media's callbacks (tokio threads) for the UI thread.
@@ -491,11 +500,67 @@ impl Images {
                         size: assumed,
                         variant: selected.scale,
                         emote_scale,
+                        fixed: false,
                     },
                 );
                 EmoteBox::Image { url, size: assumed }
             }
         }
+    }
+
+    /// The image to draw `badge` from in a square box of `size` logical pixels, starting its
+    /// load; `None` if it has no image or it failed for good (the badge is then left out of the
+    /// message). Called when a message is shaped. The box never depends on the image, so a
+    /// finished load changes nothing; a permanent failure after the message was shaped is logged
+    /// like an emote's (the view shapes its messages again, now without the badge).
+    pub fn badge_box(&mut self, badge: &Badge, size: f32, display_scale: f32) -> Option<ImageKey> {
+        let selected = scale::select(&badge.urls, display_scale, size / BADGE_BASE_SIZE)?;
+        let url = ImageKey::new(selected.url);
+        let Some(cache) = &self.cache else {
+            return Some(url);
+        };
+        match cache.status(url.url()) {
+            ImageStatus::Failed(error) if is_permanent(&error) => {
+                self.to_text.remove(url.url());
+                None
+            }
+            ImageStatus::Ready(_) => Some(url),
+            status => {
+                if matches!(status, ImageStatus::Absent) {
+                    drop(cache.request(url.url()));
+                }
+                self.expected.insert(
+                    url.clone(),
+                    Expected {
+                        size: (size, size),
+                        variant: selected.scale,
+                        emote_scale: 1.0,
+                        fixed: true,
+                    },
+                );
+                Some(url)
+            }
+        }
+    }
+
+    /// The URL and logical size of a larger preview of `badge` for the tooltip: its densest
+    /// variant, one image pixel per device pixel. `None` if it has no image.
+    pub fn badge_preview(
+        &mut self,
+        badge: &Badge,
+        display_scale: f32,
+    ) -> Option<(ImageKey, (f32, f32))> {
+        let selected = scale::select(&badge.urls, 1.0, f32::from(ImageScale::X4.factor()))?;
+        let url = ImageKey::new(selected.url);
+        if let Some(cache) = &self.cache
+            && let ImageStatus::Failed(error) = cache.status(url.url())
+            && is_permanent(&error)
+        {
+            return None;
+        }
+        // 18 px at 1x, so the variant's pixels are `18 × factor`: one per device pixel.
+        let side = BADGE_BASE_SIZE * f32::from(selected.scale.factor()) / display_scale.max(1.0);
+        Some((url, (side, side)))
     }
 
     /// The URL and logical size of a larger preview of `emote` for the tooltip: its densest
@@ -647,6 +712,7 @@ impl Images {
             return;
         };
         let changed = match cache.status(key.url()) {
+            ImageStatus::Ready(_) if expected.fixed => false,
             ImageStatus::Ready(image) => {
                 let (w, h) =
                     logical_size(image.pixel_size(), expected.variant, expected.emote_scale);

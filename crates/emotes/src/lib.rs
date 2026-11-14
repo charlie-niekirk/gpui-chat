@@ -15,8 +15,12 @@
 //! [`gpui_chat_core::WordResolver`] for the tokenizer: channel 7TV → BTTV → FFZ, then global 7TV →
 //! BTTV → FFZ, with per-provider switches ([`Providers`]).
 //!
+//! Twitch badges live in [`badges`]: the [`BadgeSource`] trait, the anonymous source (bundled global
+//! snapshot + `api.ivr.fi` for a channel's) and the [`BadgeRegistry`] the chat view reads.
+//!
 //! See the module docs of [`bttv`], [`ffz`] and [`seventv`] for endpoint and mapping details.
 
+pub mod badges;
 pub mod bttv;
 mod error;
 pub mod ffz;
@@ -29,6 +33,9 @@ pub mod seventv;
 #[cfg(test)]
 mod testutil;
 
+pub use badges::{
+    AnonymousBadgeSource, BadgeError, BadgeFuture, BadgeRegistry, BadgeSet, BadgeSource,
+};
 pub use bttv::BttvClient;
 pub use error::EmoteError;
 pub use ffz::FfzClient;

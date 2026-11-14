@@ -10,7 +10,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui_chat_core::{Author, Emote, Fragment, Message, MessageKind};
+use gpui_chat_core::{Author, Badge, Emote, Fragment, Message, MessageKind};
+use gpui_chat_media::ImageKey;
 
 /// What a span of the display text is; decides its font weight and colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +32,10 @@ pub enum Role {
     /// An emote's name: drawn as an inline image (its glyphs only if the image failed). Every
     /// emote, overlays included, is a span of its own, listed in [`DisplayText::emotes`].
     Emote,
+    /// A badge's title: drawn as an inline image, never as text (a badge without an image is not
+    /// in the display text at all). Every badge is a span of its own, listed in
+    /// [`DisplayText::badges`].
+    Badge,
     Emoji,
     Cheer,
     /// Notices, system lines and the system part of a `USERNOTICE` (muted).
@@ -61,13 +66,35 @@ pub struct DisplayEmote {
     pub overlay: bool,
 }
 
+/// A badge that is drawn: its definition and the image it is drawn from. The caller decides
+/// which badges get a slot (the ones with an image that has not failed for good); the display
+/// text has room for exactly those.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BadgeSlot {
+    pub badge: Arc<Badge>,
+    /// The variant to draw.
+    pub url: ImageKey,
+    /// Logical side of the square box (badges are square).
+    pub size: f32,
+}
+
+/// One [`Role::Badge`] span and the badge it names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayBadge {
+    /// Index into [`DisplayText::spans`].
+    pub span: usize,
+    pub slot: BadgeSlot,
+}
+
 /// The display text and its spans. Spans are contiguous, in order, and cover the whole text.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayText {
     pub text: String,
     pub spans: Vec<Span>,
     /// Every [`Role::Emote`] span, in text order.
     pub emotes: Vec<DisplayEmote>,
+    /// Every [`Role::Badge`] span, in text order (before the author's name).
+    pub badges: Vec<DisplayBadge>,
 }
 
 /// Settings that change what is drawn (and therefore the layout).
@@ -94,8 +121,12 @@ impl DisplayText {
             return;
         }
         match self.spans.last_mut() {
-            // Emotes are never merged: each span is one image.
-            Some(last) if last.role == role && last.range.end == start && role != Role::Emote => {
+            // Emotes and badges are never merged: each span is one image.
+            Some(last)
+                if last.role == role
+                    && last.range.end == start
+                    && !matches!(role, Role::Emote | Role::Badge) =>
+            {
                 last.range.end = end;
             }
             _ => self.spans.push(Span {
@@ -115,6 +146,23 @@ impl DisplayText {
                 emote: emote.clone(),
                 overlay,
             });
+        }
+    }
+
+    /// Appends each badge's title as its own [`Role::Badge`] span, each followed by a space, so
+    /// the name (or whatever follows) is a space away from the last one.
+    fn push_badges(&mut self, slots: &[BadgeSlot]) {
+        for slot in slots {
+            let span = self.spans.len();
+            self.push(&slot.badge.title, Role::Badge);
+            // A badge without a title has no span to draw into.
+            if self.spans.len() > span {
+                self.badges.push(DisplayBadge {
+                    span,
+                    slot: slot.clone(),
+                });
+                self.push(" ", Role::Separator);
+            }
         }
     }
 
@@ -170,8 +218,8 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
     }
 }
 
-/// The display text of `message`.
-pub fn build(message: &Message, options: DisplayOptions) -> DisplayText {
+/// The display text of `message`; `badges` are drawn before the author's name.
+pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -> DisplayText {
     let mut out = DisplayText::default();
     if options.timestamps {
         out.push(&clock(message.timestamp.unix_millis()), Role::Timestamp);
@@ -181,6 +229,7 @@ pub fn build(message: &Message, options: DisplayOptions) -> DisplayText {
     match message.kind {
         MessageKind::Chat => {
             if let Some(author) = author {
+                out.push_badges(badges);
                 out.push(name(author), Role::Name);
                 out.push(": ", Role::Separator);
             }
@@ -188,6 +237,7 @@ pub fn build(message: &Message, options: DisplayOptions) -> DisplayText {
         }
         MessageKind::Action => {
             if let Some(author) = author {
+                out.push_badges(badges);
                 out.push(name(author), Role::Name);
                 out.push(" ", Role::Separator);
             }
@@ -203,6 +253,7 @@ pub fn build(message: &Message, options: DisplayOptions) -> DisplayText {
                     out.push(" ", Role::Separator);
                 }
                 if let Some(author) = author {
+                    out.push_badges(badges);
                     out.push(name(author), Role::Name);
                     out.push(": ", Role::Separator);
                 }
@@ -269,7 +320,7 @@ mod tests {
                 is_self: true,
             },
         ]);
-        let display = build(&message, DisplayOptions { timestamps: true });
+        let display = build(&message, DisplayOptions { timestamps: true }, &[]);
         assert_eq!(display.text, "01:01 Alice: hi @Bob see x.com @me");
         assert_eq!(
             roles(&display),
@@ -286,7 +337,7 @@ mod tests {
                 ("@me", Role::SelfMention),
             ]
         );
-        let untimed = build(&message, DisplayOptions { timestamps: false });
+        let untimed = build(&message, DisplayOptions { timestamps: false }, &[]);
         assert!(untimed.text.starts_with("Alice: "));
     }
 
@@ -306,7 +357,7 @@ mod tests {
                 bits: 100,
             },
         ]);
-        let display = build(&message, DisplayOptions { timestamps: true });
+        let display = build(&message, DisplayOptions { timestamps: true }, &[]);
         let mut at = 0;
         for span in &display.spans {
             assert_eq!(span.range.start, at);
@@ -345,7 +396,7 @@ mod tests {
                 zero_width_overlays: vec![],
             },
         ]);
-        let display = build(&message, DisplayOptions::default());
+        let display = build(&message, DisplayOptions::default(), &[]);
         assert_eq!(
             roles(&display)[2..],
             [("Kappa", Role::Emote), ("LUL", Role::Emote)]
@@ -361,7 +412,7 @@ mod tests {
         let mut action = chat(vec![Fragment::Text("waves".into())]);
         action.kind = MessageKind::Action;
         assert_eq!(
-            roles(&build(&action, DisplayOptions::default())),
+            roles(&build(&action, DisplayOptions::default(), &[])),
             [
                 ("Alice", Role::Name),
                 (" ", Role::Separator),
@@ -371,7 +422,7 @@ mod tests {
 
         let notice = Message::plain("2", Timestamp(0), MessageKind::System, "connected");
         assert_eq!(
-            roles(&build(&notice, DisplayOptions::default())),
+            roles(&build(&notice, DisplayOptions::default(), &[])),
             [("connected", Role::System)]
         );
 
@@ -379,7 +430,7 @@ mod tests {
         sub.kind = MessageKind::UserNotice;
         sub.system_text = Some("Alice subscribed for 3 months!".into());
         assert_eq!(
-            build(&sub, DisplayOptions::default()).text,
+            build(&sub, DisplayOptions::default(), &[]).text,
             "Alice subscribed for 3 months! Alice: hype"
         );
     }
@@ -387,7 +438,7 @@ mod tests {
     #[test]
     fn control_characters_become_spaces_and_the_tag_character_is_dropped() {
         let message = chat(vec![Fragment::Text("a\nb\tc\u{E0000}d".into())]);
-        let display = build(&message, DisplayOptions::default());
+        let display = build(&message, DisplayOptions::default(), &[]);
         assert_eq!(display.text, "Alice: a b cd");
         assert!(!display.text.contains('\n'));
     }
@@ -396,6 +447,77 @@ mod tests {
     fn empty_display_name_falls_back_to_login() {
         let mut message = chat(vec![]);
         message.author = Some(Author::new("bob", " "));
-        assert_eq!(build(&message, DisplayOptions::default()).text, "bob: ");
+        assert_eq!(
+            build(&message, DisplayOptions::default(), &[]).text,
+            "bob: "
+        );
+    }
+    fn slot(title: &str, url: &str) -> BadgeSlot {
+        BadgeSlot {
+            badge: Arc::new(Badge {
+                id: gpui_chat_core::BadgeId::new(title, "1"),
+                title: title.to_owned(),
+                urls: gpui_chat_core::ImageUrls::new(),
+            }),
+            url: ImageKey::new(url),
+            size: 18.0,
+        }
+    }
+
+    #[test]
+    fn badges_come_before_the_name_each_a_span_of_its_own() {
+        let message = chat(vec![Fragment::Text("hi".into())]);
+        let slots = [slot("Moderator", "m"), slot("Subscriber", "s")];
+        let display = build(&message, DisplayOptions { timestamps: true }, &slots);
+        assert_eq!(display.text, "01:01 Moderator Subscriber Alice: hi");
+        assert_eq!(
+            roles(&display),
+            [
+                ("01:01", Role::Timestamp),
+                (" ", Role::Separator),
+                ("Moderator", Role::Badge),
+                (" ", Role::Separator),
+                ("Subscriber", Role::Badge),
+                (" ", Role::Separator),
+                ("Alice", Role::Name),
+                (": ", Role::Separator),
+                ("hi", Role::Text),
+            ]
+        );
+        let spans: Vec<_> = display.badges.iter().map(|b| b.span).collect();
+        assert_eq!(spans, [2, 4]);
+        assert_eq!(display.badges[1].slot.url.url(), "s");
+
+        // /me and the chat part of a USERNOTICE put them before the name too; notices and system
+        // lines have no author and so none.
+        let mut action = chat(vec![Fragment::Text("waves".into())]);
+        action.kind = MessageKind::Action;
+        assert_eq!(
+            build(&action, DisplayOptions::default(), &slots[..1]).text,
+            "Moderator Alice waves"
+        );
+        let mut sub = chat(vec![Fragment::Text("hype".into())]);
+        sub.kind = MessageKind::UserNotice;
+        sub.system_text = Some("Alice subscribed!".into());
+        assert_eq!(
+            build(&sub, DisplayOptions::default(), &slots[..1]).text,
+            "Alice subscribed! Moderator Alice: hype"
+        );
+        let notice = Message::plain("2", Timestamp(0), MessageKind::System, "x");
+        let display = build(&notice, DisplayOptions::default(), &slots);
+        assert_eq!(display.text, "x");
+        assert!(display.badges.is_empty());
+    }
+
+    #[test]
+    fn a_badge_without_a_title_has_no_span_and_none_means_no_text() {
+        let message = chat(vec![]);
+        let display = build(&message, DisplayOptions::default(), &[slot("", "x")]);
+        assert_eq!(display.text, "Alice: ");
+        assert!(display.badges.is_empty());
+        assert_eq!(
+            build(&message, DisplayOptions::default(), &[]).text,
+            "Alice: "
+        );
     }
 }

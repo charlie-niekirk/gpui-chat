@@ -23,7 +23,7 @@ pub(crate) fn parse_entries<T: DeserializeOwned>(what: &str, values: Vec<Value>)
         .filter_map(|(index, value)| match serde_json::from_value(value) {
             Ok(entry) => Some(entry),
             Err(error) => {
-                tracing::warn!(what, index, %error, "skipping malformed emote entry");
+                tracing::warn!(what, index, %error, "skipping malformed entry");
                 None
             }
         })

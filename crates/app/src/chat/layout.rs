@@ -21,6 +21,11 @@
 //! and as tall as its widest and tallest layer. Layers without an image are left out of the stack
 //! (an overlay that failed to load simply is not drawn); a stack with no image at all stays text.
 //!
+//! Badges are the same mechanism, ahead of the name: each badge the display text has a slot for
+//! ([`super::display::BadgeSlot`]: its title as a [`super::display::Role::Badge`] span) becomes one
+//! inline atom of a fixed square size, so its box is final before the image arrives and a badge
+//! that later fails for good only changes the layout through the per-URL invalidation.
+//!
 //! [`LayoutCache`] keeps both per store sequence number, keyed by (width, text-config generation,
 //! scale factor); a changed message (`Arc` pointer differs, e.g. marked deleted) is re-shaped.
 //! Entries for evicted messages are dropped when the view syncs with the store.
@@ -29,7 +34,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_chat_core::{Emote, Message};
+use gpui_chat_core::{Badge, Emote, Message};
 use gpui_chat_media::ImageKey;
 use gpui_kit::{FontId, GlyphId, LineLayout, Pixels};
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -61,16 +66,25 @@ pub struct InlineLayer {
     pub size: (f32, f32),
 }
 
-/// An emote (with the zero-width overlays stacked on it) drawn as images: which atom it is and
-/// what to draw.
+/// What an inline box stands for, for the tooltip.
+#[derive(Clone, Debug)]
+pub enum InlineContent {
+    /// An emote and the zero-width overlays stacked on it (every emote of the stack, drawn or
+    /// not).
+    Emotes(Vec<Arc<Emote>>),
+    /// A badge.
+    Badge(Arc<Badge>),
+}
+
+/// An emote (with the zero-width overlays stacked on it) or a badge drawn as images: which atom
+/// it is and what to draw.
 #[derive(Clone, Debug)]
 pub struct InlineImage {
     /// Index into [`ShapedMessage::atoms`] (an [`AtomKind::Inline`] atom).
     pub atom: u32,
-    /// The images to draw, bottom first (the base, then each overlay).
+    /// The images to draw, bottom first (the base, then each overlay; a badge has one).
     pub layers: Vec<InlineLayer>,
-    /// Every emote in the stack, drawn or not, for the tooltip.
-    pub emotes: Vec<Arc<Emote>>,
+    pub content: InlineContent,
 }
 
 impl InlineImage {
@@ -82,12 +96,13 @@ impl InlineImage {
     }
 }
 
-/// A stack of emotes about to become one inline atom.
+/// A stack of emotes, or one badge, about to become one inline atom.
 struct Stack {
     /// Display-text range from the base's name to the last overlay's name.
     range: std::ops::Range<usize>,
     layers: Vec<InlineLayer>,
     emotes: Vec<Arc<Emote>>,
+    badge: Option<Arc<Badge>>,
 }
 
 impl Stack {
@@ -97,6 +112,20 @@ impl Stack {
             (w.max(layer.size.0), h.max(layer.size.1))
         })
     }
+}
+
+/// One stack per badge: its title's range, drawn as a box of the slot's size. Badges come before
+/// everything else in the text, so these precede the emote stacks.
+fn badge_stacks(display: &DisplayText) -> impl Iterator<Item = Stack> + '_ {
+    display.badges.iter().map(|entry| Stack {
+        range: display.spans[entry.span].range.clone(),
+        layers: vec![InlineLayer {
+            url: entry.slot.url.clone(),
+            size: (entry.slot.size, entry.slot.size),
+        }],
+        emotes: Vec::new(),
+        badge: Some(entry.slot.badge.clone()),
+    })
 }
 
 /// Groups the display emotes into stacks (a base and the overlays after it). `boxes` has one
@@ -130,6 +159,7 @@ fn stacks(display: &DisplayText, boxes: &[EmoteBox]) -> Vec<Stack> {
                 range,
                 layers: layer.into_iter().collect(),
                 emotes: vec![emote.clone()],
+                badge: None,
             }),
         }
     }
@@ -142,7 +172,7 @@ fn stacks(display: &DisplayText, boxes: &[EmoteBox]) -> Vec<Stack> {
 pub struct ShapedMessage {
     pub display: DisplayText,
     pub atoms: Vec<Atom>,
-    /// The emotes drawn as images, in atom order.
+    /// The badges and emotes drawn as images, in atom order.
     pub inlines: Vec<InlineImage>,
     /// Span index (into `display.spans`) of each atom.
     pub atom_spans: Vec<u32>,
@@ -264,7 +294,9 @@ fn inline_emotes(
     display: &DisplayText,
     boxes: &[EmoteBox],
 ) -> (Vec<Atom>, Vec<InlineImage>) {
-    let mut stacks = stacks(display, boxes).into_iter().peekable();
+    let mut stacks = badge_stacks(display)
+        .chain(stacks(display, boxes))
+        .peekable();
     if stacks.peek().is_none() {
         return (atoms, Vec::new());
     }
@@ -302,7 +334,10 @@ fn inline_emotes(
                 inlines.push(InlineImage {
                     atom: (out.len() - 1) as u32,
                     layers: stack.layers,
-                    emotes: stack.emotes,
+                    content: match stack.badge {
+                        Some(badge) => InlineContent::Badge(badge),
+                        None => InlineContent::Emotes(stack.emotes),
+                    },
                 });
                 i = last + 1;
                 continue;
@@ -504,7 +539,7 @@ mod tests {
 
     fn shaped(text: &str) -> ShapedMessage {
         let message = message(text);
-        let display = display::build(&message, DisplayOptions::default());
+        let display = display::build(&message, DisplayOptions::default(), &[]);
         let layout = fake_layout(&display.text);
         ShapedMessage::from_layout(display, &layout, &[])
     }
@@ -535,7 +570,7 @@ mod tests {
                 emote("425618", "LUL"),
             ],
         );
-        let display = display::build(&message, DisplayOptions::default());
+        let display = display::build(&message, DisplayOptions::default(), &[]);
         let layout = fake_layout(&display.text);
         ShapedMessage::from_layout(display, &layout, boxes)
     }
@@ -623,7 +658,7 @@ mod tests {
                 Fragment::Text(" end".into()),
             ],
         );
-        let display = display::build(&message, DisplayOptions::default());
+        let display = display::build(&message, DisplayOptions::default(), &[]);
         assert_eq!(display.text, "Al: hi Base Over1 Over2 end");
         let layout = fake_layout(&display.text);
         ShapedMessage::from_layout(display, &layout, boxes)
@@ -672,11 +707,10 @@ mod tests {
                 ("o2", (24.0, 40.0))
             ]
         );
-        let names: Vec<&str> = s.inlines[0]
-            .emotes
-            .iter()
-            .map(|e| &*e.name as &str)
-            .collect();
+        let InlineContent::Emotes(emotes) = &s.inlines[0].content else {
+            panic!("not an emote stack");
+        };
+        let names: Vec<&str> = emotes.iter().map(|e| &*e.name as &str).collect();
         assert_eq!(names, ["Base", "Over1", "Over2"]);
         // The box is one unbreakable unit in the flow, and it takes one slot, not three.
         let flow = flow::flow(&s.atoms, 1000.0, 20.0);
@@ -699,7 +733,7 @@ mod tests {
         assert_eq!(s.inlines.len(), 1);
         let urls: Vec<&str> = s.inlines[0].layers.iter().map(|l| l.url.url()).collect();
         assert_eq!(urls, ["base", "o2"]);
-        assert_eq!(s.inlines[0].emotes.len(), 3);
+        assert!(matches!(&s.inlines[0].content, InlineContent::Emotes(e) if e.len() == 3));
         assert_eq!(s.atoms[7].width, 40.0);
 
         // A failed base with a drawable overlay: the overlay is the stack.
@@ -793,6 +827,7 @@ mod tests {
                 role: crate::chat::display::Role::Text,
             }],
             emotes: Vec::new(),
+            badges: Vec::new(),
         };
         assert_eq!(visual.len(), text.chars().count());
         let glyphs = visual
@@ -913,6 +948,7 @@ mod tests {
                 role: crate::chat::display::Role::Text,
             }],
             emotes: Vec::new(),
+            badges: Vec::new(),
         };
         let xs = [0.0, 8.7, 16.1, 25.3, 33.9];
         let glyphs = xs
@@ -1004,5 +1040,76 @@ mod tests {
         cache.layout(9, &m, LayoutKey::new(2, 1.0), 100.0, 10.0, || shaped("x"));
         cache.retain_key(2);
         assert_eq!(cache.len(), 1);
+    }
+    /// "Mod Sub Al: hi": two badges (titles "Mod" and "Sub") ahead of the name.
+    fn shaped_badges(slots: &[crate::chat::display::BadgeSlot]) -> ShapedMessage {
+        let message = Message::chat(
+            "1",
+            Timestamp(0),
+            Author::new("al", "Al"),
+            vec![Fragment::Text("hi".into())],
+        );
+        let display = display::build(&message, DisplayOptions::default(), slots);
+        assert_eq!(display.text, "Mod Sub Al: hi");
+        let layout = fake_layout(&display.text);
+        ShapedMessage::from_layout(display, &layout, &[])
+    }
+
+    fn slot(title: &str, url: &str, size: f32) -> crate::chat::display::BadgeSlot {
+        crate::chat::display::BadgeSlot {
+            badge: Arc::new(Badge {
+                id: gpui_chat_core::BadgeId::new(title, "1"),
+                title: title.to_owned(),
+                urls: gpui_chat_core::ImageUrls::new(),
+            }),
+            url: ImageKey::new(url),
+            size,
+        }
+    }
+
+    #[test]
+    fn each_badge_is_one_square_inline_atom_ahead_of_the_name() {
+        let s = shaped_badges(&[slot("Mod", "m", 18.0), slot("Sub", "s", 18.0)]);
+        let texts: Vec<(&str, AtomKind)> = s
+            .atoms
+            .iter()
+            .map(|atom| (&s.display.text[atom.range.clone()], atom.kind))
+            .collect();
+        assert_eq!(
+            &texts[..4],
+            [
+                ("Mod", AtomKind::Inline),
+                (" ", AtomKind::Space),
+                ("Sub", AtomKind::Inline),
+                (" ", AtomKind::Space),
+            ]
+        );
+        assert_eq!((s.atoms[0].width, s.atoms[0].height), (18.0, 18.0));
+        let drawn: Vec<(u32, &str, &str)> = s
+            .inlines
+            .iter()
+            .map(|i| {
+                let InlineContent::Badge(badge) = &i.content else {
+                    panic!("not a badge");
+                };
+                (i.atom, i.layers[0].url.url(), &*badge.title as &str)
+            })
+            .collect();
+        assert_eq!(drawn, [(0, "m", "Mod"), (2, "s", "Sub")]);
+        // "Al: hi" follows after the two boxes and spaces: 18 + 10 + 18 + 10.
+        let flow = flow::flow(&s.atoms, 1000.0, 20.0);
+        assert_eq!(flow.placements[4].x, 56.0);
+        assert_eq!(flow.height(), 20.0, "an 18 px box fits the 20 px line");
+    }
+
+    #[test]
+    fn a_message_without_badge_slots_has_none() {
+        let s = shaped_badges_none();
+        assert!(s.inlines.is_empty());
+        assert!(s.display.badges.is_empty());
+    }
+
+    fn shaped_badges_none() -> ShapedMessage {
+        shaped("hi")
     }
 }

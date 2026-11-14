@@ -1,0 +1,105 @@
+[
+ {
+  "set_id": "bits",
+  "versions": [
+   {
+    "id": "100",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/7695da2c-7e42-4652-9b94-a3f695b0ebfc/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/7695da2c-7e42-4652-9b94-a3f695b0ebfc/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/7695da2c-7e42-4652-9b94-a3f695b0ebfc/3",
+    "title": "cheer 100",
+    "description": "cheer 100",
+    "click_action": "visit_url",
+    "click_url": "https://help.twitch.tv/s/article/guide-to-cheering-with-bits"
+   },
+   {
+    "id": "1000",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/8e443882-eba2-40ed-aee2-8f66995a4205/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/8e443882-eba2-40ed-aee2-8f66995a4205/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/8e443882-eba2-40ed-aee2-8f66995a4205/3",
+    "title": "cheer 1000",
+    "description": "cheer 1000",
+    "click_action": "visit_url",
+    "click_url": "https://help.twitch.tv/s/article/guide-to-cheering-with-bits"
+   },
+   {
+    "id": "10000",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/6c5170c1-96e0-44f1-93eb-55c02f6a66f9/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/6c5170c1-96e0-44f1-93eb-55c02f6a66f9/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/6c5170c1-96e0-44f1-93eb-55c02f6a66f9/3",
+    "title": "cheer 10000",
+    "description": "cheer 10000",
+    "click_action": "visit_url",
+    "click_url": "https://help.twitch.tv/s/article/guide-to-cheering-with-bits"
+   }
+  ]
+ },
+ {
+  "set_id": "campaign-71092938-c723812a-b074-4837-94d0-83867964ceca-sub",
+  "versions": [
+   {
+    "id": "1",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/c91a6181-4ef9-424a-b638-5712212eda02/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/c91a6181-4ef9-424a-b638-5712212eda02/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/c91a6181-4ef9-424a-b638-5712212eda02/3",
+    "title": "JP",
+    "description": "Channel Campaign Badge",
+    "click_action": "",
+    "click_url": null
+   }
+  ]
+ },
+ {
+  "set_id": "subscriber",
+  "versions": [
+   {
+    "id": "0",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/42212029-4b13-4e76-91b5-c8d7d520a08a/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/42212029-4b13-4e76-91b5-c8d7d520a08a/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/42212029-4b13-4e76-91b5-c8d7d520a08a/3",
+    "title": "Subscriber",
+    "description": "Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "102",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/5eafd8c7-2606-429f-b8d2-ef1cb3a18e34/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/5eafd8c7-2606-429f-b8d2-ef1cb3a18e34/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/5eafd8c7-2606-429f-b8d2-ef1cb3a18e34/3",
+    "title": "8.5-Year Subscriber",
+    "description": "8.5-Year Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   },
+   {
+    "id": "108",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/e1837150-eb9d-405a-a146-049eae6e2576/1",
+    "image_url_2x": "https://static-cdn.jtvnw.net/badges/v1/e1837150-eb9d-405a-a146-049eae6e2576/2",
+    "image_url_4x": "https://static-cdn.jtvnw.net/badges/v1/e1837150-eb9d-405a-a146-049eae6e2576/3",
+    "title": "9-Year Subscriber",
+    "description": "9-Year Subscriber",
+    "click_action": "subscribe_to_channel",
+    "click_url": null
+   }
+  ]
+ },
+ {
+  "set_id": "broken",
+  "versions": [
+   {
+    "id": "1"
+   }
+  ]
+ },
+ {
+  "set_id": "half",
+  "versions": [
+   {
+    "id": "1",
+    "title": "Half",
+    "image_url_1x": "https://static-cdn.jtvnw.net/badges/v1/00000000-0000-0000-0000-000000000000/1"
+   }
+  ]
+ }
+]

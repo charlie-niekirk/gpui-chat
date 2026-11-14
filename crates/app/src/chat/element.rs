@@ -14,13 +14,18 @@
 //! (7TV overlays) share one box, as wide and tall as the widest and tallest layer; each layer
 //! is drawn centred in it, the base first and the overlays on top. Hovering a box shows a
 //! tooltip listing every emote in it ([`super::tooltip`]).
+//!
+//! **Badges** are drawn before the name as square boxes of one size (the same inline machinery as
+//! emotes, one layer each; a faint placeholder while the image loads) with a tooltip of their
+//! own. They are looked up when the message is shaped, in the channel's badge sets and then the
+//! global ones ([`crate::badges`]); a badge with no definition or no usable image is not shown.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_chat_core::Message;
+use gpui_chat_core::{ChannelId, Message};
 use gpui_kit::{
     App, AvailableSpace, Bounds, Corners, Element, ElementId, Font, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseExitEvent,
@@ -29,10 +34,11 @@ use gpui_kit::{
 };
 
 use super::colors;
-use super::display::{self, DisplayEmote, DisplayOptions, Role};
+use super::display::{self, BadgeSlot, DisplayEmote, DisplayOptions, Role};
 use super::flow::{AtomKind, Flow};
 use super::layout::{LayoutCache, LayoutKey, MessageLayout, ShapedMessage};
 use super::tooltip::{EmoteHover, Target};
+use crate::badges::Badges;
 use crate::images::{EmoteBox, FrameImages, Images, Lookup};
 use crate::theme::Tokens;
 
@@ -76,6 +82,7 @@ impl Palette {
             | Role::Text
             | Role::Mention
             | Role::Emote
+            | Role::Badge
             | Role::Emoji
             | Role::Cheer => self.text,
         }
@@ -93,6 +100,14 @@ pub struct EmoteStyle {
     pub light: bool,
 }
 
+/// How badges are drawn in one render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BadgeStyle {
+    /// Logical side of a badge's square box (part of the layout generation: it follows the font
+    /// size).
+    pub size: f32,
+}
+
 /// Everything about how messages are drawn that is shared by every message in one render.
 pub struct MessageStyle {
     pub font: Font,
@@ -106,6 +121,9 @@ pub struct MessageStyle {
     pub padding: Point<Pixels>,
     pub palette: Palette,
     pub emotes: EmoteStyle,
+    pub badges: BadgeStyle,
+    /// The channel the view shows: where badge definitions are looked up.
+    pub channel: ChannelId,
     /// The images the view painted (pinned while shown) and its animation timer.
     pub images: Rc<RefCell<FrameImages>>,
     pub hover: Rc<RefCell<EmoteHover>>,
@@ -154,9 +172,40 @@ fn emote_boxes(
         .collect()
 }
 
+/// The badges of `message` that can be drawn: each one that has a definition (this channel's, then
+/// the global one) and an image that has not failed for good, in message order. Starts the image
+/// loads. Without a badge registry or image store there are none.
+fn badge_slots(
+    message: &Message,
+    style: &MessageStyle,
+    window: &Window,
+    cx: &mut App,
+) -> Vec<BadgeSlot> {
+    let Some(author) = message.author.as_ref().filter(|a| !a.badges.is_empty()) else {
+        return Vec::new();
+    };
+    let (Some(badges), true) = (cx.try_global::<Badges>(), cx.has_global::<Images>()) else {
+        return Vec::new();
+    };
+    let registry = badges.registry().clone();
+    let scale = window.scale_factor();
+    let size = style.badges.size;
+    let images = cx.global_mut::<Images>();
+    author
+        .badges
+        .iter()
+        .filter_map(|id| {
+            let badge = registry.lookup(&style.channel, id)?;
+            let url = images.badge_box(&badge, size, scale)?;
+            Some(BadgeSlot { badge, url, size })
+        })
+        .collect()
+}
+
 /// Shapes `message` as one line with the window text system.
 fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App) -> ShapedMessage {
-    let display = display::build(message, style.options);
+    let slots = badge_slots(message, style, window, cx);
+    let display = display::build(message, style.options, &slots);
     let boxes = emote_boxes(&display.emotes, style, window, cx);
     let runs: Vec<TextRun> = display
         .spans
@@ -254,7 +303,7 @@ impl MessageElement {
         for inline in &shaped.inlines {
             let rect = inline_rect(flow, shaped, inline.atom as usize);
             let rect = Bounds::new(origin + rect.origin, rect.size);
-            regions.push((rect, inline.atom, inline.emotes.clone()));
+            regions.push((rect, inline.atom, inline.content.clone()));
             // Base first, overlays on top, each centred in the stack's box.
             for (n, layer) in inline.layers.iter().enumerate() {
                 let layer_rect = centred(rect, layer.size);
@@ -314,7 +363,7 @@ impl MessageElement {
                     regions
                         .iter()
                         .find(|(rect, ..)| rect.contains(&event.position))
-                        .map(|(_, atom, emotes)| (*atom, emotes.clone()))
+                        .map(|(_, atom, content)| (*atom, content.clone()))
                 })
                 .flatten();
             EmoteHover::hover(&hover, seq, over, view, window, cx);
@@ -482,6 +531,11 @@ impl Element for MessageElement {
                 if atom.kind != AtomKind::Glyphs {
                     continue;
                 }
+                // A badge's title only stands in for its image: never draw it as text.
+                let role = shaped.display.spans[shaped.atom_spans[index] as usize].role;
+                if role == Role::Badge {
+                    continue;
+                }
                 let place = flow.placements[index];
                 let position = point(
                     origin.x + px(place.x + (glyph.x - atom.src_x)),
@@ -490,7 +544,6 @@ impl Element for MessageElement {
                 let result = if glyph.is_emoji {
                     window.paint_emoji(position, glyph.font_id, glyph.id, style.font_size)
                 } else {
-                    let role = shaped.display.spans[shaped.atom_spans[index] as usize].role;
                     let color = if flags.deleted {
                         palette.muted
                     } else {
