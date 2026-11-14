@@ -79,6 +79,8 @@ impl AuthState {
 pub struct TokenLease {
     pub token: Secret,
     pub user_id: String,
+    /// The login of the account the token belongs to.
+    pub login: String,
     pub generation: u64,
 }
 
@@ -112,6 +114,7 @@ impl Slot {
         self.token.as_ref().map(|token| TokenLease {
             token: token.access_token.clone(),
             user_id: token.user_id.clone(),
+            login: token.login.clone(),
             generation: self.generation,
         })
     }

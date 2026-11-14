@@ -13,6 +13,7 @@ mod channel_list;
 mod channels;
 mod chat;
 mod cli;
+mod composer;
 mod config;
 mod diagnostics;
 mod emote_service;

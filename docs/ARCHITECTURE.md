@@ -65,7 +65,7 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   query strings) into a channel, or says why not (3–25 chars of `a-z0-9_`); `add_channel` is the ⌘N
   dialog (Kit `Dialog` + `Input`, the rejection reason under the field). Reorder is by actions
   (⌘⌥↑/↓ and the row's context menu): Kit's `SidebarMenuItem` has no drag hooks.
-- `live.rs` (PR 1.5) — `LiveSource`: one anonymous `TwitchClient` started inside the backend runtime
+- `live.rs` (PR 1.5) — `LiveSource`: one `TwitchClient` (anonymous until login, PR 3.2) started inside the backend runtime
   (`runtime::enter`), its events forwarded with `send().await` into the bridge. The channel list is the
   only thing that decides what is joined: the shell calls `join`/`part` on add/remove and for every
   restored channel at launch (the client paces the JOINs). **`--firehose` / `--replay` replace it**: no
@@ -142,8 +142,29 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   subdomain is opened, else `https://www.twitch.tv/activate`), closes itself on success, and
   cancels the backend task whenever the sheet goes away (`on_release`). `KeychainTokenStore` is the
   `TokenStore` over `keyring`: one generic-password item, service `APP_ID` (or
-  `$GPUI_CHAT_KEYCHAIN_SERVICE`), account `twitch`, holding the whole login as one JSON record. IRC stays
-  anonymous until PR 3.2. App menu: *Log In to Twitch…*, *Log Out* (`LogIn` / `LogOut` actions).
+  `$GPUI_CHAT_KEYCHAIN_SERVICE`), account `twitch`, holding the whole login as one JSON record. App menu: *Log In to Twitch…*, *Log Out* (`LogIn` / `LogOut` actions).
+- `composer.rs` (PR 3.2) — `Composer`, the input box under each live pane's chat (the offline sources have none). A
+  single-line Kit `Input`: Enter sends, so a paste can never send several messages (a multi-line paste is
+  flattened to one line by the `Input::on_paste` hook, line breaks → spaces). ↑/↓ recall what was sent
+  (`core::InputHistory`, 100 lines per pane; actions `ComposerHistoryPrevious/Next`, bound in
+  `platform::default_bindings` to `ChatComposer > Input` so they beat the input's own cursor keys). `plan_submit`
+  (pure) turns the text into *nothing / refuse with a reason / send to room id* using `core::parse_input`
+  (`/me text` = action, `//text` = a literal leading slash, any other `/command` refused, 500-character limit) and
+  the channel's `ROOMSTATE` room id. The box clears at once; if the send fails the reason shows in a strip above
+  the box and the text comes back (unless the user typed something new; ↑ finds it anyway). `Mode` (from the
+  `AuthState`) disables the box with its placeholder and a *Log in* button when logged out, still restoring, or
+  when the login lacks `user:write:chat`.
+- `live.rs` (PR 3.2 additions) — with an account, the client gets a `CredentialsProvider` (below) and
+  `reconnect_on_login_change` calls `TwitchClient::reconnect` whenever the account IRC should use changes (login,
+  logout, another user), after the stored login was read. `LiveSource::send` posts through
+  `HelixClient::send_chat_message` on the backend runtime, returns the outcome on a `oneshot`, and on success feeds
+  the *echo* (`gpui_chat_twitch::echo_message`: the text tokenized, the id Twitch returned, `EmoteService::process`
+  for third-party emotes) into the same bridge as every incoming event. The echo is flagged `MessageFlags::echo`: `ChannelStore::apply` lets the IRC copy (same id, real emotes,
+  colour, badges) **replace** it in place (`MessageStore::replace`; the view remeasures the row through
+  `ChannelStore::replaced_since`), and drops any other chat or action line whose id is already in the store, so the
+  message shows once whichever arrives first. `follow_login` compares the account IRC should use with the login
+  the provider *actually connected as* (`ConnectedAs`), so a first connection that went anonymous because the
+  keychain was slow is corrected when the login arrives.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -158,7 +179,8 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowercase login,
 `MessageId`, `EmoteId`), `emote` (`Emote`, `EmoteProvider`, `ImageUrls` by scale, `BadgeId` /
 `Badge`), `message` (`Message`, `Author`, `Fragment`, `MessageKind`, `MessageFlags`, `ReplyRef`),
-`store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`.
+`store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`, `compose` (PR 3.2: `parse_input`,
+`sanitize_line`, `InputHistory`).
 
 - **`MessageStore`** hands out a monotonically increasing *sequence number* per pushed message
   (never reused; `first_seq`/`next_seq`/`iter_since` let the UI see what is new or scrolled out) and a
@@ -369,8 +391,8 @@ runs non-GPUI crate tests on Ubuntu from PR 0.1 (job `linux`).
 |---|---|---|
 | UI | `gpui-kit = "=0.9.1"` (exact pin) | Kit usage stays inside `crates/app`. Version bumps are their own PRs |
 | Async I/O | `tokio` | Background threads; channels to the UI |
-| Chat read | `twitch-irc` TLS transport and IRC types (rustls); own connection supervisor | Anonymous by default. `gpui_chat_twitch::parse_line` maps a raw line to a `ChatEvent` with no network, and also handles recent-messages history lines. `twitch-irc`'s pooled client is not used: it reports no connection state, has no reconnect backoff and no JOIN pacing |
-| Helix + auth | Own `reqwest` client in `crates/twitch` (`auth`, `helix`), see *Login and Helix* | Device flow, single refresh owner, badges now; send, emotes, streams, moderation later |
+| Chat read | `twitch-irc` TLS transport and IRC types (rustls); own connection supervisor | Anonymous until login, then the user's token (PR 3.2). `gpui_chat_twitch::parse_line` maps a raw line to a `ChatEvent` with no network, and also handles recent-messages history lines. `twitch-irc`'s pooled client is not used: it reports no connection state, has no reconnect backoff and no JOIN pacing |
+| Helix + auth | Own `reqwest` client in `crates/twitch` (`auth`, `helix`), see *Login and Helix* | Device flow, single refresh owner, badges, send chat; emotes, streams, moderation later |
 | HTTP | `reqwest` (rustls) | `User-Agent: gpui-chat/<version>` |
 | Images | `image` crate, WebP preferred, GIF/PNG fallback | Avoid AVIF (native decoder dependency) |
 | Secrets | `keyring` | macOS Keychain now; Secret Service / Credential Manager later |
@@ -408,6 +430,32 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   bucket waits for the reset (at most 60 s) and a 429 is retried once after it.
 - The original plan named `twitch_api` / `twitch_oauth2`; they are not used: the flows above are a few
   requests each, and owning them gives the injectable base URLs and the refresh guarantee directly.
+
+### Chat sending and the authenticated connection (`crates/twitch`, PR 3.2)
+
+- **`HelixClient::post_json`** — like `get` (token from `Auth`, one retry after a refresh on an invalid-token 401,
+  one retry after the rate-limit reset on a 429) with a JSON body; `send_request` is the shared request.
+- **`HelixClient::send_chat_message(broadcaster_id, text, reply_parent)`** — `POST /helix/chat/messages` as the
+  logged-in user (`sender_id` = the token's user id; scope `user:write:chat`, already in `auth::SCOPES`). Every
+  failure is one `SendError` whose `Display` is the sentence shown under the input: `Dropped { code, message }`
+  (HTTP 200, `is_sent: false`; Twitch's `drop_reason.message`), `Rejected { status, message }` (400/403/422 with
+  Twitch's text; a 401 that survived the refresh, i.e. a missing scope, asks for a new login), `RateLimited`,
+  `Helix(..)` (not logged in, session ended, network). `/me text` is sent as `/me text`.
+- **Authenticated IRC** — `ClientConfig::credentials_provider` (a `CredentialsProvider`: an async closure) is asked
+  before **every** connection attempt, so a reconnect hours after login presents a refreshed token. The app's is
+  `Credentials::from_auth(&Auth)`: waits (≤ 5 s) for the stored login to be read, then the user's login with a fresh
+  access token, or anonymous when logged out, when the login lacks `chat:read`, or when no token can be had.
+  The provider is told how many connections in a row ended with `NOTICE * :Login authentication failed` (a token
+  revoked before its local expiry): at 1 `from_auth` refreshes the token although it has not expired, at 2+ the
+  connection stays anonymous; an accepted connection (`001`) resets the count.
+  `TwitchClient::reconnect()` drops the connection and reconnects at once (no backoff), rejoining the wanted
+  channels; `set_credentials` still works for a fixed login but a provider overrides it. Tests: the supervisor
+  against the in-memory server (provider consulted per attempt, reconnect with login / logout, reconnect while
+  connecting) and `chat_tests.rs` against a wiremock Helix / `id.twitch.tv`.
+- **Echo and de-duplication** — Twitch may not send a user's own message back over IRC, so on `is_sent` the app
+  shows the message itself (flagged `echo`), as the account whose token made the request (`SentMessage` carries
+  its login and user id), under the id Twitch returned; Twitch's own copy, if it comes, replaces it, and any other
+  second chat line with that id is ignored.
 
 ### Streamlink (`crates/streamlink`, PR 1.6)
 

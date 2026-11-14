@@ -3,10 +3,12 @@
 //! * [`Message`] / [`Fragment`]: the immutable chat message (shared as `Arc<Message>`)
 //!   and its tokenized body.
 //! * [`MessageStore`]: per-channel ring buffer with lookup by id and change tracking.
+//! * [`compose`]: what the input box does with typed text (commands, limits, history).
 //! * [`tokenizer`]: text → fragments (emote ranges, links, mentions, emoji, cheers).
 //! * [`ChatEvent`]: what network backends send to the UI.
 //! * [`APP_NAME`] / [`APP_ID`]: the one place the application identity lives.
 
+pub mod compose;
 pub mod emote;
 pub mod event;
 pub mod ids;
@@ -14,6 +16,10 @@ pub mod message;
 pub mod store;
 pub mod tokenizer;
 
+pub use compose::{
+    HISTORY_CAPACITY, Input, InputError, InputHistory, MAX_MESSAGE_CHARS, Outgoing, parse_input,
+    sanitize_line,
+};
 pub use emote::{Badge, BadgeId, Emote, EmoteProvider, ImageScale, ImageUrls};
 pub use event::{
     ChatEvent, ClearTarget, ConnectionState, FollowersOnly, RoomState, RoomStateUpdate,
