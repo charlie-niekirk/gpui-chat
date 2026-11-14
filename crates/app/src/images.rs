@@ -18,8 +18,10 @@
 //!   finish, one task on the UI thread notifies every waiter once for the whole batch.
 //! * **Layout stability.** Emote boxes are sized before their image arrives (the provider's
 //!   reported size, or Twitch's 28 px square), so lines do not jump when it does. If a finished
-//!   image turns out to have another size, or fails for good and falls back to text,
-//!   [`Images::epoch`] moves on and views re-shape their messages.
+//!   image turns out to have another size, or fails for good and falls back to text, its URL goes
+//!   into the layout change log ([`Images::changes_since`]) and each view re-shapes only the
+//!   cached messages that contain that URL. BTTV often omits sizes, so this happens for many
+//!   third-party emotes; one URL must never re-shape the whole list.
 //! * **Failures.** Only permanent ones ([`is_permanent`]: 404/410, undecodable, refused) turn an
 //!   emote into its name as text. A transient one (timeout, network error, 5xx) keeps the
 //!   placeholder, and views that painted it are woken every [`RETRY_POLL`] to ask again once
@@ -27,7 +29,7 @@
 //! * **One animation clock.** Every animated image picks its frame from the time since
 //!   [`Images`] was created, so identical emotes animate in sync wherever they are.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -46,6 +48,10 @@ pub const DEFAULT_EMOTE_SIZE: f32 = 28.0;
 
 /// A size change smaller than this (logical px) does not re-shape anything.
 const SIZE_SLACK: f32 = 0.5;
+
+/// How many layout changes the log remembers. A view that was away (a hidden pane) for longer
+/// than that re-shapes everything instead of asking which URLs changed.
+const CHANGE_LOG_CAPACITY: usize = 1024;
 
 /// How often a view showing a transiently failed image asks for it again (media remembers the
 /// failure for its back-off, 30 s by default, and answers from memory until then).
@@ -167,8 +173,8 @@ pub enum Lookup {
     /// A transient failure: keep the placeholder; the view is woken to ask again.
     Retrying,
     /// A permanent failure. `relayout`: the box was laid out as an image (it was ready when the
-    /// message was shaped, then evicted and failed to reload) and the epoch just moved so it
-    /// becomes text; the caller should make the view render again.
+    /// message was shaped, then evicted and failed to reload) and the URL was just logged as
+    /// changed so it becomes text; the caller should make the view render again.
     Failed {
         relayout: bool,
     },
@@ -256,6 +262,61 @@ impl FrameImages {
     }
 }
 
+/// Which image URLs changed what their emote's box looks like (another size, or text instead of
+/// an image) since a view last looked. See [`Images::changes_since`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutChanges {
+    /// Nothing changed.
+    None,
+    /// Only messages containing one of these URLs need to be laid out again.
+    Urls(Vec<ImageKey>),
+    /// The log no longer reaches back that far: lay everything out again.
+    Everything,
+}
+
+/// A bounded, numbered log of URLs whose box changed.
+#[derive(Default)]
+struct ChangeLog {
+    /// Number of the newest entry; the next one is `version + 1`.
+    version: u64,
+    /// `(number, url)`, oldest first, numbers consecutive.
+    entries: VecDeque<(u64, ImageKey)>,
+}
+
+impl ChangeLog {
+    fn push(&mut self, url: &ImageKey) {
+        self.version += 1;
+        self.entries.push_back((self.version, url.clone()));
+        if self.entries.len() > CHANGE_LOG_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    fn since(&self, seen: u64) -> LayoutChanges {
+        if seen >= self.version {
+            return LayoutChanges::None;
+        }
+        // Entries `seen + 1 ..= version` are needed; the oldest kept must not be newer than that.
+        if self
+            .entries
+            .front()
+            .is_none_or(|(first, _)| *first > seen + 1)
+        {
+            return LayoutChanges::Everything;
+        }
+        // Each URL once, in log order.
+        let mut seen_urls: HashSet<&str> = HashSet::new();
+        let urls: Vec<ImageKey> = self
+            .entries
+            .iter()
+            .filter(|(n, _)| *n > seen)
+            .filter(|(_, url)| seen_urls.insert(url.url()))
+            .map(|(_, url)| url.clone())
+            .collect();
+        LayoutChanges::Urls(urls)
+    }
+}
+
 /// What a load in flight was assumed to look like when its message was shaped.
 struct Expected {
     size: (f32, f32),
@@ -295,10 +356,10 @@ pub struct Images {
     clock_start: Instant,
     waiters: HashSet<EntityId>,
     expected: HashMap<ImageKey, Expected>,
-    epoch: u64,
+    changes: ChangeLog,
     /// Evicted images still held by a view (on screen); their textures go once they are not.
     graveyard: Vec<Arc<EmoteImage>>,
-    /// Permanently failed URLs the epoch already moved for, until a re-shape makes them text.
+    /// Permanently failed URLs already logged as changed, until a re-shape makes them text.
     to_text: HashSet<ImageKey>,
     /// Views that painted a transiently failed image, woken by `retry`.
     retry_waiters: HashSet<EntityId>,
@@ -316,7 +377,7 @@ impl Images {
             clock_start: Instant::now(),
             waiters: HashSet::new(),
             expected: HashMap::new(),
-            epoch: 0,
+            changes: ChangeLog::default(),
             graveyard: Vec::new(),
             to_text: HashSet::new(),
             retry_waiters: HashSet::new(),
@@ -372,10 +433,23 @@ impl Images {
         now.saturating_duration_since(self.clock_start)
     }
 
-    /// Moves on whenever an emote's box changed after it was laid out (a different size, or a
-    /// failure that falls back to text); views re-shape when it does.
-    pub fn epoch(&self) -> u64 {
-        self.epoch
+    /// Number of the newest entry in the layout change log; a view remembers it and later asks
+    /// [`Self::changes_since`].
+    pub fn layout_version(&self) -> u64 {
+        self.changes.version
+    }
+
+    /// The URLs whose emote box changed after a message was laid out with it (a different size
+    /// than assumed, or a failure that falls back to text) since the log was at `seen`. A view
+    /// re-shapes only the messages containing them.
+    pub fn changes_since(&self, seen: u64) -> LayoutChanges {
+        self.changes.since(seen)
+    }
+
+    /// Logs a box change by hand (tests of the views that consume the log).
+    #[cfg(test)]
+    pub fn record_layout_change(&mut self, url: &ImageKey) {
+        self.changes.push(url);
     }
 
     /// Decides how `emote` is drawn and starts loading its image. Called when a message is
@@ -401,7 +475,7 @@ impl Images {
                 url,
             },
             ImageStatus::Failed(error) if is_permanent(&error) => {
-                // Shaped as text now; a later image box for it may need a new epoch.
+                // Shaped as text now; a later image box for it is a new change.
                 self.to_text.remove(url.url());
                 EmoteBox::Text
             }
@@ -473,7 +547,7 @@ impl Images {
                     Some(Err(error)) if is_permanent(&error) => {
                         let relayout = self.to_text.insert(url.clone());
                         if relayout {
-                            self.epoch += 1;
+                            self.changes.push(url);
                         }
                         return Lookup::Failed { relayout };
                     }
@@ -565,8 +639,9 @@ impl Images {
     }
 
     /// A load finished: if its box was laid out with a size it does not have (or it failed for
-    /// good and becomes text), move the epoch on so views re-shape. After a transient failure
-    /// the box stays a placeholder and is checked again when a retry finishes.
+    /// good and becomes text), log the URL so views re-shape the messages that contain it. After
+    /// a transient failure the box stays a placeholder and is checked again when a retry
+    /// finishes.
     fn settle(&mut self, key: &ImageKey) {
         let (Some(expected), Some(cache)) = (self.expected.remove(key), &self.cache) else {
             return;
@@ -589,7 +664,7 @@ impl Images {
             ImageStatus::Loading | ImageStatus::Absent => false,
         };
         if changed {
-            self.epoch += 1;
+            self.changes.push(key);
         }
     }
 }

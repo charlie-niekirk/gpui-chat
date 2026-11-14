@@ -10,9 +10,10 @@
 //! * HTTP goes through the small [`HttpClient`] trait ([`ReqwestHttp`] is the real thing,
 //!   tests substitute a fake), so everything is testable offline.
 //!
-//! Twitch's own emotes come from IRC tags and are not handled here. Resolution (precedence,
-//! zero-width stacking) is the app's `EmoteResolver`; this crate only supplies the sets, in
-//! precedence order: 7TV → BTTV → FFZ (see [`ProviderResults::sets`]).
+//! Twitch's own emotes come from IRC tags and are not handled here. [`EmoteRegistry`] keeps the
+//! loaded sets (channel and global) and hands out an [`EmoteResolver`] per channel, the
+//! [`gpui_chat_core::WordResolver`] for the tokenizer: channel 7TV → BTTV → FFZ, then global 7TV →
+//! BTTV → FFZ, with per-provider switches ([`Providers`]).
 //!
 //! See the module docs of [`bttv`], [`ffz`] and [`seventv`] for endpoint and mapping details.
 
@@ -22,6 +23,7 @@ pub mod ffz;
 mod http;
 mod lenient;
 mod loader;
+mod resolver;
 mod set;
 pub mod seventv;
 #[cfg(test)]
@@ -34,6 +36,7 @@ pub use http::{
     HttpClient, HttpConfig, HttpError, HttpFuture, HttpResponse, ReqwestHttp, user_agent,
 };
 pub use loader::{EmoteLoader, ProviderResults};
+pub use resolver::{EmoteRegistry, EmoteResolver, Providers};
 pub use set::{EmoteScope, EmoteSet, SetEmote};
 pub use seventv::SevenTvClient;
 

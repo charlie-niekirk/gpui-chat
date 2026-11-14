@@ -29,7 +29,7 @@ pub enum Role {
     SelfMention,
     Link,
     /// An emote's name: drawn as an inline image (its glyphs only if the image failed). Every
-    /// emote is a span of its own, listed in [`DisplayText::emotes`].
+    /// emote, overlays included, is a span of its own, listed in [`DisplayText::emotes`].
     Emote,
     Emoji,
     Cheer,
@@ -49,13 +49,25 @@ pub struct Span {
     pub role: Role,
 }
 
+/// One [`Role::Emote`] span and the emote it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayEmote {
+    /// Index into [`DisplayText::spans`].
+    pub span: usize,
+    pub emote: Arc<Emote>,
+    /// A zero-width emote stacked on the nearest preceding non-overlay entry (its base). The
+    /// base, its overlays and the single spaces between them in the text make one stack, drawn
+    /// as one box.
+    pub overlay: bool,
+}
+
 /// The display text and its spans. Spans are contiguous, in order, and cover the whole text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DisplayText {
     pub text: String,
     pub spans: Vec<Span>,
-    /// `(span index, emote)` for every [`Role::Emote`] span, in text order.
-    pub emotes: Vec<(usize, Arc<Emote>)>,
+    /// Every [`Role::Emote`] span, in text order.
+    pub emotes: Vec<DisplayEmote>,
 }
 
 /// Settings that change what is drawn (and therefore the layout).
@@ -94,11 +106,15 @@ impl DisplayText {
     }
 
     /// Appends an emote's name as its own [`Role::Emote`] span.
-    fn push_emote(&mut self, emote: &Arc<Emote>) {
-        let spans = self.spans.len();
+    fn push_emote(&mut self, emote: &Arc<Emote>, overlay: bool) {
+        let span = self.spans.len();
         self.push(&emote.name, Role::Emote);
-        if self.spans.len() > spans {
-            self.emotes.push((spans, emote.clone()));
+        if self.spans.len() > span {
+            self.emotes.push(DisplayEmote {
+                span,
+                emote: emote.clone(),
+                overlay,
+            });
         }
     }
 
@@ -131,11 +147,12 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                 emote,
                 zero_width_overlays,
             } => {
-                out.push_emote(emote);
-                // Stacking overlays on their base is PR 2.4; until then they follow it.
+                out.push_emote(emote, false);
+                // The overlays follow their base, a space apart: the text (copy, hit-testing)
+                // names them all, and the layout draws the whole stack as one box.
                 for overlay in zero_width_overlays {
                     out.push(" ", text_role);
-                    out.push_emote(overlay);
+                    out.push_emote(overlay, true);
                 }
             }
             Fragment::Emoji { text } => out.push(text, Role::Emoji),
@@ -299,7 +316,11 @@ mod tests {
         assert!(display.text.ends_with("Kappa Kappa👍🏽Cheer100"));
         // Each emote is its own span, recorded with its emote.
         assert_eq!(display.emotes.len(), 2);
-        for (span, emote) in &display.emotes {
+        assert_eq!(
+            display.emotes.iter().map(|e| e.overlay).collect::<Vec<_>>(),
+            [false, true]
+        );
+        for DisplayEmote { span, emote, .. } in &display.emotes {
             assert_eq!(display.spans[*span].role, Role::Emote);
             assert_eq!(
                 &display.text[display.spans[*span].range.clone()],
@@ -330,7 +351,7 @@ mod tests {
             [("Kappa", Role::Emote), ("LUL", Role::Emote)]
         );
         assert_eq!(
-            display.emotes.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            display.emotes.iter().map(|e| e.span).collect::<Vec<_>>(),
             [2, 3]
         );
     }

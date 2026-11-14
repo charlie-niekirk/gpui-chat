@@ -14,8 +14,10 @@
 //!   more frame when the pill's visibility is stale.
 //! * **Settings:** font family/size (via the `FontConfig` global), `appearance.line_height`,
 //!   `chat.timestamps` and `emotes.scale` apply live: a change bumps the layout generation (every
-//!   cached layout is re-shaped on next use) and asks the list to remeasure. So does a change of
-//!   the image store's epoch (an emote box that turned out another size, or fell back to text).
+//!   cached layout is re-shaped on next use) and asks the list to remeasure. An emote box that
+//!   turned out another size, or fell back to text, does not: the image store logs its URL and
+//!   the view drops only the cached layouts that draw that URL and remeasures only those rows
+//!   (third-party emotes often lack sizes, so this happens a lot and must stay local).
 //!   Theme changes and `emotes.animate` only re-render (colours and frames are chosen at paint),
 //!   except a switch between light and dark, which re-shapes for Twitch's light emote variants.
 //! * **Images:** the view owns the [`FrameImages`] its rows paint into (pinning what is on
@@ -42,7 +44,7 @@ use super::tooltip::EmoteHover;
 use crate::channels::ChannelStore;
 use crate::config;
 use crate::fonts::FontConfig;
-use crate::images::{FrameImages, Images};
+use crate::images::{FrameImages, Images, LayoutChanges};
 use crate::theme::Tokens;
 
 /// Rows rendered beyond the viewport, so short scrolls do not pop in.
@@ -60,8 +62,6 @@ struct TextConfig {
     emote_scale: f32,
     /// Light theme: Twitch emote URLs (picked when shaping) have light variants.
     light: bool,
-    /// [`Images::epoch`]: emote boxes laid out with a size they turned out not to have.
-    image_epoch: u64,
 }
 
 pub struct ChatView {
@@ -71,6 +71,9 @@ pub struct ChatView {
     cache: Rc<RefCell<LayoutCache>>,
     text_config: Option<TextConfig>,
     generation: u64,
+    /// How far into the image store's layout change log this view has applied
+    /// ([`Images::layout_version`]); `None` before the first render.
+    image_version: Option<u64>,
     /// Sequence number of the first message that arrived while not following. The pill counts
     /// from there to the newest message, skipping any the scrollback cap already evicted, so it
     /// never claims more new messages than the list still holds.
@@ -108,6 +111,7 @@ impl ChatView {
             cache: Rc::new(RefCell::new(LayoutCache::default())),
             text_config: None,
             generation: 0,
+            image_version: None,
             unseen_from: None,
             pill_shown: false,
             line_height: px(0.0),
@@ -184,7 +188,6 @@ impl ChatView {
             },
             emote_scale: settings.emotes.scale,
             light: cx.global::<Tokens>().main_bg.l > 0.5,
-            image_epoch: cx.try_global::<Images>().map_or(0, Images::epoch),
         };
         if self.text_config.as_ref() != Some(&current) {
             if self.text_config.is_some() {
@@ -195,6 +198,62 @@ impl ChatView {
             self.text_config = Some(current.clone());
         }
         current
+    }
+}
+
+impl ChatView {
+    /// Applies the emote boxes that changed since the last render: only the cached layouts that
+    /// draw a changed URL are dropped (they are shaped again with the box the image store knows
+    /// by now) and only their rows are measured again. If the log no longer reaches back far
+    /// enough, everything is laid out again.
+    fn apply_image_changes(&mut self, cx: &Context<Self>) {
+        let Some(images) = cx.try_global::<Images>() else {
+            return;
+        };
+        let version = images.layout_version();
+        // Nothing is cached before the first render, so there is nothing to apply.
+        let Some(seen) = self.image_version.replace(version) else {
+            return;
+        };
+        match images.changes_since(seen) {
+            LayoutChanges::None => {}
+            LayoutChanges::Urls(urls) => {
+                let seqs = self.cache.borrow_mut().invalidate_urls(&urls);
+                self.remeasure_seqs(&seqs);
+            }
+            LayoutChanges::Everything => {
+                self.generation += 1;
+                self.list.remeasure();
+                self.cache.borrow_mut().retain_key(self.generation);
+            }
+        }
+    }
+
+    /// Asks the list to measure the rows of the messages `seqs` again.
+    fn remeasure_seqs(&self, seqs: &[u64]) {
+        let first = self.mirror.first_seq();
+        let count = self.list.item_count();
+        // `seqs` is ascending: merge neighbours into one call.
+        let mut run: Option<std::ops::Range<usize>> = None;
+        for &seq in seqs {
+            let Some(ix) = seq.checked_sub(first).map(|ix| ix as usize) else {
+                continue;
+            };
+            if ix >= count {
+                continue;
+            }
+            run = match run {
+                Some(range) if range.end == ix => Some(range.start..ix + 1),
+                Some(range) => {
+                    self.list.remeasure_items(range);
+                    Some(ix..ix + 1)
+                }
+                None => Some(ix..ix + 1),
+            };
+        }
+        if let Some(range) = run {
+            self.list.remeasure_items(range);
+        }
     }
 }
 
@@ -211,6 +270,7 @@ impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let config = self.update_text_config(cx);
+        self.apply_image_changes(cx);
         // What the rows painted last frame is what is on screen: pin it, let older pins go and
         // release the textures of evicted images nothing shows any more.
         self.images.borrow_mut().begin_frame();
@@ -603,6 +663,98 @@ mod tests {
             !h.view
                 .read_with(cx, |view, _| view.images.borrow().wake_pending())
         );
+    }
+
+    fn emote_message(n: u64, urls: &[&str]) -> ChatEvent {
+        let mut fragments = vec![Fragment::Text("hi ".into())];
+        for (i, url) in urls.iter().enumerate() {
+            let emote = gpui_chat_core::Emote {
+                urls: gpui_chat_core::ImageUrls::new().with(gpui_chat_core::ImageScale::X1, *url),
+                ..gpui_chat_core::Emote::twitch(format!("{n}-{i}"), format!("E{n}x{i}"))
+            };
+            fragments.push(Fragment::Emote {
+                emote: Arc::new(emote),
+                zero_width_overlays: vec![],
+            });
+            fragments.push(Fragment::Text(" ".into()));
+        }
+        ChatEvent::Message {
+            channel: ChannelId::new("test"),
+            message: Arc::new(Message::chat(
+                format!("m{n}"),
+                Timestamp(0),
+                Author::new("al", "Al"),
+                fragments,
+            )),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_changed_emote_box_reshapes_only_the_messages_that_draw_it(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut h, cx) = Harness::new(cx, 100);
+        cx.update(|_, cx| {
+            Images::install(
+                gpui_chat_media::ImageCache::builder(runtime.handle().clone())
+                    .fetcher(Arc::new(NeverFetcher)),
+                cx,
+            );
+        });
+        // Rows 0 and 3 draw "wide" (alone / with another emote), rows 1 and 4 only "plain", 2 is
+        // text, and the rest are text too: 30 rows, all on screen or measured.
+        let events = [
+            emote_message(0, &["wide"]),
+            emote_message(1, &["plain"]),
+            chat(2, "just text"),
+            emote_message(3, &["plain", "wide"]),
+            emote_message(4, &["plain"]),
+        ];
+        h.store.update(cx, |store, cx| {
+            store.apply_all(events);
+            cx.notify();
+        });
+        h.next += 5;
+        cx.run_until_parked();
+        let shaped = |cx: &mut VisualTestContext, h: &Harness| {
+            h.view.read_with(cx, |v, _| v.cache_stats().shaped)
+        };
+        let baseline = shaped(cx, &h);
+        assert_eq!(baseline, 5, "every row was shaped once");
+
+        // "wide" turned out to have another size than its placeholder.
+        cx.update(|_, cx| {
+            cx.global_mut::<Images>()
+                .record_layout_change(&gpui_chat_media::ImageKey::new("wide"));
+        });
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(
+            shaped(cx, &h) - baseline,
+            2,
+            "only rows 0 and 3 are shaped again, not all five"
+        );
+
+        // Nothing new logged: another draw shapes nothing.
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(shaped(cx, &h) - baseline, 2);
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.generation),
+            0,
+            "no global re-shape"
+        );
+
+        // A change nobody draws re-shapes nothing at all.
+        cx.update(|_, cx| {
+            cx.global_mut::<Images>()
+                .record_layout_change(&gpui_chat_media::ImageKey::new("elsewhere"));
+        });
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(shaped(cx, &h) - baseline, 2);
     }
 
     #[gpui_kit::test]

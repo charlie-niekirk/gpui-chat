@@ -149,6 +149,12 @@ pub struct EmoteSettings {
     pub scale: f32,
     /// Play animated emotes. When off they show their first frame.
     pub animate: bool,
+    /// Use 7TV emotes (channel and global sets, including zero-width ones).
+    pub seventv: bool,
+    /// Use BetterTTV emotes (channel and global sets).
+    pub bttv: bool,
+    /// Use FrankerFaceZ emotes (channel and global sets).
+    pub ffz: bool,
 }
 
 impl Default for EmoteSettings {
@@ -156,6 +162,9 @@ impl Default for EmoteSettings {
         Self {
             scale: 1.0,
             animate: true,
+            seventv: true,
+            bttv: true,
+            ffz: true,
         }
     }
 }

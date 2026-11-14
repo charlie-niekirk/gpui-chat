@@ -388,6 +388,95 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// Looks up third-party emotes in fragments that were tokenized without a resolver.
+///
+/// Chat lines are tokenized where they are received, before (or without) the channel's BTTV /
+/// FFZ / 7TV sets being known, so a message's [`Fragment::Text`] runs can hide emotes. This
+/// re-scans each text run word by word, as [`Tokenizer::tokenize`] does with a resolver: a word
+/// `resolver` knows becomes a [`Fragment::Emote`], and a zero-width emote directly after an
+/// emote (only whitespace between) is stacked onto it. Other fragments pass through untouched,
+/// including the overlays they already carry.
+///
+/// Returns `None` when nothing matched (the common case), so callers keep the original message.
+///
+/// A word is matched whole, as typed. A word cut short by an adjacent emoji, mention or link
+/// (`abc👍`, `@bob,`) is not a whole word and is left alone; a word the tokenizer already made
+/// a link, mention or emoji is not looked up either.
+pub fn resolve_fragments(
+    fragments: &[Fragment],
+    resolver: &dyn WordResolver,
+) -> Option<Vec<Fragment>> {
+    // Whether the word at `range` of fragment `i`'s text is a whole word (not glued to a
+    // neighbouring fragment that is part of the same word).
+    let whole = |i: usize, text: &str, range: &std::ops::Range<usize>| {
+        let glued_before =
+            range.start == 0 && i > 0 && fragments.get(i - 1).is_some_and(joins_word);
+        let glued_after = range.end == text.len() && fragments.get(i + 1).is_some_and(joins_word);
+        !glued_before && !glued_after
+    };
+    let any = fragments.iter().enumerate().any(|(i, fragment)| {
+        let Fragment::Text(text) = fragment else {
+            return false;
+        };
+        let mut found = false;
+        for_each_word(text, |range| {
+            found |= whole(i, text, &range) && resolver.resolve(&text[range]).is_some();
+        });
+        found
+    });
+    if !any {
+        return None;
+    }
+    let mut b = Builder::default();
+    for (i, fragment) in fragments.iter().enumerate() {
+        let Fragment::Text(text) = fragment else {
+            b.push(fragment.clone());
+            continue;
+        };
+        let mut pos = 0;
+        for_each_word(text, |range| {
+            b.push_text(&text[pos..range.start]);
+            pos = range.end;
+            let word = &text[range.clone()];
+            match whole(i, text, &range)
+                .then(|| resolver.resolve(word))
+                .flatten()
+            {
+                Some(emote) => b.push_emote(emote),
+                None => b.push_text(word),
+            }
+        });
+        b.push_text(&text[pos..]);
+    }
+    Some(b.finish().fragments)
+}
+
+/// Fragments whose text can be one piece of a larger word: the tokenizer splits `abc👍`,
+/// `@bob,` and `(x.com)` into several fragments without any whitespace between.
+fn joins_word(fragment: &Fragment) -> bool {
+    matches!(
+        fragment,
+        Fragment::Emoji { .. } | Fragment::Mention { .. } | Fragment::Link { .. }
+    )
+}
+
+/// Calls `f` with the byte range of every whitespace-delimited word of `text`, in order.
+fn for_each_word(text: &str, mut f: impl FnMut(std::ops::Range<usize>)) {
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                f(s..i);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        f(s..text.len());
+    }
+}
+
 /// Invisible character some clients append to dodge duplicate-message detection.
 const IGNORED_CHAR: char = '\u{E0000}';
 
