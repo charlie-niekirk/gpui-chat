@@ -116,3 +116,4 @@ an entry here instead of expanding a PR. Format:
 - **Hourly validation does not count sleep** (found in PR 3.1 review) — `run_validation` uses a monotonic tokio sleep, which does not advance while the Mac sleeps; validate on wake (or by wall clock) too.
 - **Sign-in poll outlives the closing sheet briefly** (found in PR 3.1 review) — the sheet cancels in `on_release`, which runs after the dialog's exit transition, so a poll can still go out meanwhile; cancel on close (`on_cancel` / `on_close`) as well.
 - **Logout revokes only the access token** (found in PR 3.1 review) — the refresh token is forgotten locally but not revoked at Twitch.
+- **Dialogs have no backdrop** (found in PR 3.1 check) — the login sheet sits over the empty-state heading with no dimming, so the heading peeks out under the dialog edge; add a scrim behind modal dialogs.
