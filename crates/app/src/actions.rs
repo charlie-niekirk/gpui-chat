@@ -18,7 +18,9 @@ actions!(
         MoveChannelDown,
         SelectNextChannel,
         SelectPreviousChannel,
-        ReloadEmotes
+        ReloadEmotes,
+        LogIn,
+        LogOut
     ]
 );
 

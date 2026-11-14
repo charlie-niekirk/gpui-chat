@@ -10,7 +10,7 @@
 
 use gpui_chat_core::{ChannelId, ChatEvent};
 use gpui_chat_emotes::Providers;
-use gpui_chat_twitch::{ClientConfig, TwitchClient};
+use gpui_chat_twitch::{Auth, ClientConfig, HelixClient, TwitchClient};
 use gpui_kit::App;
 use tokio::sync::mpsc;
 
@@ -33,11 +33,17 @@ pub struct LiveSource {
 
 impl LiveSource {
     /// Starts an anonymous client on the backend runtime and forwards its events to `sender`.
-    pub fn start(sender: BridgeSender<ChatEvent>, cx: &App) -> Self {
+    /// `account` (the login owner and its Helix client) switches badges to Helix while logged in;
+    /// IRC stays anonymous until PR 3.2.
+    pub fn start(
+        sender: BridgeSender<ChatEvent>,
+        account: Option<(Auth, HelixClient)>,
+        cx: &App,
+    ) -> Self {
         let (client, events) = runtime::enter(cx, || TwitchClient::spawn(ClientConfig::default()));
         let enabled = emote_service::providers(&config::current(cx).emotes);
         let emotes = EmoteService::start(enabled, cx);
-        let badges = BadgeService::start(cx);
+        let badges = BadgeService::start(account, cx);
         // Dropped on purpose: the task ends when the client's event channel closes or the UI
         // side of the bridge is gone, and the runtime stops on quit.
         drop(runtime::spawn_backend(

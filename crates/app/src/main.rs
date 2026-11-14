@@ -3,6 +3,7 @@
 //! GPUI / GPUI Kit signatures used here were checked against the pinned sources
 //! (`gpui-kit 0.9.1`, `gpui-component 0.9.1`, `gpui-pre 0.3.12`); see the PR 0.2 description.
 
+mod account;
 mod actions;
 mod add_channel;
 mod assets;
@@ -26,6 +27,7 @@ mod platform;
 mod replay;
 mod runtime;
 mod shell;
+mod sign_in;
 mod state;
 mod streams;
 mod theme;
@@ -37,6 +39,7 @@ use gpui_chat_core::APP_NAME;
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
+use crate::account::AccountHub;
 use crate::actions::Quit;
 use crate::channel_list::ChannelList;
 use crate::channels::ChannelHub;
@@ -123,14 +126,16 @@ fn start_chat(
         |hub, events, cx| hub.apply_batch(events, cx),
     )
     .detach();
-    let (channels, live) = if offline {
-        (ChannelList::default(), None)
+    // The account (login, Helix) exists only with the live source: offline runs never touch the
+    // keychain.
+    let (channels, live, account) = if offline {
+        (ChannelList::default(), None, None)
     } else {
         let saved = state::load().channels.unwrap_or_default();
-        (
-            ChannelList::from_saved(&saved),
-            Some(LiveSource::start(sender.clone(), cx)),
-        )
+        let account = AccountHub::create(cx);
+        let live = LiveSource::start(sender.clone(), account.clone(), cx);
+        let account = account.map(|(auth, helix)| AccountHub::start(auth, helix, cx));
+        (ChannelList::from_saved(&saved), Some(live), account)
     };
     if let Some(rate) = cli.firehose {
         let start_ts_ms = SystemTime::now()
@@ -159,6 +164,7 @@ fn start_chat(
         hub,
         channels,
         live,
+        account,
         diagnostics,
         hud_visible: cli.hud,
     }

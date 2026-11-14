@@ -118,6 +118,23 @@ own emotes are always on. Files without these keys read as all on.
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
 messages). `chat.scrollback` is read once at startup.
 
+## Twitch account (PR 3.1)
+
+The login is **not** in `settings.toml` (no settings change in this PR). It lives in the system credential
+store, through `keyring`:
+
+| What | Where |
+|---|---|
+| Keychain item (macOS) | generic password, service `dev.gpui-chat.app` (`APP_ID`), account `twitch` |
+| Item content | one JSON record: access token, refresh token, expiry (Unix s), granted scopes, login, user id |
+| `$GPUI_CHAT_KEYCHAIN_SERVICE` | use another service name (test runs that must not touch the real login) |
+| `$GPUI_CHAT_TWITCH_CLIENT_ID` | use another Twitch application's Client ID (public client, no secret) |
+
+Logging out deletes the item and revokes the token. Remove a test item by hand with
+`security delete-generic-password -s <service> -a twitch`. With a scratch `$HOME` macOS finds no default
+keychain: the app then shows "Could not read the saved Twitch login" and a login lasts only for that run.
+`--firehose` / `--replay` never read the keychain.
+
 ## Streamlink (PR 1.6)
 
 The play button in a pane header runs

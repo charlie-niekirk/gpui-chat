@@ -131,6 +131,18 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `BadgeRegistry::version(channel)` moved, so subscriber badges that arrive a few hundred ms after a join
   appear without a new message having to push them. A source failing is a `warn` and no badge (global ones
   still show). Not wired to `Reload Emotes`.
+- `account.rs` / `sign_in.rs` / `platform/keychain.rs` (PR 3.1) — the Twitch account. `AccountHub` (GPUI
+  entity, live source only: offline runs never touch the keychain) mirrors `gpui_chat_twitch::Auth`'s
+  `AuthState` (a `watch` channel) into the UI: on start the backend restores the stored login and then
+  validates it hourly. The title bar's right end shows "Log in" or the user's name with a menu (log in
+  again, log out); a strip above the content says why the user was logged out (refresh rejected,
+  unreadable keychain item) or that the login lacks scopes the app now asks for. `sign_in.rs` is the
+  login sheet (Kit `Dialog`): it starts the device flow on open, shows the user code (copy button) and
+  "Open browser" (Twitch's activation link, which carries the code), closes itself on success, and
+  cancels the backend task whenever the sheet goes away (`on_release`). `KeychainTokenStore` is the
+  `TokenStore` over `keyring`: one generic-password item, service `APP_ID` (or
+  `$GPUI_CHAT_KEYCHAIN_SERVICE`), account `twitch`, holding the whole login as one JSON record. IRC stays
+  anonymous until PR 3.2. App menu: *Log In to Twitch…*, *Log Out* (`LogIn` / `LogOut` actions).
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -232,7 +244,9 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   = 1x/2x/4x; an entry whose URLs do not fit is refused when encoding); regenerate with
   `cargo run -p gpui-chat-emotes --example badges_snapshot` (`-- --check` says whether it is stale). Only
   metadata is bundled: the images always load from Twitch's CDN through the image store. The Helix source
-  (PR 3.1) implements the same trait and replaces the anonymous one when logged in.
+  (PR 3.1) implements the same trait; in the app, `AccountBadgeSource` asks Helix while logged in (falling back
+  to the anonymous source when a Helix request fails), and `BadgeService::follow_login` reloads the global and
+  every open channel's set when the user logs in or out.
 - Async I/O runs on a `tokio` runtime on background threads. GPUI has its own
   executor; backends talk to the UI over channels.
 
@@ -355,13 +369,40 @@ runs non-GPUI crate tests on Ubuntu from PR 0.1 (job `linux`).
 | UI | `gpui-kit = "=0.9.1"` (exact pin) | Kit usage stays inside `crates/app`. Version bumps are their own PRs |
 | Async I/O | `tokio` | Background threads; channels to the UI |
 | Chat read | `twitch-irc` TLS transport and IRC types (rustls); own connection supervisor | Anonymous by default. `gpui_chat_twitch::parse_line` maps a raw line to a `ChatEvent` with no network, and also handles recent-messages history lines. `twitch-irc`'s pooled client is not used: it reports no connection state, has no reconnect backoff and no JOIN pacing |
-| Helix + auth | `twitch_api` (helix) + `twitch_oauth2` device flow | Send, badges, emotes, streams, moderation |
+| Helix + auth | Own `reqwest` client in `crates/twitch` (`auth`, `helix`), see *Login and Helix* | Device flow, single refresh owner, badges now; send, emotes, streams, moderation later |
 | HTTP | `reqwest` (rustls) | `User-Agent: gpui-chat/<version>` |
 | Images | `image` crate, WebP preferred, GIF/PNG fallback | Avoid AVIF (native decoder dependency) |
 | Secrets | `keyring` | macOS Keychain now; Secret Service / Credential Manager later |
 | Config | TOML via `serde` + `toml`, `notify` for hot reload | `~/.config/gpui-chat/{settings,keymap}.toml`, `themes/*.toml` |
 | Paths | `dirs` | Cache in the platform cache dir |
 | Font | Bundled upstream JetBrains Mono (OFL-1.1) | Default chain: `JetBrainsMono Nerd Font` → bundled `JetBrains Mono` → system monospace |
+
+### Login and Helix (`crates/twitch`, PR 3.1)
+
+GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
+
+- **`auth::OAuthClient`** — `id.twitch.tv` (base injectable): device code, device-grant poll (Twitch's
+  `{"status", "message"}` errors mapped to pending / slow down / expired / denied), refresh, validate
+  (`Authorization: OAuth`), revoke. Public client: only the client id is sent, never a secret.
+  `auth::client_id()` is `DEFAULT_CLIENT_ID` unless `$GPUI_CHAT_TWITCH_CLIENT_ID` is set; `auth::SCOPES` is the
+  one scope list.
+- **`auth::TokenStore`** — blocking `load` / `save` / `clear` of one `StoredToken` record (both tokens, expiry,
+  scopes, login, user id): access and refresh token are only ever written together. `MemoryTokenStore` for
+  tests and Linux; the app's keychain store lives in `crates/app/src/platform/keychain.rs`.
+- **`auth::Auth`** — the single owner of the tokens. Tokens sit behind one async mutex with a *generation*;
+  a caller needing a refresh (about to expire, or a 401) passes the generation it saw, the refresh runs under
+  the mutex in a task of its own (a cancelled caller cannot abort it after Twitch rotated the one-use refresh
+  token), and later callers that find the generation moved simply take the new token: N concurrent failures
+  make one refresh. The new pair is saved before the mutex is released. A rejected refresh (400/401) logs out,
+  clears the store and publishes `AuthState::LoggedOut { notice }`; a network error keeps the login.
+  `restore` + `validate_now` (start) and `run_validation` (hourly): a 401 refreshes, a refused refresh logs out
+  with a notice. `complete_device_login` polls at `interval`, adds 5 s on `slow_down`, stops at `expires_in`.
+  `logout` clears the store and revokes the token. `Secret` (every token) prints as `[redacted]`.
+- **`helix::HelixClient`** — GET below a base URL (injectable) with `Client-Id` and `Bearer`; a 401 refreshes
+  through `Auth::refresh_after_unauthorized` and retries once; `Ratelimit-*` headers are remembered, an empty
+  bucket waits for the reset (at most 60 s) and a 429 is retried once after it.
+- The original plan named `twitch_api` / `twitch_oauth2`; they are not used: the flows above are a few
+  requests each, and owning them gives the injectable base URLs and the refresh guarantee directly.
 
 ### Streamlink (`crates/streamlink`, PR 1.6)
 

@@ -3,7 +3,7 @@
 use gpui_chat_core::APP_NAME;
 use gpui_kit::{KeyBinding, Menu, MenuItem, SystemMenuType};
 
-use super::{about_item, channel_menu, quit_item, view_menu, window_menu};
+use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
 use crate::actions::{
     AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit, RemoveChannel,
     SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
@@ -32,13 +32,17 @@ pub fn bindings() -> Vec<KeyBinding> {
 
 pub fn menus() -> Vec<Menu> {
     vec![
-        Menu::new(APP_NAME).items([
-            about_item(),
-            MenuItem::separator(),
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
-            MenuItem::separator(),
-            quit_item(),
-        ]),
+        Menu::new(APP_NAME).items(
+            [about_item(), MenuItem::separator()]
+                .into_iter()
+                .chain(account_items())
+                .chain([
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    quit_item(),
+                ]),
+        ),
         channel_menu(),
         view_menu(),
         window_menu(),

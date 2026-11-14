@@ -276,3 +276,20 @@ async fn a_failing_global_load_keeps_the_bundled_badges() {
     assert_eq!(moderator(&f.registry).as_deref(), Some("Moderator"));
     assert_eq!(f.registry.version(&ChannelId::new("any")), before);
 }
+
+#[tokio::test]
+async fn reload_asks_the_source_for_the_global_and_every_channels_set_again() {
+    // What logging in or out does: the source switched between Helix and anonymous.
+    let f = fixture();
+    f.service.observe(&room("forsen", "22484632"));
+    f.service.observe(&room("xqc", "71092938"));
+    eventually(|| load_of(&f, "forsen") == Some(Load::Complete)).await;
+    eventually(|| load_of(&f, "xqc") == Some(Load::Complete)).await;
+    let global_before = f.source.global_calls.load(Ordering::SeqCst);
+    f.service.reload();
+    eventually(|| f.source.requested().len() == 4).await;
+    let mut again = f.source.requested()[2..].to_vec();
+    again.sort();
+    assert_eq!(again, ["22484632", "71092938"]);
+    eventually(|| f.source.global_calls.load(Ordering::SeqCst) == global_before + 1).await;
+}
