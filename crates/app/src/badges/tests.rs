@@ -293,3 +293,42 @@ async fn reload_asks_the_source_for_the_global_and_every_channels_set_again() {
     assert_eq!(again, ["22484632", "71092938"]);
     eventually(|| f.source.global_calls.load(Ordering::SeqCst) == global_before + 1).await;
 }
+
+#[tokio::test]
+async fn the_helix_adapter_only_fetches_below_the_helix_base() {
+    use gpui_chat_twitch::auth::{MemoryTokenStore, OAuthClient};
+
+    // Nobody is logged in, so a URL that got through would fail with "not logged in"; a refused
+    // one fails before that, without a request and without a token.
+    let oauth = OAuthClient::with_base("client", "http://127.0.0.1:9").unwrap();
+    let auth = Auth::new(oauth, Arc::new(MemoryTokenStore::new()));
+    let helix = HelixClient::with_base(auth, "https://api.twitch.tv/helix").unwrap();
+    let http = HelixHttp(helix);
+    for outside in [
+        "https://evil.example/x",
+        "//evil.example/helix/chat/badges/global",
+        "https://api.twitch.tv/helixevil/x",
+        "https://api.twitch.tv/helix.evil.example/x",
+        "https://api.twitch.tv.evil.example/helix/x",
+        "http://api.twitch.tv/helix/chat/badges/global",
+        "https://api.twitch.tv/other",
+    ] {
+        match http.get(outside).await {
+            Err(HttpError::Request(message)) => {
+                assert!(
+                    message.starts_with("not a Helix URL"),
+                    "{outside}: {message}"
+                );
+            }
+            other => panic!("{outside} was not refused: {other:?}"),
+        }
+    }
+    // Below the base it goes to the Helix client (which then needs a login).
+    match http
+        .get("https://api.twitch.tv/helix/chat/badges/global")
+        .await
+    {
+        Err(HttpError::Request(message)) => assert_eq!(message, "not logged in"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}

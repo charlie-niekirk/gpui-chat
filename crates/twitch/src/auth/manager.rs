@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use super::oauth::{AuthError, DeviceCode, OAuthClient, PollOutcome, Validation};
+use super::oauth::{AuthError, DeviceCode, OAuthClient, PollOutcome, TokenResponse, Validation};
 use super::store::{StoreError, TokenStore};
 use super::token::{StoredToken, missing_scopes};
 use super::{SCOPES, Secret, unix_now};
@@ -203,18 +203,34 @@ impl Auth {
     /// A stored login shows as logged in at once; a network failure during the validation keeps it
     /// (offline start), a rejected token is refreshed, and a rejected refresh logs out with a
     /// notice.
+    ///
+    /// If the login changed while the store was being read (a device login finished first, or a
+    /// logout), what was read is stale and is ignored.
     pub async fn restore(&self) -> AuthState {
-        match self.store_call(|store| store.load()).await {
-            Ok(None) => self.publish(AuthState::LoggedOut { notice: None }),
+        let start = self.inner.slot.lock().await.generation;
+        let loaded = self.store_call(|store| store.load()).await;
+        let mut slot = self.inner.slot.lock().await;
+        if slot.generation != start {
+            tracing::debug!("the login changed while it was being restored; keeping the newer one");
+            drop(slot);
+            return self.state();
+        }
+        match loaded {
+            Ok(None) => {
+                drop(slot);
+                self.publish(AuthState::LoggedOut { notice: None });
+            }
             Ok(Some(token)) => {
                 let account = self.account_of(&token);
-                self.inner.slot.lock().await.replace(Some(token));
+                slot.replace(Some(token));
+                drop(slot);
                 self.publish(AuthState::LoggedIn(account));
                 if let Err(error) = self.validate_now().await {
                     tracing::warn!(%error, "validating the stored Twitch login failed");
                 }
             }
             Err(error @ StoreError::Corrupt(_)) => {
+                drop(slot);
                 tracing::warn!(%error, "discarding the stored Twitch login");
                 if let Err(error) = self.store_call(|store| store.clear()).await {
                     tracing::warn!(%error, "could not remove the unreadable Twitch login");
@@ -224,6 +240,7 @@ impl Auth {
                 });
             }
             Err(error) => {
+                drop(slot);
                 tracing::warn!(%error, "cannot read the stored Twitch login");
                 self.publish(AuthState::LoggedOut {
                     notice: Some(format!("Could not read the saved Twitch login: {error}")),
@@ -426,7 +443,12 @@ impl Auth {
 
     /// Polls until the user approves `code` (honouring `interval` and `slow_down`), then stores the
     /// login and returns the account. Fails with [`AuthError::DeviceCodeExpired`] or
-    /// [`AuthError::AccessDenied`]; drop the future to cancel.
+    /// [`AuthError::AccessDenied`].
+    ///
+    /// Drop the future to cancel. Cancelling only stops the *polling*: once Twitch handed out a
+    /// token, validating and installing it runs in a task of its own, so the keychain, the
+    /// in-memory login and the published state never disagree (and a token is never dropped
+    /// without being revoked).
     pub async fn complete_device_login(
         &self,
         code: &DeviceCode,
@@ -452,7 +474,22 @@ impl Auth {
                 Err(error) => return Err(error),
             }
         };
-        let validation = oauth.validate(&response.access_token).await?;
+        let auth = self.clone();
+        tokio::spawn(async move { auth.adopt_device_token(response).await })
+            .await
+            .map_err(|error| AuthError::Interrupted(error.to_string()))?
+    }
+
+    /// Validates a token the device flow just produced (whose is it?) and installs it. A token that
+    /// cannot be validated is revoked rather than dropped.
+    async fn adopt_device_token(&self, response: TokenResponse) -> Result<Account, AuthError> {
+        let validation = match self.inner.oauth.validate(&response.access_token).await {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.revoke_in_background(response.access_token);
+                return Err(error);
+            }
+        };
         let mut token =
             StoredToken::from_response(response, validation.login, validation.user_id, unix_now());
         if token.scopes.is_empty() {

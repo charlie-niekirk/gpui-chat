@@ -18,6 +18,26 @@ use crate::account::{AccountHub, SignIn};
 
 /// What the sheet shows for the activation link (the real link carries the code as well).
 const ACTIVATE_LABEL: &str = "twitch.tv/activate";
+/// Opened instead of a `verification_uri` that is not an `https` Twitch link.
+const ACTIVATE_FALLBACK: &str = "https://www.twitch.tv/activate";
+
+/// The link "Open browser" opens: Twitch's `verification_uri` when it is `https` on `twitch.tv` or
+/// a subdomain of it (no user info, no port), else the plain activation page. The browser is never
+/// sent anywhere a response could redirect it to.
+fn activation_link(uri: &str) -> String {
+    let Some(rest) = uri.strip_prefix("https://") else {
+        return ACTIVATE_FALLBACK.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.to_ascii_lowercase();
+    let is_twitch = host == "twitch.tv" || host.ends_with(".twitch.tv");
+    let clean = !authority.contains(['@', ':', '\\']) && !uri.contains(char::is_whitespace);
+    if is_twitch && clean {
+        uri.to_owned()
+    } else {
+        ACTIVATE_FALLBACK.to_owned()
+    }
+}
 
 struct SignInSheet {
     hub: Entity<AccountHub>,
@@ -54,7 +74,7 @@ impl SignInSheet {
     fn waiting(&self, code: &str, link: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let copied = self.copied.as_deref() == Some(code);
-        let (copy_code, open_link) = (code.to_owned(), link.to_owned());
+        let (copy_code, open_link) = (code.to_owned(), activation_link(link));
         v_flex()
             .gap_3()
             .child(div().text_sm().child(format!(
@@ -164,4 +184,36 @@ pub fn open(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
                     .child(DialogClose::new().trigger(|button| button.label("Cancel"))),
             )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_https_twitch_links_are_opened() {
+        for good in [
+            "https://www.twitch.tv/activate?public=true&device-code=ABCDEFGH",
+            "https://twitch.tv/activate",
+            "https://WWW.Twitch.TV/activate",
+            "https://id.twitch.tv/device",
+        ] {
+            assert_eq!(activation_link(good), good);
+        }
+        for bad in [
+            "http://www.twitch.tv/activate",
+            "https://evil.example/activate",
+            "https://twitch.tv.evil.example/activate",
+            "https://eviltwitch.tv/activate",
+            "https://www.twitch.tv@evil.example/activate",
+            "https://www.twitch.tv:8443/activate",
+            "https://www.twitch.tv\\@evil.example/",
+            "//www.twitch.tv/activate",
+            "javascript:alert(1)",
+            "https://www.twitch.tv/activate x",
+            "",
+        ] {
+            assert_eq!(activation_link(bad), ACTIVATE_FALLBACK, "{bad:?}");
+        }
+    }
 }

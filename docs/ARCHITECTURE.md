@@ -138,7 +138,8 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   again, log out); a strip above the content says why the user was logged out (refresh rejected,
   unreadable keychain item) or that the login lacks scopes the app now asks for. `sign_in.rs` is the
   login sheet (Kit `Dialog`): it starts the device flow on open, shows the user code (copy button) and
-  "Open browser" (Twitch's activation link, which carries the code), closes itself on success, and
+  "Open browser" (Twitch's activation link, which carries the code; only an `https` link on `twitch.tv` or a
+  subdomain is opened, else `https://www.twitch.tv/activate`), closes itself on success, and
   cancels the backend task whenever the sheet goes away (`on_release`). `KeychainTokenStore` is the
   `TokenStore` over `keyring`: one generic-password item, service `APP_ID` (or
   `$GPUI_CHAT_KEYCHAIN_SERVICE`), account `twitch`, holding the whole login as one JSON record. IRC stays
@@ -397,9 +398,13 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   clears the store and publishes `AuthState::LoggedOut { notice }`; a network error keeps the login.
   `restore` + `validate_now` (start) and `run_validation` (hourly): a 401 refreshes, a refused refresh logs out
   with a notice. `complete_device_login` polls at `interval`, adds 5 s on `slow_down`, stops at `expires_in`.
+  Cancelling the device login only stops the polling: once Twitch issued a token, validating and installing it
+  runs in a task of its own (an unvalidatable token is revoked), so the keychain, memory and published state
+  agree. `restore` ignores what it read if the login changed meanwhile (a device login finished first).
   `logout` clears the store and revokes the token. `Secret` (every token) prints as `[redacted]`.
-- **`helix::HelixClient`** — GET below a base URL (injectable) with `Client-Id` and `Bearer`; a 401 refreshes
-  through `Auth::refresh_after_unauthorized` and retries once; `Ratelimit-*` headers are remembered, an empty
+- **`helix::HelixClient`** — GET below a base URL (injectable) with `Client-Id` and `Bearer`; a 401 whose body
+  says the token is invalid/expired refreshes through `Auth::refresh_after_unauthorized` and retries once (a
+  401 for a missing scope or Client-Id mismatch is returned as it is); `Ratelimit-*` headers are remembered, an empty
   bucket waits for the reset (at most 60 s) and a 429 is retried once after it.
 - The original plan named `twitch_api` / `twitch_oauth2`; they are not used: the flows above are a few
   requests each, and owning them gives the injectable base URLs and the refresh guarantee directly.

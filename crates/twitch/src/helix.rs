@@ -2,8 +2,9 @@
 //! Twitch's rate-limit headers respected.
 //!
 //! Every request carries `Client-Id` and `Authorization: Bearer <user token>` from [`Auth`]. A 401
-//! refreshes the token through [`Auth::refresh_after_unauthorized`] (so a burst of 401s makes one
-//! refresh) and retries once. `Ratelimit-Remaining` / `Ratelimit-Reset` are remembered: while the
+//! whose body says the token is invalid or expired refreshes it through
+//! [`Auth::refresh_after_unauthorized`] (so a burst of 401s makes one refresh) and retries once; any
+//! other 401 (missing scope, Client-Id mismatch) comes back as it is. `Ratelimit-Remaining` / `Ratelimit-Reset` are remembered: while the
 //! bucket is empty, requests wait for the reset (up to [`HelixClient::max_wait`]); a 429 is retried
 //! once after that wait.
 //!
@@ -42,6 +43,24 @@ pub enum HelixError {
 pub struct HelixResponse {
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+/// Whether a 401 body says the *token* is bad (invalid, expired, revoked), the only 401 a refresh
+/// can fix. Helix also answers 401 for a missing scope (`"Missing scope: ..."`) or a Client-Id that
+/// does not match the token; refreshing then would only rotate the tokens for nothing.
+fn token_rejected(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        #[serde(default)]
+        message: String,
+    }
+    let message = serde_json::from_slice::<Body>(body)
+        .map(|body| body.message.to_ascii_lowercase())
+        .unwrap_or_default();
+    message.contains("invalid oauth token")
+        || message.contains("invalid access token")
+        || message.contains("token expired")
+        || message.contains("expired token")
 }
 
 /// The last rate-limit headers Twitch sent.
@@ -160,13 +179,14 @@ impl HelixClient {
 
     /// GETs `path` (relative to the base) as the logged-in user.
     ///
-    /// A 401 refreshes the token and retries once; a 429 waits for the rate-limit reset and
+    /// A 401 saying the token is invalid or expired refreshes it and retries once (any other 401,
+    /// e.g. a missing scope, is returned as it is); a 429 waits for the rate-limit reset and
     /// retries once. Whatever the retry returns is the result.
     pub async fn get(&self, path: &str) -> Result<HelixResponse, HelixError> {
         let auth = &self.inner.auth;
         let mut lease = auth.access_token().await?;
         let mut response = self.send(path, &lease).await?;
-        if response.status == 401 {
+        if response.status == 401 && token_rejected(&response.body) {
             lease = auth.refresh_after_unauthorized(lease.generation).await?;
             response = self.send(path, &lease).await?;
         }
@@ -224,6 +244,26 @@ impl HelixClient {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+    #[test]
+    fn only_a_rejected_token_is_worth_a_refresh() {
+        let body = |message: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "error": "Unauthorized", "status": 401, "message": message
+            }))
+            .unwrap()
+        };
+        assert!(token_rejected(&body("Invalid OAuth token")));
+        assert!(token_rejected(&body("invalid access token")));
+        assert!(!token_rejected(&body(
+            "Missing scope: moderator:read:chatters"
+        )));
+        assert!(!token_rejected(&body(
+            "Client ID and OAuth token do not match"
+        )));
+        assert!(!token_rejected(b"not json"));
+        assert!(!token_rejected(b""));
+    }
 
     #[test]
     fn rate_limit_headers() {

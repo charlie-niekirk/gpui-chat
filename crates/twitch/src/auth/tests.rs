@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::*;
 use crate::helix::{HelixClient, HelixError};
@@ -71,6 +71,12 @@ fn token_body(access: &str, refresh: &str) -> serde_json::Value {
     })
 }
 
+/// A public client: the body names the client id and never carries a secret.
+fn public_client(request: &Request) -> bool {
+    let body = String::from_utf8_lossy(&request.body);
+    body.contains(&format!("client_id={CLIENT}")) && !body.contains("client_secret")
+}
+
 fn twitch_error(status: u16, message: &str) -> ResponseTemplate {
     ResponseTemplate::new(status).set_body_json(json!({ "status": status, "message": message }))
 }
@@ -80,7 +86,7 @@ async fn mount_refresh(server: &MockServer, old: &str, response: ResponseTemplat
         .and(path("/oauth2/token"))
         .and(body_string_contains("grant_type=refresh_token"))
         .and(body_string_contains(format!("refresh_token={old}")))
-        .and(body_string_contains(format!("client_id={CLIENT}")))
+        .and(public_client)
         .respond_with(response)
         .expect(times)
         .mount(server)
@@ -101,7 +107,7 @@ fn polling() -> DevicePolling {
 async fn mount_device_code(server: &MockServer, expires_in: u64) {
     Mock::given(method("POST"))
         .and(path("/oauth2/device"))
-        .and(body_string_contains(format!("client_id={CLIENT}")))
+        .and(public_client)
         .and(body_string_contains(
             "scopes=chat%3Aread+user%3Aread%3Achat",
         ))
@@ -122,6 +128,7 @@ async fn mount_poll(server: &MockServer, response: ResponseTemplate, times: u64,
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
         .and(body_string_contains("device_code=secret-device-code"))
+        .and(public_client)
         .and(body_string_contains(
             "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code",
         ))
@@ -182,6 +189,165 @@ async fn device_flow_waits_out_pending_and_slow_down_then_stores_the_login() {
     assert_eq!(
         auth.access_token().await.unwrap().token.expose(),
         "first-access"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_after_twitch_issued_the_token_still_installs_it_consistently() {
+    let server = MockServer::start().await;
+    mount_device_code(&server, 1800).await;
+    mount_poll(
+        &server,
+        ResponseTemplate::new(200).set_body_json(token_body("first-access", "first-refresh")),
+        1,
+        1,
+    )
+    .await;
+    // Validation (and the install after it) is still running when the caller gives up.
+    Mock::given(method("GET"))
+        .and(path("/oauth2/validate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(validation("viewer", WANTED))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryTokenStore::new());
+    let auth = auth_with(&server, store.clone());
+    auth.restore().await;
+    let code = auth.request_device_code().await.unwrap();
+    let flow = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.complete_device_login(&code, polling()).await })
+    };
+    // One 20 ms interval, then the token; abort while the validation is in flight.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    flow.abort();
+    assert!(flow.await.unwrap_err().is_cancelled());
+
+    let mut states = auth.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        states.wait_for(|state| state.account().is_some()),
+    )
+    .await
+    .expect("the login is installed")
+    .unwrap();
+    // Keychain, memory and published state agree.
+    assert_eq!(store.get().unwrap().access_token.expose(), "first-access");
+    assert_eq!(
+        auth.access_token().await.unwrap().token.expose(),
+        "first-access"
+    );
+    assert_eq!(auth.state().account().unwrap().login, "viewer");
+}
+
+#[tokio::test]
+async fn a_device_token_that_cannot_be_validated_is_revoked() {
+    let server = MockServer::start().await;
+    mount_device_code(&server, 1800).await;
+    mount_poll(
+        &server,
+        ResponseTemplate::new(200).set_body_json(token_body("orphan-access", "orphan-refresh")),
+        1,
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth2/validate"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/revoke"))
+        .and(body_string_contains("token=orphan-access"))
+        .and(public_client)
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(MemoryTokenStore::new());
+    let auth = auth_with(&server, store.clone());
+    let code = auth.request_device_code().await.unwrap();
+    assert!(auth.complete_device_login(&code, polling()).await.is_err());
+    assert!(store.get().is_none());
+    // The revoke runs in the background; give it a moment before the server checks `expect(1)`.
+    for _ in 0..100 {
+        let revoked = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/oauth2/revoke");
+        if revoked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A store whose `load` is slow and returns a stale login.
+struct SlowStore {
+    stale: StoredToken,
+    inner: MemoryTokenStore,
+}
+
+impl TokenStore for SlowStore {
+    fn load(&self) -> Result<Option<StoredToken>, StoreError> {
+        std::thread::sleep(Duration::from_millis(400));
+        Ok(Some(self.stale.clone()))
+    }
+    fn save(&self, token: &StoredToken) -> Result<(), StoreError> {
+        self.inner.save(token)
+    }
+    fn clear(&self) -> Result<(), StoreError> {
+        self.inner.clear()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_restore_does_not_overwrite_a_login_that_finished_first() {
+    let server = MockServer::start().await;
+    mount_device_code(&server, 1800).await;
+    mount_poll(
+        &server,
+        ResponseTemplate::new(200).set_body_json(token_body("new-access", "new-refresh")),
+        1,
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth2/validate"))
+        .and(header("Authorization", "OAuth new-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(validation("newer", WANTED)))
+        .mount(&server)
+        .await;
+    let store = Arc::new(SlowStore {
+        stale: stored("stale-access", "stale-refresh", far_future()),
+        inner: MemoryTokenStore::new(),
+    });
+    let oauth = OAuthClient::with_base(CLIENT, server.uri()).unwrap();
+    let auth = Auth::with_scopes(oauth, store.clone(), WANTED);
+    let restoring = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.restore().await })
+    };
+    let code = auth.request_device_code().await.unwrap();
+    let account = auth.complete_device_login(&code, polling()).await.unwrap();
+    assert_eq!(account.login, "newer");
+    // The keychain read finishes only now, with the stale login: it must be ignored.
+    let state = restoring.await.unwrap();
+    assert_eq!(state.account().unwrap().login, "newer");
+    assert_eq!(
+        auth.access_token().await.unwrap().token.expose(),
+        "new-access"
+    );
+    assert_eq!(
+        store.inner.get().unwrap().access_token.expose(),
+        "new-access"
     );
 }
 
@@ -567,6 +733,26 @@ async fn helix_401s_refresh_once_and_every_request_retries_with_the_new_token() 
     }
     assert_eq!(auth.refresh_count(), 1);
     assert_eq!(store.get().unwrap().refresh_token.expose(), "new-refresh");
+}
+
+#[tokio::test]
+async fn a_helix_401_for_a_missing_scope_does_not_refresh() {
+    let server = MockServer::start().await;
+    let (auth, store) = logged_in(&server, stored("old-access", "old-refresh", far_future())).await;
+    mount_helix(
+        &server,
+        "old-access",
+        twitch_error(401, "Missing scope: moderator:read:chatters"),
+    )
+    .await;
+    // No refresh may happen.
+    mount_refresh(&server, "old-refresh", ResponseTemplate::new(500), 0).await;
+    let helix = HelixClient::with_base(auth.clone(), format!("{}/helix", server.uri())).unwrap();
+    let response = helix.get("chat/badges/global").await.unwrap();
+    assert_eq!(response.status, 401);
+    assert_eq!(auth.refresh_count(), 0);
+    assert_eq!(store.get().unwrap().refresh_token.expose(), "old-refresh");
+    assert!(auth.is_logged_in());
 }
 
 #[tokio::test]
