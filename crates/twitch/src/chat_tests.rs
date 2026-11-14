@@ -114,6 +114,11 @@ async fn a_message_is_posted_as_the_logged_in_user_and_its_id_returned() {
         .await
         .unwrap();
     assert_eq!(sent.message_id, "msg-1");
+    // Who it was sent as comes from the token that made the request.
+    assert_eq!(
+        (sent.user_id.as_str(), sent.login.as_str()),
+        ("42", "viewer")
+    );
 }
 
 #[tokio::test]
@@ -337,7 +342,7 @@ fn the_echo_helper_is_exported_for_the_app() {
 async fn a_logged_in_user_connects_with_their_login_and_token() {
     let server = MockServer::start().await;
     let (auth, _) = logged_in(&server).await;
-    let credentials = Credentials::from_auth(&auth).await;
+    let credentials = Credentials::from_auth(&auth, 0).await;
     assert!(!credentials.is_anonymous());
     assert_eq!(credentials.login, "viewer");
     assert_eq!(credentials.token.as_deref(), Some("access"));
@@ -352,7 +357,7 @@ async fn logged_out_connects_anonymously() {
         WANTED,
     );
     auth.restore().await;
-    assert!(Credentials::from_auth(&auth).await.is_anonymous());
+    assert!(Credentials::from_auth(&auth, 0).await.is_anonymous());
 }
 
 #[tokio::test]
@@ -362,7 +367,7 @@ async fn a_login_without_chat_read_stays_anonymous() {
     let auth = logged_in_with(&server, stored("access", "refresh", &["user:write:chat"])).await;
     let account = auth.state().account().cloned().unwrap();
     assert!(account.needs_relogin());
-    assert!(Credentials::from_auth(&auth).await.is_anonymous());
+    assert!(Credentials::from_auth(&auth, 0).await.is_anonymous());
 }
 
 #[tokio::test]
@@ -381,7 +386,7 @@ async fn an_expired_access_token_is_refreshed_before_it_is_handed_to_irc() {
         .expect(1)
         .mount(&server)
         .await;
-    let credentials = Credentials::from_auth(&auth).await;
+    let credentials = Credentials::from_auth(&auth, 0).await;
     assert_eq!(credentials.token.as_deref(), Some("fresh"));
 }
 
@@ -398,7 +403,7 @@ async fn the_first_connection_waits_for_the_stored_login_to_be_read() {
     // `restore` has not run yet: the state is still `Restoring`.
     let waiting = tokio::spawn({
         let auth = auth.clone();
-        async move { Credentials::from_auth(&auth).await }
+        async move { Credentials::from_auth(&auth, 0).await }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!waiting.is_finished(), "still waiting for the restore");
@@ -406,4 +411,48 @@ async fn the_first_connection_waits_for_the_stored_login_to_be_read() {
     let credentials = waiting.await.unwrap();
     assert_eq!(credentials.login, "viewer");
     assert!(!credentials.is_anonymous());
+}
+
+#[tokio::test]
+async fn a_token_twitch_refused_is_refreshed_once_and_then_given_up_on() {
+    let server = MockServer::start().await;
+    // The token looks valid locally (expires in hours) but Twitch revoked it.
+    let auth = logged_in_with(&server, stored("revoked", "refresh", WANTED)).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "renewed", "refresh_token": "renewed-refresh",
+            "expires_in": 14_000, "scope": WANTED, "token_type": "bearer",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Refused once: the refresh happens although the token had not expired.
+    let credentials = Credentials::from_auth(&auth, 1).await;
+    assert_eq!(credentials.token.as_deref(), Some("renewed"));
+    assert_eq!(auth.refresh_count(), 1);
+    // Refused again: no further refresh, the connection stays anonymous.
+    assert!(Credentials::from_auth(&auth, 2).await.is_anonymous());
+    assert_eq!(auth.refresh_count(), 1);
+}
+
+#[tokio::test]
+async fn a_rejected_refresh_after_a_refused_token_ends_the_login_and_goes_anonymous() {
+    let server = MockServer::start().await;
+    let auth = logged_in_with(&server, stored("revoked", "refresh", WANTED)).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "status": 400, "message": "Invalid refresh token"
+        })))
+        .mount(&server)
+        .await;
+    assert!(Credentials::from_auth(&auth, 1).await.is_anonymous());
+    assert!(
+        !auth.is_logged_in(),
+        "Twitch rejected the refresh: logged out"
+    );
 }

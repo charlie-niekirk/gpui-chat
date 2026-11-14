@@ -159,8 +159,12 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   logout, another user), after the stored login was read. `LiveSource::send` posts through
   `HelixClient::send_chat_message` on the backend runtime, returns the outcome on a `oneshot`, and on success feeds
   the *echo* (`gpui_chat_twitch::echo_message`: the text tokenized, the id Twitch returned, `EmoteService::process`
-  for third-party emotes) into the same bridge as every incoming event. `ChannelStore::apply` drops a chat or action
-  line whose id is already in the store, so if Twitch also delivers the message over IRC it shows once.
+  for third-party emotes) into the same bridge as every incoming event. The echo is flagged `MessageFlags::echo`: `ChannelStore::apply` lets the IRC copy (same id, real emotes,
+  colour, badges) **replace** it in place (`MessageStore::replace`; the view remeasures the row through
+  `ChannelStore::replaced_since`), and drops any other chat or action line whose id is already in the store, so the
+  message shows once whichever arrives first. `follow_login` compares the account IRC should use with the login
+  the provider *actually connected as* (`ConnectedAs`), so a first connection that went anonymous because the
+  keychain was slow is corrected when the login arrives.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -441,12 +445,17 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   before **every** connection attempt, so a reconnect hours after login presents a refreshed token. The app's is
   `Credentials::from_auth(&Auth)`: waits (≤ 5 s) for the stored login to be read, then the user's login with a fresh
   access token, or anonymous when logged out, when the login lacks `chat:read`, or when no token can be had.
+  The provider is told how many connections in a row ended with `NOTICE * :Login authentication failed` (a token
+  revoked before its local expiry): at 1 `from_auth` refreshes the token although it has not expired, at 2+ the
+  connection stays anonymous; an accepted connection (`001`) resets the count.
   `TwitchClient::reconnect()` drops the connection and reconnects at once (no backoff), rejoining the wanted
   channels; `set_credentials` still works for a fixed login but a provider overrides it. Tests: the supervisor
   against the in-memory server (provider consulted per attempt, reconnect with login / logout, reconnect while
   connecting) and `chat_tests.rs` against a wiremock Helix / `id.twitch.tv`.
 - **Echo and de-duplication** — Twitch may not send a user's own message back over IRC, so on `is_sent` the app
-  shows the message itself, under the id Twitch returned; the store ignores a second chat line with that id.
+  shows the message itself (flagged `echo`), as the account whose token made the request (`SentMessage` carries
+  its login and user id), under the id Twitch returned; Twitch's own copy, if it comes, replaces it, and any other
+  second chat line with that id is ignored.
 
 ### Streamlink (`crates/streamlink`, PR 1.6)
 

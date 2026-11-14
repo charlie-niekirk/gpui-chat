@@ -92,6 +92,9 @@ pub struct ChatView {
     unseen_from: Option<u64>,
     /// Whether the last render showed the pill.
     pill_shown: bool,
+    /// How far into the store's log of replaced messages this view has applied
+    /// ([`ChannelStore::replaced_since`]).
+    replaced_seen: u64,
     /// Line height of the last render.
     line_height: Pixels,
     images: Rc<RefCell<FrameImages>>,
@@ -129,6 +132,7 @@ impl ChatView {
             badge_version: None,
             unseen_from: None,
             pill_shown: false,
+            replaced_seen: 0,
             line_height: px(0.0),
             images: Rc::default(),
             hover: Rc::default(),
@@ -158,6 +162,16 @@ impl ChatView {
             }
         }
         debug_assert_eq!(self.list.item_count(), self.mirror.len());
+        // A message replaced in place (the user's echo swapped for Twitch's copy, with its real
+        // emotes) can be a different height: measure those rows again.
+        let (replaced, serial) = self.store.read(cx).replaced_since(self.replaced_seen);
+        if serial != self.replaced_seen {
+            self.replaced_seen = serial;
+            match replaced {
+                Some(seqs) => self.remeasure_seqs(&seqs),
+                None => self.list.remeasure(),
+            }
+        }
         // Also covers changes without new messages (deletions): rows re-render.
         cx.notify();
     }

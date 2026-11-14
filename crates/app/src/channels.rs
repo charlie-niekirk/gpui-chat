@@ -10,7 +10,7 @@
 //! Both are plain data structures with the entity plumbing on top, so the batching logic is
 //! unit-tested without a window.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use gpui_chat_core::{
@@ -29,7 +29,14 @@ pub struct ChannelStore {
     connection: Option<ConnectionState>,
     /// Channel notices seen so far (kept as plain counts until the view shows them).
     notices: u64,
+    /// Which messages were replaced in place (an echo swapped for Twitch's copy), as
+    /// `(serial, seq)`, newest last and bounded; see [`ChannelStore::replaced_since`].
+    replaced: VecDeque<(u64, u64)>,
+    replaced_serial: u64,
 }
+
+/// How many replacements [`ChannelStore`] remembers for its views.
+const REPLACED_LOG: usize = 64;
 
 impl ChannelStore {
     pub fn new(channel: ChannelId, capacity: usize) -> Self {
@@ -39,7 +46,31 @@ impl ChannelStore {
             room: RoomState::default(),
             connection: None,
             notices: 0,
+            replaced: VecDeque::new(),
+            replaced_serial: 0,
         }
+    }
+
+    /// The sequence numbers of the messages replaced since `seen` (a serial returned earlier; start
+    /// with 0), and the serial to pass next time. `None` instead of the list when more were
+    /// replaced than are remembered: the view then has to treat every row as changed.
+    pub fn replaced_since(&self, seen: u64) -> (Option<Vec<u64>>, u64) {
+        let pending = self.replaced_serial - seen;
+        if pending == 0 {
+            return (Some(Vec::new()), self.replaced_serial);
+        }
+        if pending > self.replaced.len() as u64 {
+            return (None, self.replaced_serial);
+        }
+        let mut seqs: Vec<u64> = self
+            .replaced
+            .iter()
+            .filter(|(serial, _)| *serial > seen)
+            .map(|(_, seq)| *seq)
+            .collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        (Some(seqs), self.replaced_serial)
     }
 
     pub fn channel(&self) -> &ChannelId {
@@ -70,12 +101,24 @@ impl ChannelStore {
     pub fn apply(&mut self, event: ChatEvent) -> bool {
         match event {
             ChatEvent::Message { message, .. } => {
-                // The user's own message can arrive twice: as the echo made when Twitch accepted
-                // it (PR 3.2) and, if Twitch also delivers it over IRC, as a chat line with the
-                // same id. Whichever comes first stays; the other is dropped.
+                // The user's own message can arrive twice (PR 3.2): as the echo made when Twitch
+                // accepted it and, if Twitch also delivers it over IRC, as a chat line with the
+                // same id. The IRC copy is the real thing (native emotes, colour, badges) and
+                // takes the echo's place; any other repeat of an id already shown is dropped.
                 if matches!(message.kind, MessageKind::Chat | MessageKind::Action)
-                    && self.messages.contains(message.id.as_str())
+                    && let Some(shown) = self.messages.get(message.id.as_str())
                 {
+                    if shown.flags.echo
+                        && !message.flags.echo
+                        && let Some(seq) = self.messages.replace(message)
+                    {
+                        self.replaced_serial += 1;
+                        if self.replaced.len() >= REPLACED_LOG {
+                            self.replaced.pop_front();
+                        }
+                        self.replaced.push_back((self.replaced_serial, seq));
+                        return true;
+                    }
                     return false;
                 }
                 self.messages.push(message);
@@ -341,6 +384,71 @@ mod tests {
         // Different ids are different messages.
         assert!(store.apply(chat("a", "third", "me")));
         assert_eq!(store.messages().len(), 3);
+    }
+
+    #[test]
+    fn the_irc_copy_replaces_the_echo_in_place() {
+        let echo = |id: &str| {
+            let mut message = Message::chat(
+                id,
+                Timestamp(0),
+                Author::new("me", "me"),
+                vec![gpui_chat_core::Fragment::Text("Kappa".into())],
+            );
+            message.flags.echo = true;
+            ChatEvent::Message {
+                channel: ChannelId::new("a"),
+                message: Arc::new(message),
+            }
+        };
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        store.apply(chat("a", "before", "x"));
+        assert!(store.apply(echo("mine")));
+        store.apply(chat("a", "after", "x"));
+        assert_eq!(store.replaced_since(0), (Some(vec![]), 0));
+
+        // Twitch's copy arrives: it takes the echo's place, nothing is appended.
+        assert!(store.apply(chat("a", "mine", "me")));
+        assert_eq!(store.messages().len(), 3);
+        let shown = store.messages().get("mine").unwrap();
+        assert!(!shown.flags.echo, "the real message is shown now");
+        assert_eq!(store.messages().seq_of("mine"), Some(1));
+        assert_eq!(store.replaced_since(0), (Some(vec![1]), 1));
+        assert_eq!(store.replaced_since(1), (Some(vec![]), 1));
+
+        // A further copy is a plain duplicate.
+        assert!(!store.apply(chat("a", "mine", "me")));
+        // An echo never replaces anything.
+        assert!(!store.apply(echo("mine")));
+        assert_eq!(store.replaced_since(0).1, 1);
+    }
+
+    #[test]
+    fn a_view_that_missed_more_replacements_than_are_kept_is_told_to_redo_everything() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 1000);
+        let echo = |id: String| {
+            let mut message = Message::chat(
+                id,
+                Timestamp(0),
+                Author::new("me", "me"),
+                vec![gpui_chat_core::Fragment::Text("x".into())],
+            );
+            message.flags.echo = true;
+            ChatEvent::Message {
+                channel: ChannelId::new("a"),
+                message: Arc::new(message),
+            }
+        };
+        for n in 0..REPLACED_LOG + 5 {
+            store.apply(echo(format!("m{n}")));
+            store.apply(chat("a", &format!("m{n}"), "me"));
+        }
+        let (all, serial) = store.replaced_since(0);
+        assert_eq!(all, None);
+        assert_eq!(serial, (REPLACED_LOG + 5) as u64);
+        // Caught up within the log: exact.
+        let (recent, _) = store.replaced_since(serial - 2);
+        assert_eq!(recent.map(|seqs| seqs.len()), Some(2));
     }
 
     #[test]

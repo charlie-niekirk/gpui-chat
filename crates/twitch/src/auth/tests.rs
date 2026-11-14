@@ -851,6 +851,7 @@ fn tokens_never_show_in_debug_output() {
     let lease = TokenLease {
         token: Secret::new("very-secret-access"),
         user_id: "42".to_owned(),
+        login: "viewer".to_owned(),
         generation: 1,
     };
     let outputs = [

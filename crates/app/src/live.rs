@@ -9,6 +9,7 @@
 //! `--firehose` and `--replay` *replace* this source (no client is started, nothing is joined and
 //! the channel list is not saved), see `main::start_chat`.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, Timestamp};
@@ -16,10 +17,10 @@ use gpui_chat_emotes::Providers;
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::{
     Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, SendError, TwitchClient,
-    echo_message, irc_login,
+    echo_message, irc_login, settled_state,
 };
 use gpui_kit::App;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::badges::BadgeService;
 use crate::bridge::BridgeSender;
@@ -62,19 +63,33 @@ impl LiveSource {
         cx: &App,
     ) -> Self {
         let mut config = ClientConfig::default();
+        let connected_as = ConnectedAs::default();
         if let Some((auth, _)) = &account {
-            // Every connection attempt asks for the login as it is now, with a fresh token.
-            let auth = auth.clone();
-            config.credentials_provider = Some(CredentialsProvider::new(move || {
-                let auth = auth.clone();
-                async move { Credentials::from_auth(&auth).await }
+            // Every connection attempt asks for the login as it is now, with a fresh token, and
+            // notes which login it connected as for `follow_login`.
+            let (auth, noted) = (auth.clone(), connected_as.clone());
+            config.credentials_provider = Some(CredentialsProvider::new(move |refusals| {
+                let (auth, connected_as) = (auth.clone(), noted.clone());
+                async move {
+                    // What the login state asks for, noted before the (possibly slow) token fetch
+                    // so the watcher sees no difference while the connection is being made.
+                    connected_as.set(irc_login(&settled_state(&auth).await).map(str::to_owned));
+                    let credentials = Credentials::from_auth(&auth, refusals).await;
+                    // What it actually got (anonymous if the token could not be had).
+                    connected_as
+                        .set((!credentials.is_anonymous()).then(|| credentials.login.clone()));
+                    credentials
+                }
             }));
         }
         let (client, events) = runtime::enter(cx, || TwitchClient::spawn(config));
         if let Some((auth, _)) = &account {
+            let reconnecting = client.clone();
             drop(runtime::spawn_backend(
                 cx,
-                reconnect_on_login_change(auth.clone(), client.clone()),
+                follow_login(auth.subscribe(), connected_as, move || {
+                    reconnecting.reconnect();
+                }),
             ));
         }
         let enabled = emote_service::providers(&config::current(cx).emotes);
@@ -109,11 +124,11 @@ impl LiveSource {
         request: SendRequest,
         cx: &App,
     ) -> Option<oneshot::Receiver<Result<(), SendError>>> {
-        let (auth, helix) = self.account.clone()?;
+        let (_, helix) = self.account.clone()?;
         let (sender, emotes) = (self.sender.clone(), self.emotes.clone());
         let (done, result) = oneshot::channel();
         drop(runtime::spawn_backend(cx, async move {
-            let outcome = post(&auth, &helix, &sender, emotes.as_ref(), request).await;
+            let outcome = post(&helix, &sender, emotes.as_ref(), request).await;
             // The composer may be gone (pane closed): nobody to tell.
             let _ = done.send(outcome);
         }));
@@ -149,9 +164,10 @@ impl LiveSource {
     }
 }
 
-/// Sends `request` and, when Twitch accepted it, echoes it into the chat.
+/// Sends `request` and, when Twitch accepted it, echoes it into the chat as the account that sent
+/// it (taken from the request's own token, so a login switch while it was in flight cannot
+/// misattribute it).
 async fn post(
-    auth: &Auth,
     helix: &HelixClient,
     sender: &BridgeSender<ChatEvent>,
     emotes: Option<&EmoteService>,
@@ -160,30 +176,27 @@ async fn post(
     let sent = helix
         .send_chat_message(&request.room_id, &request.outgoing.wire_text(), None)
         .await?;
-    // Logged out while the request was in flight: it went out, but there is no one to show it as.
-    if let Some(account) = auth.state().account() {
-        let author = Author {
-            user_id: Some(account.user_id.clone()),
-            ..Author::new(&account.login, &account.login)
-        };
-        let message = echo_message(
-            sent.message_id,
-            author,
-            &request.outgoing.text,
-            request.outgoing.action,
-            now(),
-        );
-        let event = ChatEvent::Message {
-            channel: request.channel,
-            message: std::sync::Arc::new(message),
-        };
-        let event = match emotes {
-            Some(emotes) => emotes.process(event),
-            None => event,
-        };
-        // A closed bridge means the UI is gone; the send itself succeeded.
-        let _ = sender.send(event).await;
-    }
+    let author = Author {
+        user_id: Some(sent.user_id),
+        ..Author::new(&sent.login, &sent.login)
+    };
+    let message = echo_message(
+        sent.message_id,
+        author,
+        &request.outgoing.text,
+        request.outgoing.action,
+        now(),
+    );
+    let event = ChatEvent::Message {
+        channel: request.channel,
+        message: std::sync::Arc::new(message),
+    };
+    let event = match emotes {
+        Some(emotes) => emotes.process(event),
+        None => event,
+    };
+    // A closed bridge means the UI is gone; the send itself succeeded.
+    let _ = sender.send(event).await;
     Ok(())
 }
 
@@ -195,27 +208,49 @@ fn now() -> Timestamp {
     )
 }
 
-/// Reconnects the client when the account IRC should log in as changes (login, logout, another
-/// account), so it reads as the user right after logging in and goes anonymous again on logout.
-/// The first connection already uses whatever the stored login turns out to be (the credentials
-/// provider waits for it), so this only reacts to changes after that. Ends with the runtime.
-async fn reconnect_on_login_change(auth: Auth, client: TwitchClient) {
-    let mut states = auth.subscribe();
-    let mut applied = {
-        let settled = states
-            .wait_for(|state| !matches!(state, AuthState::Restoring))
-            .await;
-        match settled {
-            Ok(state) => irc_login(&state).map(str::to_owned),
-            Err(_) => return,
+/// The login the IRC connection was last set up as (`None`: anonymous), written by the credentials
+/// provider on every connection attempt and read by [`follow_login`].
+#[derive(Clone, Default)]
+struct ConnectedAs(Arc<Mutex<Option<String>>>);
+
+impl ConnectedAs {
+    fn set(&self, login: Option<String>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = login;
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Calls `reconnect` whenever the account IRC should log in as differs from the one it is
+/// connected as: login, logout, another user. Compares against what the connection actually used
+/// (`connected_as`), not against an earlier look at the login state, so a first connection that
+/// went anonymous because the keychain was slow to answer is corrected as soon as the login
+/// arrives. Nothing happens while the stored login is still being read. Ends with the runtime.
+async fn follow_login(
+    mut states: watch::Receiver<AuthState>,
+    connected_as: ConnectedAs,
+    reconnect: impl Fn(),
+) {
+    loop {
+        let wanted = {
+            let state = states.borrow_and_update();
+            (!matches!(*state, AuthState::Restoring)).then(|| irc_login(&state).map(str::to_owned))
+        };
+        if let Some(wanted) = wanted
+            && connected_as.get() != wanted
+        {
+            tracing::info!(login = ?wanted, "chat login changed: reconnecting");
+            // Asked for; the provider notes what it really got when the attempt starts.
+            connected_as.set(wanted);
+            reconnect();
         }
-    };
-    while states.changed().await.is_ok() {
-        let now = irc_login(&states.borrow_and_update()).map(str::to_owned);
-        if now != applied {
-            tracing::info!(login = ?now, "chat login changed: reconnecting");
-            applied = now;
-            client.reconnect();
+        if states.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -247,10 +282,101 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use gpui_chat_core::ConnectionState;
+    use gpui_chat_twitch::auth::Account;
 
     use super::*;
     use crate::bridge;
+
+    fn logged_in(login: &str, missing: &[&str]) -> AuthState {
+        AuthState::LoggedIn(Account {
+            login: login.into(),
+            user_id: "1".into(),
+            missing_scopes: missing.iter().map(|s| (*s).to_owned()).collect(),
+        })
+    }
+
+    /// Runs `follow_login` over a scripted login state; `reconnects` counts its calls.
+    struct Follow {
+        states: watch::Sender<AuthState>,
+        connected_as: ConnectedAs,
+        reconnects: Arc<AtomicUsize>,
+    }
+
+    impl Follow {
+        fn start(initial: AuthState, connected_as: Option<&str>) -> Self {
+            let (states, receiver) = watch::channel(initial);
+            let connected = ConnectedAs::default();
+            connected.set(connected_as.map(str::to_owned));
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&reconnects);
+            tokio::spawn(follow_login(receiver, connected.clone(), move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+            Self {
+                states,
+                connected_as: connected,
+                reconnects,
+            }
+        }
+
+        async fn settle(&self) -> usize {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.reconnects.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_login_that_arrives_after_an_anonymous_first_connection_reconnects() {
+        // The keychain was slow: the restore wait ran out and the client connected anonymously.
+        let follow = Follow::start(AuthState::Restoring, None);
+        assert_eq!(follow.settle().await, 0, "still reading the stored login");
+        follow.states.send_replace(logged_in("viewer", &[]));
+        assert_eq!(follow.settle().await, 1, "the login arrived: log chat in");
+        // The provider notes what the new connection used; no further reconnects.
+        follow.connected_as.set(Some("viewer".into()));
+        follow
+            .states
+            .send_replace(logged_in("viewer", &["user:read:follows"]));
+        assert_eq!(follow.settle().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_already_uses_the_login_is_left_alone() {
+        let follow = Follow::start(logged_in("viewer", &[]), Some("viewer"));
+        assert_eq!(follow.settle().await, 0);
+        // The login settling while the first connection is being made, as noted by the provider.
+        let follow = Follow::start(AuthState::Restoring, Some("viewer"));
+        follow.states.send_replace(logged_in("viewer", &[]));
+        assert_eq!(follow.settle().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn logout_and_another_account_reconnect_once_each() {
+        let follow = Follow::start(logged_in("viewer", &[]), Some("viewer"));
+        follow
+            .states
+            .send_replace(AuthState::LoggedOut { notice: None });
+        assert_eq!(follow.settle().await, 1);
+        assert_eq!(follow.connected_as.get(), None);
+        follow.states.send_replace(logged_in("other", &[]));
+        assert_eq!(follow.settle().await, 2);
+        // The same state again (a notice dismissed, a re-login as the same user) changes nothing.
+        follow.states.send_replace(logged_in("other", &[]));
+        assert_eq!(follow.settle().await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_login_without_chat_read_stays_anonymous() {
+        let follow = Follow::start(AuthState::Restoring, None);
+        follow
+            .states
+            .send_replace(logged_in("viewer", &["chat:read"]));
+        assert_eq!(follow.settle().await, 0);
+    }
 
     #[tokio::test]
     async fn forward_passes_events_in_order_and_stops_when_the_ui_is_gone() {

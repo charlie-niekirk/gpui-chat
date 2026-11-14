@@ -19,7 +19,9 @@ mod parse;
 
 pub use auth::Auth;
 pub use chat_send::{SEND_CHAT_PATH, SendError, SentMessage, echo_message};
-pub use client::{ClientConfig, Credentials, CredentialsProvider, TwitchClient, irc_login};
+pub use client::{
+    ClientConfig, Credentials, CredentialsProvider, TwitchClient, irc_login, settled_state,
+};
 pub use helix::{HelixClient, HelixError, HelixResponse};
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};

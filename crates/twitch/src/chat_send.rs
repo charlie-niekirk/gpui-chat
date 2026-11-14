@@ -34,6 +34,10 @@ pub const SEND_CHAT_PATH: &str = "chat/messages";
 pub struct SentMessage {
     /// The id the message has in chat (what the IRC copy's `id` tag will be).
     pub message_id: String,
+    /// The account the message was sent as: the one whose token made the request, whatever the
+    /// login state is by the time the answer arrives.
+    pub user_id: String,
+    pub login: String,
 }
 
 /// Why a message did not go out. `Display` is written for the user.
@@ -100,7 +104,7 @@ struct ErrorBody {
 }
 
 /// Maps a completed Send Chat Message exchange to its outcome.
-fn interpret(response: &HelixResponse) -> Result<SentMessage, SendError> {
+fn interpret(response: &HelixResponse) -> Result<String, SendError> {
     let twitch_message = || {
         serde_json::from_slice::<ErrorBody>(&response.body)
             .map(|body| body.message.trim().to_owned())
@@ -116,9 +120,7 @@ fn interpret(response: &HelixResponse) -> Result<SentMessage, SendError> {
                 .next()
                 .ok_or(SendError::BadResponse)?;
             if item.is_sent {
-                return Ok(SentMessage {
-                    message_id: item.message_id,
-                });
+                return Ok(item.message_id);
             }
             let (code, message) = item
                 .drop_reason
@@ -165,28 +167,28 @@ impl HelixClient {
         message: &str,
         reply_parent: Option<&str>,
     ) -> Result<SentMessage, SendError> {
-        let sender_id = self
-            .auth()
-            .access_token()
-            .await
-            .map_err(HelixError::from)?
-            .user_id;
+        let lease = self.auth().access_token().await.map_err(HelixError::from)?;
         let mut body = json!({
             "broadcaster_id": broadcaster_id,
-            "sender_id": sender_id,
+            "sender_id": lease.user_id,
             "message": message,
         });
         if let Some(parent) = reply_parent {
             body["reply_parent_message_id"] = json!(parent);
         }
         let response = self.post_json(SEND_CHAT_PATH, &body).await?;
-        interpret(&response)
+        Ok(SentMessage {
+            message_id: interpret(&response)?,
+            user_id: lease.user_id,
+            login: lease.login,
+        })
     }
 }
 
 /// The line chat shows for a message the user just sent: `text` tokenized the way an incoming
 /// message is (links, mentions, emoji; third-party emotes are resolved by the app afterwards, like
-/// for every message), `id` as returned by Twitch. `author` is what is known about the user (the
+/// for every message), `id` as returned by Twitch. It is flagged [`gpui_chat_core::MessageFlags::echo`]:
+/// the copy Twitch delivers over IRC replaces it. `author` is what is known about the user (the
 /// IRC copy would also carry their colour and badges).
 pub fn echo_message(
     id: impl Into<MessageId>,
@@ -197,6 +199,7 @@ pub fn echo_message(
 ) -> Message {
     let fragments = Tokenizer::new().tokenize(text, &[]).fragments;
     let mut message = Message::chat(id, timestamp, author, fragments);
+    message.flags.echo = true;
     if action {
         message.kind = MessageKind::Action;
     }
@@ -222,12 +225,7 @@ mod tests {
             200,
             json!({ "data": [{ "message_id": "abc-123", "is_sent": true }] }),
         );
-        assert_eq!(
-            interpret(&ok),
-            Ok(SentMessage {
-                message_id: "abc-123".into()
-            })
-        );
+        assert_eq!(interpret(&ok), Ok("abc-123".to_owned()));
     }
 
     #[test]
@@ -358,6 +356,7 @@ mod tests {
                 .any(|f| matches!(f, Fragment::Link { .. }))
         );
         assert!(!chat.flags.mention);
+        assert!(chat.flags.echo, "an echo says it is one");
         let action = echo_message("id-2", author, "waves", true, Timestamp(6));
         assert_eq!(action.kind, MessageKind::Action);
         assert_eq!(action.author.as_ref().unwrap().login, "viewer");

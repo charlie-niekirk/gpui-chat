@@ -436,7 +436,7 @@ async fn set_credentials_reconnects_immediately_with_the_token() {
 /// can change who is logged in between connections.
 fn provider_from(cell: &Arc<Mutex<Option<(&'static str, &'static str)>>>) -> CredentialsProvider {
     let cell = Arc::clone(cell);
-    CredentialsProvider::new(move || {
+    CredentialsProvider::new(move |_failures| {
         let cell = Arc::clone(&cell);
         async move {
             match *cell.lock().unwrap() {
@@ -558,6 +558,92 @@ async fn reconnect_while_connecting_restarts_with_fresh_credentials() {
         (nick.as_str(), pass.as_deref()),
         ("me", Some("oauth:token"))
     );
+}
+
+/// A provider whose token names how many refusals it was told about (`token-<n>`), recording them.
+fn counting_provider(seen: &Arc<Mutex<Vec<u32>>>) -> CredentialsProvider {
+    let seen = Arc::clone(seen);
+    CredentialsProvider::new(move |failures| {
+        seen.lock().unwrap().push(failures);
+        async move { Credentials::user("me", format!("token-{failures}")) }
+    })
+}
+
+const REFUSED: &str = ":tmi.twitch.tv NOTICE * :Login authentication failed";
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_login_makes_the_next_attempt_ask_for_a_new_token() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut rig = rig_with(ClientConfig {
+        credentials_provider: Some(counting_provider(&seen)),
+        ..config()
+    });
+    rig.client.join(&chan("chan"));
+    rig.expect_connection(None, ConnectionState::Connecting)
+        .await;
+
+    // Twitch refuses the token and closes: the provider hears about it, once per refusal.
+    for refusals in 0..2u32 {
+        let mut server = rig.net.accept();
+        let (_, pass) = server.handshake().await;
+        assert_eq!(pass, Some(format!("oauth:token-{refusals}")));
+        server.say(REFUSED);
+        assert!(server.client_hung_up().await, "the refused session ends");
+        rig.expect_connection(
+            None,
+            ConnectionState::Reconnecting {
+                attempt: refusals + 1,
+            },
+        )
+        .await;
+    }
+
+    // The third attempt is accepted; that ends the streak.
+    let mut server = rig.net.accept();
+    let (_, pass) = server.handshake().await;
+    assert_eq!(pass.as_deref(), Some("oauth:token-2"));
+    server.welcome("me");
+    rig.expect_connection(None, ConnectionState::Connected)
+        .await;
+    assert_eq!(server.line().await, "JOIN #chan");
+    rig.expect_connection(Some("chan"), ConnectionState::Connecting)
+        .await;
+    drop(server);
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 3 })
+        .await;
+    let mut server = rig.net.accept();
+    let (_, pass) = server.handshake().await;
+    assert_eq!(
+        pass.as_deref(),
+        Some("oauth:token-0"),
+        "accepted once: no streak"
+    );
+    assert_eq!(*seen.lock().unwrap(), [0, 1, 2, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_refusal_notice_of_an_anonymous_connection_is_not_a_token_problem() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_in = Arc::clone(&seen);
+    let provider = CredentialsProvider::new(move |failures| {
+        seen_in.lock().unwrap().push(failures);
+        async { Credentials::anonymous() }
+    });
+    let mut rig = rig_with(ClientConfig {
+        credentials_provider: Some(provider),
+        ..config()
+    });
+    rig.expect_connection(None, ConnectionState::Connecting)
+        .await;
+    let mut server = rig.net.accept();
+    server.handshake().await;
+    server.say(REFUSED);
+    assert!(server.client_hung_up().await);
+    rig.expect_connection(None, ConnectionState::Reconnecting { attempt: 1 })
+        .await;
+    let mut server = rig.net.accept();
+    server.handshake().await;
+    assert_eq!(*seen.lock().unwrap(), [0, 0]);
 }
 
 #[tokio::test(start_paused = true)]

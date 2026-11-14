@@ -48,6 +48,19 @@ const READ_SCOPE: &str = "chat:read";
 /// How long [`Credentials::from_auth`] waits for the stored login to be read.
 const RESTORE_WAIT: Duration = Duration::from_secs(5);
 
+/// The login state once the stored login has been read, waiting at most [`RESTORE_WAIT`] for it
+/// (after that, whatever the state is then, `Restoring` included).
+pub async fn settled_state(auth: &Auth) -> AuthState {
+    let mut states = auth.subscribe();
+    // Elapsed or closed: whatever the state is now decides.
+    let _ = timeout(
+        RESTORE_WAIT,
+        states.wait_for(|state| !matches!(state, AuthState::Restoring)),
+    )
+    .await;
+    auth.state()
+}
+
 /// What the client logs in as.
 ///
 /// The login and OAuth token (no `oauth:` prefix, `chat:read` scope) the client logs in with.
@@ -80,17 +93,16 @@ impl Credentials {
     /// The credentials for `auth`'s current login: the user's login and a fresh access token
     /// (refreshed first when it is about to expire), or anonymous when nobody is logged in, the
     /// login lacks `chat:read` (it predates the scope: the UI asks the user to log in again) or the
-    /// token cannot be had. Waits briefly for the stored login to be read at start-up, so the first
-    /// connection already uses it.
-    pub async fn from_auth(auth: &Auth) -> Self {
-        let mut states = auth.subscribe();
-        // Elapsed or closed: whatever the state is now decides.
-        let _ = timeout(
-            RESTORE_WAIT,
-            states.wait_for(|state| !matches!(state, AuthState::Restoring)),
-        )
-        .await;
-        let state = auth.state();
+    /// token cannot be had. Waits briefly for the stored login to be read at start-up
+    /// ([`settled_state`]), so the first connection already uses it.
+    ///
+    /// `auth_failures` is how many connections in a row Twitch refused the token of
+    /// (`NOTICE * :Login authentication failed`, see [`CredentialsProvider`]): the first time the
+    /// token is refreshed even though it has not expired (it was revoked or invalidated
+    /// server-side), after that the connection stays anonymous instead of presenting a token Twitch
+    /// keeps refusing.
+    pub async fn from_auth(auth: &Auth, auth_failures: u32) -> Self {
+        let state = settled_state(auth).await;
         let Some(login) = irc_login(&state) else {
             if let AuthState::LoggedIn(_) = state {
                 tracing::info!(
@@ -99,7 +111,20 @@ impl Credentials {
             }
             return Self::anonymous();
         };
-        match auth.access_token().await {
+        if auth_failures >= 2 {
+            tracing::warn!("Twitch keeps refusing the chat token: connecting anonymously");
+            return Self::anonymous();
+        }
+        let lease = if auth_failures == 1 {
+            // The token Twitch refused is the one `access_token` would hand out again.
+            match auth.access_token().await {
+                Ok(refused) => auth.refresh_after_unauthorized(refused.generation).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            auth.access_token().await
+        };
+        match lease {
             Ok(lease) => Self::user(login, lease.token.expose()),
             Err(error) => {
                 tracing::warn!(%error, "no access token for chat: connecting anonymously");
@@ -128,22 +153,27 @@ impl std::fmt::Debug for Credentials {
 /// login never presents a stale token. Set it on [`ClientConfig::credentials_provider`]; while it is
 /// set it decides the credentials of every attempt (and [`TwitchClient::set_credentials`] has no
 /// lasting effect). Anything but a [`Credentials::user`] is a read-only anonymous connection.
+///
+/// The provider is called with the number of connections **in a row** that Twitch refused the token
+/// of (`NOTICE * :Login authentication failed`, which a token revoked before its local expiry
+/// gets): 0 normally. At 1 it should refresh the token even though it looks valid, at 2 and more
+/// give up on it; the count resets when a connection is accepted.
 #[derive(Clone)]
-pub struct CredentialsProvider(
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Credentials> + Send>> + Send + Sync>,
-);
+pub struct CredentialsProvider(Arc<ProviderFn>);
+
+type ProviderFn = dyn Fn(u32) -> Pin<Box<dyn Future<Output = Credentials> + Send>> + Send + Sync;
 
 impl CredentialsProvider {
     pub fn new<F, Fut>(provider: F) -> Self
     where
-        F: Fn() -> Fut + Send + Sync + 'static,
+        F: Fn(u32) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Credentials> + Send + 'static,
     {
-        Self(Arc::new(move || Box::pin(provider())))
+        Self(Arc::new(move |failures| Box::pin(provider(failures))))
     }
 
-    async fn credentials(&self) -> Credentials {
-        (self.0)().await
+    async fn credentials(&self, auth_failures: u32) -> Credentials {
+        (self.0)(auth_failures).await
     }
 }
 
@@ -259,6 +289,7 @@ impl TwitchClient {
             events: events_tx,
             wanted: Vec::new(),
             rng: clock_seed() | 1,
+            auth_failures: 0,
         };
         tokio::spawn(supervisor.run());
         (
@@ -400,6 +431,8 @@ struct Supervisor<C: Connector> {
     wanted: Vec<ChannelId>,
     limiter: JoinLimiter,
     rng: u64,
+    /// Connections in a row that ended with Twitch refusing the token; see [`CredentialsProvider`].
+    auth_failures: u32,
 }
 
 impl<C: Connector> Supervisor<C> {
@@ -433,7 +466,7 @@ impl<C: Connector> Supervisor<C> {
             skip_delay = false;
 
             if let Some(provider) = self.config.credentials_provider.clone() {
-                self.credentials = provider.credentials().await;
+                self.credentials = provider.credentials(self.auth_failures).await;
                 tracing::debug!(
                     login = %self.credentials.login,
                     anonymous = self.credentials.is_anonymous(),
@@ -692,6 +725,7 @@ impl<C: Connector> Supervisor<C> {
             "RECONNECT" => return Ok(Flow::Reconnect),
             // RPL_WELCOME: the login was accepted.
             "001" => {
+                self.auth_failures = 0;
                 state.welcomed_at = Some(Instant::now());
                 state.login_deadline = None;
                 state.pending = self.wanted.iter().cloned().collect();
@@ -711,6 +745,14 @@ impl<C: Connector> Supervisor<C> {
                 }
                 return Ok(Flow::Continue);
             }
+            // The login was refused (a token Twitch no longer accepts): Twitch closes the
+            // connection next. Count it, so the next attempt asks for a refreshed token.
+            "NOTICE" if self.refused_login(&message) => {
+                if !self.credentials.is_anonymous() {
+                    self.auth_failures += 1;
+                }
+                return Err("login authentication failed".to_owned());
+            }
             _ => {}
         }
 
@@ -721,6 +763,17 @@ impl<C: Connector> Supervisor<C> {
             Err(e) => tracing::warn!("ignoring {} line: {e}", message.command),
         }
         Ok(Flow::Continue)
+    }
+
+    /// `NOTICE * :Login authentication failed` (or `Login unsuccessful`): before the welcome, with no
+    /// channel, saying the login was refused.
+    fn refused_login(&self, message: &IRCMessage) -> bool {
+        let Some(text) = message.params.get(1) else {
+            return false;
+        };
+        let text = text.to_ascii_lowercase();
+        message.params.first().is_some_and(|target| target == "*")
+            && (text.contains("login authentication failed") || text.contains("login unsuccessful"))
     }
 
     async fn send_next_join(

@@ -44,6 +44,8 @@ impl Outgoing {
 pub enum InputError {
     /// `/name` is not a command this version knows (`name` is lowercase, without the slash).
     UnknownCommand(String),
+    /// A `/` with no command name after it (`/` alone, `/ text`).
+    MissingCommand,
     /// `/me` with nothing after it.
     MissingText { command: &'static str },
     /// More than [`MAX_MESSAGE_CHARS`] characters.
@@ -56,6 +58,9 @@ impl fmt::Display for InputError {
             Self::UnknownCommand(name) => write!(
                 f,
                 "Unknown command /{name}. Start with // to send a message that begins with a slash."
+            ),
+            Self::MissingCommand => f.write_str(
+                "Type a command after the slash (try /me), or start with // to send a message that begins with a slash.",
             ),
             Self::MissingText { command } => write!(f, "Usage: /{command} <message>"),
             Self::TooLong { chars } => write!(
@@ -136,6 +141,7 @@ pub fn parse_input(raw: &str) -> Input {
                 .split_once(char::is_whitespace)
                 .map_or((rest, ""), |(name, argument)| (name, argument.trim_start()));
             match name.to_lowercase().as_str() {
+                "" => return Input::Invalid(InputError::MissingCommand),
                 "me" if argument.is_empty() => {
                     return Input::Invalid(InputError::MissingText { command: "me" });
                 }
@@ -297,9 +303,18 @@ mod tests {
             parse_input("/Timeout x 10"),
             Input::Invalid(InputError::UnknownCommand("timeout".into()))
         );
-        assert_eq!(
-            parse_input("/"),
-            Input::Invalid(InputError::UnknownCommand(String::new()))
+        // A slash with no command name says so, not "Unknown command /".
+        for line in ["/", "/ ", "/ hello", "  /   me hi"] {
+            assert_eq!(
+                parse_input(line),
+                Input::Invalid(InputError::MissingCommand),
+                "{line:?}"
+            );
+        }
+        assert!(
+            InputError::MissingCommand
+                .to_string()
+                .contains("Type a command")
         );
         assert!(
             InputError::UnknownCommand("ban".into())

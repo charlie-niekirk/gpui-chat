@@ -359,7 +359,8 @@ impl Render for Composer {
                 };
                 editor.update(cx, |input, cx| {
                     if input.is_editable() {
-                        input.insert(flat, window, cx);
+                        // Replaces the selection, like a plain paste does.
+                        input.replace(flat, window, cx);
                     }
                 });
                 true
