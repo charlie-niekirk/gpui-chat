@@ -240,6 +240,107 @@ impl HelixClient {
     }
 }
 
+/// Why a paged list request failed.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum HelixListError {
+    #[error(transparent)]
+    Helix(#[from] HelixError),
+    /// Twitch answered with a non-2xx status; `message` is its own, when it gave one.
+    #[error("Twitch answered {status}: {message}")]
+    Status { status: u16, message: String },
+    /// A 2xx body that is not the expected list.
+    #[error("unexpected Helix response: {0}")]
+    Parse(String),
+}
+
+impl HelixListError {
+    /// A 401 saying a scope is missing (the stored login predates it): refreshing cannot help, only
+    /// a new login can.
+    pub fn is_missing_scope(&self) -> bool {
+        matches!(self, Self::Status { status: 401, message } if message.to_ascii_lowercase().contains("scope"))
+    }
+}
+
+/// One page of a Helix list: the items and where the next page starts.
+#[derive(Debug, serde::Deserialize)]
+struct Page<T> {
+    #[serde(default = "Vec::new")]
+    data: Vec<T>,
+    #[serde(default)]
+    pagination: Pagination,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct Pagination {
+    cursor: Option<String>,
+}
+
+/// Percent-encodes everything but the RFC 3986 unreserved characters (cursors are base64 and may
+/// hold `=`, `+` or `/`).
+fn encode_query_value(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Paged lists (`pagination.cursor`).
+impl HelixClient {
+    /// GETs `path` and follows `pagination.cursor` (`after=`) until there is no next page, at most
+    /// `max_pages` pages, returning every `data` item in order. A page with an empty or repeated
+    /// cursor ends the walk. `path` may already carry a query (`streams/followed?user_id=1`).
+    pub async fn get_all<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        max_pages: usize,
+    ) -> Result<Vec<T>, HelixListError> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..max_pages.max(1) {
+            let page_path = match &cursor {
+                Some(cursor) => {
+                    format!("{path}{separator}after={}", encode_query_value(cursor))
+                }
+                None => path.to_owned(),
+            };
+            let response = self.get(&page_path).await?;
+            if !(200..300).contains(&response.status) {
+                return Err(HelixListError::Status {
+                    status: response.status,
+                    message: error_message(&response.body),
+                });
+            }
+            let page: Page<T> = serde_json::from_slice(&response.body)
+                .map_err(|error| HelixListError::Parse(error.to_string()))?;
+            items.extend(page.data);
+            match page.pagination.cursor.filter(|next| !next.is_empty()) {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(items)
+    }
+}
+
+/// The `message` of a Twitch error body, or the body's start.
+fn error_message(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        message: Option<String>,
+    }
+    serde_json::from_slice::<Body>(body)
+        .ok()
+        .and_then(|body| body.message)
+        .unwrap_or_else(|| String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

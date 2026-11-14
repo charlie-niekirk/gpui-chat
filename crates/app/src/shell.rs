@@ -14,18 +14,22 @@ use std::time::Duration;
 use gpui_chat_core::{APP_ID, APP_NAME, ChannelId};
 use gpui_chat_settings::SettingsError;
 use gpui_chat_twitch::auth::AuthState;
+use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    SidebarToggleButton,
 };
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled,
-    Subscription, Task, WeakEntity, Window, WindowBounds, div, px, size,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, WindowBounds, div,
+    px, size,
 };
 
 use crate::account::AccountHub;
@@ -47,6 +51,7 @@ use crate::pane::ChannelPane;
 use crate::platform;
 use crate::sign_in;
 use crate::state::{self, Mode, SavedChannels, WindowPlacement};
+use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::StreamHub;
 use crate::theme::{self, Tokens};
 
@@ -135,6 +140,9 @@ pub struct AppShell {
     list: ChannelList,
     live: Option<LiveSource>,
     account: Option<Entity<AccountHub>>,
+    /// Live state of the open and the followed channels (PR 3.5); live source only, polls while
+    /// logged in.
+    stream_info: Option<Entity<StreamInfoHub>>,
     /// Streamlink processes and their play state; ended on quit and when a channel is closed.
     streams: Entity<StreamHub>,
     /// Panes are created when a channel is first selected and kept (with their scroll position)
@@ -181,8 +189,22 @@ impl AppShell {
                 this.placement_changed(window, cx);
             }),
         ];
+        let stream_info = match &account {
+            Some(account) => {
+                let helix = account.read(cx).helix().clone();
+                Some(StreamInfoHub::start(helix, cx))
+            }
+            // Offline sources have no login; the demo variable fakes the data to look at.
+            None if std::env::var_os(stream_info::DEMO_ENV).is_some() => {
+                Some(StreamInfoHub::demo(cx))
+            }
+            None => None,
+        };
         if let Some(account) = &account {
             subscriptions.push(cx.observe(account, |_, _, cx| cx.notify()));
+        }
+        if let Some(stream_info) = &stream_info {
+            subscriptions.push(cx.observe(stream_info, |_, _, cx| cx.notify()));
         }
         window.set_window_title(APP_NAME);
         let focus_handle = cx.focus_handle();
@@ -196,6 +218,7 @@ impl AppShell {
             list: channels,
             live,
             account,
+            stream_info,
             streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
             save_task: None,
@@ -211,7 +234,16 @@ impl AppShell {
         }
         shell.hub_changed(cx);
         shell.ensure_selected_pane(cx);
+        shell.watch_open_channels(cx);
         shell
+    }
+
+    /// Tells the stream poller which channels are open.
+    fn watch_open_channels(&self, cx: &mut App) {
+        if let Some(stream_info) = &self.stream_info {
+            let channels = self.list.channels().to_vec();
+            stream_info.update(cx, |hub, cx| hub.set_channels(channels, cx));
+        }
     }
 
     /// Whether the channel list is the user's (live source) and so persisted.
@@ -242,6 +274,7 @@ impl AppShell {
             self.list.select_first();
         }
         self.ensure_selected_pane(cx);
+        self.watch_open_channels(cx);
         cx.notify();
     }
 
@@ -257,13 +290,15 @@ impl AppShell {
         let store = hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
         let live = self.live.is_some();
         let streams = self.streams.clone();
-        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, live, cx));
+        let stream_info = self.stream_info.clone();
+        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, cx));
         self.panes.insert(channel, pane);
     }
 
     /// Every edit of the channel list ends here.
     fn list_changed(&mut self, cx: &mut Context<Self>) {
         self.ensure_selected_pane(cx);
+        self.watch_open_channels(cx);
         if self.persists() {
             let saved = self.list.to_saved();
             cx.set_global(LatestChannels(saved.clone()));
@@ -494,6 +529,24 @@ impl AppShell {
     fn sidebar(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let count = self.list.channels().len();
+        // Copied out of the hub so the rows own their data.
+        let (live, followed): (HashMap<ChannelId, StreamInfo>, Option<Vec<StreamInfo>>) =
+            match &self.stream_info {
+                Some(hub) => {
+                    let hub = hub.read(cx);
+                    let live = self
+                        .list
+                        .channels()
+                        .iter()
+                        .filter_map(|channel| match hub.liveness(channel) {
+                            Liveness::Live(info) => Some((channel.clone(), info.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    (live, hub.followed_live().map(<[StreamInfo]>::to_vec))
+                }
+                None => (HashMap::new(), None),
+            };
         let items: Vec<SidebarMenuItem> = if self.list.is_empty() {
             vec![
                 SidebarMenuItem::new(format!("No channels yet: {}", platform::ADD_CHANNEL_LABEL))
@@ -510,12 +563,29 @@ impl AppShell {
                         self.list.selected() == Some(channel),
                         index > 0,
                         index + 1 < count,
+                        live.get(channel),
                         &shell,
                     )
                 })
                 .collect()
         };
-        Sidebar::<SidebarMenu>::new("channel-sidebar")
+        let mut groups = vec![SidebarGroup::new("Open").child(SidebarMenu::new().children(items))];
+        if let Some(followed) = followed {
+            let rows: Vec<SidebarMenuItem> = if followed.is_empty() {
+                vec![SidebarMenuItem::new("No one you follow is live").disable(true)]
+            } else {
+                followed
+                    .iter()
+                    .map(|info| {
+                        followed_item(info, self.list.selected() == Some(&info.channel), &shell)
+                    })
+                    .collect()
+            };
+            groups.push(
+                SidebarGroup::new("Followed — live").child(SidebarMenu::new().children(rows)),
+            );
+        }
+        Sidebar::<SidebarGroup<SidebarMenu>>::new("channel-sidebar")
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(self.sidebar_collapsed)
             .w(SIDEBAR_WIDTH)
@@ -543,7 +613,7 @@ impl AppShell {
                         ),
                 ),
             )
-            .child(SidebarMenu::new().children(items))
+            .children(groups)
     }
 
     /// A non-blocking strip above the content while `settings.toml` fails to load. The
@@ -600,6 +670,7 @@ fn channel_item(
     selected: bool,
     can_move_up: bool,
     can_move_down: bool,
+    live: Option<&StreamInfo>,
     shell: &WeakEntity<AppShell>,
 ) -> SidebarMenuItem {
     let act = |shell: &WeakEntity<AppShell>,
@@ -612,34 +683,118 @@ fn channel_item(
     };
     let (click_shell, menu_shell, menu_channel) = (shell.clone(), shell.clone(), channel.clone());
     let click_channel = channel.clone();
-    SidebarMenuItem::new(channel.login().to_owned())
+    let mut item = SidebarMenuItem::new(channel.login().to_owned())
         .active(selected)
         .on_click(act(&click_shell, &click_channel, |shell, channel, cx| {
             shell.select_channel(channel, cx);
+        }));
+    if let Some(info) = live {
+        let info = info.clone();
+        item = item
+            .accessibility_label(format!(
+                "{}, live, {} viewers",
+                channel.login(),
+                stream_info::format_viewers(info.viewers)
+            ))
+            .suffix(move |_, _| live_suffix(&info, false));
+    }
+    item.context_menu(move |menu: PopupMenu, _, _| {
+        menu.item(
+            PopupMenuItem::new("Move Up")
+                .disabled(!can_move_up)
+                .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
+                    shell.move_channel(channel, Move::Up, cx);
+                })),
+        )
+        .item(
+            PopupMenuItem::new("Move Down")
+                .disabled(!can_move_down)
+                .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
+                    shell.move_channel(channel, Move::Down, cx);
+                })),
+        )
+        .separator()
+        .item(PopupMenuItem::new("Remove").on_click(act(
+            &menu_shell,
+            &menu_channel,
+            |shell, channel, cx| {
+                shell.remove_channel(channel, cx);
+            },
+        )))
+    })
+}
+
+/// The right end of a live row: the live dot, the category (followed rows) and the viewers. The
+/// tooltip carries the title, which has no room in the row.
+fn live_suffix(info: &StreamInfo, with_category: bool) -> AnyElement {
+    let uptime = stream_info::format_uptime(info.uptime(stream_info::unix_now()));
+    let tooltip = {
+        let mut lines = vec![info.title.clone()];
+        let mut facts = Vec::new();
+        if !info.category.is_empty() {
+            facts.push(info.category.clone());
+        }
+        facts.push(format!(
+            "{} viewers",
+            stream_info::format_viewers(info.viewers)
+        ));
+        facts.push(format!("live for {uptime}"));
+        lines.push(facts.join(" · "));
+        lines.retain(|line| !line.is_empty());
+        lines.join("\n")
+    };
+    let category = (with_category && !info.category.is_empty()).then(|| info.category.clone());
+    h_flex()
+        .id(SharedString::from(format!("live-{}", info.channel)))
+        .flex_none()
+        .gap_1p5()
+        .items_center()
+        .text_xs()
+        .opacity(0.8)
+        .children(category.map(|category| {
+            div()
+                .max_w(px(60.0))
+                .truncate()
+                .text_color(gpui_kit::hsla(0.0, 0.0, 0.5, 1.0))
+                .child(category)
         }))
-        .context_menu(move |menu: PopupMenu, _, _| {
-            menu.item(
-                PopupMenuItem::new("Move Up")
-                    .disabled(!can_move_up)
-                    .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
-                        shell.move_channel(channel, Move::Up, cx);
-                    })),
-            )
-            .item(
-                PopupMenuItem::new("Move Down")
-                    .disabled(!can_move_down)
-                    .on_click(act(&menu_shell, &menu_channel, |shell, channel, cx| {
-                        shell.move_channel(channel, Move::Down, cx);
-                    })),
-            )
-            .separator()
-            .item(PopupMenuItem::new("Remove").on_click(act(
-                &menu_shell,
-                &menu_channel,
-                |shell, channel, cx| {
-                    shell.remove_channel(channel, cx);
-                },
-            )))
+        .child(
+            div()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(stream_info::live_color()),
+        )
+        .child(stream_info::compact_viewers(info.viewers))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .into_any_element()
+}
+
+/// One "Followed — live" row: click opens (adds and selects) the channel.
+fn followed_item(
+    info: &StreamInfo,
+    selected: bool,
+    shell: &WeakEntity<AppShell>,
+) -> SidebarMenuItem {
+    let (shell, channel) = (shell.clone(), info.channel.clone());
+    let shown = info.clone();
+    SidebarMenuItem::new(info.display_name.clone())
+        .active(selected)
+        .accessibility_label(format!(
+            "{}, live{}{}, {} viewers",
+            info.display_name,
+            if info.category.is_empty() {
+                ""
+            } else {
+                " playing "
+            },
+            info.category,
+            stream_info::format_viewers(info.viewers)
+        ))
+        .suffix(move |_, _| live_suffix(&shown, true))
+        .on_click(move |_, _, cx| {
+            shell
+                .update(cx, |shell, cx| shell.add_channel(channel.clone(), cx))
+                .ok();
         })
 }
 

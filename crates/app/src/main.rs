@@ -29,6 +29,7 @@ mod runtime;
 mod shell;
 mod sign_in;
 mod state;
+mod stream_info;
 mod streams;
 mod theme;
 
