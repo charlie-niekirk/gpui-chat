@@ -200,6 +200,10 @@ mod tests {
         s.appearance.theme_name = "nord".into();
         s.chat.scrollback = 250;
         s.chat.timestamps = false;
+        s.streamlink.path = Some("~/bin/streamlink".into());
+        s.streamlink.player = Some("mpv".into());
+        s.streamlink.extra_args = vec!["--twitch-low-latency".into()];
+        s.streamlink.default_quality = "720p60,720p,best".into();
         s
     }
 
@@ -249,6 +253,44 @@ mod tests {
         assert!(!s.chat.timestamps);
         assert_eq!(s.chat.scrollback, d.chat.scrollback);
         assert_eq!(s.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_file_from_before_the_streamlink_section_still_loads() {
+        let old = "schema_version = 1\n\n[appearance]\nfont_size = 15.0\n\n[chat]\nscrollback = 500\n\n[emotes]\nscale = 2.0\n";
+        let s = Settings::parse(old, Path::new("x")).unwrap();
+        assert_eq!(s.streamlink, crate::StreamlinkSettings::default());
+        assert_eq!(s.appearance.font_size, 15.0);
+        assert_eq!(s.emotes.scale, 2.0);
+    }
+
+    #[test]
+    fn the_streamlink_section_reads_and_may_be_partial() {
+        let s = Settings::parse(
+            "[streamlink]\nplayer = \"/Applications/VLC.app/Contents/MacOS/VLC\"\nextra_args = [\"--retry-open\", \"3\"]\n",
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            s.streamlink.player.as_deref(),
+            Some("/Applications/VLC.app/Contents/MacOS/VLC")
+        );
+        assert_eq!(s.streamlink.extra_args, ["--retry-open", "3"]);
+        assert_eq!(s.streamlink.path, None);
+        assert_eq!(s.streamlink.default_quality, "best");
+    }
+
+    #[test]
+    fn a_bad_default_quality_is_invalid() {
+        let err = Settings::parse("[streamlink]\ndefault_quality = \"--x\"\n", Path::new("x"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SettingsError::Invalid {
+                field: "streamlink.default_quality",
+                ..
+            }
+        ));
     }
 
     #[test]

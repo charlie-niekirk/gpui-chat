@@ -71,8 +71,9 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   restored channel at launch (the client paces the JOINs). **`--firehose` / `--replay` replace it**: no
   client, no joins, and the channel list is neither read from nor written to `state.toml`; the sidebar
   just lists channels as the offline source creates them.
-- `pane.rs` (PR 1.5) — `ChannelPane`: pane header (channel name, connection state, room-mode chips, an
-  empty slot for PR 1.6's streamlink button) over the `ChatView`. `link_status` combines the state of
+- `pane.rs` (PR 1.5) — `ChannelPane`: pane header (channel name, connection state, room-mode chips, the
+  streamlink play/stop split button with its quality menu and, when streamlink failed, the error with a
+  dismiss button; PR 1.6) over the `ChatView`. `link_status` combines the state of
   the whole connection (`Connection { channel: None }`, kept by the hub) with the channel's own join
   state; `room_chips` formats `RoomState` (emote-only, followers-only with duration, slow N s,
   subs-only, unique). Panes are created on first selection and kept (scroll position survives
@@ -103,8 +104,15 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   grapheme atoms, per-message layout cache), `colors` (fallback and readability-adjusted username
   colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
   (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
+- `streams.rs` (PR 1.6) — `StreamHub`, a GPUI entity created by the shell: owns the `Streams` tracker from
+  `crates/streamlink`, turns its events (from worker threads, through a bridge channel) into a per-channel
+  `StreamStates` (`Starting` → `Running` → `Stopping`, or `Ended` with the error until dismissed; events
+  of an old session are ignored) and exposes `toggle` / `play(quality)` / `stop` / `dismiss`. The shell
+  calls `forget` when a channel is closed; an `on_app_quit` hook calls `stop_all`. Settings are read at
+  play time (`launch_spec`), so edits apply on the next press. The button is hidden for the offline sources.
 - `emote_service.rs` (PR 2.4) — `EmoteService`: the live source's third-party emotes. The global BTTV /
-  FFZ / 7TV sets load at startup, a channel's when its ROOMSTATE supplies the room id (once per id).
+  FFZ / 7TV sets load at startup, a channel's when its ROOMSTATE supplies the room id (once per id;
+  a load with a provider error is retried: globals on `Connected`, a channel when ROOMSTATE repeats).
   Every event passes `process` on the way to the bridge (on the backend thread): chat messages get
   their text runs re-scanned with the channel's `EmoteResolver`. `Reload Emotes` (Channel menu)
   refetches everything; `emotes.seventv` / `bttv` / `ffz` switch providers live (a provider that is
@@ -320,3 +328,19 @@ runs non-GPUI crate tests on Ubuntu from PR 0.1 (job `linux`).
 | Config | TOML via `serde` + `toml`, `notify` for hot reload | `~/.config/gpui-chat/{settings,keymap}.toml`, `themes/*.toml` |
 | Paths | `dirs` | Cache in the platform cache dir |
 | Font | Bundled upstream JetBrains Mono (OFL-1.1) | Default chain: `JetBrainsMono Nerd Font` → bundled `JetBrains Mono` → system monospace |
+
+### Streamlink (`crates/streamlink`, PR 1.6)
+
+GPUI-free, std only (threads and `std::process`). `resolve` finds the binary through an injectable
+`Environment` (settings override that must be valid → login-shell `command -v` with a 3 s limit →
+`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`), `args::build_args` makes
+`[--player P] [extra…] twitch.tv/<channel> <quality>`, `classify::classify_line` turns its output into a
+`StreamError` (offline, no player, other; plus not found / spawn failure from the launcher).
+`Streams` keeps one session per channel: `launch` returns at once and a worker thread resolves
+(cached until the binary disappears or the override changes), spawns streamlink (stdout and stderr
+share one pipe, because streamlink prints its `error:` lines on stdout) in **its own process group**,
+reads that output continuously (bytes, capped lines, so it never blocks the child) and waits, sending `StreamEvent { channel, session,
+Started | Failed(error) | Exited { stopped } }` to the caller's sink. Stop signals the *group*
+(`SIGTERM`, `SIGKILL` after 3 s) with `/bin/kill`, so the player streamlink started goes down too;
+`stop_all(timeout)` is the blocking variant for quit, and `Drop` does the same. Launching a channel that
+is running restarts it under a new session id.

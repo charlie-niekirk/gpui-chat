@@ -2328,6 +2328,7 @@ dependencies = [
  "gpui-chat-emotes",
  "gpui-chat-media",
  "gpui-chat-settings",
+ "gpui-chat-streamlink",
  "gpui-chat-twitch",
  "gpui-kit",
  "gpui-pre",
@@ -2389,6 +2390,11 @@ dependencies = [
 [[package]]
 name = "gpui-chat-streamlink"
 version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "gpui-chat-twitch"

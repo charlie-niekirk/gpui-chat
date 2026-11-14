@@ -45,9 +45,9 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub chat: ChatSettings,
     pub emotes: EmoteSettings,
+    pub streamlink: StreamlinkSettings,
     // Later phases add sections here, each `#[serde(default)]`:
-    // streamlink (1.6: binary, player, quality,
-    // extra args), account (3.x: non-secret bits only; tokens live in the keychain).
+    // account (3.x: non-secret bits only; tokens live in the keychain).
 }
 
 impl Default for Settings {
@@ -57,6 +57,7 @@ impl Default for Settings {
             appearance: AppearanceSettings::default(),
             chat: ChatSettings::default(),
             emotes: EmoteSettings::default(),
+            streamlink: StreamlinkSettings::default(),
         }
     }
 }
@@ -168,6 +169,34 @@ impl Default for EmoteSettings {
     }
 }
 
+/// `[streamlink]`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamlinkSettings {
+    /// Path to the `streamlink` executable (`~/` allowed). Unset: found automatically (login
+    /// shell, then the usual install directories). A set path that is not executable is an
+    /// error shown in the pane header, not a reason to look elsewhere.
+    pub path: Option<String>,
+    /// Player passed as `--player` (`mpv`, a full path, ...). Unset: streamlink's own default.
+    pub player: Option<String>,
+    /// Extra arguments, one per entry, placed before the URL (`["--twitch-low-latency"]`).
+    pub extra_args: Vec<String>,
+    /// Quality a pane starts with and the play button uses: `best`, `720p60`, a fallback list
+    /// like `720p60,720p,best`, ... No spaces, not starting with `-`.
+    pub default_quality: String,
+}
+
+impl Default for StreamlinkSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            player: None,
+            extra_args: Vec::new(),
+            default_quality: "best".to_owned(),
+        }
+    }
+}
+
 impl Settings {
     /// Check value ranges. Returns `(field, reason)` for the first problem.
     ///
@@ -219,6 +248,13 @@ impl Settings {
                 ),
             ));
         }
+        let quality = &self.streamlink.default_quality;
+        if quality.is_empty() || quality.starts_with('-') || quality.contains(char::is_whitespace) {
+            return Err((
+                "streamlink.default_quality",
+                format!("{quality:?} is not a quality such as \"best\" or \"720p60\""),
+            ));
+        }
         Ok(())
     }
 }
@@ -239,6 +275,9 @@ mod tests {
         assert_eq!(s.appearance.theme, ThemeMode::System);
         assert_eq!(s.chat.scrollback, 1000);
         assert_eq!((s.emotes.scale, s.emotes.animate), (1.0, true));
+        assert_eq!(s.streamlink.default_quality, "best");
+        assert!(s.streamlink.path.is_none() && s.streamlink.player.is_none());
+        assert!(s.streamlink.extra_args.is_empty());
         assert!(s.validate().is_ok());
         let chain: Vec<_> = s.appearance.font_chain().collect();
         assert_eq!(
@@ -266,6 +305,12 @@ mod tests {
         let mut s = Settings::default();
         s.emotes.scale = 8.0;
         assert_eq!(s.validate().unwrap_err().0, "emotes.scale");
+
+        for bad in ["", "--player=x", "best 720p"] {
+            let mut s = Settings::default();
+            s.streamlink.default_quality = bad.into();
+            assert_eq!(s.validate().unwrap_err().0, "streamlink.default_quality");
+        }
 
         let mut s = Settings::default();
         s.appearance.font_family = "  ".into();

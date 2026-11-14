@@ -40,6 +40,7 @@ use crate::live::LiveSource;
 use crate::pane::ChannelPane;
 use crate::platform;
 use crate::state::{self, Mode, SavedChannels, WindowPlacement};
+use crate::streams::StreamHub;
 use crate::theme::{self, Tokens};
 
 const SIDEBAR_WIDTH: Pixels = px(240.0);
@@ -124,6 +125,8 @@ pub struct AppShell {
     hud: Entity<DebugHud>,
     list: ChannelList,
     live: Option<LiveSource>,
+    /// Streamlink processes and their play state; ended on quit and when a channel is closed.
+    streams: Entity<StreamHub>,
     /// Panes are created when a channel is first selected and kept (with their scroll position)
     /// until it is closed.
     panes: HashMap<ChannelId, Entity<ChannelPane>>,
@@ -178,6 +181,7 @@ impl AppShell {
             hud,
             list: channels,
             live,
+            streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
             save_task: None,
             channels_save_task: None,
@@ -237,7 +241,8 @@ impl AppShell {
         let hub = self.hub.clone();
         let store = hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
         let live = self.live.is_some();
-        let pane = cx.new(|cx| ChannelPane::new(hub, store, live, cx));
+        let streams = self.streams.clone();
+        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, live, cx));
         self.panes.insert(channel, pane);
     }
 
@@ -274,6 +279,8 @@ impl AppShell {
             return;
         }
         self.panes.remove(channel);
+        self.streams
+            .update(cx, |streams, cx| streams.forget(channel, cx));
         if let Some(live) = &self.live {
             live.part(channel);
         }
