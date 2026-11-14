@@ -4,6 +4,11 @@
 //! * The **global** sets load at startup. A channel's sets load when its `ROOMSTATE` supplies the
 //!   room id (the Twitch user id the providers are keyed by); a room id seen again does not load
 //!   again, a changed one does.
+//! * **Failures are retried.** Each load is `Complete` only if every requested provider answered.
+//!   Incomplete global sets are requested again whenever the connection reports `Connected` (the
+//!   first connect and every reconnect), and a channel whose last load was incomplete is requested
+//!   again when its `ROOMSTATE` repeats (a reconnect re-joins and so repeats it). A load still in
+//!   flight is never duplicated.
 //! * Every event on its way from the Twitch client to the UI passes [`EmoteService::process`]: a
 //!   message's text runs are re-scanned with the channel's [`EmoteResolver`] (7TV → BTTV → FFZ,
 //!   channel before global) and words that name an emote become `Fragment::Emote`s, zero-width
@@ -20,7 +25,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use gpui_chat_core::{ChannelId, ChatEvent, Message, MessageKind, resolve_fragments};
+use gpui_chat_core::{
+    ChannelId, ChatEvent, ConnectionState, Message, MessageKind, resolve_fragments,
+};
 use gpui_chat_emotes::{EmoteLoader, EmoteRegistry, Providers};
 use gpui_chat_settings::EmoteSettings;
 use gpui_kit::App;
@@ -37,12 +44,54 @@ pub fn providers(settings: &EmoteSettings) -> Providers {
     }
 }
 
+/// How far a set of loads got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Load {
+    /// Not requested yet, or the last attempt had a provider error.
+    Incomplete,
+    InFlight,
+    /// Every requested provider answered.
+    Complete,
+}
+
+/// A load's state and the number of the latest attempt: a finishing attempt only records its
+/// outcome if no newer one was started meanwhile.
+#[derive(Clone, Copy, Debug)]
+struct Attempt {
+    load: Load,
+    token: u64,
+}
+
+#[derive(Debug)]
+struct Room {
+    room_id: String,
+    attempt: Attempt,
+}
+
+struct State {
+    next_token: u64,
+    global: Attempt,
+    rooms: HashMap<ChannelId, Room>,
+}
+
+impl State {
+    fn token(&mut self) -> u64 {
+        self.next_token += 1;
+        self.next_token
+    }
+}
+
 struct Inner {
     loader: EmoteLoader,
     registry: EmoteRegistry,
     handle: Handle,
-    /// The room id each open channel's sets were requested for.
-    rooms: Mutex<HashMap<ChannelId, String>>,
+    state: Mutex<State>,
+}
+
+impl Inner {
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Cheap to clone; all clones share one registry.
@@ -59,7 +108,14 @@ impl EmoteService {
                 loader,
                 registry: EmoteRegistry::new(enabled),
                 handle,
-                rooms: Mutex::new(HashMap::new()),
+                state: Mutex::new(State {
+                    next_token: 0,
+                    global: Attempt {
+                        load: Load::Incomplete,
+                        token: 0,
+                    },
+                    rooms: HashMap::new(),
+                }),
             }),
         }
     }
@@ -79,14 +135,17 @@ impl EmoteService {
         Some(service)
     }
 
-    fn rooms(&self) -> std::sync::MutexGuard<'_, HashMap<ChannelId, String>> {
-        self.inner
-            .rooms
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
+    /// Fetches the global sets now, whatever their state.
     fn load_global(&self) {
+        let token = {
+            let mut state = self.inner.state();
+            let token = state.token();
+            state.global = Attempt {
+                load: Load::InFlight,
+                token,
+            };
+            token
+        };
         let inner = self.inner.clone();
         drop(self.inner.handle.spawn(async move {
             let results = inner
@@ -94,10 +153,34 @@ impl EmoteService {
                 .load_global_with(inner.registry.enabled())
                 .await;
             inner.registry.store_global(&results);
+            let mut state = inner.state();
+            if state.global.token == token {
+                state.global.load = if results.all_ok() {
+                    Load::Complete
+                } else {
+                    Load::Incomplete
+                };
+            }
         }));
     }
 
+    /// Fetches `channel`'s sets for `room_id` now, whatever their state.
     fn load_channel(&self, channel: ChannelId, room_id: String) {
+        let token = {
+            let mut state = self.inner.state();
+            let token = state.token();
+            state.rooms.insert(
+                channel.clone(),
+                Room {
+                    room_id: room_id.clone(),
+                    attempt: Attempt {
+                        load: Load::InFlight,
+                        token,
+                    },
+                },
+            );
+            token
+        };
         let inner = self.inner.clone();
         drop(self.inner.handle.spawn(async move {
             let results = inner
@@ -105,14 +188,20 @@ impl EmoteService {
                 .load_channel_with(&room_id, inner.registry.enabled())
                 .await;
             // The channel may have been closed (or its room id changed) while this loaded.
-            let current = inner
-                .rooms
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&channel)
-                .is_some_and(|id| *id == room_id);
-            if current {
-                inner.registry.store_channel(&channel, &results);
+            let mut state = inner.state();
+            let Some(room) = state.rooms.get_mut(&channel) else {
+                return;
+            };
+            if room.room_id != room_id {
+                return;
+            }
+            inner.registry.store_channel(&channel, &results);
+            if room.attempt.token == token {
+                room.attempt.load = if results.all_ok() {
+                    Load::Complete
+                } else {
+                    Load::Incomplete
+                };
             }
         }));
     }
@@ -121,9 +210,11 @@ impl EmoteService {
     pub fn reload(&self) {
         self.load_global();
         let rooms: Vec<(ChannelId, String)> = self
-            .rooms()
+            .inner
+            .state()
+            .rooms
             .iter()
-            .map(|(channel, id)| (channel.clone(), id.clone()))
+            .map(|(channel, room)| (channel.clone(), room.room_id.clone()))
             .collect();
         for (channel, room_id) in rooms {
             self.load_channel(channel, room_id);
@@ -144,22 +235,24 @@ impl EmoteService {
 
     /// The channel was closed: forget its room and sets.
     pub fn forget(&self, channel: &ChannelId) {
-        self.rooms().remove(channel);
+        self.inner.state().rooms.remove(channel);
         self.inner.registry.forget_channel(channel);
     }
 
-    /// Passes `event` on: a `ROOMSTATE` with a (new) room id starts loading the channel's sets, a
-    /// chat message has its emotes resolved.
+    /// Passes `event` on: a `ROOMSTATE` with a new room id (or repeating one whose last load was
+    /// incomplete) starts loading the channel's sets, `Connected` retries incomplete global sets,
+    /// a chat message has its emotes resolved.
     pub fn process(&self, event: ChatEvent) -> ChatEvent {
         match event {
             ChatEvent::RoomState { channel, update } => {
                 if let Some(room_id) = &update.room_id {
-                    let new = self
-                        .rooms()
-                        .insert(channel.clone(), room_id.clone())
-                        .as_ref()
-                        != Some(room_id);
-                    if new {
+                    let needed = match self.inner.state().rooms.get(&channel) {
+                        Some(room) => {
+                            room.room_id != *room_id || room.attempt.load == Load::Incomplete
+                        }
+                        None => true,
+                    };
+                    if needed {
                         self.load_channel(channel.clone(), room_id.clone());
                     }
                 }
@@ -168,6 +261,18 @@ impl EmoteService {
             ChatEvent::Message { channel, message } => {
                 let message = self.resolve(&channel, message);
                 ChatEvent::Message { channel, message }
+            }
+            ChatEvent::Connection {
+                channel: None,
+                state: ConnectionState::Connected,
+            } => {
+                if self.inner.state().global.load == Load::Incomplete {
+                    self.load_global();
+                }
+                ChatEvent::Connection {
+                    channel: None,
+                    state: ConnectionState::Connected,
+                }
             }
             other => other,
         }
@@ -205,17 +310,19 @@ mod tests {
 
     use super::*;
 
-    /// Answers from `fixtures/emotes/`, counting requests per URL.
+    /// Answers from `fixtures/emotes/`, recording requests; every request fails while `down`.
     #[derive(Default)]
     struct Fixtures {
         replies: HashMap<&'static str, &'static str>,
         requests: Mutex<Vec<String>>,
+        down: std::sync::atomic::AtomicBool,
     }
 
     impl HttpClient for Fixtures {
         fn get<'a>(&'a self, url: &'a str) -> HttpFuture<'a> {
             self.requests.lock().unwrap().push(url.to_owned());
-            let file = self.replies.get(url).copied();
+            let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
+            let file = self.replies.get(url).copied().filter(|_| !down);
             Box::pin(async move {
                 match file {
                     Some(file) => {
@@ -259,7 +366,23 @@ mod tests {
                 ),
             ]),
             requests: Mutex::default(),
+            down: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn set_down(http: &Fixtures, down: bool) {
+        http.down.store(down, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn connected() -> ChatEvent {
+        ChatEvent::Connection {
+            channel: None,
+            state: ConnectionState::Connected,
+        }
+    }
+
+    fn request_count(http: &Fixtures) -> usize {
+        http.requests.lock().unwrap().len()
     }
 
     fn room(channel: &str, room_id: &str) -> ChatEvent {
@@ -401,6 +524,109 @@ mod tests {
         service.forget(&ChannelId::new("pajlada"));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(emotes(&service.process(message("pajlada", "NERD"))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_global_sets_are_requested_again_on_connected() {
+        let http = fixtures();
+        set_down(&http, true);
+        let service = service(http.clone(), Providers::ALL);
+        // The app starts before the network is up: every provider fails.
+        service.load_global();
+        eventually(|| service.inner.state().global.load == Load::Incomplete).await;
+        assert!(emotes(&service.process(message("a", "RainTime"))).is_empty());
+
+        // The network is back and the connection comes up (first connect or reconnect).
+        set_down(&http, false);
+        service.process(connected());
+        eventually(|| !emotes(&service.process(message("a", "RainTime"))).is_empty()).await;
+        eventually(|| service.inner.state().global.load == Load::Complete).await;
+
+        // Complete: further `Connected` events (reconnects) ask for nothing.
+        let requests = request_count(&http);
+        service.process(connected());
+        service.process(connected());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(request_count(&http), requests);
+    }
+
+    #[tokio::test]
+    async fn a_channel_whose_load_failed_is_requested_again_when_room_state_repeats() {
+        let http = fixtures();
+        set_down(&http, true);
+        let service = service(http.clone(), Providers::ALL);
+        service.process(room("pajlada", "11148817"));
+        eventually(|| {
+            service.inner.state().rooms[&ChannelId::new("pajlada")]
+                .attempt
+                .load
+                == Load::Incomplete
+        })
+        .await;
+
+        // A repeat while the last load failed (a reconnect re-joins): try again.
+        set_down(&http, false);
+        service.process(room("pajlada", "11148817"));
+        eventually(|| !emotes(&service.process(message("pajlada", "NERD"))).is_empty()).await;
+        eventually(|| {
+            service.inner.state().rooms[&ChannelId::new("pajlada")]
+                .attempt
+                .load
+                == Load::Complete
+        })
+        .await;
+
+        // Complete: another repeat is a no-op. A different room id is a new channel.
+        let requests = request_count(&http);
+        service.process(room("pajlada", "11148817"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(request_count(&http), requests);
+        service.process(room("pajlada", "1"));
+        eventually(|| request_count(&http) > requests).await;
+    }
+
+    #[tokio::test]
+    async fn a_load_in_flight_is_not_duplicated() {
+        let http = fixtures();
+        let service = service(http.clone(), Providers::ALL);
+        // Two ROOMSTATEs and a Connected back to back, before anything finished.
+        service.process(room("pajlada", "11148817"));
+        service.load_global();
+        service.process(room("pajlada", "11148817"));
+        service.process(connected());
+        eventually(|| service.inner.state().global.load == Load::Complete).await;
+        eventually(|| {
+            service.inner.state().rooms[&ChannelId::new("pajlada")]
+                .attempt
+                .load
+                == Load::Complete
+        })
+        .await;
+        // 3 global + 3 channel requests, once each.
+        assert_eq!(request_count(&http), 6);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_provider_does_not_wipe_a_set_when_a_stale_load_lands() {
+        // 7TV is on and loaded; a load that started while it was off finishes afterwards.
+        let http = fixtures();
+        let service = service(http.clone(), Providers::ALL);
+        service.process(room("pajlada", "11148817"));
+        eventually(|| !emotes(&service.process(message("pajlada", "NERD"))).is_empty()).await;
+        let without_7tv = Providers {
+            seven_tv: false,
+            ..Providers::ALL
+        };
+        let stale = service
+            .inner
+            .loader
+            .load_channel_with("11148817", without_7tv)
+            .await;
+        service
+            .inner
+            .registry
+            .store_channel(&ChannelId::new("pajlada"), &stale);
+        assert!(!emotes(&service.process(message("pajlada", "NERD"))).is_empty());
     }
 
     #[tokio::test]

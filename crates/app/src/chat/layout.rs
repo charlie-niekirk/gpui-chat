@@ -25,7 +25,7 @@
 //! scale factor); a changed message (`Arc` pointer differs, e.g. marked deleted) is re-shaped.
 //! Entries for evicted messages are dropped when the view syncs with the store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -74,9 +74,11 @@ pub struct InlineImage {
 }
 
 impl InlineImage {
-    /// Whether one of the layers draws the image at `url`.
-    pub fn uses_url(&self, url: &str) -> bool {
-        self.layers.iter().any(|layer| layer.url.url() == url)
+    /// Whether one of the layers draws an image whose URL is in `urls`.
+    pub fn uses_any(&self, urls: &HashSet<&str>) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| urls.contains(layer.url.url()))
     }
 }
 
@@ -417,13 +419,14 @@ impl LayoutCache {
         if urls.is_empty() {
             return Vec::new();
         }
+        let urls: HashSet<&str> = urls.iter().map(ImageKey::url).collect();
         let mut dropped = Vec::new();
         self.entries.retain(|seq, entry| {
             let affected = entry
                 .shaped
                 .inlines
                 .iter()
-                .any(|inline| urls.iter().any(|url| inline.uses_url(url.url())));
+                .any(|inline| inline.uses_any(&urls));
             if affected {
                 dropped.push(*seq);
             }

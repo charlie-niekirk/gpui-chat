@@ -304,12 +304,15 @@ impl ChangeLog {
         {
             return LayoutChanges::Everything;
         }
-        let mut urls: Vec<ImageKey> = Vec::new();
-        for (_, url) in self.entries.iter().filter(|(n, _)| *n > seen) {
-            if !urls.contains(url) {
-                urls.push(url.clone());
-            }
-        }
+        // Each URL once, in log order.
+        let mut seen_urls: HashSet<&str> = HashSet::new();
+        let urls: Vec<ImageKey> = self
+            .entries
+            .iter()
+            .filter(|(n, _)| *n > seen)
+            .filter(|(_, url)| seen_urls.insert(url.url()))
+            .map(|(_, url)| url.clone())
+            .collect();
         LayoutChanges::Urls(urls)
     }
 }

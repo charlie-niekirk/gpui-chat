@@ -213,6 +213,7 @@ mod tests {
             seven_tv: Ok(set(EmoteProvider::SevenTv, scope, seven_tv)),
             bttv: Ok(set(EmoteProvider::Bttv, scope, bttv)),
             ffz: Ok(set(EmoteProvider::Ffz, scope, ffz)),
+            requested: Providers::ALL,
         }
     }
 
@@ -305,6 +306,30 @@ mod tests {
             "kept after the failure"
         );
         assert_eq!(who(&r, "C").as_deref(), Some("FFZ-C"));
+    }
+
+    #[test]
+    fn a_provider_that_was_not_requested_never_replaces_a_loaded_set() {
+        let (registry, channel) = registry();
+        // A load that started while 7TV and FFZ were off finishes late: their (empty) fields
+        // are placeholders, not results.
+        let mut late = results(EmoteScope::Channel, &[], &["Late"], &[]);
+        late.requested = Providers {
+            seven_tv: false,
+            bttv: true,
+            ffz: false,
+        };
+        registry.store_channel(&channel, &late);
+        registry.store_global(&late);
+        let r = registry.resolver(&channel);
+        assert_eq!(who(&r, "A").as_deref(), Some("7TV-A"), "7TV kept");
+        assert_eq!(who(&r, "C").as_deref(), Some("FFZ-C"), "FFZ kept");
+        assert_eq!(who(&r, "D").as_deref(), Some("7TV-D"), "global 7TV kept");
+        assert_eq!(
+            who(&r, "Late").as_deref(),
+            Some("BTTV-Late"),
+            "BTTV was requested"
+        );
     }
 
     #[test]

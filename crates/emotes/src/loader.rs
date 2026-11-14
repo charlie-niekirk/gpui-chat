@@ -12,11 +12,18 @@ use crate::seventv::SevenTvClient;
 
 /// One result per provider for one scope. Each is independent: a failing provider only
 /// shows up as an `Err` in its own field.
+///
+/// A provider that was switched off is *not requested*: its field holds an empty set so the shape
+/// stays the same, but [`ProviderResults::requested`] says it was never asked, and
+/// [`ProviderResults::sets`] leaves it out. Whoever stores the results must therefore not let a
+/// skipped provider replace a set that was loaded earlier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResults {
     pub seven_tv: Result<EmoteSet, EmoteError>,
     pub bttv: Result<EmoteSet, EmoteError>,
     pub ffz: Result<EmoteSet, EmoteError>,
+    /// The providers that were actually requested.
+    pub requested: Providers,
 }
 
 impl ProviderResults {
@@ -30,9 +37,12 @@ impl ProviderResults {
         .into_iter()
     }
 
-    /// The sets that loaded (empty ones included), in precedence order.
+    /// The sets that loaded (empty ones included), in precedence order. Providers that were not
+    /// requested are left out.
     pub fn sets(&self) -> impl Iterator<Item = &EmoteSet> {
-        self.iter().filter_map(|(_, r)| r.as_ref().ok())
+        self.iter()
+            .filter(|(provider, _)| self.requested.is_enabled(*provider))
+            .filter_map(|(_, r)| r.as_ref().ok())
     }
 
     /// The providers that failed, in precedence order.
@@ -101,6 +111,7 @@ impl EmoteLoader {
                 seven_tv,
                 bttv,
                 ffz,
+                requested: providers,
             },
         )
     }
@@ -145,6 +156,7 @@ impl EmoteLoader {
                 seven_tv,
                 bttv,
                 ffz,
+                requested: providers,
             },
         )
     }
@@ -281,6 +293,10 @@ mod tests {
             assert!(results.seven_tv.as_ref().unwrap().is_empty());
             assert!(results.ffz.as_ref().unwrap().is_empty());
             assert!(!results.bttv.as_ref().unwrap().is_empty());
+            assert_eq!(results.requested, only_bttv);
+            // Only BTTV counts as a result; the placeholders are not stored by anyone.
+            let sets: Vec<_> = results.sets().map(|s| s.provider).collect();
+            assert_eq!(sets, [EmoteProvider::Bttv]);
         }
         let requested = fake.requested();
         assert_eq!(requested.len(), 2, "{requested:?}");
