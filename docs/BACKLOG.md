@@ -88,4 +88,4 @@ an entry here instead of expanding a PR. Format:
 - **Streamlink on Windows is untested** (found in PR 1.6) — `signal_group` uses `taskkill /T /F` there (no graceful stop) and the login-shell lookup assumes `$SHELL`/`/bin/sh`; revisit with Phase 8.
 - **Player arguments as a setting** (found in PR 1.6) — `streamlink.player` is only the program; its arguments go through `extra_args` as `--player-args` plus a value. A `player_args` list would be easier to write.
 - **Per-channel quality and "open in browser" in the header** (found in PR 1.6) — the chosen quality is per run only; persist per channel in `state.toml`, and a menu entry that opens `twitch.tv/<channel>` would cover users without streamlink.
-
+- **Find streamlink installs set up in `.zshrc`** (found in PR 1.6 review) — the login-shell probe is non-interactive (`-l -c`), so pyenv/pipx/asdf paths exported only in `.zshrc` are missed (documented: set `streamlink.path`); an interactive probe was rejected because it can hang or print on startup.

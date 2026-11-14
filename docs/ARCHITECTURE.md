@@ -316,12 +316,13 @@ runs non-GPUI crate tests on Ubuntu from PR 0.1 (job `linux`).
 GPUI-free, std only (threads and `std::process`). `resolve` finds the binary through an injectable
 `Environment` (settings override that must be valid → login-shell `command -v` with a 3 s limit →
 `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`), `args::build_args` makes
-`[--player P] [extra…] twitch.tv/<channel> <quality>`, `classify::classify_line` turns stderr into a
+`[--player P] [extra…] twitch.tv/<channel> <quality>`, `classify::classify_line` turns its output into a
 `StreamError` (offline, no player, other; plus not found / spawn failure from the launcher).
 `Streams` keeps one session per channel: `launch` returns at once and a worker thread resolves
-(cached until the binary disappears or the override changes), spawns streamlink (stdout null, stderr
-piped) in **its own process group**, reads stderr and waits, sending `StreamEvent { channel, session,
+(cached until the binary disappears or the override changes), spawns streamlink (stdout and stderr
+share one pipe, because streamlink prints its `error:` lines on stdout) in **its own process group**,
+reads that output continuously (bytes, capped lines, so it never blocks the child) and waits, sending `StreamEvent { channel, session,
 Started | Failed(error) | Exited { stopped } }` to the caller's sink. Stop signals the *group*
-(`SIGTERM`, `SIGKILL` after 3 s) with the system `kill`, so the player streamlink started goes down too;
+(`SIGTERM`, `SIGKILL` after 3 s) with `/bin/kill`, so the player streamlink started goes down too;
 `stop_all(timeout)` is the blocking variant for quit, and `Drop` does the same. Launching a channel that
 is running restarts it under a new session id.

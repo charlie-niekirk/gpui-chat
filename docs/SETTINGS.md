@@ -118,7 +118,10 @@ The play button in a pane header runs
   an executable file is an error shown in the pane header; it never falls back to another
   binary. Unset: `command -v streamlink` in the login shell (`$SHELL -l -c`, 3 s limit; a GUI
   app does not inherit the shell's `PATH`), then `/opt/homebrew/bin`, `/usr/local/bin`,
-  `~/.local/bin`. Nothing found shows the hint `brew install streamlink`. The result is
+  `~/.local/bin`. Nothing found shows the hint `brew install streamlink`. The login shell is
+  non-interactive, so it reads `.zprofile` / `.profile` but **not `.zshrc`**: an install whose `PATH`
+  is set up only there (pyenv, pipx or asdf shims, say) is not found; set `streamlink.path` for
+  those. The result is
   remembered until the binary disappears or `path` changes, so installing streamlink needs no
   restart.
 - **`player`** goes to `--player` as one argument (spaces are fine); it is a program, not a

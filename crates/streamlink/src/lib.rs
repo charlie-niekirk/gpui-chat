@@ -7,13 +7,14 @@
 //!   directories). The environment is a trait ([`Environment`]), so the order is unit-tested
 //!   without touching the machine.
 //! * [`args`]: `streamlink [--player P] [extra…] twitch.tv/<channel> <quality>`.
-//! * [`classify`]: turns streamlink's stderr into a typed [`StreamError`] (channel offline,
+//! * [`classify`]: turns streamlink's output (it prints its errors on stdout) into a typed [`StreamError`] (channel offline,
 //!   no player, other).
 //! * [`Streams`]: spawns and tracks one child per channel and reports [`StreamEvent`]s to a
 //!   sink the caller provides. Dropping or [`Streams::stop_all`] ends every child.
 
 mod args;
 mod classify;
+mod proc;
 mod resolve;
 mod streams;
 

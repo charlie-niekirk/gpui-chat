@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::proc::{Signal, signal_group};
+
 /// Searched last, in order. `~/.local/bin` is relative to the home directory.
 pub const FALLBACK_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "~/.local/bin"];
 
@@ -87,33 +89,7 @@ impl Environment for SystemEnvironment {
                     "/bin/sh"
                 })
             });
-        let mut child = Command::new(shell)
-            .args(["-l", "-c", &format!("command -v {name}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut stdout = child.stdout.take()?;
-        // Read on a helper thread so a shell that hangs cannot hang the caller.
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = String::new();
-            let _ = stdout.read_to_string(&mut out);
-            let _ = tx.send(out);
-        });
-        match rx.recv_timeout(SHELL_TIMEOUT) {
-            Ok(out) => {
-                let _ = child.wait();
-                parse_which_output(&out)
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::debug!("login shell lookup of streamlink timed out");
-                None
-            }
-        }
+        probe_shell(&shell, name, SHELL_TIMEOUT)
     }
 
     fn is_executable(&self, path: &Path) -> bool {
@@ -138,6 +114,45 @@ impl Environment for SystemEnvironment {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())
+    }
+}
+
+/// Runs `shell -l -c "command -v <name>"` and parses the answer. The shell gets its own process
+/// group, so on a timeout everything it started (a profile's background job, say) is killed with
+/// it and nothing is left holding the pipe.
+fn probe_shell(shell: &Path, name: &str, timeout: Duration) -> Option<PathBuf> {
+    let mut command = Command::new(shell);
+    command
+        .args(["-l", "-c", &format!("command -v {name}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read on a helper thread so a shell that hangs cannot hang the caller.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => {
+            let _ = child.wait();
+            parse_which_output(&out)
+        }
+        Err(_) => {
+            signal_group(child.id(), Signal::Kill);
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::debug!("login shell lookup of streamlink timed out");
+            None
+        }
     }
 }
 
@@ -310,5 +325,57 @@ mod tests {
             SystemEnvironment.login_shell_lookup("no-such-binary-gpui-chat"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    fn fake_shell(dir: &tempfile::TempDir, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.path().join("shell");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_login_flags_and_parses_the_answer() {
+        let _guard = crate::proc::SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let shell = fake_shell(&dir, "echo \"banner $1 $2\"\necho \"/found/$3\"");
+        assert_eq!(
+            probe_shell(&shell, "streamlink", Duration::from_secs(5)),
+            Some(PathBuf::from("/found/command -v streamlink"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_timeout_kills_what_the_shell_started() {
+        let _guard = crate::proc::SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // A profile that starts a background job and then hangs.
+        let shell = fake_shell(
+            &dir,
+            &format!(
+                "sleep 60 &\necho $! > {}/job.pid\nwait",
+                dir.path().display()
+            ),
+        );
+        assert_eq!(
+            probe_shell(&shell, "streamlink", Duration::from_millis(500)),
+            None
+        );
+        let pid = std::fs::read_to_string(dir.path().join("job.pid")).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let alive = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "the profile's background job outlived the probe");
     }
 }

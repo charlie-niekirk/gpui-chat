@@ -1,16 +1,16 @@
 //! Spawning and tracking streamlink children.
 //!
 //! One session per channel. [`Streams::launch`] returns at once; a worker thread resolves the
-//! binary (which may run a login shell), spawns streamlink, reads its stderr and waits for it,
+//! binary (which may run a login shell), spawns streamlink, reads its output and waits for it,
 //! reporting [`StreamEvent`]s to the sink the caller gave [`Streams::new`]. The sink runs on
 //! worker threads, so it must only hand the event over (the app pushes it into its bridge).
 //!
 //! On unix streamlink is started in its own process group, so stopping signals the group: the
 //! player streamlink started goes down with it. Stop is `SIGTERM`, then `SIGKILL` after
-//! [`STOP_GRACE`]. No `unsafe` is needed: signals are sent with the system `kill` command.
+//! [`STOP_GRACE`]. No `unsafe` is needed: signals are sent with `/bin/kill`.
 
 use std::collections::HashMap;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,13 +20,17 @@ use std::time::{Duration, Instant};
 
 use crate::args::{LaunchSpec, build_args, valid_quality};
 use crate::classify::{StreamError, classify_line};
+use crate::proc::{Signal, signal_group};
 use crate::resolve::{Environment, ResolveError, SystemEnvironment, resolve};
 
 /// How long a stopped stream gets to exit on `SIGTERM` before it is killed.
 pub const STOP_GRACE: Duration = Duration::from_secs(3);
-/// After streamlink exits, how long to wait for the rest of its stderr (a player that inherited
+/// After streamlink exits, how long to wait for the rest of its output (a player that inherited
 /// the pipe can hold it open) before reporting the exit.
-const STDERR_DRAIN: Duration = Duration::from_millis(500);
+const OUTPUT_DRAIN: Duration = Duration::from_millis(500);
+
+/// Longest output line looked at; the rest of a longer one is read as another line.
+const MAX_LINE: u64 = 64 * 1024;
 
 /// Identifies one launch; a restart of the same channel is a new session, so late events of the
 /// old one can be told apart.
@@ -300,18 +304,35 @@ fn run(shared: &Arc<Shared>, session: &Arc<Session>, spec: LaunchSpec) {
         return finish(true);
     }
 
+    // streamlink prints its console output, `error: …` lines included, on **stdout** (stderr only
+    // carries Python warnings), so both go into one pipe that is read continuously: the
+    // classifier sees everything and streamlink can never block on a full pipe.
+    let (output, writer) = match std::io::pipe() {
+        Ok(pipe) => pipe,
+        Err(error) => return fail(StreamError::Spawn(error.to_string())),
+    };
+    let writers = writer.try_clone().map(|clone| (clone, writer));
+    let Ok((stdout, stderr)) = writers else {
+        return fail(StreamError::Spawn(
+            "could not set up the output pipe".into(),
+        ));
+    };
     let mut command = Command::new(&binary);
     command
         .args(build_args(&spec))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    let mut child = match command.spawn() {
+    let spawned = command.spawn();
+    // The command owns our copies of the pipe's write end; the reader only sees end-of-file once
+    // they and the child's are gone.
+    drop(command);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             let error = if error.kind() == std::io::ErrorKind::NotFound {
@@ -339,7 +360,7 @@ fn run(shared: &Arc<Shared>, session: &Arc<Session>, spec: LaunchSpec) {
 
     let saw_error = Arc::new(AtomicBool::new(false));
     let (drained_tx, drained_rx) = mpsc::channel::<()>();
-    if let Some(stderr) = child.stderr.take() {
+    {
         let (shared, session, channel, saw_error) = (
             shared.clone(),
             session.clone(),
@@ -348,8 +369,17 @@ fn run(shared: &Arc<Shared>, session: &Arc<Session>, spec: LaunchSpec) {
         );
         std::thread::spawn(move || {
             let mut last: Option<StreamError> = None;
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
+            let mut reader = BufReader::new(output);
+            let mut buf = Vec::new();
+            loop {
+                // Lines are read as bytes (output need not be UTF-8) and capped, so neither odd
+                // output nor a huge line can stop the draining or grow memory.
+                buf.clear();
+                match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
                 tracing::debug!(channel = %channel, line = %line, "streamlink");
                 if let Some(error) = classify_line(&line) {
                     saw_error.store(true, Ordering::Release);
@@ -362,14 +392,14 @@ fn run(shared: &Arc<Shared>, session: &Arc<Session>, spec: LaunchSpec) {
                     }
                 }
             }
+            // Whatever is left (after an error above) is still drained, never left to block.
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
             let _ = drained_tx.send(());
         });
-    } else {
-        drop(drained_tx);
     }
 
     let status = child.wait();
-    let _ = drained_rx.recv_timeout(STDERR_DRAIN);
+    let _ = drained_rx.recv_timeout(OUTPUT_DRAIN);
     let stopped = session.lock().stop_requested;
     if !stopped && !saw_error.load(Ordering::Acquire) {
         match &status {
@@ -395,44 +425,6 @@ fn run(shared: &Arc<Shared>, session: &Arc<Session>, spec: LaunchSpec) {
     finish(stopped);
 }
 
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-/// Signals a whole process group (streamlink and the player it started).
-#[cfg(unix)]
-fn signal_group(pid: u32, signal: Signal) {
-    let name = match signal {
-        Signal::Term => "TERM",
-        Signal::Kill => "KILL",
-    };
-    let result = Command::new("kill")
-        .args(["-s", name, "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if !matches!(result, Ok(status) if status.success()) {
-        tracing::debug!(
-            pid,
-            signal = name,
-            "kill of streamlink's process group failed"
-        );
-    }
-}
-
-#[cfg(not(unix))]
-fn signal_group(pid: u32, _signal: Signal) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -441,9 +433,6 @@ mod tests {
 
     use super::*;
 
-    /// Writing then executing scripts from many test threads races on `ETXTBSY` (a forked child
-    /// inherits the still-open write handle), so the tests that spawn take turns.
-    static SERIAL: Mutex<()> = Mutex::new(());
     const WAIT: Duration = Duration::from_secs(10);
 
     struct Rig {
@@ -454,7 +443,9 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = crate::proc::SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tx, events) = mpsc::channel();
         let sink: EventSink = Arc::new(move |event| {
             let _ = tx.send(event);
@@ -548,6 +539,23 @@ mod tests {
     fn an_offline_channel_is_reported_as_such() {
         let rig = rig();
         let spec = rig.script(
+            "echo 'error: No playable streams found on this URL: https://twitch.tv/forsen'\nexit 1",
+        );
+        rig.streams.launch(spec);
+        assert_eq!(
+            rig.until_exit(),
+            [
+                StreamEventKind::Started,
+                StreamEventKind::Failed(StreamError::ChannelOffline),
+                StreamEventKind::Exited { stopped: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn errors_on_stderr_are_classified_too() {
+        let rig = rig();
+        let spec = rig.script(
             "echo 'error: No playable streams found on this URL: https://twitch.tv/forsen' >&2\nexit 1",
         );
         rig.streams.launch(spec);
@@ -562,10 +570,63 @@ mod tests {
     }
 
     #[test]
+    fn streamlinks_info_lines_on_stdout_are_not_errors() {
+        let rig = rig();
+        let spec = rig.script(
+            "echo '[cli][info] Found matching plugin twitch for URL twitch.tv/forsen'\n\
+             echo '[cli][info] Opening stream: 720p (hls)'\nexit 0",
+        );
+        rig.streams.launch(spec);
+        assert_eq!(
+            rig.until_exit(),
+            [
+                StreamEventKind::Started,
+                StreamEventKind::Exited { stopped: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn lots_of_output_never_blocks_the_child() {
+        let rig = rig();
+        // Several MB on each stream, far beyond a pipe's buffer; the script only finishes if it
+        // is drained. The error comes last, after everything else.
+        let spec = rig.script(
+            "yes '[cli][info] Writing to the console in bulk bulk bulk' | head -n 100000\n\
+             yes '[cli][warning] on stderr' | head -n 100000 >&2\n\
+             echo 'error: No playable streams found on this URL: https://twitch.tv/forsen'\nexit 1",
+        );
+        rig.streams.launch(spec);
+        assert_eq!(
+            rig.until_exit(),
+            [
+                StreamEventKind::Started,
+                StreamEventKind::Failed(StreamError::ChannelOffline),
+                StreamEventKind::Exited { stopped: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn output_that_is_not_utf8_does_not_stop_the_reading() {
+        let rig = rig();
+        let spec = rig.script(
+            "printf '\\377\\376 not text\\n'\n\
+             echo 'error: No playable streams found on this URL: https://twitch.tv/forsen'\nexit 1",
+        );
+        rig.streams.launch(spec);
+        let events = rig.until_exit();
+        assert_eq!(
+            events[1],
+            StreamEventKind::Failed(StreamError::ChannelOffline)
+        );
+    }
+
+    #[test]
     fn a_missing_player_is_reported_as_such() {
         let rig = rig();
         let spec = rig.script(
-            "echo 'error: The default player (VLC) does not seem to be installed.' >&2\nexit 1",
+            "echo 'error: The default player (VLC) does not seem to be installed.'\nexit 1",
         );
         rig.streams.launch(spec);
         let events = rig.until_exit();
