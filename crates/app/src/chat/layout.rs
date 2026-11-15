@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_chat_core::{Badge, Emote, Message};
+use gpui_chat_core::{Badge, Emote, Message, MessageId};
 use gpui_chat_media::ImageKey;
 use gpui_kit::{FontId, GlyphId, LineLayout, Pixels};
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -179,101 +179,114 @@ pub struct ShapedMessage {
     pub glyphs: Vec<GlyphRef>,
     pub ascent: Pixels,
     pub descent: Pixels,
+    /// The context line of a reply, drawn above the text.
+    pub reply: Option<ReplyLine>,
+}
+
+/// Cuts the shaped `text` into one atom per extended grapheme cluster, each with its advance.
+fn cut_atoms(text: &str, layout: &LineLayout) -> Vec<Atom> {
+    let line_width = layout.width.as_f32();
+    // Every glyph's start offset and x, in text order.
+    let mut marks: Vec<(usize, f32)> = layout
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|glyph| (glyph.index, glyph.position.x.as_f32()))
+        .collect();
+    marks.sort_by_key(|&(index, _)| index);
+    // A glyph's visual right edge is the next greater glyph x (or the line end). Combining
+    // marks share their base's x, so they do not cut its advance short.
+    let mut edges: Vec<f32> = marks.iter().map(|&(_, x)| x).collect();
+    edges.sort_by(f32::total_cmp);
+    edges.dedup();
+    let right_of = |x: f32| {
+        let i = edges.partition_point(|&edge| edge <= x);
+        edges.get(i).copied().unwrap_or(line_width)
+    };
+    // For a cluster without glyphs of its own (the tail of a ligature): where the next
+    // glyph starts.
+    let x_at = |offset: usize| {
+        let i = marks.partition_point(|&(index, _)| index < offset);
+        marks.get(i).map_or(line_width, |&(_, x)| x)
+    };
+
+    let mut atoms: Vec<Atom> = Vec::new();
+    for (start, cluster) in text.grapheme_indices(true) {
+        let end = start + cluster.len();
+        let glyphs = &marks[marks.partition_point(|&(index, _)| index < start)
+            ..marks.partition_point(|&(index, _)| index < end)];
+        let (left, right) = if glyphs.is_empty() {
+            let x = x_at(start);
+            (x, x)
+        } else {
+            glyphs
+                .iter()
+                .fold((f32::INFINITY, 0.0f32), |(left, right), &(_, x)| {
+                    (left.min(x), right.max(right_of(x)))
+                })
+        };
+        // A cluster that starts before the previous atom's right edge does not follow it
+        // visually: it is inside a right-to-left run (glyph x falls while the text offset
+        // grows), possibly with a left-to-right run such as digits nested in it, which jumps
+        // back within the run's span. Keep the whole run as one unbreakable atom so its
+        // visual order survives; wrapping inside it is left to proper bidi support. Plain
+        // left-to-right text never merges: each cluster starts exactly where the previous
+        // glyph's advance (kerning included) ends.
+        if let Some(previous) = atoms.last_mut()
+            && !glyphs.is_empty()
+            && left < previous.src_x + previous.width - RTL_EPSILON
+        {
+            let previous_right = previous.src_x + previous.width;
+            previous.range.end = end;
+            previous.src_x = left;
+            previous.width = previous_right.max(right) - left;
+            previous.kind = AtomKind::Glyphs;
+            continue;
+        }
+        atoms.push(Atom {
+            range: start..end,
+            src_x: left,
+            width: (right - left).max(0.0),
+            height: 0.0,
+            kind: if cluster.chars().all(char::is_whitespace) {
+                AtomKind::Space
+            } else {
+                AtomKind::Glyphs
+            },
+        });
+    }
+    atoms
+}
+
+/// The shaped glyphs of `layout`, each attached to the atom of `atoms` it falls in.
+fn glyph_refs(layout: &LineLayout, atoms: &[Atom]) -> Vec<GlyphRef> {
+    layout
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter().map(|glyph| (run.font_id, glyph)))
+        .map(|(font_id, glyph)| GlyphRef {
+            font_id,
+            id: glyph.id,
+            x: glyph.position.x.as_f32(),
+            atom: atoms
+                .partition_point(|atom| atom.range.end <= glyph.index)
+                .min(atoms.len().saturating_sub(1)) as u32,
+            is_emoji: glyph.is_emoji,
+        })
+        .collect()
 }
 
 impl ShapedMessage {
     /// Cuts `layout` (the shaped `display.text`) into grapheme-cluster atoms, and each emote of
     /// `display.emotes` whose box (`boxes`, in the same order) is an image into one inline atom.
     pub fn from_layout(display: DisplayText, layout: &LineLayout, boxes: &[EmoteBox]) -> Self {
-        let line_width = layout.width.as_f32();
-        // Every glyph's start offset and x, in text order.
-        let mut marks: Vec<(usize, f32)> = layout
-            .runs
-            .iter()
-            .flat_map(|run| run.glyphs.iter())
-            .map(|glyph| (glyph.index, glyph.position.x.as_f32()))
-            .collect();
-        marks.sort_by_key(|&(index, _)| index);
-        // A glyph's visual right edge is the next greater glyph x (or the line end). Combining
-        // marks share their base's x, so they do not cut its advance short.
-        let mut edges: Vec<f32> = marks.iter().map(|&(_, x)| x).collect();
-        edges.sort_by(f32::total_cmp);
-        edges.dedup();
-        let right_of = |x: f32| {
-            let i = edges.partition_point(|&edge| edge <= x);
-            edges.get(i).copied().unwrap_or(line_width)
-        };
-        // For a cluster without glyphs of its own (the tail of a ligature): where the next
-        // glyph starts.
-        let x_at = |offset: usize| {
-            let i = marks.partition_point(|&(index, _)| index < offset);
-            marks.get(i).map_or(line_width, |&(_, x)| x)
-        };
-
-        let mut atoms: Vec<Atom> = Vec::new();
-        for (start, cluster) in display.text.grapheme_indices(true) {
-            let end = start + cluster.len();
-            let glyphs = &marks[marks.partition_point(|&(index, _)| index < start)
-                ..marks.partition_point(|&(index, _)| index < end)];
-            let (left, right) = if glyphs.is_empty() {
-                let x = x_at(start);
-                (x, x)
-            } else {
-                glyphs
-                    .iter()
-                    .fold((f32::INFINITY, 0.0f32), |(left, right), &(_, x)| {
-                        (left.min(x), right.max(right_of(x)))
-                    })
-            };
-            // A cluster that starts before the previous atom's right edge does not follow it
-            // visually: it is inside a right-to-left run (glyph x falls while the text offset
-            // grows), possibly with a left-to-right run such as digits nested in it, which jumps
-            // back within the run's span. Keep the whole run as one unbreakable atom so its
-            // visual order survives; wrapping inside it is left to proper bidi support. Plain
-            // left-to-right text never merges: each cluster starts exactly where the previous
-            // glyph's advance (kerning included) ends.
-            if let Some(previous) = atoms.last_mut()
-                && !glyphs.is_empty()
-                && left < previous.src_x + previous.width - RTL_EPSILON
-            {
-                let previous_right = previous.src_x + previous.width;
-                previous.range.end = end;
-                previous.src_x = left;
-                previous.width = previous_right.max(right) - left;
-                previous.kind = AtomKind::Glyphs;
-                continue;
-            }
-            atoms.push(Atom {
-                range: start..end,
-                src_x: left,
-                width: (right - left).max(0.0),
-                height: 0.0,
-                kind: if cluster.chars().all(char::is_whitespace) {
-                    AtomKind::Space
-                } else {
-                    AtomKind::Glyphs
-                },
-            });
-        }
+        let atoms = cut_atoms(&display.text, layout);
         let (atoms, inlines) = inline_emotes(atoms, &display, boxes);
         let atom_spans = atoms
             .iter()
             .map(|atom| display.span_at(atom.range.start).unwrap_or(0) as u32)
             .collect();
-        let glyphs = layout
-            .runs
-            .iter()
-            .flat_map(|run| run.glyphs.iter().map(|glyph| (run.font_id, glyph)))
-            .map(|(font_id, glyph)| GlyphRef {
-                font_id,
-                id: glyph.id,
-                x: glyph.position.x.as_f32(),
-                atom: atoms
-                    .partition_point(|atom| atom.range.end <= glyph.index)
-                    .min(atoms.len().saturating_sub(1)) as u32,
-                is_emoji: glyph.is_emoji,
-            })
-            .collect();
+        let glyphs = glyph_refs(layout, &atoms);
         Self {
             display,
             atoms,
@@ -282,7 +295,127 @@ impl ShapedMessage {
             glyphs,
             ascent: layout.ascent,
             descent: layout.descent,
+            reply: None,
         }
+    }
+
+    /// With the context line of a reply drawn above the text.
+    #[must_use]
+    pub fn with_reply(mut self, reply: ReplyLine) -> Self {
+        self.reply = Some(reply);
+        self
+    }
+}
+
+/// How much of a [`ReplyLine`] fits a width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReplyFit {
+    /// How many leading atoms are drawn.
+    pub atoms: usize,
+    /// Where the trailing `…` is drawn, when the text was cut.
+    pub ellipsis_x: Option<f32>,
+    /// The width of everything drawn.
+    pub width: f32,
+}
+
+/// The context line of a reply (`↳ Replying to Name: what they said`), shaped as one unwrapped
+/// line of its own: a smaller, muted line above the message that is cut with an ellipsis to the
+/// width rather than wrapped, so a reply is never more than one line taller than any message.
+/// Shaped with the message (it depends on the same fonts), cut at paint time (it depends on the
+/// width): the cache's shaping level keeps it across a resize.
+#[derive(Clone, Debug)]
+pub struct ReplyLine {
+    /// The thread this reply belongs to: what clicking the line opens.
+    pub root: MessageId,
+    /// The font size it was shaped at (a fraction of the message's).
+    pub font_size: Pixels,
+    /// One atom per grapheme cluster of the text, which ends in the `…` drawn only when the text
+    /// does not fit; the last atom is that `…`.
+    pub atoms: Vec<Atom>,
+    pub glyphs: Vec<GlyphRef>,
+    pub ascent: Pixels,
+    pub descent: Pixels,
+    /// The room the line takes at the top of the row, gap to the text included.
+    pub height: f32,
+}
+
+impl ReplyLine {
+    /// Cuts the shaped `text` (which must end in the `…` that [`ReplyLine::ellipsized`] adds).
+    pub fn from_layout(
+        root: MessageId,
+        font_size: Pixels,
+        text: &str,
+        layout: &LineLayout,
+        height: f32,
+    ) -> Self {
+        let atoms = cut_atoms(text, layout);
+        let glyphs = glyph_refs(layout, &atoms);
+        Self {
+            root,
+            font_size,
+            atoms,
+            glyphs,
+            ascent: layout.ascent,
+            descent: layout.descent,
+            height,
+        }
+    }
+
+    /// `text` with the `…` the line is cut with.
+    pub fn ellipsized(text: &str) -> String {
+        format!("{text}…")
+    }
+
+    /// The atoms before the `…`.
+    fn content(&self) -> &[Atom] {
+        &self.atoms[..self.atoms.len().saturating_sub(1)]
+    }
+
+    fn ellipsis_width(&self) -> f32 {
+        self.atoms.last().map_or(0.0, |atom| atom.width)
+    }
+
+    /// What is drawn in `available` logical pixels: all of the text when it fits, else as many
+    /// whole atoms as leave room for the `…` (never ending on a space).
+    pub fn fit(&self, available: f32) -> ReplyFit {
+        let content = self.content();
+        let total: f32 = content.iter().map(|atom| atom.width).sum();
+        if total <= available + 0.01 {
+            return ReplyFit {
+                atoms: content.len(),
+                ellipsis_x: None,
+                width: total,
+            };
+        }
+        let room = available - self.ellipsis_width();
+        let (mut count, mut x) = (0, 0.0);
+        for atom in content {
+            if x + atom.width > room {
+                break;
+            }
+            x += atom.width;
+            count += 1;
+        }
+        while count > 0 && content[count - 1].kind == AtomKind::Space {
+            count -= 1;
+            x -= content[count].width;
+        }
+        ReplyFit {
+            atoms: count,
+            ellipsis_x: Some(x),
+            width: x + self.ellipsis_width(),
+        }
+    }
+
+    /// X of every atom (relative to the content origin) for `fit`: laid end to end.
+    pub fn positions(&self, fit: ReplyFit) -> Vec<f32> {
+        let mut x = 0.0;
+        let mut out = Vec::with_capacity(fit.atoms);
+        for atom in &self.atoms[..fit.atoms] {
+            out.push(x);
+            x += atom.width;
+        }
+        out
     }
 }
 
@@ -373,6 +506,29 @@ impl LayoutKey {
 pub struct MessageLayout {
     pub shaped: Rc<ShapedMessage>,
     pub flow: Rc<Flow>,
+}
+
+impl MessageLayout {
+    /// The room the reply context line takes above the text (none for a message that is not a
+    /// reply).
+    pub fn reply_height(&self) -> f32 {
+        self.shaped.reply.as_ref().map_or(0.0, |reply| reply.height)
+    }
+
+    /// The whole content height: the reply line, then the flowed text.
+    pub fn height(&self) -> f32 {
+        self.reply_height() + self.flow.height()
+    }
+
+    /// The widest line, for an unconstrained width.
+    pub fn content_width(&self) -> f32 {
+        let reply = self
+            .shaped
+            .reply
+            .as_ref()
+            .map_or(0.0, |reply| reply.fit(f32::INFINITY).width);
+        self.flow.content_width().max(reply)
+    }
 }
 
 struct Entry {
@@ -485,6 +641,19 @@ impl LayoutCache {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The total height of message `seq` as cached (reply line and flowed text).
+    #[cfg(test)]
+    pub fn layout_height(&self, seq: u64) -> Option<f32> {
+        self.entries.get(&seq).map(|entry| {
+            entry
+                .shaped
+                .reply
+                .as_ref()
+                .map_or(0.0, |reply| reply.height)
+                + entry.flow.height()
+        })
     }
 
     /// The cached flow of message `seq`, if any.
@@ -1026,6 +1195,90 @@ mod tests {
             shape("hello world")
         });
         assert_eq!(shapes.get(), 4);
+    }
+
+    /// A reply context line shaped with the fake text system: 10 px per character.
+    fn reply_line(text: &str) -> ReplyLine {
+        let text = ReplyLine::ellipsized(text);
+        ReplyLine::from_layout(
+            MessageId::from("root"),
+            px(8.5),
+            &text,
+            &fake_layout(&text),
+            9.0,
+        )
+    }
+
+    #[test]
+    fn a_reply_line_that_fits_is_drawn_whole() {
+        let line = reply_line("↳ Replying to Bob: hi");
+        // 21 characters before the `…`.
+        let fit = line.fit(1000.0);
+        assert_eq!(fit.atoms, 21);
+        assert_eq!(fit.ellipsis_x, None);
+        assert_eq!(fit.width, 210.0);
+        // Exactly as wide as the text: still whole.
+        assert_eq!(line.fit(210.0).ellipsis_x, None);
+        assert_eq!(line.fit(f32::INFINITY).atoms, 21);
+    }
+
+    #[test]
+    fn a_reply_line_that_does_not_fit_is_cut_with_an_ellipsis_inside_the_width() {
+        let line = reply_line("↳ Replying to Bob: hi");
+        let fit = line.fit(100.0);
+        // Room for 9 characters and the 10 px `…`.
+        assert_eq!(fit.atoms, 9);
+        assert_eq!(fit.ellipsis_x, Some(90.0));
+        assert_eq!(fit.width, 100.0);
+        // Never ends on a space: "↳ Replying" cut after the `g`, not after the space.
+        let fit = line.fit(125.0);
+        assert!(fit.width <= 125.0);
+        let drawn = &line.atoms[..fit.atoms];
+        assert_ne!(drawn.last().unwrap().kind, AtomKind::Space);
+        // Nothing fits but the `…`; and not even that.
+        let fit = line.fit(5.0);
+        assert_eq!(fit.atoms, 0);
+        assert!(line.positions(fit).is_empty());
+    }
+
+    #[test]
+    fn reply_atoms_are_laid_end_to_end() {
+        let line = reply_line("↳ ab");
+        let fit = line.fit(1000.0);
+        assert_eq!(line.positions(fit), [0.0, 10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn a_reply_adds_its_line_to_the_height_and_survives_a_resize_unshaped() {
+        let mut cache = LayoutCache::default();
+        let m = message("hello world");
+        let key = LayoutKey::new(1, 2.0);
+        let shapes = std::cell::Cell::new(0);
+        let shape = || {
+            shapes.set(shapes.get() + 1);
+            shaped("hello world").with_reply(reply_line("↳ Replying to Bob: hi"))
+        };
+        let wide = cache.layout(7, &m, key, 1000.0, 10.0, shape);
+        assert_eq!(wide.reply_height(), 9.0);
+        assert_eq!(wide.height(), 9.0 + wide.flow.height());
+        assert_eq!(wide.flow.line_count(), 1);
+
+        // Narrower: the text wraps (the layout is taller) and the reply line is still the same
+        // single line on top; nothing is shaped again.
+        let narrow = cache.layout(7, &m, key, 80.0, 10.0, shape);
+        assert_eq!(shapes.get(), 1);
+        assert_eq!(narrow.flow.line_count(), 3);
+        assert_eq!(narrow.height(), 9.0 + 30.0);
+        assert!(narrow.height() > wide.height());
+        assert!(Rc::ptr_eq(&wide.shaped, &narrow.shaped));
+        // The widest line, for an unconstrained width, counts the reply line too.
+        assert_eq!(wide.content_width(), 210.0);
+
+        // A message that is not a reply has no extra height.
+        let plain =
+            LayoutCache::default().layout(1, &m, key, 1000.0, 10.0, || shaped("hello world"));
+        assert_eq!(plain.reply_height(), 0.0);
+        assert_eq!(plain.height(), plain.flow.height());
     }
 
     #[test]

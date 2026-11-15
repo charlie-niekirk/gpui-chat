@@ -22,6 +22,7 @@ use gpui_kit::{
 
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
+use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
@@ -255,6 +256,8 @@ impl ChannelPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let chat = cx.new(|cx| ChatView::new(store.clone(), cx));
+        // Reply on a row puts this pane's composer (when it has one) in reply mode.
+        chat.update(cx, |chat, cx| chat.set_can_reply(composer.is_some(), cx));
         // Room and connection state arrive as store / hub changes; redraw the header with them.
         let mut subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
@@ -264,6 +267,16 @@ impl ChannelPane {
         if let Some(stream_info) = &stream_info {
             subscriptions.push(cx.observe(stream_info, |_, _, cx| cx.notify()));
         }
+        subscriptions.push(
+            cx.subscribe(&chat, |this, _, event: &ChatViewEvent, cx| match event {
+                ChatViewEvent::ReplyRequested(message) => {
+                    if let Some(composer) = &this.composer {
+                        composer
+                            .update(cx, |composer, cx| composer.queue_reply(message.clone(), cx));
+                    }
+                }
+            }),
+        );
         Self {
             hub,
             streams,

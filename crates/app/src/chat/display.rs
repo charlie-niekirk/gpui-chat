@@ -10,7 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui_chat_core::{Author, Badge, Emote, Fragment, Message, MessageKind};
+use gpui_chat_core::{Author, Badge, Emote, Fragment, Message, MessageKind, ReplyRef};
 use gpui_chat_media::ImageKey;
 
 /// What a span of the display text is; decides its font weight and colour.
@@ -173,6 +173,19 @@ impl DisplayText {
     }
 }
 
+/// The text of a reply's context line: `↳ Replying to Name: what they said`. One line: runs of
+/// whitespace and control characters become one space, and a parent whose text Twitch did not send
+/// is just named.
+pub fn reply_text(reply: &ReplyRef) -> String {
+    let body = crate::reply::single_line(&reply.parent_body);
+    let name = reply.parent_name();
+    if body.is_empty() {
+        format!("↳ Replying to {name}")
+    } else {
+        format!("↳ Replying to {name}: {body}")
+    }
+}
+
 /// `HH:MM` (UTC) of a Unix millisecond timestamp.
 pub fn clock(unix_millis: i64) -> String {
     let minutes = unix_millis.div_euclid(60_000).rem_euclid(24 * 60);
@@ -290,6 +303,32 @@ mod tests {
             Author::new("alice", "Alice"),
             fragments,
         )
+    }
+
+    fn reply(body: &str) -> ReplyRef {
+        ReplyRef {
+            parent_id: "p".into(),
+            parent_login: "bob".into(),
+            parent_display_name: "Bob".into(),
+            parent_body: body.into(),
+            thread_parent_id: None,
+        }
+    }
+
+    #[test]
+    fn a_reply_line_names_the_parent_and_quotes_it_on_one_line() {
+        assert_eq!(
+            reply_text(&reply("hello there")),
+            "↳ Replying to Bob: hello there"
+        );
+        assert_eq!(
+            reply_text(&reply("two\nlines\u{E0000}  and\ttabs")),
+            "↳ Replying to Bob: two lines and tabs"
+        );
+        assert_eq!(reply_text(&reply("")), "↳ Replying to Bob");
+        let mut nameless = reply("x");
+        nameless.parent_display_name.clear();
+        assert_eq!(reply_text(&nameless), "↳ Replying to bob: x");
     }
 
     #[test]

@@ -141,6 +141,44 @@ async fn an_action_goes_out_as_me_text_and_a_reply_names_its_parent() {
 }
 
 #[tokio::test]
+async fn a_reply_carries_its_parent_and_a_message_without_one_does_not() {
+    let server = MockServer::start().await;
+    let (_, helix) = logged_in(&server).await;
+    let mut reply = send_body("@Alice the Italian is solid");
+    reply["reply_parent_message_id"] = json!("33333333-0000-4000-8000-000000000001");
+    // Matched on the exact body: the plain message below would not match this mock, nor this
+    // reply the plain one.
+    Mock::given(method("POST"))
+        .and(path("/helix/chat/messages"))
+        .and(body_json(reply))
+        .respond_with(accepted("reply-1"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/helix/chat/messages"))
+        .and(body_json(send_body("no parent")))
+        .respond_with(accepted("plain-1"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let sent = helix
+        .send_chat_message(
+            "1000",
+            "@Alice the Italian is solid",
+            Some("33333333-0000-4000-8000-000000000001"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.message_id, "reply-1");
+    let plain = helix
+        .send_chat_message("1000", "no parent", None)
+        .await
+        .unwrap();
+    assert_eq!(plain.message_id, "plain-1");
+}
+
+#[tokio::test]
 async fn every_drop_reason_comes_back_with_twitchs_words() {
     let cases = [
         (

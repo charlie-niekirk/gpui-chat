@@ -124,6 +124,38 @@ pub struct ReplyRef {
     pub thread_parent_id: Option<MessageId>,
 }
 
+impl ReplyRef {
+    /// The reference a reply to `parent` carries (what Twitch's own copy of the reply would have
+    /// in its `reply-parent-*` / `reply-thread-parent-*` tags). `None` for a line nobody wrote
+    /// (notice, system line). Replying to a reply joins its thread, so the root is the parent's
+    /// own root; replying to anything else starts one rooted at the parent.
+    pub fn to(parent: &Message) -> Option<Self> {
+        let author = parent.author.as_ref()?;
+        Some(Self {
+            parent_id: parent.id.clone(),
+            parent_login: author.login.clone(),
+            parent_display_name: author.display_name.clone(),
+            parent_body: parent.plain_text(),
+            thread_parent_id: Some(parent.thread_root().clone()),
+        })
+    }
+
+    /// The root of the thread this reply belongs to: the thread parent, or the parent itself when
+    /// the tags name no other root.
+    pub fn root_id(&self) -> &MessageId {
+        self.thread_parent_id.as_ref().unwrap_or(&self.parent_id)
+    }
+
+    /// The name to show for the parent's author.
+    pub fn parent_name(&self) -> &str {
+        if self.parent_display_name.trim().is_empty() {
+            &self.parent_login
+        } else {
+            &self.parent_display_name
+        }
+    }
+}
+
 /// One rendered piece of a message body. See [`crate::tokenizer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fragment {
@@ -281,6 +313,12 @@ impl Message {
         copy
     }
 
+    /// The id of the thread this message is in: its reply's root, or its own id when it is not a
+    /// reply (a message with replies is the root of its thread).
+    pub fn thread_root(&self) -> &MessageId {
+        self.reply.as_ref().map_or(&self.id, ReplyRef::root_id)
+    }
+
     /// The body as plain text (see [`Fragment::write_plain_text`]).
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
@@ -327,6 +365,62 @@ mod tests {
             "clone shares the tags"
         );
         assert_eq!((m.notice_id.as_deref(), m.bits), (None, None));
+    }
+
+    fn reply_to(id: &str, parent: &str, root: Option<&str>) -> Message {
+        let mut m = Message::chat(
+            id,
+            Timestamp(0),
+            Author::new("replier", "Replier"),
+            vec![Fragment::Text("hi".into())],
+        );
+        m.reply = Some(ReplyRef {
+            parent_id: parent.into(),
+            parent_login: "p".into(),
+            parent_display_name: String::new(),
+            parent_body: "body".into(),
+            thread_parent_id: root.map(MessageId::from),
+        });
+        m
+    }
+
+    #[test]
+    fn a_thread_root_is_the_tagged_root_the_parent_or_the_message_itself() {
+        let plain = Message::chat("m1", Timestamp(0), Author::new("a", "A"), vec![]);
+        assert_eq!(plain.thread_root().as_str(), "m1");
+        assert_eq!(
+            reply_to("m2", "m1", Some("m0")).thread_root().as_str(),
+            "m0"
+        );
+        // No thread tag: the parent is the root.
+        assert_eq!(reply_to("m2", "m1", None).thread_root().as_str(), "m1");
+        let reply = reply_to("m2", "m1", None).reply.unwrap();
+        assert_eq!(reply.parent_name(), "p", "falls back to the login");
+    }
+
+    #[test]
+    fn replying_to_a_message_builds_the_reference_twitch_would_send_back() {
+        let mut parent = Message::chat(
+            "m1",
+            Timestamp(0),
+            Author::new("alice", "Alice"),
+            vec![Fragment::Text("what is the game".into())],
+        );
+        let reference = ReplyRef::to(&parent).unwrap();
+        assert_eq!(reference.parent_id.as_str(), "m1");
+        assert_eq!(reference.parent_name(), "Alice");
+        assert_eq!(reference.parent_body, "what is the game");
+        assert_eq!(
+            reference.root_id().as_str(),
+            "m1",
+            "a new thread is rooted at the parent"
+        );
+        // Replying to a reply joins its thread.
+        parent.reply = reply_to("m1", "m0", Some("m0")).reply;
+        assert_eq!(ReplyRef::to(&parent).unwrap().root_id().as_str(), "m0");
+        // Nothing to reply to on a line without an author.
+        let notice = Message::plain("n", Timestamp(0), MessageKind::Notice, "x");
+        assert_eq!(ReplyRef::to(&notice), None);
     }
 
     #[test]

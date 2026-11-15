@@ -645,3 +645,87 @@ fn action_without_closing_marker_is_still_an_action() {
     assert_eq!(m.plain_text(), "wave Kappa");
     assert_eq!(emotes(&m), [("25", "Kappa")]);
 }
+
+// ---- replies (PR 3.4, fixtures/irc/replies.irc) -----------------------------------------
+
+fn reply_message(id_tail: &str) -> Arc<Message> {
+    message("replies.irc", &format!("33333333-0000-4000-8000-{id_tail}")).1
+}
+
+#[test]
+fn a_thread_root_has_no_reply_tags() {
+    let root = reply_message("000000000001");
+    assert!(root.reply.is_none());
+    assert_eq!(root.thread_root().as_str(), root.id.as_str());
+}
+
+#[test]
+fn a_reply_to_the_root_names_it_as_parent_and_thread() {
+    let reply = reply_message("000000000002");
+    let r = reply.reply.as_ref().expect("reply");
+    assert_eq!(r.parent_id.as_str(), "33333333-0000-4000-8000-000000000001");
+    assert_eq!(r.parent_login, "alice");
+    assert_eq!(r.parent_display_name, "Alice");
+    assert_eq!(
+        r.parent_body, "what is the best opening for a quick game?",
+        "the escaped spaces are plain spaces"
+    );
+    assert_eq!(r.root_id(), &r.parent_id);
+    assert_eq!(reply.thread_root(), &r.parent_id);
+}
+
+#[test]
+fn a_reply_to_a_reply_keeps_the_thread_root_apart_from_its_parent() {
+    let reply = reply_message("000000000003");
+    let r = reply.reply.as_ref().expect("reply");
+    assert_eq!(r.parent_id.as_str(), "33333333-0000-4000-8000-000000000002");
+    assert_eq!(r.parent_login, "bob");
+    assert_eq!(r.parent_body, "@Alice the Italian is solid");
+    assert_eq!(
+        reply.thread_root().as_str(),
+        "33333333-0000-4000-8000-000000000001"
+    );
+    assert_ne!(r.root_id(), &r.parent_id);
+}
+
+#[test]
+fn a_reply_without_a_body_or_thread_tag_still_has_a_parent_and_root() {
+    let reply = reply_message("000000000007");
+    let r = reply.reply.as_ref().expect("reply");
+    assert_eq!(r.parent_id.as_str(), "33333333-0000-4000-8000-0000000000f1");
+    assert_eq!(r.parent_name(), "Hank");
+    assert_eq!(r.parent_body, "", "no body tag: empty, not an error");
+    assert_eq!(r.thread_parent_id, None);
+    assert_eq!(reply.thread_root(), &r.parent_id);
+}
+
+#[test]
+fn the_reply_tags_stay_in_the_raw_tags_too() {
+    let reply = reply_message("000000000006");
+    assert_eq!(
+        reply.raw_tags.get("reply-thread-parent-user-login"),
+        Some("frank")
+    );
+}
+
+#[test]
+fn a_replayed_conversation_forms_one_thread_in_a_store() {
+    let mut store = gpui_chat_core::MessageStore::new();
+    for event in events("replies.irc") {
+        if let ChatEvent::Message { message, .. } = event {
+            store.push(message);
+        }
+    }
+    let thread = store.thread("33333333-0000-4000-8000-000000000001");
+    assert_eq!(thread.root.unwrap().author.as_ref().unwrap().login, "alice");
+    let replies: Vec<_> = thread
+        .replies
+        .iter()
+        .map(|m| m.author.as_ref().unwrap().login.as_str())
+        .collect();
+    assert_eq!(replies, ["bob", "carol", "alice"]);
+    // A reply to a message that is not in the log is a thread of its own, without a root.
+    let orphan = store.thread("33333333-0000-4000-8000-0000000000f0");
+    assert!(orphan.root.is_none());
+    assert_eq!(orphan.replies.len(), 1);
+}

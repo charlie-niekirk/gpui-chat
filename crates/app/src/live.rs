@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, Timestamp};
+use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, ReplyRef, Timestamp};
 use gpui_chat_emotes::Providers;
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::{
@@ -50,6 +50,9 @@ pub struct SendRequest {
     /// The channel's Twitch room (broadcaster) id, from its `ROOMSTATE`.
     pub room_id: String,
     pub outgoing: Outgoing,
+    /// The message this one replies to: its id goes to Helix as `reply_parent_message_id` and its
+    /// reference is on the echo, so the reply's context line shows at once.
+    pub reply: Option<ReplyRef>,
 }
 
 impl LiveSource {
@@ -173,20 +176,22 @@ async fn post(
     emotes: Option<&EmoteService>,
     request: SendRequest,
 ) -> Result<(), SendError> {
+    let parent = request.reply.as_ref().map(|reply| reply.parent_id.as_str());
     let sent = helix
-        .send_chat_message(&request.room_id, &request.outgoing.wire_text(), None)
+        .send_chat_message(&request.room_id, &request.outgoing.wire_text(), parent)
         .await?;
     let author = Author {
         user_id: Some(sent.user_id),
         ..Author::new(&sent.login, &sent.login)
     };
-    let message = echo_message(
+    let mut message = echo_message(
         sent.message_id,
         author,
         &request.outgoing.text,
         request.outgoing.action,
         now(),
     );
+    message.reply = request.reply;
     let event = ChatEvent::Message {
         channel: request.channel,
         message: std::sync::Arc::new(message),

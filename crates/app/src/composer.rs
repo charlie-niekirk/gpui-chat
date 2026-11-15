@@ -11,13 +11,18 @@
 //!   reason appears in a strip above the box and the text comes back (unless the user already
 //!   typed something new; ↑ finds it either way);
 //! * a successful send is echoed into the chat by the live source;
+//! * **reply mode** (PR 3.4, [`crate::reply`]): choosing Reply on a message shows a strip above the
+//!   box naming it, with a cancel button (and Esc); the next message goes out as a reply to it and
+//!   the mode ends once it is on its way (a failed send puts both the text and the mode back);
 //! * while nobody is logged in (or the login lacks the permission to chat) the box is disabled and
 //!   says why, with a button to log in.
 //!
 //! Only the live source has composers: the offline sources have nobody to send to.
 
+use std::sync::Arc;
+
 use gpui_chat_core::{
-    ChannelId, Input as Parsed, InputHistory, Outgoing, parse_input, sanitize_line,
+    ChannelId, Input as Parsed, InputHistory, Message, Outgoing, parse_input, sanitize_line,
 };
 use gpui_chat_twitch::SendError;
 use gpui_chat_twitch::auth::AuthState;
@@ -25,7 +30,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
+    AppContext as _, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, Styled, Subscription, Window, div, px,
 };
 use tokio::sync::oneshot;
@@ -34,6 +39,7 @@ use crate::account::AccountHub;
 use crate::actions::{COMPOSER_CONTEXT, ComposerHistoryNext, ComposerHistoryPrevious};
 use crate::channels::ChannelStore;
 use crate::live::{LiveSource, SendRequest};
+use crate::reply::ReplyTarget;
 use crate::sign_in;
 use crate::theme::Tokens;
 
@@ -139,6 +145,11 @@ pub struct Composer {
     /// Created by the first render (it needs the window).
     input: Option<Entity<InputState>>,
     history: InputHistory,
+    /// The message the next send replies to, while in reply mode.
+    reply: Option<ReplyTarget>,
+    /// A Reply that arrived from outside the composer, started by the next render (which has the
+    /// window the box needs to take the text and focus).
+    queued_reply: Option<Arc<Message>>,
     /// The reason the last send failed, until the next edit, send or dismissal.
     error: Option<SharedString>,
     /// The mode the box was last set up for (placeholder), so render only touches it on a change.
@@ -162,6 +173,8 @@ impl Composer {
             account,
             input: None,
             history: InputHistory::new(),
+            reply: None,
+            queued_reply: None,
             error: None,
             shown: None,
             _subscriptions: subscriptions,
@@ -225,6 +238,7 @@ impl Composer {
                     channel,
                     room_id,
                     outgoing,
+                    reply: self.reply.as_ref().map(|target| target.reference.clone()),
                 };
                 let Some(result) = self.live.send(request, cx) else {
                     return;
@@ -232,8 +246,10 @@ impl Composer {
                 self.history.push(&typed);
                 input.update(cx, |input, cx| input.set_value("", window, cx));
                 self.error = None;
+                // Reply mode ends with the send; a failure brings it back.
+                let reply = self.reply.take();
                 cx.notify();
-                self.await_result(typed.to_string(), result, window, cx);
+                self.await_result(typed.to_string(), reply, result, window, cx);
             }
         }
     }
@@ -242,6 +258,7 @@ impl Composer {
     fn await_result(
         &mut self,
         typed: String,
+        reply: Option<ReplyTarget>,
         result: oneshot::Receiver<Result<(), SendError>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -252,7 +269,7 @@ impl Composer {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.send_failed(&typed, &error, window, cx);
+                this.send_failed(&typed, reply, &error, window, cx);
             })
             .ok();
         })
@@ -262,12 +279,17 @@ impl Composer {
     fn send_failed(
         &mut self,
         typed: &str,
+        reply: Option<ReplyTarget>,
         error: &SendError,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         tracing::info!(%error, "message not sent");
         self.error = Some(error.to_string().into());
+        // Still a reply, unless the user already chose another message to reply to.
+        if self.reply.is_none() {
+            self.reply = reply;
+        }
         // Give the text back for editing, unless the user has already started something else.
         if let Some(input) = &self.input {
             input.update(cx, |input, cx| {
@@ -277,6 +299,99 @@ impl Composer {
             });
         }
         cx.notify();
+    }
+
+    /// Reply was chosen on `parent` in the chat above: start it on the next render.
+    pub fn queue_reply(&mut self, parent: Arc<Message>, cx: &mut Context<Self>) {
+        self.queued_reply = Some(parent);
+        cx.notify();
+    }
+
+    /// Puts the box in reply mode for `parent` (Reply on a row, or the context menu): shows the
+    /// strip, starts the text with `@name ` if the box is empty, and focuses the box. Does nothing
+    /// for a line that cannot be replied to.
+    pub fn start_reply(
+        &mut self,
+        parent: &Arc<Message>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = ReplyTarget::new(parent) else {
+            return;
+        };
+        let input = self.input(window, cx);
+        input.update(cx, |input, cx| {
+            // A previous reply's untouched `@name ` gives way to this one's; typed text stays.
+            let typed = input.value();
+            let untouched = self
+                .reply
+                .as_ref()
+                .is_some_and(|previous| previous.clears_on_cancel(&typed));
+            if typed.is_empty() || untouched {
+                input.set_value(target.prefill(), window, cx);
+            }
+            input.focus(window, cx);
+        });
+        self.reply = Some(target);
+        self.history.reset();
+        cx.notify();
+    }
+
+    /// Leaves reply mode; what the user typed stays, except an `@name ` they never touched.
+    fn cancel_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.reply.take() else {
+            return;
+        };
+        if let Some(input) = &self.input {
+            input.update(cx, |input, cx| {
+                if target.clears_on_cancel(&input.value()) {
+                    input.set_value("", window, cx);
+                }
+                input.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// The strip naming the message being replied to, with its cancel button.
+    fn reply_strip(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let label = self.reply.as_ref()?.label();
+        Some(
+            h_flex()
+                .id("composer-reply")
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .bg(tokens.accent.opacity(0.12))
+                .border_t_1()
+                .border_color(tokens.accent.opacity(0.5))
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Undo2)
+                        .size_4()
+                        .text_color(tokens.accent),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(tokens.text_muted)
+                        .child(label),
+                )
+                .child(
+                    Button::new("composer-reply-cancel")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::Close))
+                        .tooltip("Cancel reply (Esc)")
+                        .accessibility_label("Cancel reply")
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel_reply(window, cx))),
+                ),
+        )
     }
 
     /// ↑
@@ -341,6 +456,9 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let input = self.input(window, cx);
+        if let Some(parent) = self.queued_reply.take() {
+            self.start_reply(&parent, window, cx);
+        }
         let mode = self.mode(cx);
         if self.shown != Some(mode) {
             self.shown = Some(mode);
@@ -385,11 +503,18 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &ComposerHistoryNext, window, cx| {
                 this.history_next(window, cx);
             }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.reply.is_some() {
+                    this.cancel_reply(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .w_full()
             .flex_none()
             .border_t_1()
             .border_color(tokens.border)
             .children(self.error_strip(&tokens, cx))
+            .children(self.reply_strip(&tokens, cx))
             .child(
                 h_flex()
                     .w_full()

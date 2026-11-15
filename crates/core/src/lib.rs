@@ -26,7 +26,7 @@ pub use event::{
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
 pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
-pub use store::{DEFAULT_CAPACITY, MessageStore};
+pub use store::{DEFAULT_CAPACITY, MessageStore, Thread};
 pub use tokenizer::{
     DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,
     WordResolver, parse_emotes_tag, resolve_fragments, twitch_emote_ranges,
