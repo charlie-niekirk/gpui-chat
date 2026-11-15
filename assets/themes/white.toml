@@ -1,0 +1,11 @@
+# White. Palette transcribed from Omarchy's `white` theme (MIT).
+name = "White"
+
+[light]
+background = "#ffffff"
+window = "#f5f5f5"
+sidebar = "#f5f5f5"
+title_bar = "#f5f5f5"
+border = "#c0c0c0"
+text = "#000000"
+accent = "#6e6e6e"

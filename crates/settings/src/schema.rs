@@ -78,9 +78,15 @@ pub struct AppearanceSettings {
     pub line_height: f32,
     /// Light, dark, or follow the operating system.
     pub theme: ThemeMode,
-    /// Name of the colour theme (bundled or `themes/<name>.toml`). Only
-    /// `"default"` exists until PR 4.4; unknown names are the app's to resolve.
+    /// Name of the colour theme: a bundled one (`tokyo-night`, `catppuccin`, ...) or a file
+    /// `themes/<name>.toml` in the config directory. Case, spaces and `_` vs `-` do not
+    /// matter. An unknown name falls back to `"default"`. With `theme = "system"` a theme
+    /// that has both a dark and a light variant follows the OS; see `theme_name_light` to
+    /// pair two themes.
     pub theme_name: String,
+    /// Theme to use instead of `theme_name` whenever the light variant is wanted (the OS is
+    /// light with `theme = "system"`, or `theme = "light"`). Unset: `theme_name` for both.
+    pub theme_name_light: Option<String>,
 }
 
 impl Default for AppearanceSettings {
@@ -92,6 +98,7 @@ impl Default for AppearanceSettings {
             line_height: 1.4,
             theme: ThemeMode::default(),
             theme_name: "default".to_owned(),
+            theme_name_light: None,
         }
     }
 }
@@ -227,6 +234,12 @@ impl Settings {
         }
         if a.theme_name.trim().is_empty() {
             return Err(("appearance.theme_name", "must not be empty".into()));
+        }
+        if a.theme_name_light
+            .as_deref()
+            .is_some_and(|n| n.trim().is_empty())
+        {
+            return Err(("appearance.theme_name_light", "must not be empty".into()));
         }
         let c = &self.chat;
         if !(SCROLLBACK_RANGE.0..=SCROLLBACK_RANGE.1).contains(&c.scrollback) {

@@ -1,0 +1,12 @@
+# Vantablack. Palette transcribed from Omarchy's `vantablack` theme (MIT).
+name = "Vantablack"
+
+[dark]
+background = "#000000"
+window = "#090909"
+sidebar = "#090909"
+title_bar = "#1a1a1a"
+border = "#1a1a1a"
+surface = "#1a1a1a"
+text = "#ffffff"
+accent = "#8d8d8d"

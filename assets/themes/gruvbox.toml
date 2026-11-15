@@ -1,0 +1,15 @@
+# Gruvbox. Palette transcribed from Omarchy's `gruvbox` theme (MIT).
+name = "Gruvbox"
+
+[dark]
+background = "#282828"
+window = "#1e1e1e"
+sidebar = "#1e1e1e"
+title_bar = "#3c3836"
+border = "#504945"
+surface = "#3c3836"
+text = "#d4be98"
+accent = "#7daea3"
+danger = "#ea6962"
+success = "#a9b665"
+warning = "#d8a657"

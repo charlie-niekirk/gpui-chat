@@ -502,7 +502,7 @@ impl Render for EmotePicker {
             .rounded_lg()
             .border_1()
             .border_color(tokens.border)
-            .bg(tokens.window_bg)
+            .bg(tokens.surface)
             .shadow_lg()
             .text_color(tokens.text)
             .child(self.tab_strip(&tokens, cx))

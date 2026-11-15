@@ -1,0 +1,28 @@
+# Catppuccin: Mocha (dark) and Latte (light). Palette transcribed from Omarchy's `catppuccin` and `catppuccin-latte` themes (MIT).
+name = "Catppuccin"
+
+[dark]
+background = "#1e1e2e"
+window = "#161622"
+sidebar = "#161622"
+title_bar = "#313244"
+border = "#45475a"
+surface = "#313244"
+text = "#cdd6f4"
+accent = "#89b4fa"
+danger = "#f38ba8"
+success = "#a6e3a1"
+warning = "#f9e2af"
+
+[light]
+background = "#eff1f5"
+window = "#e3e4e8"
+sidebar = "#e3e4e8"
+title_bar = "#dce0e8"
+border = "#ccd0da"
+surface = "#dce0e8"
+text = "#4c4f69"
+accent = "#1e66f5"
+danger = "#d20f39"
+success = "#40a02b"
+warning = "#df8e1d"

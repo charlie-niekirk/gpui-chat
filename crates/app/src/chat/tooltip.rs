@@ -304,7 +304,7 @@ impl Render for EmoteTooltip {
             .rounded_md()
             .border_1()
             .border_color(tokens.border)
-            .bg(tokens.window_bg)
+            .bg(tokens.surface)
             .shadow_md()
             .font_family(family)
             .text_sm()

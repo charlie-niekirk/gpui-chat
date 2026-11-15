@@ -76,7 +76,7 @@ pub fn message_row(
                 .rounded_md()
                 .border_1()
                 .border_color(tokens.border)
-                .bg(tokens.window_bg)
+                .bg(tokens.surface)
                 // The context line of a reply row sits under the button: a press on the button
                 // must not reach it (and open the thread).
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gpui_chat_core::ChannelId;
 use gpui_chat_twitch::HelixClient;
 use gpui_chat_twitch::streams::{PollConfig, StreamInfo, StreamPoller, StreamSnapshot};
-use gpui_kit::{App, AppContext as _, Context, Entity, Hsla, Task, rgb};
+use gpui_kit::{App, AppContext as _, Context, Entity, Task};
 
 use crate::runtime;
 
@@ -129,11 +129,6 @@ fn demo_snapshot(channels: &[ChannelId]) -> StreamSnapshot {
         demo_info("demo_delta", 12, "Music"),
     ]);
     snapshot
-}
-
-/// The red of the live dot.
-pub fn live_color() -> Hsla {
-    rgb(0xe91916).into()
 }
 
 /// Seconds since the Unix epoch.

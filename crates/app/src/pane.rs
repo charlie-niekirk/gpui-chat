@@ -17,7 +17,6 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
-    rgb,
 };
 
 use crate::channels::{ChannelHub, ChannelStore};
@@ -119,13 +118,10 @@ pub fn room_chips(room: &RoomState) -> Vec<String> {
     chips
 }
 
-const OK: u32 = 0x2fbf71;
-const WARN: u32 = 0xe0a030;
-
 fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
     match status {
-        LinkStatus::Connected => rgb(OK).into(),
-        LinkStatus::Connecting | LinkStatus::Reconnecting { .. } => rgb(WARN).into(),
+        LinkStatus::Connected => tokens.success,
+        LinkStatus::Connecting | LinkStatus::Reconnecting { .. } => tokens.warning,
         LinkStatus::Error { .. } => tokens.danger,
     }
 }
@@ -133,7 +129,7 @@ fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
 /// The "LIVE" / "Offline" marker next to the channel name.
 fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
     let (color, label) = if live {
-        (stream_info::live_color(), "LIVE")
+        (tokens.danger, "LIVE")
     } else {
         (tokens.text_muted.opacity(0.6), "Offline")
     };

@@ -1,0 +1,15 @@
+# Ethereal. Palette transcribed from Omarchy's `ethereal` theme (MIT).
+name = "Ethereal"
+
+[dark]
+background = "#060b1e"
+window = "#040816"
+sidebar = "#040816"
+title_bar = "#131a3a"
+border = "#252e56"
+surface = "#131a3a"
+text = "#ffcead"
+accent = "#7d82d9"
+danger = "#ed5b5a"
+success = "#92a593"
+warning = "#e9bb4f"

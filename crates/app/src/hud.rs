@@ -171,7 +171,7 @@ impl Render for DebugHud {
             .rounded_md()
             .border_1()
             .border_color(tokens.border)
-            .bg(tokens.window_bg)
+            .bg(tokens.surface)
             .text_xs()
             .text_color(tokens.text)
             .child(

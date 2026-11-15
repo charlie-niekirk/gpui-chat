@@ -36,7 +36,7 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, Context, Entity, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
     ListState, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, canvas, div, font, list, point, px, white,
+    Subscription, Window, canvas, div, font, list, point, px,
 };
 
 use super::display::DisplayOptions;
@@ -516,7 +516,7 @@ impl Render for ChatView {
                         .py_1()
                         .rounded_full()
                         .bg(tokens.accent)
-                        .text_color(white())
+                        .text_color(tokens.accent_text)
                         .text_sm()
                         .shadow_md()
                         .cursor_pointer()

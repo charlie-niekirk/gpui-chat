@@ -778,7 +778,7 @@ fn live_suffix(info: &StreamInfo, with_category: bool, cx: &App) -> AnyElement {
             div()
                 .size(px(7.0))
                 .rounded_full()
-                .bg(stream_info::live_color()),
+                .bg(cx.global::<Tokens>().danger),
         )
         .child(stream_info::compact_viewers(info.viewers))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))

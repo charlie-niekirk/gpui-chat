@@ -1,0 +1,14 @@
+# Retro 82. Palette transcribed from Omarchy's `retro-82` theme (MIT).
+name = "Retro 82"
+
+[dark]
+background = "#05182e"
+window = "#031222"
+sidebar = "#031222"
+title_bar = "#0a2540"
+border = "#134e5a"
+surface = "#0a2540"
+text = "#f6dcac"
+accent = "#faa968"
+danger = "#f85525"
+warning = "#e97b3c"
