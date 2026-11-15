@@ -382,7 +382,7 @@ mod tests {
             channel: ChannelId::new("testchan"),
             room_id: "1000".into(),
             outgoing: Outgoing {
-                text: "@Alice chess".into(),
+                text: "chess".into(),
                 action: false,
             },
             reply,
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(message.thread_root().as_str(), "root-1");
         assert!(message.flags.echo);
         assert_eq!(message.author.as_ref().unwrap().login, "viewer");
-        assert_eq!(message.plain_text(), "@Alice chess");
+        assert_eq!(message.plain_text(), "chess");
     }
 
     #[test]

@@ -146,7 +146,7 @@ async fn a_reply_that_twitch_drops_still_names_its_parent_and_comes_back_as_a_dr
     // mock only matches that exact body), and the refusal is the ordinary drop error.
     let server = MockServer::start().await;
     let (_, helix) = logged_in(&server).await;
-    let mut reply = send_body("@Alice chess");
+    let mut reply = send_body("chess");
     reply["reply_parent_message_id"] = json!("33333333-0000-4000-8000-000000000001");
     Mock::given(method("POST"))
         .and(path("/helix/chat/messages"))
@@ -161,7 +161,7 @@ async fn a_reply_that_twitch_drops_still_names_its_parent_and_comes_back_as_a_dr
     let error = helix
         .send_chat_message(
             "1000",
-            "@Alice chess",
+            "chess",
             Some("33333333-0000-4000-8000-000000000001"),
         )
         .await

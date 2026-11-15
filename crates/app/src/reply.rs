@@ -4,10 +4,10 @@
 //!
 //! Replying puts the box in *reply mode*: the next message is sent with
 //! `reply_parent_message_id` (Helix *Send Chat Message*) and, once Twitch accepts it, echoed with
-//! the same reply reference an IRC copy would carry, so its context line shows at once. The box is
-//! prefilled with `@name ` like Twitch's own chat does (Twitch does not add the mention itself);
-//! the user may delete it. Cancelling leaves what the user typed alone, except for that untouched
-//! prefill.
+//! the same reply reference an IRC copy would carry, so its context line shows at once. The box
+//! starts empty: Twitch itself puts `@parent ` in front of a reply sent with a parent id (found in
+//! the live check of PR 3.4: a prefilled mention came out doubled), and the strip already names the
+//! parent. Cancelling leaves what the user typed alone.
 
 use gpui_chat_core::{Message, MessageKind, ReplyRef};
 
@@ -24,7 +24,6 @@ pub fn can_reply_to(message: &Message) -> bool {
 pub struct ReplyTarget {
     /// What the reply will carry (and what its echo shows).
     pub reference: ReplyRef,
-    prefill: String,
 }
 
 impl ReplyTarget {
@@ -33,15 +32,9 @@ impl ReplyTarget {
         if !can_reply_to(message) {
             return None;
         }
-        let reference = ReplyRef::to(message)?;
-        let prefill = format!("@{} ", mention_name(&reference));
-        Some(Self { reference, prefill })
-    }
-
-    /// The `@name ` the box starts with.
-    #[cfg(test)]
-    pub fn prefill(&self) -> &str {
-        &self.prefill
+        Some(Self {
+            reference: ReplyRef::to(message)?,
+        })
     }
 
     /// The reply strip's text, `Replying to Name: what they said` (the view cuts it to the width).
@@ -52,34 +45,6 @@ impl ReplyTarget {
         } else {
             format!("Replying to {}: {body}", self.reference.parent_name())
         }
-    }
-
-    /// What starting this reply puts in a box holding `typed` while `previous` was the reply
-    /// target: the `@name ` prefill when the box is empty or still holds only the previous
-    /// target's untouched prefill, `None` to leave what the user typed alone.
-    pub fn text_to_start(&self, typed: &str, previous: Option<&Self>) -> Option<&str> {
-        let untouched = previous.is_some_and(|previous| previous.clears_on_cancel(typed));
-        (typed.is_empty() || untouched).then_some(self.prefill.as_str())
-    }
-
-    /// Whether cancelling should also empty the box: it still holds exactly the prefill, which the
-    /// user never made their own.
-    pub fn clears_on_cancel(&self, typed: &str) -> bool {
-        typed == self.prefill
-    }
-}
-
-/// The name `@`-mentioning the parent's author uses: the login, so a localised display name still
-/// mentions the right user, except when the display name is only the login in another
-/// capitalisation (`Alice` for `alice`), which reads better.
-pub fn mention_name(reference: &ReplyRef) -> &str {
-    let display = reference.parent_display_name.trim();
-    if !display.is_empty() && display.eq_ignore_ascii_case(&reference.parent_login) {
-        display
-    } else if reference.parent_login.is_empty() {
-        reference.parent_name()
-    } else {
-        &reference.parent_login
     }
 }
 
@@ -142,7 +107,6 @@ mod tests {
         assert_eq!(target.reference.parent_id.as_str(), "m1");
         assert_eq!(target.reference.parent_login, "alice");
         assert_eq!(target.reference.parent_body, "what is the game");
-        assert_eq!(target.prefill(), "@Alice ");
         assert_eq!(target.label(), "Replying to Alice: what is the game");
     }
 
@@ -174,51 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn the_mention_is_the_login_unless_the_display_name_only_capitalises_it() {
-        let named = |login: &str, display: &str| ReplyRef {
-            parent_id: "p".into(),
-            parent_login: login.into(),
-            parent_display_name: display.into(),
-            parent_body: String::new(),
-            thread_parent_id: None,
-        };
-        assert_eq!(mention_name(&named("alice", "Alice")), "Alice");
-        assert_eq!(mention_name(&named("alice", "alice")), "alice");
-        // A localised display name is not something chat can mention.
-        assert_eq!(mention_name(&named("hello_kr", "안녕")), "hello_kr");
-        assert_eq!(mention_name(&named("alice", "")), "alice");
-        assert_eq!(mention_name(&named("", "Alice")), "Alice");
-        let mut localised = chat("m1", "hi");
-        localised.author = Some(Author::new("hello_kr", "안녕"));
-        assert_eq!(
-            ReplyTarget::new(&localised).unwrap().prefill(),
-            "@hello_kr "
-        );
-        // The strip still shows the name as chat does.
-        assert_eq!(
-            ReplyTarget::new(&localised).unwrap().label(),
-            "Replying to 안녕: hi"
-        );
-    }
-
-    #[test]
-    fn starting_a_reply_replaces_an_untouched_prefill_but_keeps_typed_text() {
-        let first = ReplyTarget::new(&chat("m1", "a")).unwrap();
-        let mut other = chat("m2", "b");
-        other.author = Some(Author::new("bob", "Bob"));
-        let second = ReplyTarget::new(&other).unwrap();
-        // An empty box starts with the prefill.
-        assert_eq!(second.text_to_start("", None), Some("@Bob "));
-        // Another reply replaces the previous one's untouched `@name `...
-        assert_eq!(second.text_to_start("@Alice ", Some(&first)), Some("@Bob "));
-        // ...but never what the user typed, with or without a previous reply.
-        assert_eq!(second.text_to_start("@Alice well", Some(&first)), None);
-        assert_eq!(second.text_to_start("something", None), None);
-        // A prefill-looking text that was not a reply's is the user's.
-        assert_eq!(second.text_to_start("@Alice ", None), None);
-    }
-
-    #[test]
     fn a_failed_send_restores_its_reply_unless_another_was_chosen() {
         let failed = ReplyTarget::new(&chat("m1", "a")).unwrap();
         let mut other = chat("m2", "b");
@@ -232,14 +151,5 @@ mod tests {
         assert_eq!(restored(None, None), None);
         // A send that was not a reply restores nothing.
         assert_eq!(restored(None, None), None);
-    }
-
-    #[test]
-    fn cancelling_clears_only_an_untouched_prefill() {
-        let target = ReplyTarget::new(&chat("m1", "hi")).unwrap();
-        assert!(target.clears_on_cancel("@Alice "));
-        assert!(!target.clears_on_cancel("@Alice well"));
-        assert!(!target.clears_on_cancel(""));
-        assert!(!target.clears_on_cancel("something else"));
     }
 }

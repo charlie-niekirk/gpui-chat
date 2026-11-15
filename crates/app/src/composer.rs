@@ -380,8 +380,8 @@ impl Composer {
     }
 
     /// Puts the box in reply mode for `parent` (Reply on a row, or the context menu): shows the
-    /// strip, starts the text with `@name ` if the box is empty, and focuses the box. Does nothing
-    /// for a line that cannot be replied to.
+    /// strip and focuses the box. The text is left alone (Twitch puts the `@parent ` mention in
+    /// front of the reply itself). Does nothing for a line that cannot be replied to.
     pub fn start_reply(
         &mut self,
         parent: &Arc<Message>,
@@ -392,31 +392,19 @@ impl Composer {
             return;
         };
         let input = self.input(window, cx);
-        input.update(cx, |input, cx| {
-            // A previous reply's untouched `@name ` gives way to this one's; typed text stays.
-            if let Some(text) = target.text_to_start(&input.value(), self.reply.as_ref()) {
-                input.set_value(text, window, cx);
-            }
-            input.focus(window, cx);
-        });
+        input.update(cx, |input, cx| input.focus(window, cx));
         self.reply = Some(target);
         self.history.reset();
         cx.notify();
     }
 
-    /// Leaves reply mode; what the user typed stays, except an `@name ` they never touched.
-    /// `false` when there was no reply to cancel.
+    /// Leaves reply mode; what the user typed stays. `false` when there was no reply to cancel.
     fn cancel_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(target) = self.reply.take() else {
+        if self.reply.take().is_none() {
             return false;
-        };
+        }
         if let Some(input) = &self.input {
-            input.update(cx, |input, cx| {
-                if target.clears_on_cancel(&input.value()) {
-                    input.set_value("", window, cx);
-                }
-                input.focus(window, cx);
-            });
+            input.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
         true
@@ -718,11 +706,11 @@ mod tests {
         let target = ReplyTarget::new(&parent).unwrap();
         let Plan::Send {
             outgoing, reply, ..
-        } = plan_submit("@Alice chess", &channel, Some("1"), Some(&target))
+        } = plan_submit("chess", &channel, Some("1"), Some(&target))
         else {
             panic!("a reply is sent")
         };
-        assert_eq!(outgoing.text, "@Alice chess");
+        assert_eq!(outgoing.text, "chess");
         let reply = reply.expect("the request carries the reply");
         assert_eq!(reply.parent_id.as_str(), "parent-1");
         assert_eq!(reply.parent_body, "what is the game");

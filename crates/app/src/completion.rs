@@ -618,30 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn completing_after_a_reply_prefill_leaves_the_prefill_alone() {
-        // Reply mode starts the box with `@Bob `: that is not a word being completed...
-        let catalog = catalog(&["Kappa", "KappaPride"]);
-        let mut auto = Autocomplete::default();
-        assert_eq!(
-            refresh(&mut auto, "@Bob ", false, &catalog),
-            Outcome::Closed
-        );
-        // ...and an emote or a chatter completed after it replaces only the word being typed.
-        assert_eq!(
-            refresh(&mut auto, "@Bob :kap", false, &catalog),
-            Outcome::Open
-        );
-        let edit = auto.popup().unwrap().edit_for(0, "").unwrap();
-        assert_eq!(edit.applied_to("@Bob :kap"), ("@Bob Kappa ".to_owned(), 11));
-        assert_eq!(
-            refresh(&mut auto, "@Bob @zo", false, &catalog),
-            Outcome::Open
-        );
-        let edit = auto.popup().unwrap().edit_for(0, "").unwrap();
-        assert_eq!(edit.applied_to("@Bob @zo").0, "@Bob @Zoe ");
-    }
-
-    #[test]
     fn a_slash_at_the_start_lists_the_commands() {
         let catalog = catalog(&[]);
         let mut auto = Autocomplete::default();

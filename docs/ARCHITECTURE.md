@@ -234,18 +234,26 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   text origin by `reply_height()` (emote boxes, tooltips and underlines follow) and gives the line its own hit area:
   pointing hand, text colour on hover, click → `MessageStyle::on_open_thread` with the thread root.
   The thread popover's own style sets `reply_line: false` (and no click handler).
+  **The leading mention is not drawn.** Twitch's copy of a reply starts with `@<parent login> `; the context line
+  already says who is replied to, so `display::body_fragments` leaves out one leading `Mention` of the reply's parent
+  login (any capitalisation) and one space after it, when something else remains (a reply that is only the mention
+  keeps it). Display only: `Message::fragments`, `plain_text()` and the raw tags are untouched, so copy and other text
+  actions (PR 5.6) can still have the full text. The local echo carries no mention, so it and Twitch's copy that
+  replaces it draw the same.
 - **Reply action.** `chat/row.rs` wraps rows that can be replied to (`reply::can_reply_to`: chat or `/me` lines by a
-  user, not deleted; only when the pane has a composer) in a `div` with a Reply button shown while the pointer is
-  over the row (`group_hover` opacity) and a right-click menu (*Reply*, *View thread*, disabled when the message is
-  neither a reply nor replied to; the check runs when the menu opens). `ChatView` emits
+  user, not deleted; only when the pane has a composer): rows report whether the pointer is over them
+  (`MessageStyle::hovered_row`), and only that row is wrapped in a `div` with a Reply button; one right-click menu
+  around the list (and one around the thread popover) resolves the hovered row when it opens (*Reply*, *View thread*,
+  disabled when the message is neither a reply nor replied to). `ChatView` emits
   `ChatViewEvent::ReplyRequested(message)`; `ChannelPane` hands it to `Composer::queue_reply`, which the next render
   turns into `start_reply` (it needs the window).
 - **Reply mode** (`reply::ReplyTarget`, pure; `composer.rs`). A strip above the box names the parent (`Replying to
-  Name: text`, cancel button, Esc); an empty box starts with `@Name ` (Twitch does not add the mention itself; the user
-  may delete it). Enter sends with `SendRequest::reply`: `LiveSource::post` passes its parent id to
+  Name: text`, cancel button, Esc); the box is left as it is, **without** an `@name`: Twitch puts `@parent ` in front
+  of a reply sent with `reply_parent_message_id` itself (a prefilled mention came out doubled in the live check).
+  Esc is one chain with the completion list (close the list, else cancel the reply, else propagate). Enter sends with `SendRequest::reply`: `LiveSource::post` passes its parent id to
   `HelixClient::send_chat_message` (`reply_parent_message_id`) and puts the same `ReplyRef` on the echo, so the
   context line shows at once and Twitch's own copy replaces it as before. Reply mode ends with the send; a failed send
-  restores it with the text. Cancelling clears the box only if it still holds exactly the untouched prefill.
+  restores it with the text. Cancelling leaves the text alone.
 - **Thread popover** (`chat/thread.rs`). Opened by a context line or *View thread*; a panel at the top right of the
   chat (`ChatView::thread`) with the root message and the replies the store still holds (newest 200), read from the
   store on every render so new replies appear. Its rows are ordinary `MessageElement`s with a `LayoutCache` and hover
