@@ -32,13 +32,19 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
   character (`-` is written `cmd--`) or one of `enter escape tab space backspace delete up down left
   right pageup pagedown home end insert f1`…`f35`. `cmd`, `super` and `win` are the same modifier;
   `secondary` is `cmd` on macOS and `ctrl` elsewhere, so one file can serve both. Space-separated
-  keystrokes (`"cmd-k cmd-s"`) are a sequence.
+  keystrokes (`"cmd-k cmd-s"`) are a sequence. **A key that types a character** (a letter, digit,
+  symbol or `space`) needs `ctrl`, `cmd`, `fn` or `secondary` in the shortcut: `r`, `shift-d` or
+  `alt-e` would fire before text input and the input box could no longer type them (and on macOS
+  `alt-` makes accents). Keys that type nothing (`escape`, arrows, `f1`…, `tab`, `enter`) may stand
+  alone.
 - **`context`** is a GPUI key-context expression (`AppShell`, `ChatComposer > Input`,
   `EmotePicker > Input`). Left out, it is the context the action's own default shortcut has, so
   rebinding keeps working where the default did. A shortcut in a narrower context beats one in a
   wider context (the input box's Tab beats a global Tab).
 - If the new shortcut is another action's *default* on the same keystroke and context, that default
-  is dropped: the keystroke now runs the new action.
+  is dropped: the keystroke now runs the new action. On the same keystroke in a *different* context
+  (say `SplitRight = "cmd-q"`: ⌘Q is Quit's everywhere) both stay, the narrower context wins, and the
+  strip says so.
 - **Problems show up in the window**, in a strip above the chat, and in the log: an unknown action,
   a keystroke that does not parse, a context that does not parse, two entries on one key (the
   first by action name keeps it), a value of the wrong type. The entry with the problem is skipped
@@ -50,7 +56,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 
 | Name | Palette label | Default (macOS) |
 |---|---|---|
-| `OpenPalette` | Command Palette… | ⌘K |
+| `OpenPalette` | Command Palette… (not listed in the palette itself) | ⌘K |
 | `OpenChannelSwitcher` | Go to Channel… | ⌘T |
 | `AddChannel` | Add Channel… | ⌘N |
 | `RemoveChannel` | Remove Channel | ⌘⌫ |

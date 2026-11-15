@@ -263,12 +263,19 @@ const NAMED_KEYS: &[&str] = &[
 /// `home`, `end`, `insert`, `f1` to `f35`). `secondary` is `cmd` on macOS and `ctrl` elsewhere.
 ///
 /// GPUI itself accepts any word as a key (`cmd-ctl-k` would bind a key called `ctl`), so this is
-/// stricter on purpose: a mistyped modifier is reported instead of binding nothing.
+/// stricter on purpose: a mistyped modifier is reported instead of binding nothing. Likewise a
+/// **printable** key (a character or `space`) must carry `ctrl`, `cmd` (`super`, `win`), `fn` or
+/// `secondary`: a binding on `r`, `shift-d` or `alt-e` fires before text input does, so the input
+/// box could no longer type that character (on macOS `alt-` also makes accents and dead keys).
+/// Keys that type nothing (`escape`, the arrows, `f1`…, `tab`, `enter`, …) may stand alone.
 pub fn validate_keystroke(stroke: &str) -> Result<(), String> {
     let mut components = stroke.split('-').peekable();
     let mut key = None;
+    // ctrl, cmd, fn or secondary: a modifier that does not produce text.
+    let mut command_modifier = false;
     while let Some(component) = components.next() {
-        if MODIFIERS.iter().any(|m| component.eq_ignore_ascii_case(m)) {
+        if let Some(modifier) = MODIFIERS.iter().find(|m| component.eq_ignore_ascii_case(m)) {
+            command_modifier |= !matches!(*modifier, "alt" | "shift");
             continue;
         }
         if let Some(next) = components.peek() {
@@ -287,21 +294,29 @@ pub fn validate_keystroke(stroke: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("it has no key after the last `-`".to_owned());
     }
-    if key.chars().count() == 1 {
-        return if key.chars().all(char::is_whitespace) {
-            Err("the key is blank".to_owned())
-        } else {
-            Ok(())
-        };
-    }
     let lower = key.to_ascii_lowercase();
-    if NAMED_KEYS.contains(&lower.as_str()) || is_function_key(&lower) {
-        return Ok(());
+    let printable = if key.chars().count() == 1 {
+        if key.chars().all(char::is_whitespace) {
+            return Err("the key is blank".to_owned());
+        }
+        true
+    } else if lower == "space" {
+        true
+    } else if NAMED_KEYS.contains(&lower.as_str()) || is_function_key(&lower) {
+        false
+    } else {
+        return Err(format!(
+            "`{key}` is not a key (a character, or one of enter, escape, tab, space, backspace, \
+             delete, up, down, left, right, pageup, pagedown, home, end, insert, f1 to f35)"
+        ));
+    };
+    if printable && !command_modifier {
+        return Err(format!(
+            "`{key}` types a character, so it needs ctrl, cmd, fn or secondary (a shortcut on it \
+             alone, or with only shift or alt, would stop the input box typing it)"
+        ));
     }
-    Err(format!(
-        "`{key}` is not a key (a character, or one of enter, escape, tab, space, backspace, \
-         delete, up, down, left, right, pageup, pagedown, home, end, insert, f1 to f35)"
-    ))
+    Ok(())
 }
 
 fn is_function_key(key: &str) -> bool {
@@ -478,6 +493,29 @@ mod tests {
     }
 
     #[test]
+    fn a_binding_that_would_swallow_typing_is_reported() {
+        let report = parse(
+            "ClosePane = \"r\"\nSplitRight = [\"cmd-r\", \"shift-d\"]\nToggleSidebar = \"escape\"",
+        );
+        let messages: Vec<String> = report.problems.iter().map(ToString::to_string).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[0].starts_with("ClosePane: keystroke \"r\""),
+            "{messages:?}"
+        );
+        assert!(
+            messages[0].contains("needs ctrl, cmd, fn or secondary"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[1].starts_with("SplitRight: keystroke \"shift-d\""),
+            "{messages:?}"
+        );
+        // The entry with the problem is skipped as a whole; the fine one applies.
+        assert_eq!(report.entries, [entry("ToggleSidebar", &["escape"], None)]);
+    }
+
+    #[test]
     fn keystroke_syntax() {
         for good in [
             "cmd-k",
@@ -491,16 +529,34 @@ mod tests {
             "cmd-alt-shift-d",
             "cmd-\\",
             "super-pageup",
-            "shift-é",
             "cmd-ctrl-left",
             "f1",
             "cmd-K",
             "cmd-,",
             "cmd-+",
+            "ctrl-space",
+            "fn-a",
+            "tab",
+            "shift-tab",
+            "escape",
+            "alt-left",
+            "shift-f5",
+            "alt-enter",
+            "fn-space",
         ] {
             assert_eq!(validate_keystroke(good), Ok(()), "{good}");
         }
         for bad in [
+            // A printable key needs ctrl, cmd, fn or secondary, or the input box cannot type it.
+            "r",
+            "R",
+            "shift-d",
+            "alt-e",
+            "alt-shift-é",
+            "space",
+            "shift-space",
+            "alt-space",
+            "shift--",
             "",
             "cmd-",
             "cmd",

@@ -41,13 +41,6 @@ pub struct Entry {
     pub keywords: String,
 }
 
-impl Entry {
-    /// What a query is matched against.
-    fn haystack(&self) -> String {
-        format!("{} {}", self.label, self.keywords)
-    }
-}
-
 /// Entries of the command palette (every listed action, with its shortcut right now) and, in the
 /// same order, the actions they stand for.
 pub fn palette_entries(cx: &App) -> (Vec<Entry>, Vec<&'static keymap::ActionInfo>) {
@@ -68,14 +61,28 @@ pub fn palette_entries(cx: &App) -> (Vec<Entry>, Vec<&'static keymap::ActionInfo
     (entries, actions)
 }
 
-/// The indices of `entries` that match `query`, best first (`rank`), or all of them in order for
-/// an empty query.
+/// The indices of `entries` that match `query`, best first, or all of them in order for an empty
+/// query. Matches in the **label** come first (ranked by `rank`: prefix, hump, substring,
+/// subsequence), then entries only the keywords (group, action id) match, so a long label with
+/// the right word never loses to a short one that matched through its keywords.
 pub fn ranked(query: &str, entries: &[Entry]) -> Vec<usize> {
-    if query.trim().is_empty() {
+    let query = query.trim();
+    if query.is_empty() {
         return (0..entries.len().min(LIMIT)).collect();
     }
-    let haystacks: Vec<String> = entries.iter().map(Entry::haystack).collect();
-    rank(query.trim(), &haystacks, |h| h.as_str(), |_| None, LIMIT)
+    let mut order = rank(query, entries, |e| &*e.label, |_| None, LIMIT);
+    let in_label: std::collections::HashSet<usize> = order.iter().copied().collect();
+    let rest: Vec<usize> = (0..entries.len())
+        .filter(|index| !in_label.contains(index))
+        .collect();
+    let keywords: Vec<&str> = rest
+        .iter()
+        .map(|&index| entries[index].keywords.as_str())
+        .collect();
+    let by_keywords = rank(query, &keywords, |keywords| *keywords, |_| None, LIMIT);
+    order.extend(by_keywords.into_iter().map(|at| rest[at]));
+    order.truncate(LIMIT);
+    order
 }
 
 /// What choosing a row does: gets the entry's index, with the dialog already closed.
@@ -86,6 +93,9 @@ struct Picker {
     state: Entity<CommandState>,
     entries: Vec<Entry>,
     query: String,
+    /// `ranked(query)` for the query it was made for, so a render that did not change the query
+    /// (a hover, the cursor blink) does not rank again.
+    shown: Option<(String, Rc<Vec<usize>>)>,
     placeholder: SharedString,
     empty: SharedString,
     on_pick: Rc<OnPick>,
@@ -93,7 +103,14 @@ struct Picker {
 
 impl Render for Picker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let order = Rc::new(ranked(&self.query, &self.entries));
+        let order = match &self.shown {
+            Some((query, order)) if *query == self.query => order.clone(),
+            _ => {
+                let order = Rc::new(ranked(&self.query, &self.entries));
+                self.shown = Some((self.query.clone(), order.clone()));
+                order
+            }
+        };
         let items: Vec<CommandItem> = order
             .iter()
             .map(|&index| row(&self.entries[index]))
@@ -182,6 +199,7 @@ pub fn open(
         state: state.clone(),
         entries,
         query: String::new(),
+        shown: None,
         placeholder: placeholder.into(),
         empty: empty.into(),
         on_pick: Rc::new(on_pick),
@@ -248,5 +266,21 @@ mod tests {
         assert_eq!(labels("account", &entries), ["Log In to Twitch…"]);
         assert_eq!(labels("ToggleSidebar", &entries), ["Toggle Sidebar"]);
         assert!(labels("zzz", &entries).is_empty());
+    }
+
+    #[test]
+    fn a_label_match_beats_a_keyword_match() {
+        // Ranked on label + keywords, the short "Go" would win the tie by length.
+        let entries = [
+            entry("Go", "Pane GoPane"),
+            entry("Close Pane Quickly", "Misc"),
+            entry("Panel", "Other"),
+        ];
+        assert_eq!(
+            labels("pane", &entries),
+            ["Panel", "Close Pane Quickly", "Go"]
+        );
+        // Only keywords match: still found.
+        assert_eq!(labels("gopane", &entries), ["Go"]);
     }
 }

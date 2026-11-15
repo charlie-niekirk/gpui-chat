@@ -158,3 +158,5 @@ an entry here instead of expanding a PR. Format:
 - **Palette extras** (found in PR 4.3) — Kit's `Command` clears the query on the first Esc and closes on the second; recently-run actions first; commands that take an argument (jump to a setting, theme picker).
 - **Keymap editing UI** (found in PR 4.3) — rebinding is by editing `keymap.toml`; the settings window (4.2) could record a keystroke and write the entry. Sequences (`"cmd-k cmd-s"`) pass the file check but are only exercised by GPUI itself.
 - **Keymap per platform in one file** (found in PR 4.3) — `secondary-` covers cmd/ctrl, but nothing lets one file hold different keys for macOS and Linux.
+- **Keymap edits before the watcher starts are missed** (found in PR 4.3) — `keymap::init` reads the file, then starts the watcher; an edit in between is not seen until the next event (same gap as the settings and theme watchers).
+- **Palette and switcher do nothing in the settings window** (found in PR 4.3) — ⌘K, ⌘T and the View-menu palette items are handled on `AppShell` only, so from the settings window (#24) they have no effect; handle them globally or per window.

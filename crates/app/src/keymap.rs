@@ -9,6 +9,13 @@
 //! before ours), then ours, then the menu bar (macOS reads the shortcuts a menu shows when it
 //! is set).
 //!
+//! **This module is the only place that registers key bindings.** The rebuild drops anything bound
+//! with `cx.bind_keys` outside it (after `init`, nothing but Kit's own startup bindings survives),
+//! so a feature that wants keys exposes them through `platform::default_bindings` (as
+//! `completion::bindings` and `emote_picker::bindings` do) and gets an entry in [`catalog`]. `apply`
+//! checks the count: the keymap must hold exactly Kit's bindings plus the effective ones, and a
+//! rebuild that finds extra bindings logs an error (a `debug_assert` in debug builds).
+//!
 //! [`catalog`] is the list of actions `keymap.toml` and the command palette know by name. A test
 //! keeps it in step with the actions the app defines.
 //!
@@ -73,7 +80,7 @@ macro_rules! catalog {
 }
 
 catalog![
-    true "Go" OpenPalette "Command Palette…",
+    false "Go" OpenPalette "Command Palette…",
         true "Go" OpenChannelSwitcher "Go to Channel…",
         true "Channel" AddChannel "Add Channel…",
         true "Channel" RemoveChannel "Remove Channel",
@@ -130,6 +137,9 @@ pub struct KeymapState {
     file_problems: Vec<String>,
     /// Problems found turning the entries into bindings.
     apply_problems: Vec<String>,
+    /// How many bindings the keymap held after the last [`apply`]; a different count at the next
+    /// one means something bound keys behind this module's back (see the module docs).
+    applied: usize,
 }
 
 impl Global for KeymapState {}
@@ -159,7 +169,11 @@ struct KeymapWatchGuard(Option<KeymapWatcher>);
 impl Global for KeymapWatchGuard {}
 
 /// Installs the key bindings (Kit's, then the app's defaults, then the user's `keymap.toml`) and
-/// the menu bar, and starts watching the file. Call once at startup after `gpui_kit::init`.
+/// the menu bar, and starts watching the file. Call once at startup right after `gpui_kit::init`
+/// and **before anything else binds keys**: whatever is in the keymap now is taken as Kit's
+/// (`base`), and every later change rebuilds from `base` + the defaults + the file, so a binding
+/// added elsewhere with `cx.bind_keys` would be wiped by the first edit of `keymap.toml`
+/// (see the module docs).
 /// Returns the receiver to hand to [`attach_reloads`] once a window exists, or `None` when the
 /// file is not being watched (no home directory, or the watcher could not start; logged, and
 /// the keymap read at startup still applies).
@@ -179,6 +193,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<KeymapReport>> {
         entries: report.entries.clone(),
         file_problems: report.problems.iter().map(ToString::to_string).collect(),
         apply_problems: Vec::new(),
+        applied: 0,
     });
     apply(cx);
 
@@ -260,9 +275,28 @@ fn apply(cx: &mut App) {
         return;
     };
     let (bindings, problems) = effective(&state.defaults, &state.entries, cx);
+    let held = cx.key_bindings().borrow().bindings().count();
+    if state.applied != 0 && held != state.applied {
+        tracing::error!(
+            held,
+            expected = state.applied,
+            "key bindings were registered outside `keymap` and are dropped by this rebuild: \
+             hand them to `platform::default_bindings` instead"
+        );
+        debug_assert_eq!(
+            held, state.applied,
+            "something called `cx.bind_keys` after `keymap::init`; keymap is the only place that may"
+        );
+    }
+    let expected = state.base.len() + bindings.len();
     cx.clear_key_bindings();
     cx.bind_keys(state.base.iter().cloned());
     cx.bind_keys(bindings);
+    state.applied = cx.key_bindings().borrow().bindings().count();
+    debug_assert_eq!(
+        state.applied, expected,
+        "the keymap holds exactly Kit's bindings plus the effective app bindings"
+    );
     // The menus read the shortcuts they show from the keymap when they are set.
     cx.set_menus(platform::menus());
     state.apply_problems = problems;
@@ -331,6 +365,10 @@ fn effective(
             }
             taken.is_none()
         });
+        if !entry.keys.is_empty() && added.is_empty() {
+            // Every key was another entry's: the defaults stay, the problem is already listed.
+            continue;
+        }
         bindings.retain(|binding| {
             binding.action().name() != name
                 && !added.iter().any(|new| {
@@ -340,6 +378,39 @@ fn effective(
         });
         claimed.extend(added.iter().cloned().map(|binding| (binding, info.id)));
         bindings.extend(added);
+    }
+    // A user shortcut that shares its keystroke with another action in a *different* context
+    // (so the displacement above did not take it) now answers to whichever context is narrower:
+    // say so. Restating one of the action's own defaults is not news, and neither is a default
+    // that was displaced (it is gone from `bindings`).
+    for (binding, id) in &claimed {
+        let restates_default = defaults.iter().any(|default| {
+            default.action().partial_eq(binding.action())
+                && default.keystrokes() == binding.keystrokes()
+                && default.predicate() == binding.predicate()
+        });
+        if restates_default {
+            continue;
+        }
+        for other in &bindings {
+            if other.action().partial_eq(binding.action())
+                || other.keystrokes() != binding.keystrokes()
+            {
+                continue;
+            }
+            let other_name = other.action().name();
+            let other_id = catalog()
+                .iter()
+                .find(|info| info.build().name() == other_name)
+                .map_or(other_name, |info| info.id);
+            let context = other
+                .predicate()
+                .map_or_else(|| "everywhere".to_owned(), |p| format!("in {p}"));
+            problems.push(format!(
+                "{id}: {} is also bound to {other_id} ({context}); the narrower context wins",
+                keys_label(binding)
+            ));
+        }
     }
     (bindings, problems)
 }
@@ -396,6 +467,7 @@ mod tests {
                 entries: Vec::new(),
                 file_problems: Vec::new(),
                 apply_problems: Vec::new(),
+                applied: 0,
             });
             apply(cx);
             kit
@@ -508,40 +580,121 @@ mod tests {
     #[gpui_kit::test]
     fn problems_are_reported_and_the_defaults_stay(cx: &mut TestAppContext) {
         setup(cx);
-        let default = keys_of(SplitDown, cx);
+        let palette_default = keys_of(OpenPalette, cx);
         cx.update(|cx| {
             update(cx, |state| {
                 state.entries = vec![
-                    // GPUI's own parser is stricter about some things than the file check.
+                    // Fine: `-` is the key (GPUI reads `cmd-ctrl--` the same way).
                     entry("SplitDown", &["cmd-ctrl--"], None),
+                    // GPUI's context grammar rejects the dangling `&&`, which the file check
+                    // (which only balances parentheses) does not.
                     entry("OpenPalette", &["cmd-p"], Some("AppShell &&")),
                     entry("FocusPaneUp", &["cmd-u"], None),
                     entry("FocusPaneDown", &["cmd-u"], None),
                 ];
             });
             let shown = notices(cx);
+            assert_eq!(shown.len(), 2, "{shown:?}");
             assert!(
-                shown
-                    .iter()
-                    .any(|line| line.starts_with("OpenPalette: context \"AppShell &&\"")),
+                shown[0].starts_with("OpenPalette: context \"AppShell &&\""),
                 "{shown:?}"
             );
-            assert!(
-                shown
-                    .iter()
-                    .any(|line| line.starts_with("FocusPaneUp: ")
-                        || line.starts_with("FocusPaneDown: ")),
-                "two actions on one key: {shown:?}"
+            assert_eq!(
+                shown[1],
+                format!(
+                    "FocusPaneDown: {} is already bound to FocusPaneUp; keeping that",
+                    keys_label_in("cmd-u", cx)
+                )
             );
         });
-        assert_eq!(keys_of(OpenPalette, cx), keys_of_default(OpenPalette, cx));
-        let _ = default;
+        // The bad context left the action's defaults; the conflict left FocusPaneDown's.
+        assert_eq!(keys_of(OpenPalette, cx), palette_default);
+        assert_eq!(
+            keys_of(FocusPaneDown, cx),
+            keys_of_default(FocusPaneDown, cx)
+        );
+        assert_eq!(keys_of(FocusPaneUp, cx), [keys_label_of("cmd-u", cx)]);
+        // The valid entry applied.
+        assert_eq!(keys_of(SplitDown, cx), [keys_label_of("cmd-ctrl--", cx)]);
+    }
+
+    fn keys_label_in(keys: &str, cx: &mut App) -> String {
+        let binding = KeyBinding::load(keys, Box::new(Quit), None, false, None, cx).unwrap();
+        keys_label(&binding)
+    }
+
+    #[gpui_kit::test]
+    fn a_key_another_action_has_in_another_context_is_reported(cx: &mut TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            // ⌘Q is Quit's everywhere; SplitRight's shortcut lives in the shell context, so
+            // the two coexist and the narrower one wins inside the shell.
+            update(cx, |state| {
+                state.entries = vec![entry("SplitRight", &["cmd-q"], None)]
+            });
+            let shown = notices(cx);
+            assert_eq!(shown.len(), 1, "{shown:?}");
+            assert!(
+                shown[0].starts_with("SplitRight: ")
+                    && shown[0].contains("is also bound to Quit (everywhere)"),
+                "{shown:?}"
+            );
+        });
+        assert_eq!(keys_of(Quit, cx).len(), 1, "Quit keeps its key");
+    }
+
+    #[gpui_kit::test]
+    fn swapping_two_defaults_and_restating_one_are_not_problems(cx: &mut TestAppContext) {
+        setup(cx);
+        let (right, down) = (keys_of(SplitRight, cx), keys_of(SplitDown, cx));
+        cx.update(|cx| {
+            update(cx, |state| {
+                state.entries = vec![
+                    entry("SplitDown", &["cmd-d"], None),
+                    entry("SplitRight", &["cmd-alt-shift-d"], None),
+                    // The default again, spelled out.
+                    entry("ClosePane", &["cmd-shift-w"], None),
+                    entry("ComposerHistoryPrevious", &["up"], None),
+                ];
+            });
+            assert_eq!(notices(cx), Vec::<String>::new());
+        });
+        assert_eq!(keys_of(SplitDown, cx), right);
+        assert_eq!(keys_of(SplitRight, cx), down);
+    }
+
+    #[gpui_kit::test]
+    fn an_entry_whose_keys_all_lose_a_conflict_keeps_the_defaults(cx: &mut TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            update(cx, |state| {
+                state.entries = vec![
+                    entry("FocusPaneDown", &["cmd-u"], None),
+                    entry("FocusPaneUp", &["cmd-u"], None),
+                ];
+            });
+        });
+        // FocusPaneDown (first by name) won ⌘U; FocusPaneUp lost its only key and kept its default.
+        assert_eq!(keys_of(FocusPaneDown, cx), [keys_label_of("cmd-u", cx)]);
+        assert_eq!(keys_of(FocusPaneUp, cx), keys_of_default(FocusPaneUp, cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_rebuild_holds_exactly_kits_bindings_plus_the_effective_ones(cx: &mut TestAppContext) {
+        let kit = setup(cx);
+        cx.update(|cx| {
+            update(cx, |state| {
+                state.entries = vec![entry("ClosePane", &[], None)]
+            });
+            let held = cx.key_bindings().borrow().bindings().count();
+            assert_eq!(held, kit + platform::default_bindings().len() - 1);
+        });
     }
 
     fn keys_of_default<A: Action>(action: A, cx: &mut TestAppContext) -> Vec<String> {
         cx.update(|cx| {
             let defaults = platform::default_bindings();
-            let _ = cx;
+            let _ = &cx;
             defaults
                 .iter()
                 .filter(|binding| binding.action().partial_eq(&action))
