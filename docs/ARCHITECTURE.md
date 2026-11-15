@@ -81,7 +81,23 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   embedded, registered with the text system at startup and the family is resolved against the
   installed list (GPUI panics on unknown families, so there is no blind fallback).
 - `actions.rs` + `platform/` — action definitions; key bindings and the native menu bar are
-  per-platform and live only under `platform/`. The Kit `native_menu` is a popup context menu;
+  per-platform and live only under `platform/`.
+- `keymap.rs` / `palette.rs` (PR 4.3) — the user's `keymap.toml` and the ⌘K / ⌘T pickers, see `docs/KEYMAP.md`.
+  `crates/settings` parses and checks the file (`parse_keymap` / `load_keymap`, GPUI-free; `watch_keymap`, the
+  debounced directory watch, like the theme one). The app keeps `KeymapState` (a global): `base` = what Kit
+  registered at startup, `defaults` = `platform::default_bindings()`, the user's entries and the problems. Every
+  change rebuilds the keymap from scratch (`clear_key_bindings`, base, then `effective(defaults, entries)`) and
+  re-sets the menu bar, because macOS reads the shortcuts a menu item shows when the menus are set. An entry
+  replaces all default shortcuts of its action (context defaulting to the one the action's first default has) and
+  displaces another action's default on the identical keystroke and context. `keymap::catalog()` names every
+  bindable action (and whether the palette lists it); a test checks it against `all_action_names`. Problems are a
+  strip in the shell (`keymap_notice_banner`, same pattern as the theme one); the UI's shortcut hints (welcome text,
+  empty sidebar, emote button) read the live binding through `keymap::shortcut_of`, there are no hard-coded labels.
+  `palette.rs` is one Kit `Dialog` holding a Kit `Command` with its own filter switched off (`filterable(false)`):
+  rows are ranked with `core::complete::rank` and rebuilt on each query change. The palette's rows are the catalog's
+  with the shortcut read from the keymap; choosing one closes the dialog (focus goes back to where it was) and
+  dispatches the action on the window, as the key would. ⌘T lists `ChannelList::channels()`, and the shell shows
+  the choice in the focused pane (`Layout::show`, so a channel in another pane swaps places). The Kit `native_menu` is a popup context menu;
   the application menu bar uses GPUI `cx.set_menus`.
 - `channel_list.rs` / `login.rs` / `add_channel.rs` (PR 1.5) — `ChannelList` is the plain-data list of
   open channels plus the selection (add appends and selects, remove selects the next/previous, move

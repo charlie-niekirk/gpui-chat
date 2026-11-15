@@ -6,16 +6,11 @@ use gpui_kit::{KeyBinding, Menu, MenuItem, SystemMenuType};
 use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
 use crate::actions::{
     AddChannel, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft,
-    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
-    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
-    ToggleDebugHud, ToggleSidebar,
+    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    OpenChannelSwitcher, OpenPalette, Quit, RemoveChannel, SHELL_CONTEXT, SelectNextChannel,
+    SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::completion::ComposerToggleEmotePicker;
-
-pub const TOGGLE_SIDEBAR_LABEL: &str = "⌘B";
-pub const TOGGLE_HUD_LABEL: &str = "⌘⇧D";
-pub const EMOTE_PICKER_LABEL: &str = "⌘E";
-pub const ADD_CHANNEL_LABEL: &str = "⌘N";
 
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
@@ -26,6 +21,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
         KeyBinding::new("cmd-shift-d", ToggleDebugHud, None),
         KeyBinding::new("cmd-n", AddChannel, None),
+        KeyBinding::new("cmd-k", OpenPalette, None),
+        KeyBinding::new("cmd-t", OpenChannelSwitcher, None),
         KeyBinding::new("cmd-backspace", RemoveChannel, Some(SHELL_CONTEXT)),
         KeyBinding::new("cmd-alt-up", MoveChannelUp, Some(SHELL_CONTEXT)),
         KeyBinding::new("cmd-alt-down", MoveChannelDown, Some(SHELL_CONTEXT)),

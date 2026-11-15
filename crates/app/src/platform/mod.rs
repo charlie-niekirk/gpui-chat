@@ -7,8 +7,9 @@ use gpui_kit::{KeyBinding, Menu, MenuItem};
 use crate::actions::{
     About, AddChannel, ClosePane, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious,
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow,
-    MoveChannelDown, MoveChannelUp, Quit, ReloadEmotes, RemoveChannel, SelectNextChannel,
-    SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
+    MoveChannelDown, MoveChannelUp, OpenChannelSwitcher, OpenPalette, Quit, ReloadEmotes,
+    RemoveChannel, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud,
+    ToggleSidebar,
 };
 
 pub mod keychain;
@@ -21,9 +22,6 @@ mod other;
 use macos as imp;
 #[cfg(not(target_os = "macos"))]
 use other as imp;
-
-/// Human-readable label of the Toggle Sidebar shortcut (kept in sync with `bindings()`).
-pub use imp::{ADD_CHANNEL_LABEL, EMOTE_PICKER_LABEL, TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
 
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
@@ -51,6 +49,8 @@ pub fn menus() -> Vec<Menu> {
 /// Items shared by every platform's menu bar.
 fn view_menu() -> Menu {
     Menu::new("View").items([
+        MenuItem::action("Command Palette…", OpenPalette),
+        MenuItem::separator(),
         MenuItem::action("Toggle Sidebar", ToggleSidebar),
         MenuItem::action("Toggle Debug HUD", ToggleDebugHud),
         MenuItem::separator(),
@@ -67,6 +67,8 @@ fn view_menu() -> Menu {
 
 fn channel_menu() -> Menu {
     Menu::new("Channel").items([
+        MenuItem::action("Go to Channel…", OpenChannelSwitcher),
+        MenuItem::separator(),
         MenuItem::action("Add Channel…", AddChannel),
         MenuItem::action("Remove Channel", RemoveChannel),
         MenuItem::separator(),

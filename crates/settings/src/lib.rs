@@ -24,6 +24,8 @@
 //! See `docs/SETTINGS.md` for the file format and the compatibility rules.
 
 mod error;
+mod keymap;
+mod keymap_watch;
 mod paths;
 mod schema;
 mod store;
@@ -33,6 +35,10 @@ mod themes;
 mod watch;
 
 pub use error::SettingsError;
+pub use keymap::{
+    KeymapEntry, KeymapProblem, KeymapReport, load_keymap, parse_keymap, validate_keystroke,
+};
+pub use keymap_watch::{KeymapWatcher, watch_keymap};
 pub use paths::{
     CACHE_DIR_ENV, CONFIG_DIR_ENV, KEYMAP_FILE_NAME, PathsError, SETTINGS_FILE_NAME, SettingsPaths,
     THEMES_DIR_NAME,

@@ -29,7 +29,9 @@ actions!(
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
-        FocusPaneDown
+        FocusPaneDown,
+        OpenPalette,
+        OpenChannelSwitcher
     ]
 );
 
