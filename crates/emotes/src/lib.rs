@@ -23,6 +23,7 @@
 
 pub mod badges;
 pub mod bttv;
+pub mod catalog;
 mod error;
 pub mod ffz;
 mod http;
@@ -39,6 +40,7 @@ pub use badges::{
     HelixBadgeSource,
 };
 pub use bttv::BttvClient;
+pub use catalog::EmoteCatalog;
 pub use error::EmoteError;
 pub use ffz::FfzClient;
 pub use http::{

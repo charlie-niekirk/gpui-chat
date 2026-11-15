@@ -5,12 +5,15 @@ use gpui_kit::{KeyBinding, Menu};
 
 use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
 use crate::actions::{
-    AddChannel, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit, RemoveChannel,
-    SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
+    AddChannel, COMPOSER_CONTEXT, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    Quit, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
+    ToggleSidebar,
 };
+use crate::completion::ComposerToggleEmotePicker;
 
 pub const TOGGLE_SIDEBAR_LABEL: &str = "Ctrl+B";
 pub const TOGGLE_HUD_LABEL: &str = "Ctrl+Shift+D";
+pub const EMOTE_PICKER_LABEL: &str = "Ctrl+E";
 pub const ADD_CHANNEL_LABEL: &str = "Ctrl+N";
 
 pub fn bindings() -> Vec<KeyBinding> {
@@ -27,6 +30,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-down", MoveChannelDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-shift-]", SelectNextChannel, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-shift-[", SelectPreviousChannel, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-e", ComposerToggleEmotePicker, Some(COMPOSER_CONTEXT)),
     ]
 }
 

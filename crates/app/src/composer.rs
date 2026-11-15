@@ -14,6 +14,9 @@
 //! * while nobody is logged in (or the login lacks the permission to chat) the box is disabled and
 //!   says why, with a button to log in.
 //!
+//! Autocomplete (`:` / `@` / `/` / Tab) and the emote picker (PR 3.3) live in [`emotes`], with the
+//! lists in `crate::completion` and the picker in `crate::emote_picker`.
+//!
 //! Only the live source has composers: the offline sources have nobody to send to.
 
 use gpui_chat_core::{
@@ -30,9 +33,17 @@ use gpui_kit::{
 };
 use tokio::sync::oneshot;
 
+mod emotes;
+
 use crate::account::AccountHub;
 use crate::actions::{COMPOSER_CONTEXT, ComposerHistoryNext, ComposerHistoryPrevious};
 use crate::channels::ChannelStore;
+use crate::completion::{
+    Autocomplete, ComposerComplete, ComposerCompletePrevious, ComposerCompletionDismiss,
+    ComposerToggleEmotePicker,
+};
+use crate::emote_picker::EmotePicker;
+use crate::emote_sources::EmoteSources;
 use crate::live::{LiveSource, SendRequest};
 use crate::sign_in;
 use crate::theme::Tokens;
@@ -143,8 +154,15 @@ pub struct Composer {
     error: Option<SharedString>,
     /// The mode the box was last set up for (placeholder), so render only touches it on a change.
     shown: Option<Mode>,
+    /// The `:` / `@` / `/` / Tab completion list (PR 3.3).
+    completion: Autocomplete,
+    /// The user's own Twitch emotes and the merged emote catalog (PR 3.3).
+    emotes: EmoteSources,
+    /// The open emote picker, if any (PR 3.3).
+    picker: Option<Entity<EmotePicker>>,
     _subscriptions: Vec<Subscription>,
     _input_subscription: Option<Subscription>,
+    _picker_subscription: Option<Subscription>,
 }
 
 impl Composer {
@@ -164,8 +182,12 @@ impl Composer {
             history: InputHistory::new(),
             error: None,
             shown: None,
+            completion: Autocomplete::default(),
+            emotes: EmoteSources::default(),
+            picker: None,
             _subscriptions: subscriptions,
             _input_subscription: None,
+            _picker_subscription: None,
         }
     }
 
@@ -188,6 +210,7 @@ impl Composer {
                 // is now the user's own text, and an old error no longer applies.
                 InputEvent::Change => {
                     this.history.reset();
+                    this.refresh_completion(false, window, cx);
                     if this.error.take().is_some() {
                         cx.notify();
                     }
@@ -207,6 +230,11 @@ impl Composer {
             return;
         };
         if !self.mode(cx).can_send() {
+            return;
+        }
+        // Enter takes the highlighted candidate while the list is open.
+        if self.completion.is_open() {
+            self.accept_completion(None, window, cx);
             return;
         }
         let typed = input.read(cx).value();
@@ -281,6 +309,10 @@ impl Composer {
 
     /// ↑
     fn history_previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // With the completion list open the arrows choose from it.
+        if self.move_completion(-1, cx) {
+            return;
+        }
         let Some(input) = self.input.clone() else {
             return;
         };
@@ -292,6 +324,9 @@ impl Composer {
 
     /// ↓
     fn history_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.move_completion(1, cx) {
+            return;
+        }
         let Some(input) = self.input.clone() else {
             return;
         };
@@ -342,6 +377,13 @@ impl Render for Composer {
         let tokens = *cx.global::<Tokens>();
         let input = self.input(window, cx);
         let mode = self.mode(cx);
+        if !mode.can_send() && self.picker.is_some() {
+            self.close_picker(window, cx);
+        }
+        self.request_own_emotes(window, cx);
+        self.sync_completion(cx);
+        let overlays = self.overlays(&tokens, window, cx);
+        let emotes_button = self.picker_button(cx);
         if self.shown != Some(mode) {
             self.shown = Some(mode);
             input.update(cx, |input, cx| {
@@ -385,11 +427,27 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &ComposerHistoryNext, window, cx| {
                 this.history_next(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ComposerComplete, window, cx| {
+                this.complete(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ComposerCompletePrevious, _, cx| {
+                this.complete_previous(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ComposerCompletionDismiss, _, cx| {
+                this.dismiss_completion(cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ComposerToggleEmotePicker, window, cx| {
+                    this.toggle_picker(window, cx);
+                }),
+            )
             .w_full()
             .flex_none()
             .border_t_1()
             .border_color(tokens.border)
             .children(self.error_strip(&tokens, cx))
+            // The completion list / emote picker hang off this zero-height line, above the box.
+            .child(div().w_full().h(px(0.0)).children(overlays))
             .child(
                 h_flex()
                     .w_full()
@@ -399,6 +457,7 @@ impl Render for Composer {
                     .items_center()
                     .min_h(px(44.0))
                     .child(div().flex_1().min_w_0().child(field))
+                    .children(emotes_button)
                     .children(login),
             )
     }

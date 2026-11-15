@@ -165,6 +165,33 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   message shows once whichever arrives first. `follow_login` compares the account IRC should use with the login
   the provider *actually connected as* (`ConnectedAs`), so a first connection that went anonymous because the
   keychain was slow is corrected when the login arrives.
+- `completion.rs` / `composer/emotes.rs` / `emote_picker.rs` / `emote_thumb.rs` / `emote_sources.rs` (PR 3.3) —
+  autocomplete and the emote picker over the composer. **What a word asks for and how candidates rank is in
+  `core::complete`** (unit-tested there): `find_trigger` reads the token ending at the caret (`@name` users,
+  `/name` as the first word commands, `:name` with two characters or more emotes, any other word as emotes on
+  Tab), `rank` orders by tier (case-sensitive prefix, case-insensitive prefix, camelCase/digit/`_` "hump",
+  substring, subsequence) then recency, shorter name, alphabetical; `apply` makes the edit (token replaced,
+  sigil added for users and commands, a space after). `Autocomplete` (`completion.rs`) holds the open list
+  (candidates, selection, an 8-row scroll window) and draws it; `Composer` routes keys to it through actions
+  bound to `ChatComposer > Input` (Tab / Shift-Tab / Esc; ↑/↓ go to the list while it is open, else to history;
+  Enter accepts instead of sending while it is open). Tab opens the list for a plain word (a lone candidate is
+  taken at once); Esc keeps it shut for that word. The caret is re-checked at render (arrow keys and clicks emit
+  no change event). Candidates: the channel's `EmoteCatalog` (`crates/emotes`: the user's own Twitch emotes, then
+  channel 7TV → BTTV → FFZ, then global, each name once; plus per-provider lists), `core::recent_chatters` over the
+  pane's `MessageStore` (newest speaker first; the display name is inserted, the login is matched), and
+  `core::COMMANDS` (a test keeps it in step with `parse_input`). The picker (`emote_picker.rs`, ⌘E / Ctrl-E or the
+  🙂 button) is its own entity in a `deferred(anchored(..))` above the box: tabs Recent · Twitch · 7TV · BTTV · FFZ
+  (empty third-party tabs hidden, Twitch always, to say why it is empty), a Kit `Input` for search (a search spans
+  every provider, best match first), a `uniform_list` grid of 9 emotes per row so only visible rows build and
+  request images. Keys, bound to `EmotePicker > Input` after the composer's so they win in the search field:
+  arrows move, Tab / Shift-Tab change tab, Enter inserts and closes, Esc closes, a click inserts. Thumbnails
+  (`emote_thumb.rs`) go through the chat's `Images` store (de-duplicated, cached, pinned per view in a
+  `FrameImages`), the first frame of an animated emote. `EmoteSources` owns the user's own Twitch emotes (asked from
+  Helix `Get User Emotes` once per user and room as soon as the room id is known and the login has
+  `user:read:emotes`; a failure shows on the Twitch tab and is asked again when the picker opens) and rebuilds the
+  catalog only when a set's identity or those emotes changed. Recently used emotes (40, by name, shared by every
+  pane) are kept in `state.toml` under `[emotes] recent`, so the Recent tab shows those the current channel can
+  still use. Nothing here applies to the offline sources (they have no composer).
 - `stream_info.rs` (PR 3.5) — `StreamInfoHub` (GPUI entity, live source only, created by the shell next to the
   `AccountHub`) mirrors the snapshots of `gpui_chat_twitch::streams::StreamPoller` (see *Stream state* below)
   and answers `liveness(channel)` (`Unknown` / `Offline` / `Live(info)`) and `followed_live()`. The shell calls
@@ -178,8 +205,8 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `GPUI_CHAT_DEMO_STREAMS=1` with `--firehose` / `--replay` fakes the data (no network, no login) so the UI can
   be looked at and screenshotted offline.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
-  (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
-  `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
+  (validated against connected displays on restore), `[channels]` (`open` in sidebar order,
+  `selected`) and `[emotes]` (`recent`, PR 3.3: the emotes used last, newest first). Separate from user settings. Sections load independently (a malformed `[channels]`
   leaves `[window]` intact and vice versa) and each writer replaces only its own top-level key in the
   file's TOML table under one lock, so other sections (even ones this build cannot read) survive; a
   file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore
@@ -192,7 +219,7 @@ Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowe
 `MessageId`, `EmoteId`), `emote` (`Emote`, `EmoteProvider`, `ImageUrls` by scale, `BadgeId` /
 `Badge`), `message` (`Message`, `Author`, `Fragment`, `MessageKind`, `MessageFlags`, `ReplyRef`),
 `store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`, `compose` (PR 3.2: `parse_input`,
-`sanitize_line`, `InputHistory`).
+`sanitize_line`, `InputHistory`), `complete` (PR 3.3: `find_trigger`, `rank`, `apply`, `recent_chatters`, `Recents`).
 
 - **`MessageStore`** hands out a monotonically increasing *sequence number* per pushed message
   (never reused; `first_seq`/`next_seq`/`iter_since` let the UI see what is new or scrolled out) and a
@@ -270,6 +297,10 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   never blocks the others and a channel with no account (404) is an empty set. FFZ uses the
   official API with the BTTV mirror as fallback. All HTTP goes through the `HttpClient` trait so
   tests run offline against `fixtures/emotes/`.
+- **Emote catalog (`emotes` crate, `catalog` module, PR 3.3):** `EmoteCatalog::build(own_twitch, sets)` merges what
+  one channel's input box can offer: every name once in the precedence order above (Twitch's own first, as the IRC
+  tags win in chat), plus per-provider lists (channel before global) for the picker's tabs.
+  `EmoteResolver::sets()` exposes the sets it resolves against.
 - **Badges (`emotes` crate, `badges` module):** `BadgeSource` (`global()` / `channel(room_id)` → `BadgeSet`, boxed
   futures like `HttpClient`) is the seam; `BadgeSet` is `set → version → Arc<Badge>` so a lookup is two hash probes
   with no allocation, and `BadgeRegistry` layers a channel's set over the global one and numbers each store.
@@ -468,6 +499,16 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   shows the message itself (flagged `echo`), as the account whose token made the request (`SentMessage` carries
   its login and user id), under the id Twitch returned; Twitch's own copy, if it comes, replaces it, and any other
   second chat line with that id is ignored.
+
+### User emotes (`crates/twitch`, PR 3.3)
+
+- **`HelixClient::get_user_emotes(user_id, broadcaster_id)`** — `GET /helix/chat/emotes/user` (scope
+  `user:read:emotes`, already in `auth::SCOPES`) through `get_all` (up to 100 pages). With a broadcaster the answer
+  also holds that channel's follower emotes, so the app asks per channel (a superset of the user's emotes
+  elsewhere). Each entry becomes a `UserEmote { emote, owner_id, kind }` with `Emote::twitch`'s standard CDN URLs
+  (`animated` when Twitch lists the animated format); entries without id or name are dropped and an emote in two
+  sets is kept once. A 401 about the scope is `HelixListError::is_missing_scope`. Tested against a wiremock Helix
+  (paging with an escaped cursor, user and broadcaster in the query, scope error, Twitch's message).
 
 ### Stream state (`crates/twitch`, PR 3.5)
 

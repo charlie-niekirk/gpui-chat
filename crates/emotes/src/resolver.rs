@@ -163,6 +163,13 @@ impl EmoteResolver {
     pub fn is_empty(&self) -> bool {
         self.sets.is_empty()
     }
+
+    /// The sets in precedence order (channel 7TV → BTTV → FFZ, then the global ones; enabled
+    /// providers only, empty sets left out). The input box lists them for completion and the
+    /// emote picker.
+    pub fn sets(&self) -> &[Arc<EmoteSet>] {
+        &self.sets
+    }
 }
 
 impl WordResolver for EmoteResolver {
