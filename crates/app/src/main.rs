@@ -34,6 +34,7 @@ mod reply;
 mod runtime;
 mod shell;
 mod sign_in;
+mod splits;
 mod state;
 mod stream_info;
 mod streams;

@@ -1,4 +1,5 @@
-//! Persisted UI state (`state.toml`): window placement and the open channels.
+//! Persisted UI state (`state.toml`): window placement, the open channels and the split-pane
+//! layout.
 //!
 //! This is machine-written UI state, deliberately separate from user settings
 //! (`crates/settings`). It lives next to them in the platform config dir, in a directory
@@ -57,6 +58,41 @@ pub struct SavedEmotes {
     pub recent: Vec<String>,
 }
 
+/// How a split lays out its panes: side by side (`row`) or stacked (`column`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SavedAxis {
+    #[default]
+    Row,
+    Column,
+}
+
+/// One node of the saved pane tree (PR 4.1): a pane (`channel`, absent for an empty pane) or, when
+/// `panes` is not empty, a split of them along `axis` with their relative `sizes`. Validated when
+/// restored, see [`crate::splits::Layout::from_saved`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedPane {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<SavedAxis>,
+    /// Fractions of the split, written rounded so the file stays readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sizes: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<SavedPane>,
+}
+
+/// The split-pane layout: the tree and which pane has focus (its index among the panes, in
+/// reading order). A file without it opens one pane on `[channels] selected`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedLayout {
+    #[serde(default)]
+    pub focused: usize,
+    #[serde(default)]
+    pub root: SavedPane,
+}
+
 /// Contents of `state.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
@@ -66,6 +102,8 @@ pub struct AppState {
     pub channels: Option<SavedChannels>,
     #[serde(default)]
     pub emotes: Option<SavedEmotes>,
+    #[serde(default)]
+    pub layout: Option<SavedLayout>,
 }
 
 /// A connected display as far as restore logic cares.
@@ -164,6 +202,7 @@ pub fn load_from(path: &Path) -> AppState {
             window: section(&table, "window"),
             channels: section(&table, "channels"),
             emotes: section(&table, "emotes"),
+            layout: section(&table, "layout"),
         },
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "ignoring corrupt state file");
@@ -248,6 +287,11 @@ pub fn save_channels(channels: SavedChannels) {
     update_section("channels", &channels);
 }
 
+/// Best-effort save of the split-pane layout; same rules as [`save_window`].
+pub fn save_layout(layout: SavedLayout) {
+    update_section("layout", &layout);
+}
+
 /// Best-effort save of the recent emotes; same rules as [`save_window`].
 #[cfg_attr(test, allow(dead_code))] // tests do not write the real state file
 pub fn save_emotes(emotes: SavedEmotes) {
@@ -276,6 +320,31 @@ mod tests {
         SavedChannels {
             open: vec!["forsen".into(), "xqc".into(), "a_b".into()],
             selected: Some("xqc".into()),
+        }
+    }
+
+    /// `forsen | (xqc over an empty pane)`, the empty one focused.
+    fn layout() -> SavedLayout {
+        let pane = |channel: Option<&str>| SavedPane {
+            channel: channel.map(str::to_owned),
+            ..SavedPane::default()
+        };
+        SavedLayout {
+            focused: 2,
+            root: SavedPane {
+                axis: Some(SavedAxis::Row),
+                sizes: vec![0.25, 0.75],
+                panes: vec![
+                    pane(Some("forsen")),
+                    SavedPane {
+                        axis: Some(SavedAxis::Column),
+                        sizes: vec![0.5, 0.5],
+                        panes: vec![pane(Some("xqc")), pane(None)],
+                        ..SavedPane::default()
+                    },
+                ],
+                ..SavedPane::default()
+            },
         }
     }
 
@@ -311,6 +380,7 @@ mod tests {
             }),
             channels: Some(channels()),
             emotes: Some(emotes()),
+            layout: Some(layout()),
         };
         assert_eq!(AppState::parse(&state.render()).unwrap(), state);
     }
@@ -330,6 +400,7 @@ mod tests {
             window: Some(placement()),
             channels: Some(channels()),
             emotes: Some(emotes()),
+            layout: Some(layout()),
         };
         save_to(&path, &state).unwrap();
         assert_eq!(load_from(&path), state);
@@ -343,7 +414,7 @@ mod tests {
         let text = AppState {
             window: None,
             channels: Some(channels()),
-            emotes: None,
+            ..AppState::default()
         }
         .render();
         assert!(text.contains("[channels]"), "{text}");
@@ -377,6 +448,54 @@ mod tests {
         // A table with only one of the keys is fine too.
         let partial = AppState::parse("[channels]\nopen = [\"a_b\"]\n").unwrap();
         assert_eq!(partial.channels.unwrap().selected, None);
+    }
+
+    #[test]
+    fn the_layout_is_a_nested_table_next_to_the_channels() {
+        let text = AppState {
+            channels: Some(channels()),
+            layout: Some(layout()),
+            ..AppState::default()
+        }
+        .render();
+        assert!(text.contains("[layout.root]"), "{text}");
+        assert!(text.contains(r#"axis = "column""#), "{text}");
+        let parsed = AppState::parse(&text).unwrap();
+        assert_eq!(parsed.layout, Some(layout()));
+        assert_eq!(parsed.channels, Some(channels()));
+    }
+
+    #[test]
+    fn files_from_before_the_layout_existed_still_load() {
+        // What PR 1.5 to 3.5 wrote: channels, no layout.
+        let old = "[channels]\nopen = [\"forsen\", \"xqc\"]\nselected = \"xqc\"\n";
+        let state = AppState::parse(old).unwrap();
+        assert_eq!(state.layout, None);
+        assert_eq!(state.channels.unwrap().selected.as_deref(), Some("xqc"));
+        // A layout with only a root pane needs no other keys.
+        let bare = AppState::parse("[layout.root]\nchannel = \"forsen\"\n").unwrap();
+        let layout = bare.layout.unwrap();
+        assert_eq!(layout.focused, 0);
+        assert_eq!(layout.root.channel.as_deref(), Some("forsen"));
+    }
+
+    #[test]
+    fn a_malformed_layout_keeps_the_channels() {
+        let (path, dir) = temp_state("layout");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "[channels]\nopen = [\"a_b\"]\n\n[layout]\nroot = \"left\"\n",
+        )
+        .unwrap();
+        let state = load_from(&path);
+        assert_eq!(state.layout, None);
+        assert_eq!(state.channels.unwrap().open, ["a_b"]);
+        update_at(&path, "layout", value(&layout()));
+        let state = load_from(&path);
+        assert_eq!(state.layout, Some(layout()));
+        assert_eq!(state.channels.unwrap().open, ["a_b"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn value<T: Serialize>(section: &T) -> toml::Value {

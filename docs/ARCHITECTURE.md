@@ -45,10 +45,29 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 ### App shell (`crates/app`)
 
 - `shell.rs` — root view: Kit `TitleBar`, collapsible Kit `Sidebar` (the channel list), main area
-  (one `ChannelPane`, PR 1.5; splits come in 4.1). Owns the `ChannelList` and the live source; every
-  list edit ends in `list_changed` (make sure the selected channel has a pane, schedule the
-  `state.toml` write). Handles the window actions (`ToggleSidebar`, `CloseWindow`, `MinimizeWindow`,
-  `About`, and the channel actions below); `Quit` is global.
+  (split panes, PR 4.1). Owns the `ChannelList`, the split `Layout` and the live source; every list
+  or layout edit ends in `list_changed` (every shown channel has a pane, the sidebar selection is the
+  focused pane's channel, schedule the `state.toml` write). Handles the window actions
+  (`ToggleSidebar`, `CloseWindow`, `MinimizeWindow`, `About`, the channel actions below and the pane
+  actions); `Quit` is global.
+- `splits.rs` (PR 4.1) — `Layout`, plain data: a tree of `Split { axis: Row | Column, children,
+  sizes }` whose leaves are panes (`PaneId`, `Option<ChannelId>`), plus the focused pane. A channel
+  is shown in at most one pane (showing it elsewhere swaps the two). Split right/down inserts into the
+  parent when it runs the same way (halving the split pane's share), else wraps the pane in a new
+  two-way split; close gives the space to the sibling that takes its place and collapses splits of
+  one and same-axis nesting; `move_pane` / `drop_channel` take a `DropZone` (centre: swap/show,
+  edge: put beside); `resize` moves one line with a minimum; `neighbour` finds the pane on a side
+  from the unit-square rects (keyboard focus). New panes show the next open channel no pane shows.
+  `splits/view.rs` draws it: flex rows/columns sized by `flex_grow(size)`, a 5 px divider between
+  children dragged with `on_drag` + the split's `on_drag_move` (fraction of the split's length), an
+  accent outline on the focused pane when split, and drop zones from `on_drag_move` /
+  `on_drop` for `DraggedPane` (from the channel name in a pane header) and `DraggedChannel` (sidebar
+  rows: `ChannelRows`, our `SidebarItem` that wraps each Kit `SidebarMenuItem` in a draggable `div`).
+  A press anywhere in a pane focuses it (`capture_any_mouse_down`); keyboard focus follows on the
+  next frame (`on_next_frame`, after a new pane's input exists): the pane's input, or the pane's
+  own focus handle when it cannot type. Keys (macOS): ⌘D split right, ⇧⌥⌘D split down (⌥⌘D is the
+  system's Dock toggle), ⇧⌘W close pane, ⌃⌘←/→/↑/↓ move focus; also in the View menu and as
+  buttons in each pane header.
 - `theme.rs` — our own `Tokens` (dark/light), chosen from the system appearance (live, via
   `observe_window_appearance`) and mirrored into Kit's `Theme` so Kit components match.
   Theme packs (PR 4.4) extend `Tokens`.
@@ -76,8 +95,9 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   dismiss button; PR 1.6) over the `ChatView`. `link_status` combines the state of
   the whole connection (`Connection { channel: None }`, kept by the hub) with the channel's own join
   state; `room_chips` formats `RoomState` (emote-only, followers-only with duration, slow N s,
-  subs-only, unique). Panes are created on first selection and kept (scroll position survives
-  switching) until the channel is closed.
+  subs-only, unique). A pane belongs to its channel: created when the channel is first shown and
+  kept (scroll position survives switching and moving between splits) until the channel is closed;
+  closing a split only hides it.
 - `channels.rs` — `ChannelStore` (GPUI entity: core `MessageStore` + room/connection state, one per
   channel) and `ChannelHub` (owns the stores; its `apply_batch` is the bridge's `apply`: it splits a
   frame's batch by channel, applies each run in order and notifies each touched store once; it also
@@ -211,7 +231,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   be looked at and screenshotted offline.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore), `[channels]` (`open` in sidebar order,
-  `selected`) and `[emotes]` (`recent`, PR 3.3: the emotes used last, newest first). Separate from user settings. Sections load independently (a malformed `[channels]`
+  `selected`), `[emotes]` (`recent`, PR 3.3: the emotes used last, newest first) and `[layout]`
+  (PR 4.1: `focused`, the focused pane's index in reading order, and `root`, a nested
+  `channel` / `axis` + `sizes` + `panes` tree; checked against the open channels on restore, broken
+  sizes evened out, at most 16 panes / 8 levels; a file without it opens one pane on `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
   leaves `[window]` intact and vice versa) and each writer replaces only its own top-level key in the
   file's TOML table under one lock, so other sections (even ones this build cannot read) survive; a
   file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore

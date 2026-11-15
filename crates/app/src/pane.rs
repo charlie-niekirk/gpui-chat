@@ -2,8 +2,9 @@
 //! with the live source, the input box ([`crate::composer`]).
 //!
 //! The formatting rules live in plain functions ([`link_status`], [`room_chips`]) so they are
-//! unit-tested; [`ChannelPane`] is the thin view on top. Splits arrive in PR 4.1; until then the
-//! shell shows exactly one pane.
+//! unit-tested; [`ChannelPane`] is the thin view on top. The shell lays panes out in splits
+//! ([`crate::splits`]); a pane belongs to its channel, so its chat, input and streamlink button go
+//! wherever the channel is shown. The channel name in the header is the handle to drag the pane by.
 
 use std::time::Duration;
 
@@ -15,15 +16,17 @@ use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
-    rgb,
+    Action, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
+    Styled, Subscription, Window, div, px, rgb,
 };
 
+use crate::actions::{ClosePane, SplitDown, SplitRight};
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
+use crate::splits::view::{DragChip, DraggedPane};
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
 use crate::theme::Tokens;
@@ -242,6 +245,10 @@ pub struct ChannelPane {
     composer: Option<Entity<Composer>>,
     /// `false` for the offline sources, which have no connection to report.
     live: bool,
+    /// Keyboard focus for a pane without an input box (the offline sources).
+    focus_handle: FocusHandle,
+    /// Whether the window is split, so the pane can be closed.
+    in_split: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -285,8 +292,71 @@ impl ChannelPane {
             chat,
             composer,
             live,
+            focus_handle: cx.focus_handle(),
+            in_split: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Gives the pane keyboard focus: its input box, or the pane itself when it has none.
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.update(cx, |composer, cx| composer.focus(window, cx)));
+        if !typed {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    pub fn set_in_split(&mut self, in_split: bool, cx: &mut Context<Self>) {
+        if self.in_split != in_split {
+            self.in_split = in_split;
+            cx.notify();
+        }
+    }
+
+    /// Split right / split down / close: they act on the focused pane, which a press in this
+    /// pane has just made this one.
+    fn pane_actions(&self, tokens: &Tokens) -> impl IntoElement {
+        let button =
+            |id: &'static str, icon: IconName, label: &'static str, action: Box<dyn Action>| {
+                Button::new(id)
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(icon))
+                    .tooltip(label)
+                    .accessibility_label(label)
+                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            };
+        h_flex()
+            .id("pane-split-actions")
+            .flex_none()
+            .gap_0p5()
+            .items_center()
+            .pl_1p5()
+            .border_l_1()
+            .border_color(tokens.border)
+            .child(button(
+                "pane-split-right",
+                IconName::PanelRight,
+                "Split right",
+                Box::new(SplitRight),
+            ))
+            .child(button(
+                "pane-split-down",
+                IconName::PanelBottom,
+                "Split down",
+                Box::new(SplitDown),
+            ))
+            .children(self.in_split.then(|| {
+                button(
+                    "pane-close",
+                    IconName::Close,
+                    "Close pane",
+                    Box::new(ClosePane),
+                )
+            }))
     }
 
     fn header(&self, tokens: &Tokens, cx: &App) -> impl IntoElement {
@@ -303,10 +373,14 @@ impl ChannelPane {
                     .id("pane-status")
                     .gap_1p5()
                     .items_center()
-                    .flex_none()
-                    .child(div().size(px(8.0)).rounded_full().bg(color))
+                    // In a narrow split the label gives way before the buttons do.
+                    .flex_shrink(1.0)
+                    .min_w_0()
+                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(color))
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_xs()
                             .text_color(tokens.text_muted)
                             .child(status.label()),
@@ -339,16 +413,26 @@ impl ChannelPane {
             .id("pane-header-main")
             .w_full()
             .flex_none()
+            .overflow_x_hidden()
             .h(px(36.0))
             .px_3()
             .gap_3()
             .items_center()
-            .child(
+            .child({
+                let login = store.channel().login().to_owned();
                 div()
+                    .id("pane-drag-handle")
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
-                    .child(store.channel().login().to_owned()),
-            )
+                    .cursor_grab()
+                    .child(login.clone())
+                    .on_drag(
+                        DraggedPane {
+                            channel: store.channel().clone(),
+                        },
+                        move |_, _, _, cx| DragChip::build(login.clone(), cx),
+                    )
+            })
             .children(live_badge)
             .child(status_view)
             .child(
@@ -371,7 +455,8 @@ impl ChannelPane {
                             .child(chip)
                     })),
             )
-            .child(self.stream_actions(tokens, cx));
+            .child(self.stream_actions(tokens, cx))
+            .child(self.pane_actions(tokens));
         v_flex()
             .id("pane-header")
             .w_full()
@@ -487,10 +572,18 @@ impl Render for ChannelPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         v_flex()
+            .id("channel-pane")
+            .track_focus(&self.focus_handle)
             .size_full()
             .child(self.header(&tokens, cx))
             .child(div().flex_1().min_h_0().w_full().child(self.chat.clone()))
             .children(self.composer.clone())
+    }
+}
+
+impl Focusable for ChannelPane {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
