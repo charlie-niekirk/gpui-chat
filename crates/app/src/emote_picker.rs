@@ -327,7 +327,7 @@ impl EmotePicker {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let owner = cx.entity_id();
-        let light = tokens.main_bg.l > 0.5;
+        let light = tokens.light;
         let placeholder = tokens.text_muted.opacity(0.15);
         range
             .map(|row| {

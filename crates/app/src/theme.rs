@@ -67,10 +67,17 @@ pub struct Tokens {
     pub accent_text: Hsla,
     /// Errors and warnings, e.g. the settings-error banner, and the live dot.
     pub danger: Hsla,
+    /// `danger` drawn as text: readable (4.5:1) on every surface and under a danger tint.
+    pub danger_text: Hsla,
+    /// `accent` drawn as text or a thin icon, same rule.
+    pub accent_link: Hsla,
     /// Connected.
     pub success: Hsla,
     /// Connecting / reconnecting.
     pub warning: Hsla,
+    /// Whether the resolved variant is light. Use this, not the luminance of a colour, to pick
+    /// light or dark assets (a dark theme can have a mid-tone background).
+    pub light: bool,
 }
 
 impl Global for Tokens {}
@@ -80,7 +87,7 @@ fn hsla(color: Color) -> Hsla {
 }
 
 impl Tokens {
-    pub fn from_palette(palette: &Palette) -> Self {
+    pub fn from_palette(palette: &Palette, variant: ThemeVariant) -> Self {
         Self {
             window_bg: hsla(palette.window),
             main_bg: hsla(palette.background),
@@ -93,8 +100,11 @@ impl Tokens {
             accent: hsla(palette.accent),
             accent_text: hsla(palette.accent_text),
             danger: hsla(palette.danger),
+            danger_text: hsla(palette.danger_text),
+            accent_link: hsla(palette.accent_link),
             success: hsla(palette.success),
             warning: hsla(palette.warning),
+            light: variant == ThemeVariant::Light,
         }
     }
 
@@ -105,7 +115,7 @@ impl Tokens {
         let theme = registry
             .get(gpui_chat_settings::DEFAULT_THEME_ID)
             .expect("the default theme is bundled");
-        Self::from_palette(&theme.palette(variant).1)
+        Self::from_palette(&theme.palette(variant).1, variant)
     }
 
     #[cfg(test)]
@@ -170,6 +180,9 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
     let dir = paths.themes_dir();
     let report = load_user_themes(&dir, &[]);
     log_errors(&report.errors);
+    set_notices(cx, |n| {
+        n.files = report.errors.iter().map(ToString::to_string).collect()
+    });
     cx.set_global(Themes {
         registry: ThemeRegistry::with_user_themes(report.themes.clone()),
     });
@@ -193,6 +206,31 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
             None
         }
     }
+}
+
+/// Problems with the theme setup that the user should see (the app has no log viewer): bad or
+/// ignored theme files, and `theme_name`s that matched nothing.
+#[derive(Clone, Debug, Default)]
+struct ThemeNotices {
+    /// From the `themes/` directory (parse errors, duplicate names, low contrast).
+    files: Vec<String>,
+    /// From resolving the settings (unknown names).
+    selection: Vec<String>,
+}
+
+impl Global for ThemeNotices {}
+
+/// What to tell the user about their themes: one line each, empty when all is well.
+pub fn notices(cx: &App) -> Vec<String> {
+    cx.try_global::<ThemeNotices>().map_or_else(Vec::new, |n| {
+        n.files.iter().chain(&n.selection).cloned().collect()
+    })
+}
+
+fn set_notices(cx: &mut App, update: impl FnOnce(&mut ThemeNotices)) {
+    let mut current = cx.try_global::<ThemeNotices>().cloned().unwrap_or_default();
+    update(&mut current);
+    cx.set_global(current);
 }
 
 /// Theme directory events are rare and small.
@@ -231,6 +269,9 @@ pub fn attach_reloads(
             return false;
         };
         log_errors(&report.errors);
+        set_notices(cx, |n| {
+            n.files = report.errors.iter().map(ToString::to_string).collect()
+        });
         cx.set_global(Themes {
             registry: ThemeRegistry::with_user_themes(report.themes),
         });
@@ -305,10 +346,21 @@ fn apply(cx: &mut App) {
         .try_global::<SystemVariant>()
         .map_or(ThemeVariant::Dark, |system| system.0);
     let resolved = themes(cx).registry.resolve(&appearance, system);
-    if let Some(name) = &resolved.unknown_name {
-        tracing::warn!(theme = %name, using = %resolved.id, "unknown theme name; using the default");
+    let unknown: Vec<String> = resolved
+        .unknown
+        .iter()
+        .map(|unknown| {
+            format!(
+                "{} = \"{}\" is not a known theme; using \"{}\" instead",
+                unknown.setting, unknown.name, resolved.name
+            )
+        })
+        .collect();
+    for line in &unknown {
+        tracing::warn!("{line}");
     }
-    let tokens = Tokens::from_palette(&resolved.palette);
+    set_notices(cx, |n| n.selection = unknown);
+    let tokens = Tokens::from_palette(&resolved.palette, resolved.variant);
     let font = cx.try_global::<FontConfig>().cloned();
     // Selecting the mode loads Kit's colours for it; ours go on top.
     Theme::change(mode_of(resolved.variant), None, cx);
@@ -739,6 +791,62 @@ mod tests {
                 cx.global::<Tokens>().main_bg,
                 registry_color("gruvbox", ThemeVariant::Dark)
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tokens_know_their_variant_and_have_readable_status_text(cx: &mut gpui_kit::TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            // A dark theme with a bright mid-tone background is still dark.
+            cx.set_global(Themes {
+                registry: ThemeRegistry::with_user_themes(vec![
+                    gpui_chat_settings::Theme::parse(
+                        "bright-dark",
+                        "bright-dark.toml",
+                        "[dark]\nbackground=\"#d0d0d0\"\ntext=\"#000000\"\naccent=\"#2060c0\"\n",
+                        gpui_chat_settings::ThemeOrigin::Bundled,
+                    )
+                    .unwrap(),
+                ]),
+            });
+            apply_settings(&named(ThemeSetting::Dark, "bright-dark", None), None, cx);
+            let tokens = *cx.global::<Tokens>();
+            assert!(tokens.main_bg.l > 0.5, "the background is light...");
+            assert!(!tokens.light, "...but the variant is dark");
+            apply_settings(&named(ThemeSetting::Light, "rose-pine", None), None, cx);
+            assert!(cx.global::<Tokens>().light);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn unknown_theme_names_and_bad_files_become_notices(cx: &mut gpui_kit::TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            assert!(notices(cx).is_empty());
+            apply_settings(&named(ThemeSetting::Dark, "tokyonight", None), None, cx);
+            let shown = notices(cx);
+            assert_eq!(shown.len(), 1);
+            assert!(
+                shown[0].contains("appearance.theme_name") && shown[0].contains("tokyonight"),
+                "{shown:?}"
+            );
+            // Fixing the name clears it.
+            apply_settings(&named(ThemeSetting::Dark, "tokyo-night", None), None, cx);
+            assert!(notices(cx).is_empty());
+            // Theme file problems are listed too, and kept until the next reload clears them.
+            set_notices(cx, |n| {
+                n.files = vec!["theme x.toml: invalid `dark.accent`".into()]
+            });
+            assert_eq!(notices(cx).len(), 1);
+            apply_settings(&named(ThemeSetting::Dark, "nord", None), None, cx);
+            assert_eq!(
+                notices(cx).len(),
+                1,
+                "file problems outlive a settings change"
+            );
+            set_notices(cx, |n| n.files.clear());
+            assert!(notices(cx).is_empty());
         });
     }
 

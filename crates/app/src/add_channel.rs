@@ -7,7 +7,7 @@ use gpui_chat_core::ChannelId;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
+use gpui_kit::component::{WindowExt as _, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString,
     Styled, Window, div,
@@ -23,7 +23,7 @@ struct AddChannelForm {
 
 impl Render for AddChannelForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
+        let danger = cx.global::<crate::theme::Tokens>().danger_text;
         v_flex()
             .gap_2()
             .child(div().text_sm().child("Channel name or twitch.tv link"))

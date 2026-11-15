@@ -280,7 +280,7 @@ impl ChatView {
                 timestamps: settings.chat.timestamps,
             },
             emote_scale: settings.emotes.scale,
-            light: cx.global::<Tokens>().main_bg.l > 0.5,
+            light: cx.global::<Tokens>().light,
         };
         if self.text_config.as_ref() != Some(&current) {
             if self.text_config.is_some() {

@@ -147,7 +147,11 @@ fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
                 } else {
                     FontWeight::NORMAL
                 })
-                .text_color(if live { color } else { tokens.text_muted })
+                .text_color(if live {
+                    tokens.danger_text
+                } else {
+                    tokens.text_muted
+                })
                 .child(label),
         )
 }
@@ -199,7 +203,7 @@ fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
                 .max_w(px(220.0))
                 .truncate()
                 .text_xs()
-                .text_color(tokens.accent)
+                .text_color(tokens.accent_link)
                 .child(info.category.clone())
         }))
         .child(fact(format!("{viewers} viewers")))
@@ -412,7 +416,7 @@ impl ChannelPane {
                         .min_w_0()
                         .truncate()
                         .text_xs()
-                        .text_color(tokens.danger)
+                        .text_color(tokens.danger_text)
                         .child(message),
                 )
                 .child(

@@ -14,7 +14,8 @@ theme_name_light = "rose-pine"  # optional: use this theme whenever the light va
 ```
 
 * `theme_name` ignores case, spaces and `_` vs `-` (`Tokyo Night` = `tokyo-night`). An unknown
-  name falls back to `default` (logged).
+  name falls back to `default`, and a banner in the window says so. An unknown `theme_name_light`
+  falls back to `theme_name`'s light variant first, then to `default`.
 * A theme file has a `[dark]` section, a `[light]` section, or both. `theme = "dark"` / `"light"`
   pins the variant; `"system"` follows the OS appearance live. A theme that lacks the wanted variant
   still wins: its only palette is used (Kit's light/dark mode follows the palette actually used).
@@ -23,7 +24,12 @@ theme_name_light = "rose-pine"  # optional: use this theme whenever the light va
   different themes set `theme_name` (dark) and `theme_name_light` (light).
 * Everything hot-reloads: edit `settings.toml` to switch themes, or edit/add/remove a file in
   `themes/` and the app re-resolves the active theme (a file that fails to parse keeps its last
-  good version and is logged).
+  good version).
+* **Problems are shown in the window** (a "Theme problem" strip above the content): a theme file
+  that does not parse or lacks a required colour, two files with the same name once normalised
+  (`Tokyo Night.toml` and `tokyo_night.toml`; the later file wins), a theme whose text is below
+  3:1 contrast on its background, and a `theme_name` that matches nothing. The strip goes when
+  the problem is fixed.
 
 ## File format (`<config>/themes/<name>.toml`)
 
@@ -48,7 +54,10 @@ warning = "#e0af68"         # connecting / reconnecting
 ```
 
 Colours are `#rgb` or `#rrggbb`. Unknown keys are ignored. A user file with the id of a bundled
-theme replaces it. Chat usernames keep their Twitch colours (adjusted for readability against the
+theme replaces it, but keeps the variant it does not define: a `catppuccin.toml` with only
+`[dark]` still follows the OS to the bundled Latte. `danger_text` and `accent_link` (danger / accent drawn as *text*) are derived, never written:
+each is nudged towards `text` until it has 4.5:1 on every surface it is drawn on, plain and under
+a tint. Chat usernames keep their Twitch colours (adjusted for readability against the
 theme's `background`).
 
 ## Bundled pack
@@ -61,22 +70,25 @@ from a palette's red/green/yellow only where it has recognisable ones; otherwise
 defaults apply. Omarchy's `catppuccin` + `catppuccin-latte` are one two-variant theme here. The dark
 half of `rose-pine` is the published Rosé Pine palette (Omarchy's `rose-pine` is Dawn, the light one).
 
-| Id | Variants | Palette from (licence) |
+| Id | Variants | Palette from |
 |---|---|---|
 | `default` | dark, light | this app |
-| `catppuccin` | dark (Mocha), light (Latte) | Catppuccin (MIT) |
-| `everforest` | dark | Everforest (MIT) |
-| `flexoki-light` | light | Flexoki (MIT) |
-| `gruvbox` | dark | Gruvbox Material-style dark, as in Omarchy (MIT) |
-| `kanagawa` | dark | Kanagawa (MIT) |
-| `nord` | dark | Nord (MIT) |
-| `rose-pine` | dark, light (Dawn) | Rosé Pine (MIT) |
-| `tokyo-night` | dark | Tokyo Night (MIT) |
-| `ristretto` | dark | Omarchy's Ristretto (Monokai Pro filter colours; values only) |
-| `ethereal`, `hackerman`, `jade-horse`, `last-horizon`, `lumon`, `lupine`, `matte-black`, `miasma`, `retro-82`, `solitude`, `starship`, `vantablack`, `white` | one each | Omarchy's own bundled themes (MIT, same repository) |
+| `catppuccin` | dark (Mocha), light (Latte) | Catppuccin |
+| `catppuccin-latte` | light | alias of `catppuccin`'s light variant (Omarchy's name) |
+| `everforest` | dark | Everforest |
+| `flexoki-light` | light | Flexoki |
+| `gruvbox` | dark | Gruvbox Material, as in Omarchy |
+| `kanagawa` | dark | Kanagawa |
+| `nord` | dark | Nord |
+| `rose-pine` | dark, light (Dawn) | Rosé Pine |
+| `tokyo-night` | dark | Tokyo Night |
+| `ristretto` | dark | Omarchy's Ristretto (see the licence note) |
+| `ethereal`, `hackerman`, `jade-horse`, `last-horizon`, `lumon`, `lupine`, `matte-black`, `miasma`, `retro-82`, `solitude`, `starship`, `vantablack`, `white` | one each | Omarchy's own themes |
 
-Each bundled file's first line names its source. Upstream licences are as far as I could tell from
-the projects; the colour values are facts, no code or artwork is copied.
+**Licences:** `assets/themes/NOTICES.md` holds the MIT notices (Omarchy, Catppuccin, Rosé Pine)
+and the upstream licence of every other palette. The Omarchy values were verified against
+`basecamp/omarchy@d76f364b41ccf01909b1d84ffcc6bd4fbb8cd91d`. Ristretto's upstream (Monokai Pro)
+is the one licence that is **not** verified; only Omarchy's colour values are used.
 
 ## What the theme drives
 

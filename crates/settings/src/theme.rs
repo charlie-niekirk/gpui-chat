@@ -31,7 +31,8 @@ pub enum ThemeVariant {
 }
 
 impl ThemeVariant {
-    fn key(self) -> &'static str {
+    /// `"dark"` / `"light"`, as written in theme files.
+    pub fn key(self) -> &'static str {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
@@ -113,6 +114,17 @@ impl Color {
         0.2126 * linear(self.r) + 0.7152 * linear(self.g) + 0.0722 * linear(self.b)
     }
 
+    /// `self` moved towards `towards` just far enough to reach `min` contrast against every
+    /// colour in `backgrounds` (unchanged when it already does; as far as `towards` itself when
+    /// it cannot).
+    pub fn with_contrast(self, towards: Self, backgrounds: &[Self], min: f32) -> Self {
+        let ok = |c: Self| backgrounds.iter().all(|bg| c.contrast(*bg) >= min);
+        (0..=20)
+            .map(|step| self.mix(towards, step as f32 * 0.05))
+            .find(|c| ok(*c))
+            .unwrap_or(towards)
+    }
+
     /// WCAG contrast ratio, 1 to 21.
     pub fn contrast(self, other: Self) -> f32 {
         let (a, b) = (self.luminance(), other.luminance());
@@ -147,11 +159,23 @@ pub struct Palette {
     pub accent_text: Color,
     /// Errors, the live dot.
     pub danger: Color,
+    /// `danger` as *text* (error messages, the LIVE label): moved towards `text` until it has
+    /// 4.5:1 on every surface it is drawn on (the backgrounds, and a danger tint over them).
+    pub danger_text: Color,
+    /// `accent` as *text* or a thin icon (links, stream category, reply strip), same rule.
+    pub accent_link: Color,
     /// Connected / healthy.
     pub success: Color,
     /// Connecting / reconnecting / caution.
     pub warning: Color,
 }
+
+/// Contrast the derived `danger_text` / `accent_link` reach on the surfaces they sit on.
+pub const TEXT_CONTRAST: f32 = 4.5;
+
+/// How strongly a status colour is tinted over a surface for a banner or strip (the app uses
+/// 0.12 to 0.18); text must stay readable on that tint too.
+const TINT: f32 = 0.18;
 
 /// Fallback status colours for a variant when a theme does not choose its own.
 struct StatusDefaults {
@@ -258,20 +282,41 @@ impl RawPalette {
             .or(window)
             .unwrap_or_else(|| background.mix(text, 0.04));
         let title_bar_color = title_bar.unwrap_or_else(|| background.mix(text, 0.08));
+        let window_color = window.unwrap_or(sidebar_color);
+        let border = color("border", &self.border)?.unwrap_or_else(|| background.mix(text, 0.16));
+        let surface = color("surface", &self.surface)?.unwrap_or(title_bar_color);
+        let danger = color("danger", &self.danger)?.unwrap_or(status.danger);
+        let surfaces = [
+            background,
+            window_color,
+            title_bar_color,
+            sidebar_color,
+            surface,
+        ];
+        let readable_on = |colour: Color| {
+            let mut backgrounds = Vec::with_capacity(surfaces.len() * 2);
+            for surface in surfaces {
+                backgrounds.push(surface);
+                backgrounds.push(surface.mix(colour, TINT));
+            }
+            colour.with_contrast(text, &backgrounds, TEXT_CONTRAST)
+        };
         Ok(Palette {
             background,
-            window: window.unwrap_or(sidebar_color),
+            window: window_color,
             title_bar: title_bar_color,
             sidebar: sidebar_color,
-            border: color("border", &self.border)?.unwrap_or_else(|| background.mix(text, 0.16)),
-            surface: color("surface", &self.surface)?.unwrap_or(title_bar_color),
+            border,
+            surface,
             text,
             text_muted: color("text_muted", &self.text_muted)?
                 .unwrap_or_else(|| muted_text(text, background)),
             accent,
             accent_text: color("accent_text", &self.accent_text)?
                 .unwrap_or_else(|| text_on(accent)),
-            danger: color("danger", &self.danger)?.unwrap_or(status.danger),
+            danger,
+            danger_text: readable_on(danger),
+            accent_link: readable_on(accent),
             success: color("success", &self.success)?.unwrap_or(status.success),
             warning: color("warning", &self.warning)?.unwrap_or(status.warning),
         })
@@ -331,6 +376,24 @@ pub enum ThemeError {
         source_name: String,
         field: String,
         reason: String,
+    },
+    /// Two files in `themes/` have the same id once normalised; `source_name` was ignored.
+    #[error(
+        "theme {source_name} is ignored: it has the same name as {kept} (`{id}`; case, spaces and `_` vs `-` do not count)"
+    )]
+    DuplicateId {
+        source_name: String,
+        kept: String,
+        id: String,
+    },
+    /// The theme loads, but its text is hard to read on its background.
+    #[error(
+        "theme {source_name}: the {variant} text on the background has only {ratio}:1 contrast (aim for 4.5:1 or more)"
+    )]
+    LowContrast {
+        source_name: String,
+        variant: &'static str,
+        ratio: String,
     },
 }
 

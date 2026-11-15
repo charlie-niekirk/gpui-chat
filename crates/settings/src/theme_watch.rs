@@ -136,4 +136,31 @@ mod tests {
         let report = rx.recv_timeout(WAIT).expect("theme removed");
         assert!(report.themes.is_empty() && report.errors.is_empty());
     }
+
+    #[test]
+    fn a_rename_style_save_is_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes = dir.path().join("themes");
+        let (tx, rx) = channel();
+        let _watcher = watch_themes(&themes, LoadReport::default(), opts(), move |report| {
+            let _ = tx.send(report);
+        })
+        .unwrap();
+
+        // What vim / VS Code do: write a sibling, then rename it over the theme.
+        let temp = themes.join("mine.toml.swp-new");
+        fs::write(&temp, GOOD).unwrap();
+        fs::rename(&temp, themes.join("mine.toml")).unwrap();
+        let report = rx.recv_timeout(WAIT).expect("theme created by rename");
+        assert_eq!(report.themes.len(), 1);
+
+        fs::write(&temp, GOOD.replace("#0f0", "#00f")).unwrap();
+        fs::rename(&temp, themes.join("mine.toml")).unwrap();
+        let report = rx.recv_timeout(WAIT).expect("theme replaced by rename");
+        assert_eq!(report.themes[0].dark.unwrap().accent.to_string(), "#0000ff");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "no stray events"
+        );
+    }
 }

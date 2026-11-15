@@ -138,7 +138,7 @@ impl Render for DebugHud {
 
         let budget_colour = |value: Duration| {
             if value > FRAME_BUDGET {
-                tokens.danger
+                tokens.danger_text
             } else {
                 tokens.text
             }
@@ -210,7 +210,7 @@ impl Render for DebugHud {
                     ms(frames.total_p99)
                 ),
                 if frames.over_budget > 0 {
-                    tokens.danger
+                    tokens.danger_text
                 } else {
                     tokens.text
                 },
@@ -245,7 +245,7 @@ impl Render for DebugHud {
                 "behind",
                 format!("{} msgs", counters.behind()),
                 if counters.behind() > 0 {
-                    tokens.danger
+                    tokens.danger_text
                 } else {
                     tokens.text
                 },
@@ -254,7 +254,7 @@ impl Render for DebugHud {
                 "parse",
                 format!("{} errors", counters.parse_errors()),
                 if counters.parse_errors() > 0 {
-                    tokens.danger
+                    tokens.danger_text
                 } else {
                     tokens.text
                 },
@@ -263,7 +263,7 @@ impl Render for DebugHud {
                 "dropped",
                 format!("{dropped} of {}", counters.sent() + dropped),
                 if dropped > 0 {
-                    tokens.danger
+                    tokens.danger_text
                 } else {
                     tokens.text
                 },
