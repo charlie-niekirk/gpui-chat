@@ -127,3 +127,5 @@ an entry here instead of expanding a PR. Format:
 - **Sidebar rows have no room for the title** (found in PR 3.5) — `SidebarMenuItem` rows are one fixed-height line, so the title is only in the tooltip of the dot/viewers part; a custom row element (or two-line rows) could show it.
 - **Followed-live is capped at 1 000 channels** (found in PR 3.5) — `get_followed_streams` reads at most 10 pages of 100.
 - **Poll failures are only logged** (found in PR 3.5) — `StreamSnapshot::error` is not shown anywhere; a faint "stream info unavailable" hint in the header would say why a live dot is stale.
+- **Duplicate Helix error-body parser** (found in PR 3.2 review) — `chat_send.rs` has its own `ErrorBody` parsing next to `helix.rs`'s `pub(crate) error_message`; reuse the helix one.
+- **Same channel listed under Open and Followed — live** (found in PR 3.5 check) — a followed live channel that is also open appears in both sidebar groups; consider hiding it from the followed group or marking it open.
