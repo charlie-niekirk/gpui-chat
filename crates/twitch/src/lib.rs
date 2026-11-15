@@ -11,6 +11,7 @@
 //!   rate limits); [`HelixClient::send_chat_message`] sends chat (PR 3.2).
 //! * [`streams`]: `Get Streams` / `Get Followed Streams` and the [`streams::StreamPoller`] behind
 //!   the live dot, the header stream info and the followed-live sidebar.
+//! * [`user_emotes`]: `Get User Emotes`, the Twitch emotes the logged-in user may use (PR 3.3).
 
 pub mod auth;
 mod chat_send;
@@ -19,6 +20,7 @@ pub mod helix;
 mod limits;
 mod parse;
 pub mod streams;
+pub mod user_emotes;
 
 pub use auth::Auth;
 pub use chat_send::{SEND_CHAT_PATH, SendError, SentMessage, echo_message};
@@ -28,6 +30,7 @@ pub use client::{
 pub use helix::{HelixClient, HelixError, HelixListError, HelixResponse};
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
+pub use user_emotes::UserEmote;
 
 #[cfg(test)]
 mod chat_tests;

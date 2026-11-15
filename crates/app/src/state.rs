@@ -50,6 +50,13 @@ pub struct SavedChannels {
     pub selected: Option<String>,
 }
 
+/// The emotes used last in the input box (PR 3.3), newest first, by the name that is typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedEmotes {
+    #[serde(default)]
+    pub recent: Vec<String>,
+}
+
 /// Contents of `state.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
@@ -57,6 +64,8 @@ pub struct AppState {
     pub window: Option<WindowPlacement>,
     #[serde(default)]
     pub channels: Option<SavedChannels>,
+    #[serde(default)]
+    pub emotes: Option<SavedEmotes>,
 }
 
 /// A connected display as far as restore logic cares.
@@ -154,6 +163,7 @@ pub fn load_from(path: &Path) -> AppState {
         Ok(table) => AppState {
             window: section(&table, "window"),
             channels: section(&table, "channels"),
+            emotes: section(&table, "emotes"),
         },
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "ignoring corrupt state file");
@@ -238,6 +248,12 @@ pub fn save_channels(channels: SavedChannels) {
     update_section("channels", &channels);
 }
 
+/// Best-effort save of the recent emotes; same rules as [`save_window`].
+#[cfg_attr(test, allow(dead_code))] // tests do not write the real state file
+pub fn save_emotes(emotes: SavedEmotes) {
+    update_section("emotes", &emotes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +276,12 @@ mod tests {
         SavedChannels {
             open: vec!["forsen".into(), "xqc".into(), "a_b".into()],
             selected: Some("xqc".into()),
+        }
+    }
+
+    fn emotes() -> SavedEmotes {
+        SavedEmotes {
+            recent: vec!["Kappa".into(), "monkaW".into()],
         }
     }
 
@@ -288,6 +310,7 @@ mod tests {
                 ..placement()
             }),
             channels: Some(channels()),
+            emotes: Some(emotes()),
         };
         assert_eq!(AppState::parse(&state.render()).unwrap(), state);
     }
@@ -306,6 +329,7 @@ mod tests {
         let state = AppState {
             window: Some(placement()),
             channels: Some(channels()),
+            emotes: Some(emotes()),
         };
         save_to(&path, &state).unwrap();
         assert_eq!(load_from(&path), state);
@@ -319,12 +343,29 @@ mod tests {
         let text = AppState {
             window: None,
             channels: Some(channels()),
+            emotes: None,
         }
         .render();
         assert!(text.contains("[channels]"), "{text}");
         assert!(text.contains(r#"selected = "xqc""#), "{text}");
         let parsed = AppState::parse(&text).unwrap();
         assert_eq!(parsed.channels.unwrap().open, ["forsen", "xqc", "a_b"]);
+    }
+
+    #[test]
+    fn recent_emotes_are_a_list_of_names() {
+        let text = AppState {
+            emotes: Some(emotes()),
+            ..AppState::default()
+        }
+        .render();
+        assert!(text.contains("[emotes]"), "{text}");
+        assert_eq!(
+            AppState::parse(&text).unwrap().emotes.unwrap().recent,
+            ["Kappa", "monkaW"]
+        );
+        // A file from before the section existed, or with a bad one, has none.
+        assert_eq!(AppState::parse("").unwrap().emotes, None);
     }
 
     #[test]
@@ -350,12 +391,19 @@ mod tests {
     }
 
     #[test]
-    fn updating_one_section_keeps_the_other() {
+    fn updating_one_section_keeps_the_others() {
         let (path, dir) = temp_state("update");
         update_at(&path, "window", value(&placement()));
         update_at(&path, "channels", value(&channels()));
+        update_at(&path, "emotes", value(&emotes()));
         let state = load_from(&path);
         assert_eq!(state.window, Some(placement()));
+        assert_eq!(state.channels, Some(channels()));
+        assert_eq!(state.emotes, Some(emotes()));
+        // Saving the recents again replaces only them.
+        update_at(&path, "emotes", value(&SavedEmotes { recent: vec![] }));
+        let state = load_from(&path);
+        assert_eq!(state.emotes, Some(SavedEmotes::default()));
         assert_eq!(state.channels, Some(channels()));
         let _ = std::fs::remove_dir_all(&dir);
     }
