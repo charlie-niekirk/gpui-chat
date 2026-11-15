@@ -251,19 +251,16 @@ fn main() {
                 let appearance = config::current(cx).appearance.clone();
                 theme::apply_settings(&appearance, Some(window), cx);
                 // Settings changes reach the UI through the bridge: the watcher thread sends,
-                // and the store is updated once per frame on the main thread.
+                // and the store is updated on the main thread without waiting for a frame (the
+                // settings window must follow the file while the main window is hidden).
                 if let Some(events) = settings_events {
-                    bridge::attach(
-                        &config::store(cx),
-                        window.window_handle(),
-                        events,
-                        cx,
-                        |store, events, _| store.apply_events(events),
-                    )
+                    bridge::attach_unframed(&config::store(cx), events, cx, |store, events, _| {
+                        store.apply_events(events)
+                    })
                     .detach();
                 }
                 if let Some(events) = theme_events {
-                    theme::attach_reloads(events, window.window_handle(), cx);
+                    theme::attach_reloads(events, cx);
                 }
                 let parts = start_chat(&cli, replay_log.clone(), window, cx);
                 cx.new(|cx| AppShell::new(window, parts, cx))

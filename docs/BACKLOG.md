@@ -159,3 +159,4 @@ an entry here instead of expanding a PR. Format:
 - **Settings window position and size are not remembered** (found in PR 4.2) — it opens centred at 880×640 each time; `state.toml` could hold it like the main window's.
 - **Settings search covers titles and descriptions only** (found in PR 4.2) — Kit's `Settings` matches `SettingItem` title, description and `.keywords(..)`; add keywords (e.g. "ttv", "bttv", "ffz", "scale", "dark") per item.
 - **Settings window is untested off macOS** (found in PR 4.2) — the Linux CI job excludes the app; `⌃,` and the menu item are wired in `platform/other.rs` but never run.
+- **Two sign-in sheets can be open at once** (found in PR 4.2 review) — Log in from the settings window and from the main window each open a `sign_in` sheet over the same `AccountHub`; the second `begin_sign_in` cancels the first flow. The hub needs an in-progress flag (and the second entry point should show the running sheet or be disabled).

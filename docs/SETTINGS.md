@@ -99,6 +99,21 @@ values) and shows a refused change next to the control or in the banner. Edits m
 is open elsewhere are a read-modify-write: an editor saving in the few milliseconds between our
 read and rename is overwritten by our (otherwise identical) text.
 
+Known limits of the in-place edit:
+
+- A value is rewritten as a whole, so comments **inside** a multi-line array
+  (`streamlink.extra_args = [ ... ]`) are lost when that array is changed. A
+  comment after the closing `]` on the same line stays.
+- A comment at the very end of the file belongs to the last table; when an edit
+  adds a new section (`[emotes]`, say) it is written after the existing text, so
+  that trailing comment ends up above the new section instead of at the end.
+- A whole number replacing an integer literal (or a new key) is written as an
+  integer (`font_size = 16`), a float literal stays a float (`14.0`).
+- Text typed into a field of the settings window is committed when the field loses
+  focus or Enter is pressed (stepping a number commits at once); closing the
+  window (button or ⌘W) and quitting commit what is still being typed. A refused
+  value (out of range, or the file is invalid) is not saved and not kept.
+
 `appearance.theme`, `theme_name` and `theme_name_light` are written as plain strings; the theme list
 is `theme::choices` (bundled pack plus `themes/`), and "Same as Theme" for the light theme removes
 `theme_name_light`.
@@ -126,7 +141,7 @@ let settings = config::current(cx);     // &Settings in effect
 ```
 
 The watcher's callback pushes each `SettingsEvent` into a bounded `bridge` channel; the bridge
-applies the events to the store on the UI thread, once per frame, with one notify per batch. The
+applies the events to the store on the UI thread (a foreground task, not a frame callback, so it works while the main window is minimised), with one notify per batch. The
 app shell observes the store and calls `theme::apply_settings`, so **font family, font size and
 theme (`system` / `light` / `dark`) change live** when the file is edited. A file that fails to
 load keeps the previous settings in effect and shows a banner with the file path and the parse

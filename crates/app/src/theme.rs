@@ -167,7 +167,7 @@ fn system_variant(window: Option<&Window>, cx: &App) -> ThemeVariant {
 }
 
 /// Loads the user's `themes/` directory and starts watching it. Call once at startup, before
-/// [`apply_settings`]. Returns the receiver to hand to [`attach_reloads`] once a window exists,
+/// [`apply_settings`]. Returns the receiver to hand to [`attach_reloads`],
 /// or `None` when the directory cannot be watched (no home directory, or the watcher could not
 /// start; logged, and the themes found at startup still work).
 pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
@@ -295,13 +295,11 @@ impl Global for ThemeReloadsHandle {}
 /// Connects the themes-directory watcher to the UI: when a theme file is added, edited or
 /// removed, the registry is replaced and the active theme re-applied, so editing the theme
 /// that is in use recolours the app live.
-pub fn attach_reloads(
-    receiver: BridgeReceiver<LoadReport>,
-    window: gpui_kit::AnyWindowHandle,
-    cx: &mut App,
-) {
+pub fn attach_reloads(receiver: BridgeReceiver<LoadReport>, cx: &mut App) {
     let entity: Entity<ThemeReloads> = cx.new(|_| ThemeReloads);
-    bridge::attach(&entity, window, receiver, cx, |_, reports, cx| {
+    // Not tied to a window's frames: the settings window must see a theme change while the main
+    // window is minimised.
+    bridge::attach_unframed(&entity, receiver, cx, |_, reports, cx| {
         let Some(report) = reports.into_iter().last() else {
             return false;
         };

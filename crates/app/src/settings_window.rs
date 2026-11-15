@@ -48,6 +48,19 @@ struct OpenWindow(AnyWindowHandle);
 
 impl Global for OpenWindow {}
 
+/// The settings view of the open window, so a write that has no handle to it (a page's reset
+/// button) can still put a refusal in the banner.
+struct ActiveView(WeakEntity<SettingsView>);
+
+impl Global for ActiveView {}
+
+/// Writes `edits` for the open settings window (see [`SettingsView::write`]).
+pub fn write(edits: Vec<SettingEdit>, cx: &mut App) {
+    if let Some(view) = cx.try_global::<ActiveView>().map(|view| view.0.clone()) {
+        SettingsView::write(&view, edits, cx);
+    }
+}
+
 /// Opens the settings window, or brings the open one to the front.
 pub fn open(cx: &mut App) {
     if let Some(handle) = cx.try_global::<OpenWindow>().map(|open| open.0) {
@@ -99,6 +112,14 @@ impl SettingsView {
         window.set_window_title("Settings");
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let this = cx.entity().downgrade();
+        cx.set_global(ActiveView(this));
+        // Text typed into a field but not yet committed is committed when the window closes
+        // (the close button) or the app quits; ⌘W does the same in its action handler.
+        window.on_window_should_close(cx, |_, cx| {
+            fields::flush_all(cx);
+            true
+        });
         let mut subscriptions = vec![
             cx.observe(&config::store(cx), |this, _, cx| {
                 this.edit_error = None;
@@ -108,6 +129,10 @@ impl SettingsView {
             // added or removed re-applies the theme too, which refreshes the theme list.
             cx.observe_global::<Tokens>(|_, cx| cx.notify()),
             cx.observe_global::<FontConfig>(|_, cx| cx.notify()),
+            cx.on_app_quit(|_, cx| {
+                fields::flush_all(cx);
+                async {}
+            }),
         ];
         if let Some(hub) = account::current(cx) {
             subscriptions.push(cx.observe(&hub, |_, _, cx| cx.notify()));
@@ -204,7 +229,10 @@ impl Render for SettingsView {
         v_flex()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, cx| {
+                fields::flush_all(cx);
+                window.remove_window();
+            }))
             .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
             // ⌘, inside the settings window: it is already open, so just keep it in front.
             .on_action(cx.listener(|_, _: &OpenSettings, window, _| window.activate_window()))
@@ -270,7 +298,7 @@ fn current(cx: &App) -> &Settings {
     config::current(cx)
 }
 
-/// A float setting as the user types it (`1.4`, not the `f64` widening of the `f32`).
+/// A field's page-reset hook: dirty when the setting differs from its default.
 fn reset<T: PartialEq + 'static>(field: &'static str, get: fn(&Settings) -> T) -> Reset {
     Reset {
         field,
@@ -278,6 +306,7 @@ fn reset<T: PartialEq + 'static>(field: &'static str, get: fn(&Settings) -> T) -
     }
 }
 
+/// A float setting as the user types it (`1.4`, not the `f64` widening of the `f32`).
 fn float_text(value: f32) -> String {
     value.to_string()
 }
@@ -804,7 +833,7 @@ mod tests {
     #[test]
     fn a_refusal_names_the_setting_and_the_reason_not_the_path() {
         let invalid = SettingsError::Invalid {
-            path: PathBuf::from("/home/me/.config/gpui-chat/settings.toml"),
+            path: PathBuf::from("/config/settings.toml"),
             field: "appearance.font_size",
             reason: "500 is outside 6 to 72".into(),
         };

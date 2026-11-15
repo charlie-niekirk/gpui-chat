@@ -115,10 +115,7 @@ pub fn current(cx: &App) -> &Settings {
 /// the error says what to fix. Does blocking file I/O on the calling thread; the file is tiny.
 pub fn edit(edits: &[gpui_chat_settings::SettingEdit], cx: &mut App) -> Result<(), SettingsError> {
     let Some(file) = cx.try_global::<SettingsFile>() else {
-        return Err(SettingsError::Watch {
-            path: PathBuf::new(),
-            message: "there is no settings location (no home directory)".to_owned(),
-        });
+        return Err(SettingsError::NoLocation);
     };
     let settings = Settings::update_file(&file.0, edits)?;
     let store = store(cx);
@@ -180,7 +177,7 @@ pub fn install_for_test(settings: Settings, cx: &mut App) -> Entity<SettingsStor
 
 /// Loads `settings.toml`, stores the settings as a global and starts watching the file.
 ///
-/// Returns the receiver the caller must [`bridge::attach`] to the [`store`] once a window
+/// Returns the receiver the caller must [`bridge::attach_unframed`] to the [`store`] once the app
 /// exists (events queue up until then), or `None` when the file is not being watched (no home
 /// directory, or the watcher could not start; both are logged and the app carries on with
 /// what it has).

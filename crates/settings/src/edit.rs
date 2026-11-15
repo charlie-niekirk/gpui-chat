@@ -148,6 +148,18 @@ fn apply_one(doc: &mut DocumentMut, path: &Path, edit: &SettingEdit) -> Result<(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_like_mut()
         .ok_or_else(|| wrong_shape(&format!("`{section}` is not a table")))?;
+    // A whole number is written as an integer (`font_size = 16`) unless the value already there
+    // is a float literal (`14.0`): the file keeps the style its author used.
+    let existing_is_float = table
+        .get(key)
+        .and_then(Item::as_value)
+        .is_some_and(Value::is_float);
+    let value = match value {
+        EditValue::Float(v) if v.fract() == 0.0 && v.abs() < 1e15 && !existing_is_float => {
+            EditValue::Int(v as i64)
+        }
+        other => other,
+    };
     let mut new = value.into_toml();
     match table.get_mut(key) {
         Some(item) => {
@@ -274,7 +286,7 @@ x = 1
 
     #[test]
     fn a_float_is_written_the_way_it_is_typed() {
-        for (value, text) in [(1.4_f32, "1.4"), (0.7, "0.7"), (3.0, "3.0"), (2.35, "2.35")] {
+        for (value, text) in [(1.4_f32, "1.4"), (0.7, "0.7"), (3.5, "3.5"), (2.35, "2.35")] {
             let (out, _) = edit(
                 "",
                 &[SettingEdit::set("emotes.scale", EditValue::float(value))],
@@ -284,16 +296,31 @@ x = 1
     }
 
     #[test]
-    fn an_integer_where_a_float_is_wanted_is_replaced() {
-        let (out, settings) = edit(
-            "[appearance]\nfont_size = 14\n",
-            &[SettingEdit::set(
-                "appearance.font_size",
-                EditValue::float(15.0),
-            )],
+    fn a_whole_number_keeps_the_style_of_the_literal_it_replaces() {
+        let set = |text: &str, v: f32| {
+            edit(
+                text,
+                &[SettingEdit::set(
+                    "appearance.font_size",
+                    EditValue::float(v),
+                )],
+            )
+        };
+        // An integer literal stays an integer, and so does a new key.
+        let (out, settings) = set("[appearance]\nfont_size = 14\n", 16.0);
+        assert_eq!(out, "[appearance]\nfont_size = 16\n");
+        assert_eq!(settings.appearance.font_size, 16.0);
+        assert_eq!(set("", 16.0).0, "[appearance]\nfont_size = 16\n");
+        // A float literal stays a float.
+        assert_eq!(
+            set("[appearance]\nfont_size = 14.0 # pt\n", 16.0).0,
+            "[appearance]\nfont_size = 16.0 # pt\n"
         );
-        assert_eq!(out, "[appearance]\nfont_size = 15.0\n");
-        assert_eq!(settings.appearance.font_size, 15.0);
+        // A fraction is a float whatever was there.
+        assert_eq!(
+            set("[appearance]\nfont_size = 14\n", 14.5).0,
+            "[appearance]\nfont_size = 14.5\n"
+        );
     }
 
     #[test]
@@ -377,7 +404,7 @@ x = 1
             )],
         );
         assert_eq!(settings.appearance.font_size, 16.0);
-        assert!(out.contains("font_size = 16.0 # too big"), "{out}");
+        assert!(out.contains("font_size = 16 # too big"), "{out}");
     }
 
     #[test]
