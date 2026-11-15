@@ -373,6 +373,17 @@ impl Composer {
         cx.notify();
     }
 
+    /// Gives the input box keyboard focus (creating it if it was never drawn); `false` when it
+    /// cannot take text (logged out), and so is left alone.
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.mode(cx).can_send() {
+            return false;
+        }
+        let input = self.input(window, cx);
+        input.update(cx, |input, cx| input.focus(window, cx));
+        true
+    }
+
     /// Reply was chosen on `parent` in the chat above: start it on the next render.
     pub fn queue_reply(&mut self, parent: Arc<Message>, cx: &mut Context<Self>) {
         self.queued_reply = Some(parent);

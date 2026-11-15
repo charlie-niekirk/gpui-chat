@@ -5,9 +5,10 @@ use gpui_kit::{KeyBinding, Menu};
 
 use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
 use crate::actions::{
-    AddChannel, COMPOSER_CONTEXT, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    Quit, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
-    ToggleSidebar,
+    AddChannel, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft,
+    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
+    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
+    ToggleDebugHud, ToggleSidebar,
 };
 use crate::completion::ComposerToggleEmotePicker;
 
@@ -30,6 +31,14 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-down", MoveChannelDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-shift-]", SelectNextChannel, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-shift-[", SelectPreviousChannel, Some(SHELL_CONTEXT)),
+        // Split panes (PR 4.1).
+        KeyBinding::new("ctrl-d", SplitRight, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-alt-shift-d", SplitDown, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-shift-w", ClosePane, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-alt-shift-left", FocusPaneLeft, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-alt-shift-right", FocusPaneRight, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-alt-shift-up", FocusPaneUp, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-alt-shift-down", FocusPaneDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-e", ComposerToggleEmotePicker, Some(COMPOSER_CONTEXT)),
     ]
 }

@@ -22,7 +22,14 @@ actions!(
         LogIn,
         LogOut,
         ComposerHistoryPrevious,
-        ComposerHistoryNext
+        ComposerHistoryNext,
+        SplitRight,
+        SplitDown,
+        ClosePane,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown
     ]
 );
 

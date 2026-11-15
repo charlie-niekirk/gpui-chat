@@ -5,9 +5,10 @@
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
-    About, AddChannel, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious, LogIn, LogOut,
-    MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit, ReloadEmotes, RemoveChannel,
-    SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
+    About, AddChannel, ClosePane, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious,
+    FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow,
+    MoveChannelDown, MoveChannelUp, Quit, ReloadEmotes, RemoveChannel, SelectNextChannel,
+    SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 
 pub mod keychain;
@@ -52,6 +53,15 @@ fn view_menu() -> Menu {
     Menu::new("View").items([
         MenuItem::action("Toggle Sidebar", ToggleSidebar),
         MenuItem::action("Toggle Debug HUD", ToggleDebugHud),
+        MenuItem::separator(),
+        MenuItem::action("Split Right", SplitRight),
+        MenuItem::action("Split Down", SplitDown),
+        MenuItem::action("Close Pane", ClosePane),
+        MenuItem::separator(),
+        MenuItem::action("Focus Pane Left", FocusPaneLeft),
+        MenuItem::action("Focus Pane Right", FocusPaneRight),
+        MenuItem::action("Focus Pane Above", FocusPaneUp),
+        MenuItem::action("Focus Pane Below", FocusPaneDown),
     ])
 }
 
