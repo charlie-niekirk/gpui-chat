@@ -9,6 +9,8 @@
 //!   owner of the tokens (refresh, validation, logout).
 //! * [`helix`]: [`HelixClient`], authenticated Helix GETs and JSON POSTs (refresh-and-retry on 401,
 //!   rate limits); [`HelixClient::send_chat_message`] sends chat (PR 3.2).
+//! * [`streams`]: `Get Streams` / `Get Followed Streams` and the [`streams::StreamPoller`] behind
+//!   the live dot, the header stream info and the followed-live sidebar.
 
 pub mod auth;
 mod chat_send;
@@ -16,13 +18,14 @@ mod client;
 pub mod helix;
 mod limits;
 mod parse;
+pub mod streams;
 
 pub use auth::Auth;
 pub use chat_send::{SEND_CHAT_PATH, SendError, SentMessage, echo_message};
 pub use client::{
     ClientConfig, Credentials, CredentialsProvider, TwitchClient, irc_login, settled_state,
 };
-pub use helix::{HelixClient, HelixError, HelixResponse};
+pub use helix::{HelixClient, HelixError, HelixListError, HelixResponse};
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
 

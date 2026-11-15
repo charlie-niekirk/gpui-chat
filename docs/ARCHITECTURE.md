@@ -155,7 +155,7 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `AuthState`) disables the box with its placeholder and a *Log in* button when logged out, still restoring, or
   when the login lacks `user:write:chat`.
 - `live.rs` (PR 3.2 additions) — with an account, the client gets a `CredentialsProvider` (below) and
-  `reconnect_on_login_change` calls `TwitchClient::reconnect` whenever the account IRC should use changes (login,
+  `follow_login` calls `TwitchClient::reconnect` whenever the account IRC should use changes (login,
   logout, another user), after the stored login was read. `LiveSource::send` posts through
   `HelixClient::send_chat_message` on the backend runtime, returns the outcome on a `oneshot`, and on success feeds
   the *echo* (`gpui_chat_twitch::echo_message`: the text tokenized, the id Twitch returned, `EmoteService::process`
@@ -165,6 +165,18 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   message shows once whichever arrives first. `follow_login` compares the account IRC should use with the login
   the provider *actually connected as* (`ConnectedAs`), so a first connection that went anonymous because the
   keychain was slow is corrected when the login arrives.
+- `stream_info.rs` (PR 3.5) — `StreamInfoHub` (GPUI entity, live source only, created by the shell next to the
+  `AccountHub`) mirrors the snapshots of `gpui_chat_twitch::streams::StreamPoller` (see *Stream state* below)
+  and answers `liveness(channel)` (`Unknown` / `Offline` / `Live(info)`) and `followed_live()`. The shell calls
+  `set_channels` with the open channels on every list edit. The pane header shows a LIVE / Offline marker after
+  the channel name and, while live, a second line: title (tooltip: full title and category), category, viewers
+  and uptime; sidebar rows of live channels get a red dot and a compact viewer count (tooltip: title, category,
+  viewers, uptime). A second sidebar group, *Followed — live*, lists the followed channels that are live
+  (category, dot, viewers); clicking one adds (if needed) and selects the channel, like ⌘N. The group is
+  hidden while the list is unknown (logged out, login without `user:read:follows`). Uptime and viewers refresh
+  with each poll (every minute). Logged out, nothing is polled and the header/sidebar show no stream state.
+  `GPUI_CHAT_DEMO_STREAMS=1` with `--firehose` / `--replay` fakes the data (no network, no login) so the UI can
+  be looked at and screenshotted offline.
 - `state.rs` — `state.toml` in `<config dir>/<APP_NAME>/` with the last window placement
   (validated against connected displays on restore) and `[channels]` (`open` in sidebar order,
   `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
@@ -456,6 +468,22 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   shows the message itself (flagged `echo`), as the account whose token made the request (`SentMessage` carries
   its login and user id), under the id Twitch returned; Twitch's own copy, if it comes, replaces it, and any other
   second chat line with that id is ignored.
+
+### Stream state (`crates/twitch`, PR 3.5)
+
+- **`helix::HelixClient::get_all`** — GET a list endpoint and follow `pagination.cursor` (`after=`, percent-encoded)
+  until it ends (a repeated or empty cursor also ends it; `max_pages` bounds it). Non-2xx is
+  `HelixListError::Status` with Twitch's `message` (`is_missing_scope()` for a 401 about a scope).
+- **`streams::get_streams`** — `Get Streams` for any number of logins, `user_login=` ×100 per request (Helix's
+  limit), duplicates dropped; offline channels are simply absent, other types are ignored (an empty `type` counts as live); the followed list is de-duplicated by channel.
+  **`get_followed_streams`** — `Get Followed Streams` for the logged-in user, 100 per page, up to 10 pages.
+- **`streams::StreamPoller`** — one task on the backend runtime. Each cycle polls the watched channels (the open
+  ones) and, when the login has `user:read:follows`, the followed list, and publishes a `StreamSnapshot` (`live`,
+  `checked` — to tell "offline" from "not polled yet" —, `followed`, `error`) on a `watch` channel. Interval 60 s
+  (Helix caches stream data about that long); each of the two calls has its own schedule, so one that keeps
+  failing doubles to a 5 min cap alone (the last good data stays, `error` set) while the other keeps its interval; a change of the watched set (compared as a set: reordering is none) polls the open channels after a 500 ms settle, a login change polls at once,
+  logged out it publishes an empty snapshot and sleeps. A 401 refreshes through `Auth` (the HelixClient's
+  retry), so an expired token costs no poll. Dropping the poller stops it.
 
 ### Streamlink (`crates/streamlink`, PR 1.6)
 
