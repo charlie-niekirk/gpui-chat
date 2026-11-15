@@ -117,3 +117,8 @@ an entry here instead of expanding a PR. Format:
 - **Sign-in poll outlives the closing sheet briefly** (found in PR 3.1 review) — the sheet cancels in `on_release`, which runs after the dialog's exit transition, so a poll can still go out meanwhile; cancel on close (`on_cancel` / `on_close`) as well.
 - **Logout revokes only the access token** (found in PR 3.1 review) — the refresh token is forgotten locally but not revoked at Twitch.
 - **Dialogs have no backdrop** (found in PR 3.1 check) — the login sheet sits over the empty-state heading with no dimming, so the heading peeks out under the dialog edge; add a scrim behind modal dialogs.
+- **Stream state by EventSub instead of polling** (found in PR 3.5) — `stream.online` / `stream.offline` (and `channel.update` for title/category) would make the header update at once and cost no requests; the 60 s poll is the simple version.
+- **Uptime does not tick between polls** (found in PR 3.5) — the header's uptime and viewer count are redrawn on each poll (every minute) and whenever something else redraws the pane; a once-a-minute timer while a pane is live would keep it exact.
+- **Sidebar rows have no room for the title** (found in PR 3.5) — `SidebarMenuItem` rows are one fixed-height line, so the title is only in the tooltip of the dot/viewers part; a custom row element (or two-line rows) could show it.
+- **Followed-live is capped at 1 000 channels** (found in PR 3.5) — `get_followed_streams` reads at most 10 pages of 100.
+- **Poll failures are only logged** (found in PR 3.5) — `StreamSnapshot::error` is not shown anywhere; a faint "stream info unavailable" hint in the header would say why a live dot is stale.
