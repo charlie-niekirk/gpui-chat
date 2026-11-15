@@ -103,7 +103,8 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   text with span roles), `flow` (line wrapping and hit-testing, pure), `layout` (shaping into
   grapheme atoms, per-message layout cache), `colors` (fallback and readability-adjusted username
   colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
-  (`ChatView`: list, follow-bottom, "new messages" pill, live settings).
+  (`ChatView`: list, follow-bottom, "new messages" pill, live settings), `row` (reply button and
+  context menu around a message, PR 3.4), `thread` (the thread popover, PR 3.4).
 - `streams.rs` (PR 1.6) — `StreamHub`, a GPUI entity created by the shell: owns the `Streams` tracker from
   `crates/streamlink`, turns its events (from worker threads, through a bridge channel) into a per-channel
   `StreamStates` (`Starting` → `Running` → `Stopping`, or `Ended` with the error until dismissed; events
@@ -154,6 +155,7 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   the box and the text comes back (unless the user typed something new; ↑ finds it anyway). `Mode` (from the
   `AuthState`) disables the box with its placeholder and a *Log in* button when logged out, still restoring, or
   when the login lacks `user:write:chat`.
+  PR 3.4 adds *reply mode* (see `reply.rs`, `chat/row.rs` and *Replies and threads* below).
 - `live.rs` (PR 3.2 additions) — with an account, the client gets a `CredentialsProvider` (below) and
   `follow_login` calls `TwitchClient::reconnect` whenever the account IRC should use changes (login,
   logout, another user), after the stored login was read. `LiveSource::send` posts through
@@ -215,6 +217,49 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore
   normalises every saved login (`Forsen`, `#forsen` still restore) and drops invalid or duplicate ones
   and a stale selection.
+
+### Replies and threads (PR 3.4)
+
+- **Data.** `parse_line` already turned the `reply-parent-*` / `reply-thread-parent-*` tags into `Message::reply`
+  (`ReplyRef`: parent id, login, display name, body, thread root). PR 3.4 adds `ReplyRef::root_id()` (the thread
+  parent, or the parent when no root is tagged), `ReplyRef::to(&parent)` (the reference a reply to `parent` carries,
+  used for the echo), `Message::thread_root()` and `MessageStore::thread(root_id)` (the root if retained, then every
+  retained message whose reply names that root; a scan, called only for the thread being looked at).
+- **Context line.** A reply is drawn with a smaller, muted line above it, `↳ Replying to Name: parent text`,
+  cut with `…` to the width. It is **not** part of the flowed display text: `ShapedMessage::reply` holds a second,
+  single-line shaping (`ReplyLine`: atoms cut by the same `cut_atoms` as the message, one trailing `…` atom), made
+  with the message in `shape` (so it follows font/size changes through the layout key). Cutting depends on the width
+  and is done at paint time (`ReplyLine::fit`), so the cache's flow level (a resize) never re-shapes it. The row's
+  height is `MessageLayout::height()` = reply line + flowed text; `MessageElement` measures with that, offsets the
+  text origin by `reply_height()` (emote boxes, tooltips and underlines follow) and gives the line its own hit area:
+  pointing hand, text colour on hover, click → `MessageStyle::on_open_thread` with the thread root.
+  The thread popover's own style sets `reply_line: false` (and no click handler).
+  **The leading mention is not drawn.** Twitch's copy of a reply starts with `@<parent login> `; the context line
+  already says who is replied to, so `display::body_fragments` leaves out one leading `Mention` of the reply's parent
+  login (any capitalisation) and one space after it, when something else remains (a reply that is only the mention
+  keeps it). Display only: `Message::fragments`, `plain_text()` and the raw tags are untouched, so copy and other text
+  actions (PR 5.6) can still have the full text. The local echo carries no mention, so it and Twitch's copy that
+  replaces it draw the same.
+- **Reply action.** `chat/row.rs` wraps rows that can be replied to (`reply::can_reply_to`: chat or `/me` lines by a
+  user, not deleted; only when the pane has a composer): rows report whether the pointer is over them
+  (`MessageStyle::hovered_row`), and only that row is wrapped in a `div` with a Reply button; one right-click menu
+  around the list (and one around the thread popover) resolves the hovered row when it opens (*Reply*, *View thread*,
+  disabled when the message is neither a reply nor replied to). `ChatView` emits
+  `ChatViewEvent::ReplyRequested(message)`; `ChannelPane` hands it to `Composer::queue_reply`, which the next render
+  turns into `start_reply` (it needs the window).
+- **Reply mode** (`reply::ReplyTarget`, pure; `composer.rs`). A strip above the box names the parent (`Replying to
+  Name: text`, cancel button, Esc); the box is left as it is, **without** an `@name`: Twitch puts `@parent ` in front
+  of a reply sent with `reply_parent_message_id` itself (a prefilled mention came out doubled in the live check).
+  Esc is one chain with the completion list (close the list, else cancel the reply, else propagate). Enter sends with `SendRequest::reply`: `LiveSource::post` passes its parent id to
+  `HelixClient::send_chat_message` (`reply_parent_message_id`) and puts the same `ReplyRef` on the echo, so the
+  context line shows at once and Twitch's own copy replaces it as before. Reply mode ends with the send; a failed send
+  restores it with the text. Cancelling leaves the text alone.
+- **Thread popover** (`chat/thread.rs`). Opened by a context line or *View thread*; a panel at the top right of the
+  chat (`ChatView::thread`) with the root message and the replies the store still holds (newest 200), read from the
+  store on every render so new replies appear. Its rows are ordinary `MessageElement`s with a `LayoutCache` and hover
+  state of their own (same message, other width); the caches follow evictions, generation changes and image
+  invalidations together (`ChatView::caches`). A root that left the store is introduced by the reply tags (author and,
+  for a direct reply, the text).
 
 ### Domain model (`crates/core`)
 

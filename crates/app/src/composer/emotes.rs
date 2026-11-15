@@ -157,6 +157,11 @@ impl Composer {
         self.move_completion(-1, cx)
     }
 
+    /// Whether a completion list is open (Esc closes it before it cancels a reply).
+    pub(super) fn completion_is_open(&self) -> bool {
+        self.completion.is_open()
+    }
+
     /// Esc. `false` when there is no list: the key then falls through (to the input's own Escape,
     /// or a parent's such as cancelling a reply).
     pub(super) fn dismiss_completion(&mut self, cx: &mut Context<Self>) -> bool {
@@ -404,6 +409,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::composer::Escape;
 
     /// The composer's key wiring without its backend: the same context, the same actions, the same
     /// "act only when there is a list, else propagate" rule as `Composer::render`, around a real
@@ -412,6 +418,8 @@ mod tests {
         input: Entity<InputState>,
         log: Rc<RefCell<Vec<&'static str>>>,
         list_open: bool,
+        /// Reply mode (PR 3.4): the box is replying to a message.
+        replying: bool,
     }
 
     impl Render for Probe {
@@ -429,7 +437,26 @@ mod tests {
                     cx,
                     "complete-previous",
                 ))
-                .on_action(acts_typed::<ComposerCompletionDismiss>(cx, "dismiss"))
+                // Esc exactly as `Composer::render` routes it (`Escape::of`).
+                .on_action(cx.listener(
+                    |this, _: &ComposerCompletionDismiss, _, cx| match Escape::of(
+                        this.list_open,
+                        this.replying,
+                    ) {
+                        Escape::CloseList => {
+                            this.log.borrow_mut().push("close-list");
+                            this.list_open = false;
+                        }
+                        Escape::CancelReply => {
+                            this.log.borrow_mut().push("cancel-reply");
+                            this.replying = false;
+                        }
+                        Escape::Pass => {
+                            this.log.borrow_mut().push("dismiss");
+                            cx.propagate();
+                        }
+                    },
+                ))
                 .child(Input::new(&self.input))
         }
     }
@@ -466,6 +493,7 @@ mod tests {
                 input,
                 log: shared,
                 list_open: false,
+                replying: false,
             }
         });
         cx.run_until_parked();
@@ -482,7 +510,7 @@ mod tests {
             [
                 "complete",
                 "complete-previous",
-                "dismiss",
+                "close-list",
                 "history-previous",
                 "history-next"
             ]
@@ -505,7 +533,38 @@ mod tests {
         // No list: the action propagates and the input's own Escape (clean on escape) runs.
         probe.update(cx, |p, _| p.list_open = false);
         cx.simulate_keystrokes("escape");
-        assert_eq!(*log.borrow(), ["dismiss", "dismiss"]);
+        assert_eq!(*log.borrow(), ["close-list", "dismiss"]);
         assert_eq!(text(cx), "", "the input saw the Escape");
+    }
+
+    #[gpui_kit::test]
+    fn escape_closes_the_list_then_cancels_the_reply_then_falls_through(cx: &mut TestAppContext) {
+        let (probe, log, cx) = probe(cx);
+        cx.simulate_input("@Bob hi");
+        let text =
+            |cx: &mut VisualTestContext| probe.read_with(cx, |p, cx| p.input.read(cx).value());
+        probe.update(cx, |p, _| {
+            p.list_open = true;
+            p.replying = true;
+        });
+        // First Esc: the list, and the reply stays.
+        cx.simulate_keystrokes("escape");
+        assert!(probe.read_with(cx, |p, _| p.replying && !p.list_open));
+        // Second: the reply. The text is left alone (the input never saw this Esc).
+        cx.simulate_keystrokes("escape");
+        assert!(probe.read_with(cx, |p, _| !p.replying));
+        assert_eq!(text(cx), "@Bob hi");
+        // Third: nothing to close or cancel, so it propagates to the input (clean on escape).
+        cx.simulate_keystrokes("escape");
+        assert_eq!(*log.borrow(), ["close-list", "cancel-reply", "dismiss"]);
+        assert_eq!(text(cx), "");
+    }
+
+    #[test]
+    fn the_escape_order_is_list_then_reply_then_pass() {
+        assert_eq!(Escape::of(true, true), Escape::CloseList);
+        assert_eq!(Escape::of(true, false), Escape::CloseList);
+        assert_eq!(Escape::of(false, true), Escape::CancelReply);
+        assert_eq!(Escape::of(false, false), Escape::Pass);
     }
 }

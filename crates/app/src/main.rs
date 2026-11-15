@@ -30,6 +30,7 @@ mod login;
 mod pane;
 mod platform;
 mod replay;
+mod reply;
 mod runtime;
 mod shell;
 mod sign_in;

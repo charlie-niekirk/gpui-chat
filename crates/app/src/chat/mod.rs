@@ -7,6 +7,7 @@
 //! * [`colors`] — username fallback colours and readability adjustment (pure).
 //! * [`element`] — the custom GPUI `Element` that measures and paints one message.
 //! * [`list_sync`] — incremental list splices from store sequence numbers (pure).
+//! * [`row`] — a row with its reply button and context menu; [`thread`] — the thread popover.
 //! * [`tooltip`] — emote hover tooltips (preview, name, provider).
 //! * [`view`] — the `ChatView` entity: list, follow-bottom, "new messages" pill, live settings.
 
@@ -16,6 +17,8 @@ pub mod element;
 pub mod flow;
 pub mod layout;
 pub mod list_sync;
+pub mod row;
+pub mod thread;
 pub mod tooltip;
 pub mod view;
 

@@ -14,6 +14,15 @@ struct Entry {
     message: Arc<Message>,
 }
 
+/// One thread as held by a [`MessageStore`], see [`MessageStore::thread`].
+#[derive(Debug)]
+pub struct Thread<'a> {
+    /// The message the thread hangs off; `None` once it has scrolled out of the store.
+    pub root: Option<&'a Arc<Message>>,
+    /// The replies still retained, oldest first.
+    pub replies: Vec<&'a Arc<Message>>,
+}
+
 /// A bounded, ordered buffer of the most recent messages of one channel.
 ///
 /// * `push` and eviction are O(1); lookup by id is O(1) (hash map + the fact that
@@ -199,6 +208,27 @@ impl MessageStore {
         self.entries.range(start..).map(|e| (e.seq, &e.message))
     }
 
+    /// The thread rooted at `root_id`: the root message if it is still retained, then every
+    /// retained reply to it (a reply names its root in `reply-thread-parent-msg-id`, or its parent
+    /// when it has none), oldest first. Scans the buffer, so call it for a thread being looked at,
+    /// not for every message.
+    pub fn thread(&self, root_id: &str) -> Thread<'_> {
+        let root = self.get(root_id);
+        let replies = self
+            .entries
+            .iter()
+            .map(|entry| &entry.message)
+            .filter(|message| {
+                message.id.as_str() != root_id
+                    && message
+                        .reply
+                        .as_ref()
+                        .is_some_and(|reply| reply.root_id().as_str() == root_id)
+            })
+            .collect();
+        Thread { root, replies }
+    }
+
     /// Replaces the message with the same id as `message` by `message`, keeping its place (and
     /// sequence number) in the store. Returns that sequence number, or `None` if no retained
     /// message has the id. Used to swap a local echo for the real message.
@@ -281,6 +311,52 @@ mod tests {
 
     fn ids(store: &MessageStore) -> Vec<String> {
         store.iter().map(|m| m.id.to_string()).collect()
+    }
+
+    fn reply(id: &str, parent: &str, root: Option<&str>) -> Arc<Message> {
+        let mut m = Message::chat(
+            id,
+            Timestamp(0),
+            Author::new("replier", "replier"),
+            vec![Fragment::Text(id.to_owned())],
+        );
+        m.reply = Some(crate::message::ReplyRef {
+            parent_id: parent.into(),
+            parent_login: "p".into(),
+            parent_display_name: "P".into(),
+            parent_body: "b".into(),
+            thread_parent_id: root.map(Into::into),
+        });
+        Arc::new(m)
+    }
+
+    #[test]
+    fn a_thread_is_its_root_and_the_replies_that_name_it() {
+        let mut store = MessageStore::with_capacity(10);
+        store.push(msg("root"));
+        store.push(msg("other"));
+        store.push(reply("r1", "root", Some("root")));
+        store.push(reply("x1", "other", Some("other")));
+        // A reply to a reply carries the same root; one without a thread tag falls back to its parent.
+        store.push(reply("r2", "r1", Some("root")));
+        store.push(reply("r3", "root", None));
+        let thread = store.thread("root");
+        assert_eq!(thread.root.unwrap().id.as_str(), "root");
+        let ids: Vec<_> = thread.replies.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["r1", "r2", "r3"]);
+        assert!(store.thread("none").replies.is_empty());
+        assert!(store.thread("none").root.is_none());
+    }
+
+    #[test]
+    fn a_thread_outlives_its_root_leaving_the_store() {
+        let mut store = MessageStore::with_capacity(2);
+        store.push(msg("root"));
+        store.push(reply("r1", "root", Some("root")));
+        store.push(reply("r2", "root", Some("root")));
+        let thread = store.thread("root");
+        assert!(thread.root.is_none(), "the root was evicted");
+        assert_eq!(thread.replies.len(), 2);
     }
 
     #[test]

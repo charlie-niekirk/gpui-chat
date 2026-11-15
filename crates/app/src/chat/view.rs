@@ -28,18 +28,23 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
+use gpui_chat_core::{Message, MessageId};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
-    Context, Entity, FollowMode, InteractiveElement, IntoElement, ListAlignment, ListState,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, font, list, point, px, white,
+    App, Context, Entity, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
+    ListState, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, canvas, div, font, list, point, px, white,
 };
 
 use super::display::DisplayOptions;
-use super::element::{BadgeStyle, EmoteStyle, MessageElement, MessageStyle, Palette};
+use super::element::{BadgeStyle, EmoteStyle, HoveredRow, MessageStyle, OpenThread, Palette};
 use super::layout::LayoutCache;
 use super::list_sync::ListMirror;
+use super::row::{RowContext, message_row, row_menu};
+use super::thread::{self, ThreadPanel};
 use super::tooltip::EmoteHover;
 use crate::badges::Badges;
 use crate::channels::ChannelStore;
@@ -71,6 +76,15 @@ fn badge_size(font_size: Pixels) -> f32 {
     (font_size.as_f32() * 1.3).round().clamp(12.0, 36.0)
 }
 
+/// What the chat view asks of whoever owns it.
+#[derive(Debug, Clone)]
+pub enum ChatViewEvent {
+    /// The user chose Reply on this message: put the composer in reply mode.
+    ReplyRequested(Arc<Message>),
+}
+
+impl EventEmitter<ChatViewEvent> for ChatView {}
+
 pub struct ChatView {
     store: Entity<ChannelStore>,
     list: ListState,
@@ -99,6 +113,12 @@ pub struct ChatView {
     line_height: Pixels,
     images: Rc<RefCell<FrameImages>>,
     hover: Rc<RefCell<EmoteHover>>,
+    /// Whether rows offer Reply (there is a composer to reply with).
+    can_reply: bool,
+    /// The list's row the pointer is over (kept current by the rows when `can_reply`).
+    hovered: HoveredRow,
+    /// The thread popover, while one is open.
+    thread: Option<ThreadPanel>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -136,8 +156,50 @@ impl ChatView {
             line_height: px(0.0),
             images: Rc::default(),
             hover: Rc::default(),
+            can_reply: false,
+            hovered: Rc::default(),
+            thread: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Whether rows offer Reply: only a chat with a composer can reply.
+    pub fn set_can_reply(&mut self, can_reply: bool, cx: &mut Context<Self>) {
+        if self.can_reply != can_reply {
+            self.can_reply = can_reply;
+            cx.notify();
+        }
+    }
+
+    /// Reply was chosen on `message`: tell the owner.
+    pub fn request_reply(&mut self, message: Arc<Message>, cx: &mut Context<Self>) {
+        cx.emit(ChatViewEvent::ReplyRequested(message));
+    }
+
+    /// Opens the thread popover on the thread rooted at `root` (replacing an open one).
+    pub fn open_thread(&mut self, root: MessageId, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread.as_ref().is_some_and(|panel| panel.root == root) {
+            return;
+        }
+        self.thread = Some(ThreadPanel::new(root));
+        cx.notify();
+    }
+
+    pub fn close_thread(&mut self, cx: &mut Context<Self>) {
+        if self.thread.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The root of the open thread popover, if any.
+    #[cfg(test)]
+    pub fn open_thread_root(&self) -> Option<&MessageId> {
+        self.thread.as_ref().map(|panel| &panel.root)
+    }
+
+    /// The layout caches in use: the list's and the thread popover's.
+    fn caches(&self) -> impl Iterator<Item = &Rc<RefCell<LayoutCache>>> {
+        std::iter::once(&self.cache).chain(self.thread.as_ref().map(|panel| &panel.cache))
     }
 
     /// Brings the list up to date with the store: splices, drops evicted layouts, counts unseen.
@@ -156,7 +218,9 @@ impl ChatView {
                 let end = self.list.item_count();
                 self.list.splice(end..end, change.appended);
             }
-            self.cache.borrow_mut().evict_before(first);
+            for cache in self.caches() {
+                cache.borrow_mut().evict_before(first);
+            }
             if change.appended > 0 && !self.list.is_following_tail() {
                 self.unseen_from.get_or_insert(previous_next);
             }
@@ -222,7 +286,7 @@ impl ChatView {
             if self.text_config.is_some() {
                 self.generation += 1;
                 self.list.remeasure();
-                self.cache.borrow_mut().retain_key(self.generation);
+                self.retain_generation();
             }
             self.text_config = Some(current.clone());
         }
@@ -247,13 +311,18 @@ impl ChatView {
         match images.changes_since(seen) {
             LayoutChanges::None => {}
             LayoutChanges::Urls(urls) => {
+                // The popover's rows are not in the list: they are measured at every frame, so
+                // dropping their layouts is all they need.
+                for cache in self.caches().skip(1) {
+                    cache.borrow_mut().invalidate_urls(&urls);
+                }
                 let seqs = self.cache.borrow_mut().invalidate_urls(&urls);
                 self.remeasure_seqs(&seqs);
             }
             LayoutChanges::Everything => {
                 self.generation += 1;
                 self.list.remeasure();
-                self.cache.borrow_mut().retain_key(self.generation);
+                self.retain_generation();
             }
         }
     }
@@ -272,7 +341,14 @@ impl ChatView {
         if seen != version {
             self.generation += 1;
             self.list.remeasure();
-            self.cache.borrow_mut().retain_key(self.generation);
+            self.retain_generation();
+        }
+    }
+
+    /// Drops the cached layouts of older generations from every cache.
+    fn retain_generation(&self) {
+        for cache in self.caches() {
+            cache.borrow_mut().retain_key(self.generation);
         }
     }
 
@@ -356,16 +432,46 @@ impl Render for ChatView {
             channel: self.store.read(cx).channel().clone(),
             images: self.images.clone(),
             hover: self.hover.clone(),
+            reply_line: true,
+            // A reply's context line opens its thread.
+            on_open_thread: Some({
+                let view = cx.entity().downgrade();
+                Rc::new(move |root: &MessageId, window: &mut Window, cx: &mut App| {
+                    view.update(cx, |view, cx| view.open_thread(root.clone(), window, cx))
+                        .ok();
+                }) as OpenThread
+            }),
+            hovered_row: self.can_reply.then(|| self.hovered.clone()),
+        });
+        let handle = cx.entity().downgrade();
+        let rows = |id, hovered: &HoveredRow| RowContext {
+            id,
+            view: handle.clone(),
+            tokens,
+            hovered: self.can_reply.then(|| hovered.get()).flatten(),
+        };
+        let thread_panel = self.thread.as_ref().map(|panel| {
+            // The thread is the context: no reply lines inside it, and no popover on top of it.
+            let style = Rc::new(MessageStyle {
+                reply_line: false,
+                on_open_thread: None,
+                hover: panel.hover.clone(),
+                hovered_row: self.can_reply.then(|| panel.hovered.clone()),
+                ..(*style).clone()
+            });
+            let view = thread::thread_view(self.store.read(cx).messages(), panel.root.as_str());
+            let rows = rows("thread-row", &panel.hovered);
+            thread::render(panel, &view, &style, &rows, self.store.clone(), cx)
         });
         let store = self.store.clone();
         let cache = self.cache.clone();
         let first = self.mirror.first_seq();
+        let list_rows = rows("chat-row", &self.hovered);
         let messages = list(self.list.clone(), move |ix, _window, cx| {
             let seq = first + ix as u64;
             match store.read(cx).messages().get_by_seq(seq) {
                 Some(message) => {
-                    MessageElement::new(seq, message.clone(), style.clone(), cache.clone())
-                        .into_any_element()
+                    message_row(seq, message, style.clone(), cache.clone(), &list_rows)
                 }
                 None => div().into_any_element(),
             }
@@ -420,6 +526,12 @@ impl Render for ChatView {
         });
 
         // The channel name and state are shown by the pane header (`crate::pane`).
+        // One right-click menu for the whole list: it resolves the row under the pointer.
+        let menu = row_menu(
+            cx.entity().downgrade(),
+            self.store.clone(),
+            self.hovered.clone(),
+        );
         div().size_full().flex().flex_col().child(
             div()
                 .relative()
@@ -427,7 +539,9 @@ impl Render for ChatView {
                 .min_h_0()
                 .child(messages)
                 .child(probe)
-                .children(pill),
+                .children(pill)
+                .children(thread_panel)
+                .context_menu(menu),
         )
     }
 }
@@ -546,6 +660,153 @@ mod tests {
             });
             cx.run_until_parked();
         }
+    }
+
+    fn reply_event(n: u64, parent: &str, root: &str) -> ChatEvent {
+        let mut message = Message::chat(
+            format!("m{n}"),
+            Timestamp(0),
+            Author::new("bo", "Bo"),
+            vec![Fragment::Text("in reply".into())],
+        );
+        message.reply = Some(gpui_chat_core::ReplyRef {
+            parent_id: parent.into(),
+            parent_login: "al".into(),
+            parent_display_name: "Al".into(),
+            parent_body: "what was said".into(),
+            thread_parent_id: Some(root.into()),
+        });
+        ChatEvent::Message {
+            channel: ChannelId::new("test"),
+            message: Arc::new(message),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_reply_row_is_one_context_line_taller_and_the_cache_stays_correct(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "hello", cx);
+        h.store.update(cx, |store, cx| {
+            store.apply_all(vec![reply_event(1, "m0", "m0")]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (plain, reply) = h.view.read_with(cx, |view, _| {
+            let cache = view.cache.borrow();
+            (cache.flow_of(0).unwrap(), cache.flow_of(1).unwrap())
+        });
+        // Both are one line of text; the reply's extra line is not part of the flow but of the
+        // layout's height, which the row measures with.
+        assert_eq!((plain.line_count(), reply.line_count()), (1, 1));
+        let (plain_height, reply_height) = h.view.read_with(cx, |view, _| {
+            let cache = view.cache.borrow();
+            let height = |seq| cache.layout_height(seq).expect("the message was laid out");
+            (height(0), height(1))
+        });
+        assert!(
+            reply_height > plain_height,
+            "{reply_height} vs {plain_height}"
+        );
+        // A resize of the window re-flows but leaves the reply line in place.
+        cx.simulate_resize(size(px(500.0), px(600.0)));
+        cx.run_until_parked();
+        let again = h
+            .view
+            .read_with(cx, |view, _| view.cache.borrow().layout_height(1).unwrap());
+        assert_eq!(again, reply_height);
+    }
+
+    #[gpui_kit::test]
+    fn the_thread_popover_opens_follows_the_store_and_closes(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "root message", cx);
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.open_thread_root().cloned()),
+            None
+        );
+        h.view.update_in(cx, |view, window, cx| {
+            view.open_thread("m0".into(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.open_thread_root().map(|id| id.to_string())),
+            Some("m0".to_owned())
+        );
+        // A reply that arrives while it is open is shaped into the popover's own cache.
+        h.store.update(cx, |store, cx| {
+            store.apply_all(vec![reply_event(1, "m0", "m0")]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let in_popover = h.view.read_with(cx, |v, _| {
+            let panel = v.thread.as_ref().unwrap();
+            let cache = panel.cache.borrow();
+            (cache.layout_height(0).is_some(), cache.layout_height(1))
+        });
+        assert!(in_popover.0, "the root is drawn in the popover");
+        let reply_in_popover = in_popover.1.expect("the reply is drawn in the popover");
+        // No context line inside the popover: the thread is the context.
+        let in_list = h
+            .view
+            .read_with(cx, |v, _| v.cache.borrow().layout_height(1).unwrap());
+        assert!(
+            reply_in_popover < in_list,
+            "{reply_in_popover} vs {in_list}"
+        );
+
+        h.view.update(cx, |view, cx| view.close_thread(cx));
+        cx.run_until_parked();
+        assert!(h.view.read_with(cx, |v, _| v.open_thread_root().is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn the_row_under_the_pointer_is_tracked_only_when_replying_is_possible(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(3, "hello", cx);
+        // The newest row is at the bottom of the (800x600) window.
+        let over_newest = point(px(400.0), px(595.0));
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.hovered.get()),
+            None,
+            "nothing tracks the pointer in a chat that cannot reply"
+        );
+
+        h.view.update(cx, |view, cx| view.set_can_reply(true, cx));
+        cx.run_until_parked();
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(h.view.read_with(cx, |v, _| v.hovered.get()), Some(2));
+
+        // Pointing at an older row moves it; leaving the rows clears it.
+        cx.simulate_mouse_move(point(px(400.0), px(570.0)), None, Default::default());
+        cx.run_until_parked();
+        let hovered = h.view.read_with(cx, |v, _| v.hovered.get());
+        assert!(matches!(hovered, Some(seq) if seq < 2), "{hovered:?}");
+    }
+
+    #[gpui_kit::test]
+    fn choosing_reply_tells_the_owner_which_message(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "hello", cx);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let sink = heard.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                let ChatViewEvent::ReplyRequested(message) = event;
+                sink.borrow_mut().push(message.id.to_string());
+            })
+        });
+        let message = h.store.read_with(cx, |store, _| {
+            store.messages().get_by_seq(0).unwrap().clone()
+        });
+        h.view
+            .update(cx, |view, cx| view.request_reply(message, cx));
+        assert_eq!(*heard.borrow(), ["m0"]);
     }
 
     #[gpui_kit::test]

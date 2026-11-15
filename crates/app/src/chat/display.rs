@@ -7,10 +7,11 @@
 //! clients append is dropped (the tokenizer already strips it from fragments; author-supplied
 //! system text is covered here).
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui_chat_core::{Author, Badge, Emote, Fragment, Message, MessageKind};
+use gpui_chat_core::{Author, Badge, Emote, Fragment, Message, MessageKind, ReplyRef};
 use gpui_chat_media::ImageKey;
 
 /// What a span of the display text is; decides its font weight and colour.
@@ -173,6 +174,19 @@ impl DisplayText {
     }
 }
 
+/// The text of a reply's context line: `↳ Replying to Name: what they said`. One line: runs of
+/// whitespace and control characters become one space, and a parent whose text Twitch did not send
+/// is just named.
+pub fn reply_text(reply: &ReplyRef) -> String {
+    let body = crate::reply::single_line(&reply.parent_body);
+    let name = reply.parent_name();
+    if body.is_empty() {
+        format!("↳ Replying to {name}")
+    } else {
+        format!("↳ Replying to {name}: {body}")
+    }
+}
+
 /// `HH:MM` (UTC) of a Unix millisecond timestamp.
 pub fn clock(unix_millis: i64) -> String {
     let minutes = unix_millis.div_euclid(60_000).rem_euclid(24 * 60);
@@ -218,6 +232,39 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
     }
 }
 
+/// The fragments of `message` as drawn: for a reply, without the `@parent ` Twitch puts in front of
+/// it (the context line already says who is being replied to, and Twitch's own chat hides it too).
+/// Only a single leading mention of the reply's parent (any capitalisation) and one space after it
+/// go, and only when something else is left; the stored message is untouched.
+pub fn body_fragments(message: &Message) -> Cow<'_, [Fragment]> {
+    let fragments = &message.fragments[..];
+    let Some(reply) = &message.reply else {
+        return Cow::Borrowed(fragments);
+    };
+    let [Fragment::Mention { login, .. }, rest @ ..] = fragments else {
+        return Cow::Borrowed(fragments);
+    };
+    if !login.eq_ignore_ascii_case(&reply.parent_login) {
+        return Cow::Borrowed(fragments);
+    }
+    let mut out = Vec::with_capacity(rest.len());
+    match rest {
+        [Fragment::Text(text), tail @ ..] => {
+            let text = text.strip_prefix(' ').unwrap_or(text);
+            if !text.is_empty() {
+                out.push(Fragment::Text(text.to_owned()));
+            }
+            out.extend_from_slice(tail);
+        }
+        rest => out.extend_from_slice(rest),
+    }
+    if out.is_empty() {
+        // A reply that is only the mention keeps it.
+        return Cow::Borrowed(fragments);
+    }
+    Cow::Owned(out)
+}
+
 /// The display text of `message`; `badges` are drawn before the author's name.
 pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -> DisplayText {
     let mut out = DisplayText::default();
@@ -233,7 +280,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                 out.push(name(author), Role::Name);
                 out.push(": ", Role::Separator);
             }
-            push_body(&mut out, &message.fragments, Role::Text);
+            push_body(&mut out, &body_fragments(message), Role::Text);
         }
         MessageKind::Action => {
             if let Some(author) = author {
@@ -241,7 +288,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                 out.push(name(author), Role::Name);
                 out.push(" ", Role::Separator);
             }
-            push_body(&mut out, &message.fragments, Role::ActionText);
+            push_body(&mut out, &body_fragments(message), Role::ActionText);
         }
         MessageKind::UserNotice => {
             let header_end = out.text.len();
@@ -257,7 +304,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                     out.push(name(author), Role::Name);
                     out.push(": ", Role::Separator);
                 }
-                push_body(&mut out, &message.fragments, Role::Text);
+                push_body(&mut out, &body_fragments(message), Role::Text);
             }
         }
         MessageKind::Notice | MessageKind::System => {
@@ -290,6 +337,138 @@ mod tests {
             Author::new("alice", "Alice"),
             fragments,
         )
+    }
+
+    fn reply(body: &str) -> ReplyRef {
+        ReplyRef {
+            parent_id: "p".into(),
+            parent_login: "bob".into(),
+            parent_display_name: "Bob".into(),
+            parent_body: body.into(),
+            thread_parent_id: None,
+        }
+    }
+
+    #[test]
+    fn a_reply_line_names_the_parent_and_quotes_it_on_one_line() {
+        assert_eq!(
+            reply_text(&reply("hello there")),
+            "↳ Replying to Bob: hello there"
+        );
+        assert_eq!(
+            reply_text(&reply("two\nlines\u{E0000}  and\ttabs")),
+            "↳ Replying to Bob: two lines and tabs"
+        );
+        assert_eq!(reply_text(&reply("")), "↳ Replying to Bob");
+        let mut nameless = reply("x");
+        nameless.parent_display_name.clear();
+        assert_eq!(reply_text(&nameless), "↳ Replying to bob: x");
+    }
+
+    /// A reply to `parent_login` whose text is `text`, tokenized as a real message is.
+    fn reply_to(parent_login: &str, text: &str) -> Message {
+        let mut message = chat(
+            gpui_chat_core::Tokenizer::new()
+                .tokenize(text, &[])
+                .fragments,
+        );
+        message.reply = Some(ReplyRef {
+            parent_id: "p".into(),
+            parent_login: parent_login.into(),
+            parent_display_name: parent_login.into(),
+            parent_body: "x".into(),
+            thread_parent_id: None,
+        });
+        message
+    }
+
+    fn drawn(message: &Message) -> String {
+        build(message, DisplayOptions::default(), &[]).text
+    }
+
+    #[test]
+    fn a_reply_does_not_draw_the_mention_twitch_put_in_front_of_it() {
+        assert_eq!(
+            drawn(&reply_to("bob", "@bob it is chess")),
+            "Alice: it is chess"
+        );
+        // Capitalisation does not matter (the tag is a lowercase login, the text is as typed).
+        assert_eq!(
+            drawn(&reply_to("bob", "@BoB it is chess")),
+            "Alice: it is chess"
+        );
+        // Only the first mention and a single space go.
+        assert_eq!(drawn(&reply_to("bob", "@bob @bob hi")), "Alice: @bob hi");
+        assert_eq!(
+            drawn(&reply_to("bob", "@bob  two spaces")),
+            "Alice:  two spaces"
+        );
+        // The stored text is untouched: copy and other text actions can still have all of it.
+        let message = reply_to("bob", "@bob it is chess");
+        assert_eq!(message.plain_text(), "@bob it is chess");
+    }
+
+    #[test]
+    fn a_reply_keeps_text_that_does_not_start_with_its_parents_mention() {
+        // Another user mentioned first, the parent later, or no mention at all.
+        assert_eq!(drawn(&reply_to("bob", "@carol hi")), "Alice: @carol hi");
+        assert_eq!(drawn(&reply_to("bob", "hi @bob")), "Alice: hi @bob");
+        assert_eq!(
+            drawn(&reply_to("bob", "no mention here")),
+            "Alice: no mention here"
+        );
+        // A longer name that merely starts the same.
+        assert_eq!(drawn(&reply_to("bob", "@bobby hi")), "Alice: @bobby hi");
+        // A reply that is only the mention keeps it (nothing would be left to draw).
+        assert_eq!(drawn(&reply_to("bob", "@bob")), "Alice: @bob");
+        assert_eq!(drawn(&reply_to("bob", "@bob ")), "Alice: @bob ");
+    }
+
+    #[test]
+    fn a_message_that_is_not_a_reply_keeps_a_leading_mention() {
+        let plain = chat(
+            gpui_chat_core::Tokenizer::new()
+                .tokenize("@bob hi", &[])
+                .fragments,
+        );
+        assert_eq!(drawn(&plain), "Alice: @bob hi");
+    }
+
+    #[test]
+    fn the_mention_is_hidden_in_the_recorded_replies() {
+        // fixtures/irc/replies.irc: Twitch's replies all start with `@parent `.
+        let path = format!(
+            "{}/../../fixtures/irc/replies.irc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut shown = Vec::new();
+        for line in text.lines() {
+            if let Some(gpui_chat_core::ChatEvent::Message { message, .. }) =
+                gpui_chat_twitch::parse_line(line).unwrap()
+            {
+                shown.push((
+                    message.plain_text(),
+                    drawn(&message),
+                    message.reply.is_some(),
+                ));
+            }
+        }
+        // The root has no reply: drawn as is. Each reply loses its `@Parent `.
+        assert_eq!(
+            shown[0].1,
+            "Alice: what is the best opening for a quick game?"
+        );
+        for (plain, drawn, is_reply) in &shown {
+            assert_eq!(plain.starts_with('@'), *is_reply, "{plain}");
+            if *is_reply {
+                assert!(!drawn.contains('@'), "{drawn}");
+            }
+        }
+        let bodies: Vec<_> = shown.iter().map(|(_, drawn, _)| drawn.as_str()).collect();
+        assert!(bodies.contains(&"Bob: the Italian is solid"), "{bodies:?}");
+        assert!(bodies.contains(&"Carol: until someone plays the Sicilian"));
+        assert!(bodies.contains(&"Gina: agreed"));
     }
 
     #[test]

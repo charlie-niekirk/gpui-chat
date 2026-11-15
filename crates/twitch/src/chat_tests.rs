@@ -141,6 +141,35 @@ async fn an_action_goes_out_as_me_text_and_a_reply_names_its_parent() {
 }
 
 #[tokio::test]
+async fn a_reply_that_twitch_drops_still_names_its_parent_and_comes_back_as_a_drop() {
+    // What the composer relies on to restore reply mode: the request did carry the parent (the
+    // mock only matches that exact body), and the refusal is the ordinary drop error.
+    let server = MockServer::start().await;
+    let (_, helix) = logged_in(&server).await;
+    let mut reply = send_body("chess");
+    reply["reply_parent_message_id"] = json!("33333333-0000-4000-8000-000000000001");
+    Mock::given(method("POST"))
+        .and(path("/helix/chat/messages"))
+        .and(body_json(reply))
+        .respond_with(dropped(
+            "msg_duplicate",
+            "Your message was not sent because it is identical to the previous one you sent.",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = helix
+        .send_chat_message(
+            "1000",
+            "chess",
+            Some("33333333-0000-4000-8000-000000000001"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SendError::Dropped { ref code, .. } if code == "msg_duplicate"));
+}
+
+#[tokio::test]
 async fn every_drop_reason_comes_back_with_twitchs_words() {
     let cases = [
         (

@@ -20,23 +20,23 @@
 //! own. They are looked up when the message is shaped, in the channel's badge sets and then the
 //! global ones ([`crate::badges`]); a badge with no definition or no usable image is not shown.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_chat_core::{ChannelId, Message};
+use gpui_chat_core::{ChannelId, Message, MessageId, ReplyRef};
 use gpui_kit::{
-    App, AvailableSpace, Bounds, Corners, Element, ElementId, Font, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseExitEvent,
-    MouseMoveEvent, Pixels, Point, ScrollEvent, StrikethroughStyle, Style, TextRun, UnderlineStyle,
-    Window, fill, point, px, size, underline_y_offset,
+    App, AvailableSpace, Bounds, Corners, CursorStyle, Element, ElementId, Font, GlobalElementId,
+    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, Pixels, Point, ScrollEvent, StrikethroughStyle,
+    Style, TextRun, UnderlineStyle, Window, fill, point, px, size, underline_y_offset,
 };
 
 use super::colors;
 use super::display::{self, BadgeSlot, DisplayEmote, DisplayOptions, Role};
 use super::flow::{AtomKind, Flow};
-use super::layout::{LayoutCache, LayoutKey, MessageLayout, ShapedMessage};
+use super::layout::{LayoutCache, LayoutKey, MessageLayout, ReplyFit, ReplyLine, ShapedMessage};
 use super::tooltip::{EmoteHover, Target};
 use crate::badges::Badges;
 use crate::images::{EmoteBox, FrameImages, Images, Lookup};
@@ -108,7 +108,22 @@ pub struct BadgeStyle {
     pub size: f32,
 }
 
+/// What the context line of a reply does when it is clicked: open the thread with this root.
+pub type OpenThread = Rc<dyn Fn(&MessageId, &mut Window, &mut App)>;
+
+/// The row the pointer is over (its store sequence number), shared by a view's rows: each row
+/// that has it in its style keeps it current, and the view shows the Reply button on that row
+/// only and resolves the right-click menu against it.
+pub type HoveredRow = Rc<Cell<Option<u64>>>;
+
+/// The reply context line is a fraction of the text's size: it is a quotation, not the message.
+const REPLY_SCALE: f32 = 0.85;
+/// Space above the reply line, so it reads as belonging to the message under it, not to the one
+/// above.
+const REPLY_GAP: f32 = 4.0;
+
 /// Everything about how messages are drawn that is shared by every message in one render.
+#[derive(Clone)]
 pub struct MessageStyle {
     pub font: Font,
     pub bold_font: Font,
@@ -127,6 +142,14 @@ pub struct MessageStyle {
     /// The images the view painted (pinned while shown) and its animation timer.
     pub images: Rc<RefCell<FrameImages>>,
     pub hover: Rc<RefCell<EmoteHover>>,
+    /// Draw a reply's context line above it. Off in the thread popover, where the thread is
+    /// already the context.
+    pub reply_line: bool,
+    /// Clicking a reply's context line; without it the line is not interactive.
+    pub on_open_thread: Option<OpenThread>,
+    /// Where each row reports whether the pointer is over it; `None` when nothing needs to know
+    /// (a chat without a composer).
+    pub hovered_row: Option<HoveredRow>,
 }
 
 /// One message in the chat list.
@@ -202,6 +225,25 @@ fn badge_slots(
         .collect()
 }
 
+/// Shapes the context line of `reply`: a smaller, single line.
+fn shape_reply(reply: &ReplyRef, style: &MessageStyle, window: &Window) -> ReplyLine {
+    let text = ReplyLine::ellipsized(&display::reply_text(reply));
+    let font_size = style.font_size * REPLY_SCALE;
+    let run = TextRun {
+        len: text.len(),
+        font: style.font.clone(),
+        color: style.palette.muted,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let layout = window
+        .text_system()
+        .layout_line(&text, font_size, &[run], None);
+    let height = (style.line_height.as_f32() * REPLY_SCALE).round() + REPLY_GAP;
+    ReplyLine::from_layout(reply.root_id().clone(), font_size, &text, &layout, height)
+}
+
 /// Shapes `message` as one line with the window text system.
 fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App) -> ShapedMessage {
     let slots = badge_slots(message, style, window, cx);
@@ -227,7 +269,11 @@ fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App)
     let layout = window
         .text_system()
         .layout_line(&display.text, style.font_size, &runs, None);
-    ShapedMessage::from_layout(display, &layout, &boxes)
+    let shaped = ShapedMessage::from_layout(display, &layout, &boxes);
+    match &message.reply {
+        Some(reply) if style.reply_line => shaped.with_reply(shape_reply(reply, style, window)),
+        _ => shaped,
+    }
 }
 
 /// The cached layout of message `seq` for a content width (width minus padding).
@@ -278,6 +324,17 @@ fn centred(outer: Bounds<Pixels>, size_: (f32, f32)) -> Bounds<Pixels> {
 pub struct Prepainted {
     layout: MessageLayout,
     /// For messages with emotes: hover detection.
+    hitbox: Option<Hitbox>,
+    /// The reply context line as laid out for this width, with its hit area when it can be
+    /// clicked.
+    reply: Option<PreparedReply>,
+}
+
+/// The reply context line for one frame.
+struct PreparedReply {
+    fit: ReplyFit,
+    /// Where it is drawn.
+    rect: Bounds<Pixels>,
     hitbox: Option<Hitbox>,
 }
 
@@ -386,6 +443,125 @@ impl MessageElement {
     }
 }
 
+impl MessageElement {
+    /// Keeps [`MessageStyle::hovered_row`] pointing at this row while the pointer is over it (not
+    /// over something drawn above it, such as the thread popover), and wakes the view when that
+    /// changes. Checked at paint (rows move under a still pointer when the list scrolls) and on
+    /// every mouse move.
+    fn track_hover(&self, hitbox: &Hitbox, window: &mut Window, cx: &mut App) {
+        let Some(cell) = self.style.hovered_row.clone() else {
+            return;
+        };
+        let (seq, view) = (self.seq, window.current_view());
+        let sync = move |over: bool, cx: &mut App| match (over, cell.get()) {
+            (true, current) if current != Some(seq) => {
+                cell.set(Some(seq));
+                cx.notify(view);
+            }
+            (false, Some(current)) if current == seq => {
+                cell.set(None);
+                cx.notify(view);
+            }
+            _ => {}
+        };
+        sync(hitbox.is_hovered(window), cx);
+        let moved = hitbox.clone();
+        let on_move = sync.clone();
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+            if phase.bubble() {
+                on_move(moved.is_hovered(window), cx);
+            }
+        });
+        window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| sync(false, cx));
+    }
+
+    /// Where the flowed text starts: inside the padding, under the reply line.
+    fn content_origin(&self, bounds: Bounds<Pixels>, layout: &MessageLayout) -> Point<Pixels> {
+        bounds.origin + self.style.padding + point(px(0.0), px(layout.reply_height()))
+    }
+
+    /// The reply line cut to `content` width and where it goes; registers its hit area.
+    fn prepare_reply(
+        &self,
+        line: &ReplyLine,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) -> PreparedReply {
+        let content = bounds.size.width - self.style.padding.x * 2.0;
+        let fit = line.fit(content.as_f32());
+        // Without the gap above: that is not part of the line.
+        let rect = Bounds::new(
+            bounds.origin + self.style.padding + point(px(0.0), px(REPLY_GAP)),
+            size(px(fit.width), px(line.height - REPLY_GAP)),
+        );
+        let hitbox = self
+            .style
+            .on_open_thread
+            .is_some()
+            .then(|| window.insert_hitbox(rect, HitboxBehavior::Normal));
+        PreparedReply { fit, rect, hitbox }
+    }
+
+    /// Draws the reply line (muted, the text colour under the pointer) and makes it open the
+    /// thread when clicked.
+    fn paint_reply(&self, line: &ReplyLine, prepared: &PreparedReply, window: &mut Window) {
+        let style = &*self.style;
+        let hovered = prepared
+            .hitbox
+            .as_ref()
+            .is_some_and(|hitbox| hitbox.is_hovered(window));
+        let color = if self.message.flags.deleted || !hovered {
+            style.palette.muted
+        } else {
+            style.palette.text
+        };
+        let text_height = line.height - REPLY_GAP;
+        let baseline = (text_height - line.ascent.as_f32() - line.descent.as_f32()) / 2.0
+            + line.ascent.as_f32();
+        let fit = prepared.fit;
+        let last = line.atoms.len().saturating_sub(1);
+        for glyph in &line.glyphs {
+            let index = glyph.atom as usize;
+            let Some(atom) = line.atoms.get(index) else {
+                continue;
+            };
+            if atom.kind != AtomKind::Glyphs {
+                continue;
+            }
+            let x = match fit.ellipsis_x {
+                _ if index < fit.atoms => line.offsets[index],
+                Some(x) if index == last => x,
+                _ => continue,
+            };
+            let position = point(
+                prepared.rect.origin.x + px(x + glyph.x - atom.src_x),
+                prepared.rect.origin.y + px(baseline),
+            );
+            let result = if glyph.is_emoji {
+                window.paint_emoji(position, glyph.font_id, glyph.id, line.font_size)
+            } else {
+                window.paint_glyph(position, glyph.font_id, glyph.id, line.font_size, color)
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "failed to paint a glyph");
+            }
+        }
+
+        let (Some(hitbox), Some(open)) = (prepared.hitbox.clone(), style.on_open_thread.clone())
+        else {
+            return;
+        };
+        window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+        let root = line.root.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase.bubble() && event.button == MouseButton::Left && hitbox.is_hovered(window) {
+                open(&root, window, cx);
+                cx.stop_propagation();
+            }
+        });
+    }
+}
+
 impl IntoElement for MessageElement {
     type Element = Self;
 
@@ -431,9 +607,9 @@ impl Element for MessageElement {
                 let width = if width.as_f32().is_finite() {
                     width
                 } else {
-                    px(layout.flow.content_width()) + style.padding.x * 2.0
+                    px(layout.content_width()) + style.padding.x * 2.0
                 };
-                size(width, px(layout.flow.height()) + style.padding.y * 2.0)
+                size(width, px(layout.height()) + style.padding.y * 2.0)
             },
         );
         (layout_id, ())
@@ -458,16 +634,22 @@ impl Element for MessageElement {
             window,
             cx,
         );
-        if layout.shaped.inlines.is_empty() {
+        let reply = layout
+            .shaped
+            .reply
+            .as_ref()
+            .map(|line| self.prepare_reply(line, bounds, window));
+        if layout.shaped.inlines.is_empty() && self.style.hovered_row.is_none() {
             return Prepainted {
                 layout,
                 hitbox: None,
+                reply,
             };
         }
         // Normal behaviour: it only answers "is the pointer over this message"; wheel events
         // still reach the list.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let origin = bounds.origin + self.style.padding;
+        let origin = self.content_origin(bounds, &layout);
         for inline in &layout.shaped.inlines {
             let target = Target {
                 seq: self.seq,
@@ -482,6 +664,7 @@ impl Element for MessageElement {
         Prepainted {
             layout,
             hitbox: Some(hitbox),
+            reply,
         }
     }
 
@@ -501,6 +684,10 @@ impl Element for MessageElement {
         let flags = message.flags;
         let MessageLayout { shaped, flow } = &prepainted.layout;
 
+        if let Some(hitbox) = &prepainted.hitbox {
+            self.track_hover(hitbox, window, cx);
+        }
+
         window.paint_layer(bounds, |window| {
             if flags.mention {
                 window.paint_quad(fill(bounds, palette.mention_bg));
@@ -514,7 +701,10 @@ impl Element for MessageElement {
                     .unwrap_or_else(|| colors::fallback_color(&author.login));
                 colors::readable(color, palette.background)
             });
-            let origin = bounds.origin + style.padding;
+            if let (Some(line), Some(prepared)) = (&shaped.reply, &prepainted.reply) {
+                self.paint_reply(line, prepared, window);
+            }
+            let origin = self.content_origin(bounds, &prepainted.layout);
             let line_height = style.line_height;
             let baseline = (line_height - shaped.ascent - shaped.descent) / 2.0 + shaped.ascent;
             // Top of the text in `line`: the line-height box centred in the (maybe taller) line.
