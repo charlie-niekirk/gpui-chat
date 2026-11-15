@@ -6,6 +6,8 @@
 //! ([`crate::splits`]); a pane belongs to its channel, so its chat, input and streamlink button go
 //! wherever the channel is shown. The channel name in the header is the handle to drag the pane by.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_chat_core::{ChannelId, ConnectionState, FollowersOnly, RoomState};
@@ -16,9 +18,9 @@ use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Action, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
-    Styled, Subscription, Window, div, px, rgb,
+    Action, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight,
+    Hsla, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
+    Styled, Subscription, Window, canvas, div, px, rgb,
 };
 
 use crate::actions::{ClosePane, SplitDown, SplitRight};
@@ -122,6 +124,11 @@ pub fn room_chips(room: &RoomState) -> Vec<String> {
     chips
 }
 
+/// Below this header width (a narrow split) the header goes compact: no room-mode chips, the
+/// connection state and LIVE marker as dots, the play button as its icon. The buttons on the
+/// right never shrink; the channel name truncates.
+const COMPACT_BELOW: f32 = 480.0;
+
 const OK: u32 = 0x2fbf71;
 const WARN: u32 = 0xe0a030;
 
@@ -134,7 +141,7 @@ fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
 }
 
 /// The "LIVE" / "Offline" marker next to the channel name.
-fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
+fn live_badge(live: bool, compact: bool, tokens: &Tokens) -> impl IntoElement {
     let (color, label) = if live {
         (stream_info::live_color(), "LIVE")
     } else {
@@ -145,8 +152,8 @@ fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
         .flex_none()
         .gap_1p5()
         .items_center()
-        .child(div().size(px(8.0)).rounded_full().bg(color))
-        .child(
+        .child(div().flex_none().size(px(8.0)).rounded_full().bg(color))
+        .children((!compact).then(|| {
             div()
                 .text_xs()
                 .font_weight(if live {
@@ -155,12 +162,13 @@ fn live_badge(live: bool, tokens: &Tokens) -> impl IntoElement {
                     FontWeight::NORMAL
                 })
                 .text_color(if live { color } else { tokens.text_muted })
-                .child(label),
-        )
+                .child(label)
+        }))
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
 }
 
 /// The second header line of a live channel: title, category, viewers and uptime.
-fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
+fn stream_row(info: &StreamInfo, compact: bool, tokens: &Tokens) -> impl IntoElement {
     let uptime = info
         .uptime(stream_info::unix_now())
         .map(stream_info::format_uptime);
@@ -186,6 +194,7 @@ fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
         .id("pane-stream-info")
         .w_full()
         .flex_none()
+        .overflow_x_hidden()
         .h(px(26.0))
         .px_3()
         .gap_3()
@@ -200,7 +209,7 @@ fn stream_row(info: &StreamInfo, tokens: &Tokens) -> impl IntoElement {
                 .child(title)
                 .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
         )
-        .children((!info.category.is_empty()).then(|| {
+        .children((!compact && !info.category.is_empty()).then(|| {
             div()
                 .flex_none()
                 .max_w(px(220.0))
@@ -249,6 +258,8 @@ pub struct ChannelPane {
     focus_handle: FocusHandle,
     /// Whether the window is split, so the pane can be closed.
     in_split: bool,
+    /// The header's width at the last paint (narrow splits get a compact header).
+    header_width: Rc<Cell<f32>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -294,6 +305,7 @@ impl ChannelPane {
             live,
             focus_handle: cx.focus_handle(),
             in_split: false,
+            header_width: Rc::new(Cell::new(f32::INFINITY)),
             _subscriptions: subscriptions,
         }
     }
@@ -359,7 +371,9 @@ impl ChannelPane {
             }))
     }
 
-    fn header(&self, tokens: &Tokens, cx: &App) -> impl IntoElement {
+    /// `compact` is what the last measured width asked for; the measuring canvas asks for a
+    /// redraw of `pane` when the width crosses [`COMPACT_BELOW`].
+    fn header(&self, tokens: &Tokens, compact: bool, pane: EntityId, cx: &App) -> impl IntoElement {
         let store = self.store.read(cx);
         let status = self
             .live
@@ -369,26 +383,29 @@ impl ChannelPane {
         let status_view = match status {
             Some(status) => {
                 let color = status_color(&status, tokens);
+                let label = status.label();
                 h_flex()
                     .id("pane-status")
                     .gap_1p5()
                     .items_center()
-                    // In a narrow split the label gives way before the buttons do.
                     .flex_shrink(1.0)
                     .min_w_0()
                     .child(div().flex_none().size(px(8.0)).rounded_full().bg(color))
-                    .child(
+                    .children((!compact).then(|| {
                         div()
                             .min_w_0()
                             .truncate()
                             .text_xs()
                             .text_color(tokens.text_muted)
-                            .child(status.label()),
-                    )
+                            .child(label.clone())
+                    }))
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
                     .into_any_element()
             }
             None => div()
                 .id("pane-status")
+                .min_w_0()
+                .truncate()
                 .text_xs()
                 .text_color(tokens.text_muted)
                 .child("Offline source")
@@ -400,29 +417,47 @@ impl ChannelPane {
             .as_ref()
             .map(|hub| hub.read(cx).liveness(store.channel()));
         let live_badge = match liveness {
-            Some(Liveness::Live(_)) => Some(live_badge(true, tokens)),
-            Some(Liveness::Offline) => Some(live_badge(false, tokens)),
+            Some(Liveness::Live(_)) => Some(live_badge(true, compact, tokens)),
+            Some(Liveness::Offline) => Some(live_badge(false, compact, tokens)),
             _ => None,
         };
         let stream_row = match liveness {
-            Some(Liveness::Live(info)) => Some(stream_row(info, tokens)),
+            Some(Liveness::Live(info)) => Some(stream_row(info, compact, tokens)),
             _ => None,
         };
 
-        let main_row = h_flex()
-            .id("pane-header-main")
-            .w_full()
-            .flex_none()
+        // Measures the row; crossing the compact width redraws the pane after this frame.
+        let measure = canvas(
+            move |bounds, window, _| {
+                if (bounds.size.width.as_f32() < COMPACT_BELOW) != compact {
+                    window.on_next_frame(move |_, cx| cx.notify(pane));
+                }
+                bounds.size.width.as_f32()
+            },
+            {
+                let width = self.header_width.clone();
+                move |_, measured, _, _| width.set(measured)
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        // Name, LIVE, connection state and chips give way (truncate, then clip); the buttons
+        // on the right never shrink.
+        let left = h_flex()
+            .id("pane-header-left")
+            .flex_1()
+            .min_w_0()
             .overflow_x_hidden()
-            .h(px(36.0))
-            .px_3()
             .gap_3()
             .items_center()
             .child({
                 let login = store.channel().login().to_owned();
                 div()
                     .id("pane-drag-handle")
-                    .flex_none()
+                    .min_w_0()
+                    .flex_shrink(1.0)
+                    .truncate()
                     .font_weight(FontWeight::BOLD)
                     .cursor_grab()
                     .child(login.clone())
@@ -435,7 +470,7 @@ impl ChannelPane {
             })
             .children(live_badge)
             .child(status_view)
-            .child(
+            .children((!compact).then(|| {
                 h_flex()
                     .id("pane-chips")
                     .flex_1()
@@ -453,10 +488,28 @@ impl ChannelPane {
                             .text_xs()
                             .text_color(tokens.text_muted)
                             .child(chip)
-                    })),
-            )
-            .child(self.stream_actions(tokens, cx))
+                    }))
+            }));
+        let right = h_flex()
+            .id("pane-header-right")
+            .flex_none()
+            .gap_3()
+            .items_center()
+            .child(self.stream_actions(tokens, compact, cx))
             .child(self.pane_actions(tokens));
+        let main_row = h_flex()
+            .id("pane-header-main")
+            .relative()
+            .w_full()
+            .flex_none()
+            .overflow_x_hidden()
+            .h(px(36.0))
+            .px_3()
+            .gap_3()
+            .items_center()
+            .child(measure)
+            .child(left)
+            .child(right);
         v_flex()
             .id("pane-header")
             .w_full()
@@ -469,11 +522,10 @@ impl ChannelPane {
 
     /// Streamlink error (when there is one) and the play / stop button with its quality menu.
     /// Offline sources have no real channels, so they get nothing.
-    fn stream_actions(&self, tokens: &Tokens, cx: &App) -> impl IntoElement {
+    fn stream_actions(&self, tokens: &Tokens, compact: bool, cx: &App) -> impl IntoElement {
         let actions = h_flex()
             .id("pane-actions")
             .flex_none()
-            .min_w_0()
             .gap_1p5()
             .items_center();
         if !self.live {
@@ -495,7 +547,7 @@ impl ChannelPane {
                 .gap_1()
                 .items_center()
                 .min_w_0()
-                .max_w(px(420.0))
+                .max_w(px(if compact { 120.0 } else { 420.0 }))
                 .child(
                     div()
                         .min_w_0()
@@ -519,19 +571,24 @@ impl ChannelPane {
         let toggle = {
             let streams = self.streams.clone();
             let target = channel.clone();
-            Button::new("stream-toggle")
+            let label = play_label(state, &quality);
+            // Compact: the icon alone, with the label in the tooltip.
+            let tooltip = match (compact, active) {
+                (true, _) => label.clone(),
+                (false, true) => "Stop the stream".to_owned(),
+                (false, false) => "Watch with streamlink".to_owned(),
+            };
+            let button = Button::new("stream-toggle")
                 .small()
                 .icon(Icon::new(if active {
                     IconName::Square
                 } else {
                     IconName::Play
                 }))
-                .label(play_label(state, &quality))
-                .tooltip(if active {
-                    "Stop the stream"
-                } else {
-                    "Watch with streamlink"
-                })
+                .accessibility_label(label.clone());
+            let button = if compact { button } else { button.label(label) };
+            button
+                .tooltip(tooltip)
                 .disabled(stopping)
                 .on_click(move |_, _, cx| {
                     streams.update(cx, |hub, cx| hub.toggle(&target, cx));
@@ -575,7 +632,12 @@ impl Render for ChannelPane {
             .id("channel-pane")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(self.header(&tokens, cx))
+            .child(self.header(
+                &tokens,
+                self.header_width.get() < COMPACT_BELOW,
+                cx.entity_id(),
+                cx,
+            ))
             .child(div().flex_1().min_h_0().w_full().child(self.chat.clone()))
             .children(self.composer.clone())
     }

@@ -101,7 +101,9 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   state; `room_chips` formats `RoomState` (emote-only, followers-only with duration, slow N s,
   subs-only, unique). A pane belongs to its channel: created when the channel is first shown and
   kept (scroll position survives switching and moving between splits) until the channel is closed;
-  closing a split only hides it.
+  closing a split only hides it. The header measures its width (a `canvas`) and below 480 px goes
+  compact: no room-mode chips, the connection state and LIVE marker as dots (label in a tooltip),
+  the play button as its icon; the buttons on the right never shrink and the name truncates.
 - `channels.rs` — `ChannelStore` (GPUI entity: core `MessageStore` + room/connection state, one per
   channel) and `ChannelHub` (owns the stores; its `apply_batch` is the bridge's `apply`: it splits a
   frame's batch by channel, applies each run in order and notifies each touched store once; it also
