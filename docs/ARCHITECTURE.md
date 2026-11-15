@@ -55,13 +55,17 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   is shown in at most one pane (showing it elsewhere swaps the two). Split right/down inserts into the
   parent when it runs the same way (halving the split pane's share), else wraps the pane in a new
   two-way split; close gives the space to the sibling that takes its place and collapses splits of
-  one and same-axis nesting; `move_pane` / `drop_channel` take a `DropZone` (centre: swap/show,
-  edge: put beside); `resize` moves one line with a minimum; `neighbour` finds the pane on a side
-  from the unit-square rects (keyboard focus). New panes show the next open channel no pane shows.
-  `splits/view.rs` draws it: flex rows/columns sized by `flex_grow(size)`, a 5 px divider between
-  children dragged with `on_drag` + the split's `on_drag_move` (fraction of the split's length), an
-  accent outline on the focused pane when split, and drop zones from `on_drag_move` /
-  `on_drop` for `DraggedPane` (from the channel name in a pane header) and `DraggedChannel` (sidebar
+  one and same-axis nesting, and focuses the pane of the heir nearest the closed one;
+  `move_pane` / `drop_channel` take a `DropZone` (centre: swap/show, edge: put beside) and
+  `accepts_pane` / `accepts_channel` say beforehand whether a drop would do anything (not onto the
+  dragged pane itself, no new pane past 16); `resize` moves one line keeping 220 px per pane lined
+  up on each side (`extent`), sharing half of the pair when that does not fit so a line never
+  freezes; `neighbour` finds the pane on a side from the unit-square rects (keyboard focus);
+  `zone_in` / `divider_fractions` are the pixel maths. New panes show the next open channel no pane
+  shows. `splits/view.rs` draws it: flex rows/columns sized by `flex_grow(size)` with no gaps,
+  Kit's `resize_handle` (themed hairline and pill, straddling the leading edge of every child after
+  the first) whose `on_drag` payload the split follows with `on_drag_move`, an accent outline on
+  the focused pane when split, and drop zones from `on_drag_move` / `on_drop` for `DraggedPane` (from the channel name in a pane header) and `DraggedChannel` (sidebar
   rows: `ChannelRows`, our `SidebarItem` that wraps each Kit `SidebarMenuItem` in a draggable `div`).
   A press anywhere in a pane focuses it (`capture_any_mouse_down`); keyboard focus follows on the
   next frame (`on_next_frame`, after a new pane's input exists): the pane's input, or the pane's
@@ -234,7 +238,9 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `selected`), `[emotes]` (`recent`, PR 3.3: the emotes used last, newest first) and `[layout]`
   (PR 4.1: `focused`, the focused pane's index in reading order, and `root`, a nested
   `channel` / `axis` + `sizes` + `panes` tree; checked against the open channels on restore, broken
-  sizes evened out, at most 16 panes / 8 levels; a file without it opens one pane on `selected`). Separate from user settings. Sections load independently (a malformed `[channels]`
+  sizes (anything not a normal positive `f32`, or a total that overflows) evened out, at most 16
+  panes / 8 levels; a file without it opens one pane on `selected`). The shell writes `[channels]`
+  and `[layout]` together in one read-modify-write. Separate from user settings. Sections load independently (a malformed `[channels]`
   leaves `[window]` intact and vice versa) and each writer replaces only its own top-level key in the
   file's TOML table under one lock, so other sections (even ones this build cannot read) survive; a
   file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore

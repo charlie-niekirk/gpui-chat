@@ -111,6 +111,22 @@ impl DropZone {
     }
 }
 
+/// The drop zone at `x`, `y` (pixels from the top left) of a pane `width` × `height`; `None`
+/// outside it.
+pub fn zone_in(x: f32, y: f32, width: f32, height: f32) -> Option<DropZone> {
+    let inside =
+        width > 0.0 && height > 0.0 && (0.0..=width).contains(&x) && (0.0..=height).contains(&y);
+    inside.then(|| DropZone::at(x / width, y / height))
+}
+
+/// A divider dragged to `offset` pixels into a split `length` pixels long: where its line goes
+/// and the smallest a pane may be (`min_pane` pixels), both as fractions of the split, for
+/// [`Layout::resize`]. `None` for a split with no length.
+pub fn divider_fractions(offset: f32, length: f32, min_pane: f32) -> Option<(f32, f32)> {
+    (length.is_finite() && length > 0.0 && offset.is_finite())
+        .then(|| (offset / length, min_pane / length))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Leaf {
     pub id: PaneId,
@@ -295,15 +311,14 @@ impl Layout {
     /// Closes pane `id`; its space goes to the pane that takes its place, which gets focus if
     /// the closed one had it. The last pane cannot be closed.
     pub fn close(&mut self, id: PaneId) -> bool {
-        let Some(index) = self.ids().iter().position(|i| *i == id) else {
-            return false;
-        };
-        if self.len() <= 1 || detach(&mut self.root, id).is_none() {
+        if self.len() <= 1 {
             return false;
         }
+        let Some((_, heir)) = detach(&mut self.root, id) else {
+            return false;
+        };
         if self.focused == id {
-            let ids = self.ids();
-            self.focused = ids[index.min(ids.len() - 1)];
+            self.focused = heir;
         }
         true
     }
@@ -311,7 +326,7 @@ impl Layout {
     /// Moves pane `src` onto `target`: into it swaps their channels, beside it moves the pane
     /// there. The moved channel's pane gets focus.
     pub fn move_pane(&mut self, src: PaneId, target: PaneId, zone: DropZone) -> bool {
-        if src == target || self.leaf(src).is_none() || self.leaf(target).is_none() {
+        if !self.accepts_pane(src, target) {
             return false;
         }
         match zone {
@@ -321,7 +336,7 @@ impl Layout {
                 self.focused = target;
             }
             DropZone::Edge(direction) => {
-                let mut node = detach(&mut self.root, src);
+                let mut node = detach(&mut self.root, src).map(|(node, _)| node);
                 insert_beside(&mut self.root, target, direction, &mut node);
                 self.focused = src;
             }
@@ -332,7 +347,7 @@ impl Layout {
     /// A channel from the sidebar dropped on `target`: into it shows it there, beside it opens a
     /// new pane for it. A channel that already has a pane moves with it.
     pub fn drop_channel(&mut self, channel: ChannelId, target: PaneId, zone: DropZone) -> bool {
-        if self.leaf(target).is_none() {
+        if !self.accepts_channel(&channel, target, zone) {
             return false;
         }
         if let Some(src) = self.pane_showing(&channel) {
@@ -352,22 +367,60 @@ impl Layout {
         }
     }
 
+    /// Whether pane `src` can be dropped on `target` (anywhere but itself).
+    pub fn accepts_pane(&self, src: PaneId, target: PaneId) -> bool {
+        src != target && self.leaf(src).is_some() && self.leaf(target).is_some()
+    }
+
+    /// Whether dropping the sidebar channel on `zone` of `target` would do something: a
+    /// channel's own pane takes it only in the middle (focus), and a new pane needs room under
+    /// [`MAX_PANES`].
+    pub fn accepts_channel(&self, channel: &ChannelId, target: PaneId, zone: DropZone) -> bool {
+        if self.leaf(target).is_none() {
+            return false;
+        }
+        match self.pane_showing(channel) {
+            Some(src) if src == target => zone == DropZone::Center,
+            Some(src) => self.accepts_pane(src, target),
+            None => zone == DropZone::Center || self.len() < MAX_PANES,
+        }
+    }
+
     /// Moves the line after child `handle` of the split at `path` to `at` (a fraction of the
-    /// split's length), keeping both sides at least `min` long. `false` when nothing changed.
-    pub fn resize(&mut self, path: &[usize], handle: usize, at: f32, min: f32) -> bool {
+    /// split's length). Each side keeps `min_pane` (a fraction of the split's length) for every
+    /// pane it lines up along the split, so nested panes keep the minimum too. When the two
+    /// sides together are too small for that (many panes, small window), each keeps a share of
+    /// half of what they have instead, so the line still moves; a side already below its minimum
+    /// may always grow. `false` when nothing changed.
+    pub fn resize(&mut self, path: &[usize], handle: usize, at: f32, min_pane: f32) -> bool {
         let Some(Node::Split(split)) = node_at_mut(&mut self.root, path) else {
             return false;
         };
-        if handle + 1 >= split.sizes.len() || !at.is_finite() {
+        if handle + 1 >= split.sizes.len() || !at.is_finite() || !min_pane.is_finite() {
             return false;
         }
+        let mut min_before = extent(&split.children[handle], split.axis) as f32 * min_pane;
+        let mut min_after = extent(&split.children[handle + 1], split.axis) as f32 * min_pane;
         let start: f32 = split.sizes[..handle].iter().sum();
-        let end = start + split.sizes[handle] + split.sizes[handle + 1];
-        if end - start < 2.0 * min {
+        let line = start + split.sizes[handle];
+        let end = line + split.sizes[handle + 1];
+        // Written so NaN anywhere refuses rather than reaching `clamp`.
+        if !(start.is_finite() && end.is_finite() && end > start) {
             return false;
         }
-        let at = at.clamp(start + min, end - min);
-        if (at - start - split.sizes[handle]).abs() < 1e-4 {
+        let pair = end - start;
+        if min_before + min_after > pair {
+            let scale = 0.5 * pair / (min_before + min_after);
+            min_before *= scale;
+            min_after *= scale;
+        }
+        let low = (start + min_before).min(line);
+        let high = (end - min_after).max(line);
+        if low.is_nan() || high.is_nan() || low > high {
+            return false;
+        }
+        let at = at.clamp(low, high);
+        if (at - line).abs() < 1e-4 {
             return false;
         }
         split.sizes[handle] = at - start;
@@ -553,8 +606,12 @@ impl Layout {
                 channel,
             }));
         }
+        // Checked as the `f32` they become: `1e-50` and `1e39` are fine `f64`s but not `f32`s.
         let sizes_ok = saved.sizes.len() == saved.panes.len()
-            && saved.sizes.iter().all(|s| s.is_finite() && *s > 0.0);
+            && saved
+                .sizes
+                .iter()
+                .all(|s| (*s as f32).is_normal() && *s > 0.0);
         let mut children = Vec::new();
         let mut sizes = Vec::new();
         for (i, pane) in saved.panes.iter().enumerate() {
@@ -567,8 +624,13 @@ impl Layout {
             return children.pop();
         }
         let total: f32 = sizes.iter().sum();
-        sizes.iter_mut().for_each(|s| *s /= total);
-        if sizes.iter().any(|s| *s < MIN_SAVED_SIZE) {
+        if total.is_finite() && total > 0.0 {
+            sizes.iter_mut().for_each(|s| *s /= total);
+        }
+        // NaN evens out too.
+        if !(total.is_finite() && total > 0.0)
+            || sizes.iter().any(|s| s.is_nan() || *s < MIN_SAVED_SIZE)
+        {
             let even = 1.0 / sizes.len() as f32;
             sizes.iter_mut().for_each(|s| *s = even);
         }
@@ -651,8 +713,9 @@ fn insert_beside(
 }
 
 /// Takes pane `id` out of the tree (never the root itself); its space goes to the sibling that
-/// takes its place.
-fn detach(node: &mut Node, id: PaneId) -> Option<Node> {
+/// takes its place. Returns the pane and the heir: the pane of that sibling nearest to where the
+/// removed one was.
+fn detach(node: &mut Node, id: PaneId) -> Option<(Node, PaneId)> {
     let Node::Split(split) = node else {
         return None;
     };
@@ -664,14 +727,53 @@ fn detach(node: &mut Node, id: PaneId) -> Option<Node> {
         Some(i) => {
             let size = split.sizes.remove(i);
             let child = split.children.remove(i);
-            let heir = i.min(split.children.len() - 1);
+            // The next sibling moves into the space (its leading pane is the nearest), or, for
+            // the last child, the one before (its trailing pane).
+            let (heir, leading) = if i < split.children.len() {
+                (i, true)
+            } else {
+                (i - 1, false)
+            };
             split.sizes[heir] += size;
-            Some(child)
+            let heir_pane = edge_leaf(&split.children[heir], leading);
+            Some((child, heir_pane))
         }
         None => split.children.iter_mut().find_map(|c| detach(c, id)),
     }?;
     normalise(node);
     Some(removed)
+}
+
+/// The first (`leading`) or last pane of `node` in reading order.
+fn edge_leaf(node: &Node, leading: bool) -> PaneId {
+    match node {
+        Node::Leaf(leaf) => leaf.id,
+        Node::Split(split) => {
+            let child = if leading {
+                split.children.first()
+            } else {
+                split.children.last()
+            };
+            child.map_or(PaneId(u64::MAX), |c| edge_leaf(c, leading))
+        }
+    }
+}
+
+/// How many panes `node` lines up along `axis` (the most of any line through it): what decides
+/// how small it may be dragged.
+fn extent(node: &Node, axis: Axis) -> usize {
+    match node {
+        Node::Leaf(_) => 1,
+        Node::Split(split) if split.axis == axis => {
+            split.children.iter().map(|c| extent(c, axis)).sum()
+        }
+        Node::Split(split) => split
+            .children
+            .iter()
+            .map(|c| extent(c, axis))
+            .max()
+            .unwrap_or(1),
+    }
 }
 
 /// Merges child splits that run the same way into `node` and replaces a split of one by its
@@ -1122,6 +1224,220 @@ mod tests {
             &sizes(&Layout::from_saved(Some(&tiny), &list)),
             &[0.5, 0.5]
         ));
+    }
+
+    fn split_sizes<'a>(layout: &'a Layout, path: &[usize]) -> &'a [f32] {
+        let mut node = layout.root();
+        for i in path {
+            let Node::Split(split) = node else {
+                panic!("a split")
+            };
+            node = &split.children[*i];
+        }
+        match node {
+            Node::Split(split) => &split.sizes,
+            Node::Leaf(_) => panic!("a split"),
+        }
+    }
+
+    #[test]
+    fn the_minimum_counts_the_panes_nested_along_the_line() {
+        // a | (b over (c | d)): the right side lines up two panes across.
+        let mut layout = Layout::single(Some(ch("a")));
+        let a = layout.focused();
+        let b = layout.split(a, Direction::Right, Some(ch("b"))).unwrap();
+        let c = layout.split(b, Direction::Down, Some(ch("c"))).unwrap();
+        layout.split(c, Direction::Right, Some(ch("d")));
+        assert_eq!(shape(&layout), "row(a, col(b, row(c, d)))");
+        assert!(layout.resize(&[], 0, 0.9, 0.2));
+        assert!(
+            approx(split_sizes(&layout, &[]), &[0.6, 0.4]),
+            "two minimums kept"
+        );
+        // Inside, c and d keep one each.
+        assert!(layout.resize(&[1, 1], 0, 0.05, 0.2));
+        assert!(approx(split_sizes(&layout, &[1, 1]), &[0.2, 0.8]));
+    }
+
+    #[test]
+    fn lines_still_move_when_the_minimum_does_not_fit() {
+        // Split right three times: 0.5, 0.25, 0.125, 0.125, with a minimum of 0.26 each.
+        let mut layout = Layout::single(Some(ch("a")));
+        for name in ["b", "c", "d"] {
+            layout.split(layout.focused(), Direction::Right, Some(ch(name)));
+        }
+        assert!(approx(
+            split_sizes(&layout, &[]),
+            &[0.5, 0.25, 0.125, 0.125]
+        ));
+        assert!(layout.resize(&[], 2, 0.8, 0.26), "c | d moves");
+        assert!(approx(
+            split_sizes(&layout, &[]),
+            &[0.5, 0.25, 0.0625, 0.1875]
+        ));
+        assert!(layout.resize(&[], 1, 0.6, 0.26), "b | c moves");
+        assert!(layout.resize(&[], 0, 0.3, 0.26), "a | b moves");
+        // An undersized side may grow even when its neighbour is at its own minimum.
+        let mut two = Layout::single(Some(ch("a")));
+        let a = two.focused();
+        two.split(a, Direction::Right, Some(ch("b")));
+        two.resize(&[], 0, 0.9, 0.05);
+        assert!(
+            two.resize(&[], 0, 0.85, 0.3),
+            "b grows from 0.1 towards its minimum"
+        );
+        assert!(
+            !two.resize(&[], 0, 0.95, 0.3),
+            "but does not shrink further"
+        );
+    }
+
+    #[test]
+    fn resizing_refuses_nan() {
+        let (mut layout, _) = three();
+        assert!(!layout.resize(&[], 0, 0.5, f32::NAN));
+        assert!(!layout.resize(&[], 0, f32::INFINITY, 0.1));
+    }
+
+    #[test]
+    fn closing_the_focused_pane_focuses_the_pane_that_takes_its_space() {
+        // row(col(a, b), c): closing b gives its space to a, which gets focus (not c, the next
+        // pane in reading order).
+        let mut layout = Layout::single(Some(ch("a")));
+        let a = layout.focused();
+        layout.split(a, Direction::Right, Some(ch("c")));
+        let b = layout.split(a, Direction::Down, Some(ch("b"))).unwrap();
+        assert_eq!(shape(&layout), "row(col(a, b), c)");
+        assert_eq!(layout.focused(), b);
+        assert!(layout.close(b));
+        assert_eq!(shape(&layout), "row(a, c)");
+        assert_eq!(layout.focused(), a);
+        // A first child hands over to the next one's nearest (first) pane.
+        let (mut layout, [a, b, _]) = three();
+        layout.focus(a);
+        assert!(layout.close(a));
+        assert_eq!(shape(&layout), "col(b, c)");
+        assert_eq!(layout.focused(), b);
+    }
+
+    #[test]
+    fn drops_that_would_do_nothing_are_refused() {
+        let (mut layout, [a, b, _]) = three();
+        assert!(!layout.accepts_pane(a, a), "a pane on itself");
+        assert!(layout.accepts_pane(a, b));
+        // A channel's own pane takes it only in the middle.
+        assert!(layout.accepts_channel(&ch("a"), a, DropZone::Center));
+        assert!(!layout.accepts_channel(&ch("a"), a, DropZone::Edge(Direction::Left)));
+        assert!(!layout.drop_channel(ch("a"), a, DropZone::Edge(Direction::Left)));
+        // At the limit a new channel can still go into a pane, not beside one.
+        while layout.len() < MAX_PANES {
+            layout.split(layout.focused(), Direction::Down, None);
+        }
+        let edge = DropZone::Edge(Direction::Right);
+        assert!(!layout.accepts_channel(&ch("z"), a, edge));
+        let before = layout.clone();
+        assert!(!layout.drop_channel(ch("z"), a, edge));
+        assert_eq!(layout, before, "nothing changed");
+        assert!(layout.accepts_channel(&ch("z"), a, DropZone::Center));
+        // Moving an existing pane keeps the count, so it is still allowed.
+        assert!(layout.accepts_channel(&ch("b"), a, edge));
+        assert!(layout.drop_channel(ch("b"), a, edge));
+        assert_eq!(layout.len(), MAX_PANES);
+    }
+
+    #[test]
+    fn pixel_positions_become_zones_and_fractions() {
+        assert_eq!(zone_in(200.0, 150.0, 400.0, 300.0), Some(DropZone::Center));
+        assert_eq!(
+            zone_in(10.0, 150.0, 400.0, 300.0),
+            Some(DropZone::Edge(Direction::Left))
+        );
+        assert_eq!(
+            zone_in(200.0, 290.0, 400.0, 300.0),
+            Some(DropZone::Edge(Direction::Down))
+        );
+        assert_eq!(zone_in(-1.0, 150.0, 400.0, 300.0), None, "outside");
+        assert_eq!(zone_in(200.0, 301.0, 400.0, 300.0), None, "outside");
+        assert_eq!(zone_in(0.0, 0.0, 0.0, 300.0), None, "no width");
+        assert_eq!(divider_fractions(300.0, 1200.0, 240.0), Some((0.25, 0.2)));
+        assert_eq!(divider_fractions(300.0, 0.0, 240.0), None);
+        assert_eq!(divider_fractions(f32::NAN, 1200.0, 240.0), None);
+    }
+
+    #[test]
+    fn neighbours_in_an_unequal_grid() {
+        // (a over c) | (b over d), the left column split at 0.3, the right at 0.7.
+        let mut layout = Layout::single(Some(ch("a")));
+        let a = layout.focused();
+        let b = layout.split(a, Direction::Right, Some(ch("b"))).unwrap();
+        let c = layout.split(a, Direction::Down, Some(ch("c"))).unwrap();
+        let d = layout.split(b, Direction::Down, Some(ch("d"))).unwrap();
+        assert!(layout.resize(&[0], 0, 0.3, 0.05));
+        assert!(layout.resize(&[1], 0, 0.7, 0.05));
+        // c (y 0.3..1) shares 0.4 with b (0..0.7) and 0.3 with d (0.7..1): b.
+        assert_eq!(layout.neighbour(c, Direction::Right), Some(b));
+        // a (0..0.3) touches only b.
+        assert_eq!(layout.neighbour(a, Direction::Right), Some(b));
+        // d (0.7..1) touches only c.
+        assert_eq!(layout.neighbour(d, Direction::Left), Some(c));
+        // b (0..0.7) shares 0.4 with c and 0.3 with a: c.
+        assert_eq!(layout.neighbour(b, Direction::Left), Some(c));
+        assert_eq!(layout.neighbour(a, Direction::Down), Some(c));
+        assert_eq!(layout.neighbour(d, Direction::Up), Some(b));
+    }
+
+    #[test]
+    fn neighbours_in_a_deeper_tree() {
+        // a | (b over (c | d)).
+        let mut layout = Layout::single(Some(ch("a")));
+        let a = layout.focused();
+        let b = layout.split(a, Direction::Right, Some(ch("b"))).unwrap();
+        let c = layout.split(b, Direction::Down, Some(ch("c"))).unwrap();
+        let d = layout.split(c, Direction::Right, Some(ch("d"))).unwrap();
+        assert_eq!(
+            layout.neighbour(d, Direction::Left),
+            Some(c),
+            "the nearest, not a"
+        );
+        assert_eq!(layout.neighbour(c, Direction::Left), Some(a));
+        assert_eq!(layout.neighbour(d, Direction::Up), Some(b));
+        assert_eq!(
+            layout.neighbour(b, Direction::Down),
+            Some(c),
+            "c and d tie: the first"
+        );
+        assert_eq!(
+            layout.neighbour(a, Direction::Right),
+            Some(b),
+            "b and the c|d row tie"
+        );
+        assert_eq!(layout.neighbour(d, Direction::Right), None);
+    }
+
+    #[test]
+    fn corrupt_saved_sizes_are_evened_out_and_never_reach_a_resize_as_nan() {
+        let list = list(&["a"]);
+        let saved = |sizes: Vec<f64>| SavedLayout {
+            focused: 0,
+            root: SavedPane {
+                panes: vec![SavedPane::default(); sizes.len()],
+                sizes,
+                ..SavedPane::default()
+            },
+        };
+        for bad in [
+            vec![f64::NAN, f64::NAN],
+            vec![1e-50, 1e-50], // zero as f32
+            vec![1e39, 1e39],   // infinite as f32
+            vec![3e38, 3e38],   // finite, but the total overflows
+            vec![f64::INFINITY, 1.0],
+            vec![-1.0, 2.0],
+        ] {
+            let mut layout = Layout::from_saved(Some(&saved(bad.clone())), &list);
+            assert!(approx(&sizes(&layout), &[0.5, 0.5]), "{bad:?}");
+            // The first divider drag must not panic (it did with NaN sizes).
+            assert!(layout.resize(&[], 0, 0.3, 0.1), "{bad:?}");
+        }
     }
 
     #[test]

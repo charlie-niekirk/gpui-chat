@@ -242,6 +242,11 @@ static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A file that is not TOML at all is moved to `state.toml.bad` first (so nothing is silently
 /// destroyed) and a fresh file is started; a file that cannot be read is left alone.
 fn update_at(path: &Path, key: &str, value: toml::Value) {
+    update_many_at(path, vec![(key, value)]);
+}
+
+/// [`update_at`] for several keys in one read-modify-write.
+fn update_many_at(path: &Path, entries: Vec<(&str, toml::Value)>) {
     let _guard = SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -261,7 +266,9 @@ fn update_at(path: &Path, key: &str, value: toml::Value) {
             return;
         }
     };
-    table.insert(key.to_owned(), value);
+    for (key, value) in entries {
+        table.insert(key.to_owned(), value);
+    }
     let text = toml::to_string_pretty(&table).expect("a TOML table serialises");
     if let Err(error) = write_atomic(path, &text) {
         tracing::warn!(%error, path = %path.display(), "could not save state");
@@ -290,6 +297,22 @@ pub fn save_channels(channels: SavedChannels) {
 /// Best-effort save of the split-pane layout; same rules as [`save_window`].
 pub fn save_layout(layout: SavedLayout) {
     update_section("layout", &layout);
+}
+
+/// The channel list and the layout in one write of the file (they change together).
+pub fn save_channels_and_layout(channels: SavedChannels, layout: SavedLayout) {
+    let Some(path) = state_path() else { return };
+    match (
+        toml::Value::try_from(&channels),
+        toml::Value::try_from(&layout),
+    ) {
+        (Ok(channels), Ok(layout)) => {
+            update_many_at(&path, vec![("channels", channels), ("layout", layout)]);
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(%error, "could not serialise the channels and layout");
+        }
+    }
 }
 
 /// Best-effort save of the recent emotes; same rules as [`save_window`].
@@ -477,6 +500,24 @@ mod tests {
         let layout = bare.layout.unwrap();
         assert_eq!(layout.focused, 0);
         assert_eq!(layout.root.channel.as_deref(), Some("forsen"));
+    }
+
+    #[test]
+    fn channels_and_layout_are_written_together() {
+        let (path, dir) = temp_state("together");
+        update_at(&path, "window", value(&placement()));
+        update_many_at(
+            &path,
+            vec![
+                ("channels", value(&channels())),
+                ("layout", value(&layout())),
+            ],
+        );
+        let state = load_from(&path);
+        assert_eq!(state.window, Some(placement()));
+        assert_eq!(state.channels, Some(channels()));
+        assert_eq!(state.layout, Some(layout()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

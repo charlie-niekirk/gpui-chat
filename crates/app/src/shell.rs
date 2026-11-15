@@ -123,11 +123,16 @@ pub fn flush_state(cx: &App) {
     if let Some(LatestPlacement(placement)) = cx.try_global::<LatestPlacement>() {
         state::save_window(placement.clone());
     }
-    if let Some(LatestChannels(channels)) = cx.try_global::<LatestChannels>() {
-        state::save_channels(channels.clone());
-    }
-    if let Some(LatestLayout(layout)) = cx.try_global::<LatestLayout>() {
-        state::save_layout(layout.clone());
+    match (
+        cx.try_global::<LatestChannels>(),
+        cx.try_global::<LatestLayout>(),
+    ) {
+        (Some(LatestChannels(channels)), Some(LatestLayout(layout))) => {
+            state::save_channels_and_layout(channels.clone(), layout.clone());
+        }
+        (Some(LatestChannels(channels)), None) => state::save_channels(channels.clone()),
+        (None, Some(LatestLayout(layout))) => state::save_layout(layout.clone()),
+        (None, None) => {}
     }
 }
 
@@ -395,10 +400,7 @@ impl AppShell {
         self.channels_save_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(CHANNELS_SAVE_DEBOUNCE).await;
             cx.background_executor()
-                .spawn(async move {
-                    state::save_channels(channels);
-                    state::save_layout(layout);
-                })
+                .spawn(async move { state::save_channels_and_layout(channels, layout) })
                 .await;
         }));
     }
@@ -490,12 +492,41 @@ impl AppShell {
         }
     }
 
-    /// The pointer is over `zone` of `pane` while dragging a pane or a channel.
-    pub(crate) fn drag_over(&mut self, pane: PaneId, zone: DropZone, cx: &mut Context<Self>) {
-        if self.drop_target != Some((pane, zone)) {
-            self.drop_target = Some((pane, zone));
+    /// Shows (or, with `None`, hides) where a drop would land.
+    fn set_drop_target(&mut self, target: Option<(PaneId, DropZone)>, cx: &mut Context<Self>) {
+        if self.drop_target != target {
+            self.drop_target = target;
             cx.notify();
         }
+    }
+
+    /// The pointer is over `zone` of `pane` while dragging the pane showing `channel`: nothing to
+    /// show over the dragged pane itself.
+    pub(crate) fn drag_pane_over(
+        &mut self,
+        channel: &ChannelId,
+        pane: PaneId,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let accepted = self
+            .layout
+            .pane_showing(channel)
+            .is_some_and(|src| self.layout.accepts_pane(src, pane));
+        self.set_drop_target(accepted.then_some((pane, zone)), cx);
+    }
+
+    /// The pointer is over `zone` of `pane` while dragging a sidebar channel: only zones where a
+    /// drop would do something are shown (no new pane at the limit).
+    pub(crate) fn drag_channel_over(
+        &mut self,
+        channel: &ChannelId,
+        pane: PaneId,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let accepted = self.layout.accepts_channel(channel, pane, zone);
+        self.set_drop_target(accepted.then_some((pane, zone)), cx);
     }
 
     /// Where a drop on `pane` lands: the zone last seen under the pointer.
@@ -530,8 +561,10 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let zone = self.take_drop_zone(target);
-        let added = self.open_channel(&channel, cx);
-        if self.layout.drop_channel(channel, target, zone) || added {
+        // A followed channel is opened only when the drop takes it (not at the pane limit).
+        if self.layout.accepts_channel(&channel, target, zone) {
+            self.open_channel(&channel, cx);
+            self.layout.drop_channel(channel, target, zone);
             self.list_changed(cx);
         }
         cx.notify();

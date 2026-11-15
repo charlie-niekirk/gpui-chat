@@ -1,5 +1,5 @@
-//! Draws the split-pane [`Layout`]: rows and columns of panes with a draggable line between
-//! neighbours, an accent outline on the focused pane, and drop zones while a pane (from its
+//! Draws the split-pane [`Layout`]: rows and columns of panes with Kit's resize handle on the
+//! line between neighbours, an accent outline on the focused pane, and drop zones while a pane (from its
 //! header) or a channel (from the sidebar) is dragged over one.
 //!
 //! The listeners call back into the [`AppShell`], which owns the layout and the panes.
@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use gpui_chat_core::ChannelId;
 use gpui_kit::base::component_traits::Collapsible;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::resizable::resize_handle;
 use gpui_kit::component::sidebar::{SidebarItem, SidebarMenuItem};
 use gpui_kit::component::{Sizable as _, v_flex};
 use gpui_kit::{
@@ -17,15 +18,15 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled, Window, div, px, relative,
 };
 
-use super::{Axis, Direction, DropZone, Layout, Leaf, Node, PaneId, Split};
+use super::{
+    Axis, Direction, DropZone, Layout, Leaf, Node, PaneId, Split, divider_fractions, zone_in,
+};
 use crate::pane::ChannelPane;
 use crate::shell::AppShell;
 use crate::theme::Tokens;
 
 /// Dragging a line stops when a pane would get narrower (or shorter) than this.
 const MIN_PANE: f32 = 220.0;
-/// The grab area of the line between two panes.
-const DIVIDER: f32 = 5.0;
 
 /// A pane picked up by its header, to move it.
 #[derive(Clone, Debug)]
@@ -162,7 +163,6 @@ impl Splits<'_> {
 
     fn split(&self, split: &Split, path: Vec<usize>, cx: &mut Context<AppShell>) -> AnyElement {
         let axis = split.axis;
-        let count = split.children.len();
         let key = path_key(&path);
         let mut container = div()
             .id(SharedString::from(format!("split-{key}")))
@@ -183,24 +183,16 @@ impl Splits<'_> {
                     return;
                 }
                 let (offset, length) = along(axis, event.bounds, event.event.position);
-                // The dividers take room too: measure in the space the panes share.
-                let lines = (count - 1) as f32 * DIVIDER;
-                let shared = length - lines;
-                if shared <= 0.0 {
-                    return;
+                if let Some((at, min_pane)) = divider_fractions(offset, length, MIN_PANE) {
+                    this.resize_split(&own, drag.handle, at, min_pane, cx);
                 }
-                let at = (offset - drag.handle as f32 * DIVIDER - DIVIDER / 2.0) / shared;
-                let min = (MIN_PANE / shared).min(0.45);
-                this.resize_split(&own, drag.handle, at, min, cx);
             },
         ));
         for (i, (child, size)) in split.children.iter().zip(&split.sizes).enumerate() {
-            if i > 0 {
-                container = container.child(divider(axis, &path, i - 1, &self.tokens));
-            }
             let mut child_path = path.clone();
             child_path.push(i);
             let cell = div()
+                .relative()
                 .flex()
                 .flex_grow(*size)
                 .flex_shrink(1.0)
@@ -211,7 +203,15 @@ impl Splits<'_> {
                 Axis::Row => cell.h_full(),
                 Axis::Column => cell.w_full(),
             };
-            container = container.child(cell.child(self.node(child, child_path, cx)));
+            let cell = cell.child(self.node(child, child_path, cx));
+            // Every child after the first carries the handle for the line before it, straddling
+            // its leading edge (drawn over both neighbours, so the panes need no gap).
+            let cell = if i > 0 {
+                cell.child(divider(axis, &path, i - 1))
+            } else {
+                cell
+            };
+            container = container.child(cell);
         }
         container.into_any_element()
     }
@@ -241,14 +241,16 @@ impl Splits<'_> {
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedPane>, _, cx| {
                     if let Some(zone) = zone_under(event.bounds, event.event.position) {
-                        this.drag_over(id, zone, cx);
+                        let channel = event.drag(cx).channel.clone();
+                        this.drag_pane_over(&channel, id, zone, cx);
                     }
                 }),
             )
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedChannel>, _, cx| {
                     if let Some(zone) = zone_under(event.bounds, event.event.position) {
-                        this.drag_over(id, zone, cx);
+                        let channel = event.drag(cx).channel.clone();
+                        this.drag_channel_over(&channel, id, zone, cx);
                     }
                 }),
             )
@@ -298,46 +300,32 @@ fn along(axis: Axis, bounds: Bounds<Pixels>, position: Point<Pixels>) -> (f32, f
 
 /// The drop zone under `position`, if it is over `bounds` at all.
 fn zone_under(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<DropZone> {
-    if !bounds.contains(&position) {
-        return None;
-    }
-    let (x, width) = along(Axis::Row, bounds, position);
-    let (y, height) = along(Axis::Column, bounds, position);
-    (width > 0.0 && height > 0.0).then(|| DropZone::at(x / width, y / height))
+    zone_in(
+        (position.x - bounds.origin.x).as_f32(),
+        (position.y - bounds.origin.y).as_f32(),
+        bounds.size.width.as_f32(),
+        bounds.size.height.as_f32(),
+    )
 }
 
-fn divider(axis: Axis, path: &[usize], handle: usize, tokens: &Tokens) -> impl IntoElement {
-    let key = path_key(path);
-    let line = div().bg(tokens.border);
-    let grab = div()
-        .id(SharedString::from(format!("divider-{key}-{handle}")))
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .bg(tokens.window_bg)
-        .hover(|style| style.bg(tokens.accent.opacity(0.35)))
-        .on_drag(
-            DraggedDivider {
-                path: path.to_vec(),
-                handle,
-            },
-            |_, _, _, cx| cx.new(|_| EmptyView),
-        );
-    match axis {
-        Axis::Row => grab
-            .flex_row()
-            .w(px(DIVIDER))
-            .h_full()
-            .cursor_col_resize()
-            .child(line.w(px(1.0)).h_full()),
-        Axis::Column => grab
-            .flex_col()
-            .h(px(DIVIDER))
-            .w_full()
-            .cursor_row_resize()
-            .child(line.h(px(1.0)).w_full()),
-    }
+/// Kit's resize handle for the line after child `handle` of the split at `path`: its band,
+/// cursor and themed hairline/pill; the drag is followed by the split's `on_drag_move`.
+fn divider(axis: Axis, path: &[usize], handle: usize) -> impl IntoElement {
+    let kit_axis = match axis {
+        Axis::Row => gpui_kit::Axis::Horizontal,
+        Axis::Column => gpui_kit::Axis::Vertical,
+    };
+    resize_handle::<DraggedDivider, EmptyView>(
+        SharedString::from(format!("divider-{}-{handle}", path_key(path))),
+        kit_axis,
+    )
+    .on_drag(
+        DraggedDivider {
+            path: path.to_vec(),
+            handle,
+        },
+        |_, _, _, cx| cx.new(|_| EmptyView),
+    )
 }
 
 /// Shades where a drop would land: the whole pane, or the half on that side.
