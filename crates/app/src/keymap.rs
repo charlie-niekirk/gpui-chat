@@ -100,6 +100,7 @@ catalog![
         true "View" ToggleDebugHud "Toggle Debug HUD",
         true "Account" LogIn "Log In to Twitch…",
         true "Account" LogOut "Log Out",
+        true "App" OpenSettings "Settings…",
         true "App" About "About",
         true "App" MinimizeWindow "Minimize Window",
         true "App" CloseWindow "Close Window",

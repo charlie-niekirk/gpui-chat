@@ -21,6 +21,7 @@ actions!(
         ReloadEmotes,
         LogIn,
         LogOut,
+        OpenSettings,
         ComposerHistoryPrevious,
         ComposerHistoryNext,
         SplitRight,

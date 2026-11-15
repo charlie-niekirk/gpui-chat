@@ -191,6 +191,40 @@ where
     })
 }
 
+/// [`attach`] without a window: events are applied as soon as the foreground executor gets to
+/// them, whether or not any window is drawing. For rare, tiny events that every window must see
+/// even while the one `attach` would have used is minimised, occluded or on another Space (macOS
+/// stops a hidden window's display link, and with it its frame callbacks): the settings and theme
+/// file watchers. Each wake-up applies everything queued so far as one batch and notifies once if
+/// `apply` reports a change. The task ends when all senders are gone or the entity is released.
+pub fn attach_unframed<E, T>(
+    entity: &Entity<T>,
+    mut receiver: BridgeReceiver<E>,
+    cx: &mut App,
+    mut apply: impl FnMut(&mut T, Vec<E>, &mut Context<T>) -> bool + 'static,
+) -> Task<()>
+where
+    E: 'static,
+    T: 'static,
+{
+    let entity = entity.downgrade();
+    cx.spawn(async move |cx| {
+        while let Some(first) = receiver.first().await {
+            let batch = receiver.drain(first);
+            let alive = entity
+                .update(cx, |target, cx| {
+                    if apply(target, batch, cx) {
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -352,6 +386,28 @@ mod tests {
         fn batches(&self, cx: &mut TestAppContext) -> Vec<Vec<u32>> {
             self.sink.read_with(cx, |sink, _| sink.batches.clone())
         }
+    }
+
+    #[gpui_kit::test]
+    fn unframed_events_are_applied_without_any_window_drawing(cx: &mut TestAppContext) {
+        let sink = cx.new(|_| Sink::default());
+        let (tx, rx) = channel::<u32>(16, 16);
+        let _task = cx.update(|cx| {
+            attach_unframed(&sink, rx, cx, |sink: &mut Sink, batch, _| {
+                sink.batches.push(batch);
+                true
+            })
+        });
+        // No window exists, so no frame ever runs; the events are applied all the same.
+        tx.try_send(1).unwrap();
+        cx.run_until_parked();
+        tx.try_send(2).unwrap();
+        tx.try_send(3).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            sink.read_with(cx, |s, _| s.batches.clone()),
+            vec![vec![1], vec![2, 3]]
+        );
     }
 
     #[gpui_kit::test]

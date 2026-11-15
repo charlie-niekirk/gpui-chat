@@ -4,8 +4,9 @@
 //! * Every struct is `#[serde(default)]`, so a file may omit any key, section or
 //!   the whole file. New fields therefore never break existing files.
 //! * Unknown keys are **ignored** on load (no `deny_unknown_fields`), so a file
-//!   written by a newer build still loads in an older one. They are not
-//!   preserved when the app saves.
+//!   written by a newer build still loads in an older one. The settings window
+//!   keeps them when it edits the file (`Settings::update_file`); `Settings::save`
+//!   does not.
 //! * Bump [`SCHEMA_VERSION`] only for changes a default cannot express
 //!   (renames, changed meaning). Adding a field is not such a change.
 
@@ -25,13 +26,13 @@ fn unversioned_schema_version() -> u32 {
 }
 
 /// Allowed range for [`AppearanceSettings::font_size`] (points).
-pub(crate) const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
+pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 /// Allowed range for [`AppearanceSettings::line_height`] (multiplier).
-pub(crate) const LINE_HEIGHT_RANGE: (f32, f32) = (1.0, 3.0);
+pub const LINE_HEIGHT_RANGE: (f32, f32) = (1.0, 3.0);
 /// Allowed range for [`ChatSettings::scrollback`] (messages per channel).
-pub(crate) const SCROLLBACK_RANGE: (usize, usize) = (10, 100_000);
+pub const SCROLLBACK_RANGE: (usize, usize) = (10, 100_000);
 /// Allowed range for [`EmoteSettings::scale`] (multiplier).
-pub(crate) const EMOTE_SCALE_RANGE: (f32, f32) = (0.5, 4.0);
+pub const EMOTE_SCALE_RANGE: (f32, f32) = (0.5, 4.0);
 
 /// Top-level settings, stored as `settings.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

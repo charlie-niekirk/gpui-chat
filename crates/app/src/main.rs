@@ -34,6 +34,7 @@ mod platform;
 mod replay;
 mod reply;
 mod runtime;
+mod settings_window;
 mod shell;
 mod sign_in;
 mod splits;
@@ -50,7 +51,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::account::AccountHub;
-use crate::actions::Quit;
+use crate::actions::{OpenSettings, Quit};
 use crate::channel_list::ChannelList;
 use crate::channels::ChannelHub;
 use crate::cli::{Cli, Parsed};
@@ -222,6 +223,7 @@ fn main() {
             // Kit's bindings, the app's defaults and the user's `keymap.toml`, and the menu bar.
             let keymap_events = keymap::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
 
             // Persist the last window placement and channel list on the way out (⌘Q and last-window close).
             cx.on_app_quit(|cx| {
@@ -230,9 +232,9 @@ fn main() {
             })
             .detach();
 
-            // Quit when the last window closes (single-window app for now).
+            // Quit when the last chat window closes (the settings window does not keep the app open).
             cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
+                if settings_window::only_settings_left(cx) {
                     cx.quit();
                 }
             })
@@ -251,19 +253,16 @@ fn main() {
                 let appearance = config::current(cx).appearance.clone();
                 theme::apply_settings(&appearance, Some(window), cx);
                 // Settings changes reach the UI through the bridge: the watcher thread sends,
-                // and the store is updated once per frame on the main thread.
+                // and the store is updated on the main thread without waiting for a frame (the
+                // settings window must follow the file while the main window is hidden).
                 if let Some(events) = settings_events {
-                    bridge::attach(
-                        &config::store(cx),
-                        window.window_handle(),
-                        events,
-                        cx,
-                        |store, events, _| store.apply_events(events),
-                    )
+                    bridge::attach_unframed(&config::store(cx), events, cx, |store, events, _| {
+                        store.apply_events(events)
+                    })
                     .detach();
                 }
                 if let Some(events) = theme_events {
-                    theme::attach_reloads(events, window.window_handle(), cx);
+                    theme::attach_reloads(events, cx);
                 }
                 if let Some(events) = keymap_events {
                     keymap::attach_reloads(events, window.window_handle(), cx);

@@ -47,6 +47,10 @@ pub enum SettingsError {
         source: Arc<std::io::Error>,
     },
 
+    /// There is nowhere to keep settings (no home directory), so nothing can be written.
+    #[error("there is no settings location (no home directory)")]
+    NoLocation,
+
     /// The file watcher could not be started or failed.
     #[error("could not watch {}: {message}", path.display())]
     Watch { path: PathBuf, message: String },

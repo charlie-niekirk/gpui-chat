@@ -23,6 +23,7 @@
 //!
 //! See `docs/SETTINGS.md` for the file format and the compatibility rules.
 
+mod edit;
 mod error;
 mod keymap;
 mod keymap_watch;
@@ -34,6 +35,7 @@ mod theme_watch;
 mod themes;
 mod watch;
 
+pub use edit::{EditValue, SettingEdit, apply_edits};
 pub use error::SettingsError;
 pub use keymap::{
     KeymapEntry, KeymapProblem, KeymapReport, load_keymap, parse_keymap, validate_keystroke,
@@ -44,8 +46,9 @@ pub use paths::{
     THEMES_DIR_NAME,
 };
 pub use schema::{
-    AppearanceSettings, ChatSettings, EmoteSettings, SCHEMA_VERSION, Settings, StreamlinkSettings,
-    ThemeMode, UNVERSIONED_SCHEMA_VERSION,
+    AppearanceSettings, ChatSettings, EMOTE_SCALE_RANGE, EmoteSettings, FONT_SIZE_RANGE,
+    LINE_HEIGHT_RANGE, SCHEMA_VERSION, SCROLLBACK_RANGE, Settings, StreamlinkSettings, ThemeMode,
+    UNVERSIONED_SCHEMA_VERSION,
 };
 pub use store::LoadOutcome;
 pub use theme::{

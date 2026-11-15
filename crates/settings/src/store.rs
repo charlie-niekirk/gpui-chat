@@ -109,7 +109,8 @@ impl Settings {
     /// Saving rewrites the whole file from the typed struct: comments and
     /// unknown keys in the existing file are lost. Callers must not save over a
     /// file that failed to load (see [`LoadOutcome::error`]) without the
-    /// user's say-so.
+    /// user's say-so. To change single keys of a hand-edited file, use
+    /// [`Settings::update_file`], which keeps everything else.
     pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
         let text = self.to_toml()?;
         atomic_write(path, text.as_bytes()).map_err(|source| SettingsError::Write {
@@ -119,7 +120,7 @@ impl Settings {
     }
 }
 
-fn line_col(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn line_col(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
     // Span offsets are byte offsets; fall back to the previous char boundary.
     let mut end = offset;
@@ -134,7 +135,7 @@ fn line_col(text: &str, offset: usize) -> (usize, usize) {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Write through a symlink rather than replacing it.
     let target: PathBuf = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let dir = match target.parent() {

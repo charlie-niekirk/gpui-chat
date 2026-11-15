@@ -20,7 +20,7 @@ use gpui_chat_twitch::auth::{
     AuthError, AuthState, DeviceCode, DevicePolling, OAuthClient, client_id,
 };
 use gpui_chat_twitch::{Auth, HelixClient};
-use gpui_kit::{App, AppContext as _, Context, Entity, Task};
+use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
@@ -57,6 +57,17 @@ fn failure_message(error: &AuthError) -> String {
         AuthError::Network(_) => format!("Could not reach Twitch ({error})."),
         other => format!("Login failed: {other}"),
     }
+}
+
+/// The app's [`AccountHub`], for windows other than the main one (the settings window).
+struct AccountHandle(Entity<AccountHub>);
+
+impl Global for AccountHandle {}
+
+/// The account hub, or `None` when there is none (offline runs, or no HTTP client).
+pub fn current(cx: &App) -> Option<Entity<AccountHub>> {
+    cx.try_global::<AccountHandle>()
+        .map(|handle| handle.0.clone())
 }
 
 /// The account as the UI sees it. One per app, owned by the shell.
@@ -109,7 +120,7 @@ impl AccountHub {
             restoring.restore().await;
             restoring.run_validation(VALIDATION_INTERVAL).await;
         }));
-        cx.new(|cx: &mut Context<Self>| {
+        let hub = cx.new(|cx: &mut Context<Self>| {
             let state_task = cx.spawn(async move |this, cx| {
                 while states.changed().await.is_ok() {
                     let state = states.borrow_and_update().clone();
@@ -129,7 +140,9 @@ impl AccountHub {
                 _sign_in_task: None,
                 _state_task: state_task,
             }
-        })
+        });
+        cx.set_global(AccountHandle(hub.clone()));
+        hub
     }
 
     pub fn helix(&self) -> &HelixClient {
