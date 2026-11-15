@@ -342,7 +342,7 @@ impl Composer {
         if let Some(picker) = &self.picker {
             return vec![place(picker.clone().into_any_element())];
         }
-        let light = tokens.main_bg.l > 0.5;
+        let light = tokens.light;
         let (owner, composer) = (cx.entity_id(), cx.entity());
         let outside = cx.entity();
         self.completion

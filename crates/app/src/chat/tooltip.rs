@@ -251,7 +251,7 @@ impl Render for EmoteTooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let family = cx.global::<FontConfig>().family.clone();
-        let light = tokens.main_bg.l > 0.5;
+        let light = tokens.light;
         self.frame.borrow_mut().begin_frame();
         Images::sweep(window, cx);
         let entity = cx.entity_id();
@@ -304,7 +304,7 @@ impl Render for EmoteTooltip {
             .rounded_md()
             .border_1()
             .border_color(tokens.border)
-            .bg(tokens.window_bg)
+            .bg(tokens.surface)
             .shadow_md()
             .font_family(family)
             .text_sm()

@@ -1,0 +1,12 @@
+# Lumon. Palette transcribed from Omarchy's `lumon` theme (MIT).
+name = "Lumon"
+
+[dark]
+background = "#16242d"
+window = "#101b21"
+sidebar = "#101b21"
+title_bar = "#1b2d40"
+border = "#243d56"
+surface = "#1b2d40"
+text = "#d6e2ee"
+accent = "#8bc9eb"

@@ -1,0 +1,15 @@
+# Flexoki Light. Palette transcribed from Omarchy's `flexoki-light` theme (MIT).
+name = "Flexoki Light"
+
+[light]
+background = "#fffcf0"
+window = "#f2efe4"
+sidebar = "#f2efe4"
+title_bar = "#e6e4d9"
+border = "#cecdc3"
+surface = "#e6e4d9"
+text = "#100f0f"
+accent = "#205ea6"
+danger = "#d14d41"
+success = "#879a39"
+warning = "#d0a215"

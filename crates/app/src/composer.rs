@@ -439,7 +439,7 @@ impl Composer {
                 .child(
                     Icon::new(gpui_kit::assets::IconName::Undo2)
                         .size_4()
-                        .text_color(tokens.accent),
+                        .text_color(tokens.accent_link),
                 )
                 .child(
                     div()
@@ -511,7 +511,7 @@ impl Composer {
                         .flex_1()
                         .min_w_0()
                         .text_sm()
-                        .text_color(tokens.danger)
+                        .text_color(tokens.danger_text)
                         .child(error),
                 )
                 .child(

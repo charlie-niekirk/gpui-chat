@@ -1,0 +1,12 @@
+# Lupine. Palette transcribed from Omarchy's `lupine` theme (MIT).
+name = "Lupine"
+
+[light]
+background = "#fafafa"
+window = "#ececec"
+sidebar = "#ececec"
+title_bar = "#f5f5f5"
+border = "#d0d0d0"
+surface = "#f5f5f5"
+text = "#212121"
+accent = "#3264eb"

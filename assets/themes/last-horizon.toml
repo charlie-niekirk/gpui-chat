@@ -1,0 +1,10 @@
+# Last Horizon. Palette transcribed from Omarchy's `last-horizon` theme (MIT).
+name = "Last Horizon"
+
+[dark]
+background = "#0c0b0c"
+window = "#090809"
+sidebar = "#090809"
+border = "#584e51"
+text = "#fafcfb"
+accent = "#b59790"

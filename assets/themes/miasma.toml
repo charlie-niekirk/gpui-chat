@@ -1,0 +1,12 @@
+# Miasma. Palette transcribed from Omarchy's `miasma` theme (MIT).
+name = "Miasma"
+
+[dark]
+background = "#222222"
+window = "#191919"
+sidebar = "#191919"
+title_bar = "#2c2c2c"
+border = "#383838"
+surface = "#2c2c2c"
+text = "#c2c2b0"
+accent = "#78824b"

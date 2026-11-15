@@ -1,0 +1,13 @@
+# Starship. Palette transcribed from Omarchy's `starship` theme (MIT).
+name = "Starship"
+
+[dark]
+background = "#1c1c1e"
+window = "#161618"
+sidebar = "#161618"
+title_bar = "#2c2c2e"
+border = "#3a3a3c"
+surface = "#2c2c2e"
+text = "#f5f5f7"
+accent = "#ff9f0a"
+danger = "#ff5f4a"

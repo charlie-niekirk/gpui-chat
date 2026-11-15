@@ -10,7 +10,7 @@ atomic save, hot reload and paths. No GPUI, no async runtime.
 | Config dir | `$GPUI_CHAT_CONFIG_DIR`, else `$XDG_CONFIG_HOME/<APP_NAME>` (absolute only), else `~/.config/<APP_NAME>/` (macOS and Linux alike) |
 | Settings | `<config>/settings.toml` |
 | Keymap | `<config>/keymap.toml` (PR 4.3) |
-| Themes | `<config>/themes/*.toml` (PR 4.4) |
+| Themes | `<config>/themes/*.toml`, watched (see `docs/THEMES.md`) |
 | Cache | `$GPUI_CHAT_CACHE_DIR`, else `dirs::cache_dir()/<APP_NAME>` |
 
 `<APP_NAME>` is `gpui_chat_core::APP_NAME`. Tests build a `SettingsPaths` with
@@ -27,7 +27,8 @@ font_fallbacks = ["JetBrains Mono", "monospace"]
 font_size = 14.0                           # 6 to 72
 line_height = 1.4                          # 1.0 to 3.0
 theme = "system"                           # system | light | dark
-theme_name = "default"                     # colour theme (PR 4.4)
+theme_name = "default"                     # colour theme: bundled id or themes/<name>.toml (docs/THEMES.md)
+# theme_name_light = "rose-pine"           # optional: theme for the light variant (follow-system pairing)
 
 [chat]
 scrollback = 1000                          # 10 to 100000

@@ -1,0 +1,15 @@
+# Jade Horse. Palette transcribed from Omarchy's `jade-horse` theme (MIT).
+name = "Jade Horse"
+
+[dark]
+background = "#142620"
+window = "#0f1e19"
+sidebar = "#0f1e19"
+title_bar = "#203b31"
+border = "#2b5147"
+surface = "#203b31"
+text = "#dfede5"
+accent = "#8bcbb1"
+danger = "#d88d91"
+success = "#8bcbb1"
+warning = "#c5cc91"

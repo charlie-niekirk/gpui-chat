@@ -1,0 +1,33 @@
+# The built-in look: the Twitch-flavoured grey scale with a purple accent, dark and light.
+# Chosen when `appearance.theme_name = "default"`.
+name = "Default"
+
+[dark]
+background = "#0e0e10"
+window = "#18181b"
+sidebar = "#18181b"
+title_bar = "#1f1f23"
+border = "#2f2f35"
+surface = "#1f1f23"
+text = "#efeff1"
+text_muted = "#adadb8"
+accent = "#9147ff"
+accent_text = "#ffffff"
+danger = "#ff6b6b"
+success = "#2fbf71"
+warning = "#e0a030"
+
+[light]
+background = "#ffffff"
+window = "#f7f7f8"
+sidebar = "#f7f7f8"
+title_bar = "#ebebef"
+border = "#d7d7dc"
+surface = "#ebebef"
+text = "#0e0e10"
+text_muted = "#53535f"
+accent = "#772ce8"
+accent_text = "#ffffff"
+danger = "#c4221f"
+success = "#1f9d55"
+warning = "#b7791f"

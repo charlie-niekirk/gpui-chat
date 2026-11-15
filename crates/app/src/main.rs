@@ -213,6 +213,8 @@ fn main() {
             let settings_events = config::init(cx);
             let appearance = config::current(cx).appearance.clone();
             fonts::init(&appearance, cx);
+            // User themes (`themes/*.toml`) load before the first theme is applied.
+            let theme_events = theme::init(cx);
             theme::apply_settings(&appearance, None, cx);
 
             cx.bind_keys(platform::default_bindings());
@@ -257,6 +259,9 @@ fn main() {
                         |store, events, _| store.apply_events(events),
                     )
                     .detach();
+                }
+                if let Some(events) = theme_events {
+                    theme::attach_reloads(events, window.window_handle(), cx);
                 }
                 let parts = start_chat(&cli, replay_log.clone(), window, cx);
                 cx.new(|cx| AppShell::new(window, parts, cx))

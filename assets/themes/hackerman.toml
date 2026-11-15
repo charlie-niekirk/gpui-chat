@@ -1,0 +1,12 @@
+# Hackerman. Palette transcribed from Omarchy's `hackerman` theme (MIT).
+name = "Hackerman"
+
+[dark]
+background = "#0b0c16"
+window = "#080910"
+sidebar = "#080910"
+title_bar = "#151828"
+border = "#1f253a"
+surface = "#151828"
+text = "#ddf7ff"
+accent = "#82fb9c"

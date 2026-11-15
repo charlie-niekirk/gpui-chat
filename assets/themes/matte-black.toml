@@ -1,0 +1,13 @@
+# Matte Black. Palette transcribed from Omarchy's `matte-black` theme (MIT).
+name = "Matte Black"
+
+[dark]
+background = "#121212"
+window = "#0d0d0d"
+sidebar = "#0d0d0d"
+title_bar = "#1e1e1e"
+border = "#2a2a2a"
+surface = "#1e1e1e"
+text = "#bebebe"
+accent = "#e68e0d"
+danger = "#d35f5f"

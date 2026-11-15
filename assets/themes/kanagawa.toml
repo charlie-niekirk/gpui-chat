@@ -1,0 +1,15 @@
+# Kanagawa. Palette transcribed from Omarchy's `kanagawa` theme (MIT).
+name = "Kanagawa"
+
+[dark]
+background = "#1f1f28"
+window = "#17171e"
+sidebar = "#17171e"
+title_bar = "#223249"
+border = "#363646"
+surface = "#223249"
+text = "#dcd7ba"
+accent = "#dcd7ba"
+danger = "#e82424"
+success = "#98bb6c"
+warning = "#e6c384"

@@ -477,7 +477,7 @@ impl Autocomplete {
                 .rounded_md()
                 .border_1()
                 .border_color(tokens.border)
-                .bg(tokens.window_bg)
+                .bg(tokens.surface)
                 .shadow_md()
                 .text_sm()
                 .text_color(tokens.text)

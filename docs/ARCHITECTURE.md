@@ -18,9 +18,9 @@ crates/
   media/       image fetch, disk cache, decode (static + animated), memory budget
   settings/    typed settings, load/save/watch, paths
   streamlink/  locate binary, launch, track child processes
-assets/        fonts, icons, bundled themes; badges/global.json = bundled global-badge snapshot (PR 2.5)
+assets/        fonts, icons, bundled themes (`themes/*.toml`); badges/global.json = bundled global-badge snapshot (PR 2.5)
 fixtures/      recorded raw IRC lines, API JSON samples                      (added by later PRs)
-docs/          ARCHITECTURE.md, BACKLOG.md
+docs/          ARCHITECTURE.md, BACKLOG.md, SETTINGS.md, THEMES.md
 ```
 
 Package names are `gpui-chat-<dir>` for libraries (`gpui-chat-core`, …); the
@@ -72,9 +72,11 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   own focus handle when it cannot type. Keys (macOS): ⌘D split right, ⇧⌥⌘D split down (⌥⌘D is the
   system's Dock toggle), ⇧⌘W close pane, ⌃⌘←/→/↑/↓ move focus; also in the View menu and as
   buttons in each pane header.
-- `theme.rs` — our own `Tokens` (dark/light), chosen from the system appearance (live, via
-  `observe_window_appearance`) and mirrored into Kit's `Theme` so Kit components match.
-  Theme packs (PR 4.4) extend `Tokens`.
+- `theme.rs` — our own `Tokens`, filled from a theme palette (`gpui-chat-settings`:
+  `ThemeRegistry::resolve` picks theme + variant from `appearance.theme` / `theme_name` /
+  `theme_name_light` and the OS appearance, live via `observe_window_appearance`) and mirrored into
+  Kit's `Theme` colours so Kit components match. The user's `themes/` directory is watched and
+  re-applied (`attach_reloads`). See `docs/THEMES.md`.
 - `fonts.rs` / `assets.rs` — bundled JetBrains Mono TTFs (`assets/fonts/`, OFL in `OFL.txt`) are
   embedded, registered with the text system at startup and the family is resolved against the
   installed list (GPUI panics on unknown families, so there is no blind fallback).

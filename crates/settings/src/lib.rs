@@ -27,6 +27,9 @@ mod error;
 mod paths;
 mod schema;
 mod store;
+mod theme;
+mod theme_watch;
+mod themes;
 mod watch;
 
 pub use error::SettingsError;
@@ -39,6 +42,14 @@ pub use schema::{
     ThemeMode, UNVERSIONED_SCHEMA_VERSION,
 };
 pub use store::LoadOutcome;
+pub use theme::{
+    Color, Palette, TEXT_CONTRAST, Theme, ThemeError, ThemeOrigin, ThemeVariant, normalize_id,
+};
+pub use theme_watch::{ThemeWatcher, watch_themes};
+pub use themes::{
+    DEFAULT_THEME_ID, LoadReport, ResolvedTheme, ThemeRegistry, UnknownTheme, bundled_themes,
+    load_user_themes,
+};
 pub use watch::{
     DEFAULT_DEBOUNCE, SettingsEvent, SettingsWatcher, WatchOptions, watch, watch_channel,
 };

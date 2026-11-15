@@ -1,0 +1,15 @@
+# Nord. Palette transcribed from Omarchy's `nord` theme (MIT).
+name = "Nord"
+
+[dark]
+background = "#2e3440"
+window = "#222730"
+sidebar = "#222730"
+title_bar = "#3b4252"
+border = "#434c5e"
+surface = "#3b4252"
+text = "#d8dee9"
+accent = "#81a1c1"
+danger = "#bf616a"
+success = "#a3be8c"
+warning = "#ebcb8b"

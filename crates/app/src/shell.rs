@@ -897,10 +897,37 @@ impl AppShell {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(danger)
+                    .text_color(tokens.danger_text)
                     .child("Settings not applied: keeping the previous settings"),
             )
             .child(div().text_sm().child(error.to_string()))
+    }
+
+    /// A strip listing problems with the user's themes: a theme file that does not parse, a
+    /// duplicate name, unreadable colours, or a `theme_name` that matches no theme. The theme
+    /// in effect keeps working; the strip goes when the problem is fixed.
+    fn theme_notice_banner(notices: &[String], tokens: &Tokens) -> impl IntoElement {
+        v_flex()
+            .id("theme-notice-banner")
+            .w_full()
+            .flex_none()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .bg(tokens.warning.opacity(0.14))
+            .border_b_1()
+            .border_color(tokens.warning)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Theme problem"),
+            )
+            .children(
+                notices
+                    .iter()
+                    .map(|line| div().text_sm().child(line.clone())),
+            )
     }
 
     fn main_area(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1033,7 +1060,7 @@ fn live_suffix(info: &StreamInfo, with_category: bool, cx: &App) -> AnyElement {
             div()
                 .size(px(7.0))
                 .rounded_full()
-                .bg(stream_info::live_color()),
+                .bg(cx.global::<Tokens>().danger),
         )
         .child(stream_info::compact_viewers(info.viewers))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -1088,6 +1115,7 @@ impl Render for AppShell {
         }
         let font = cx.global::<FontConfig>().clone();
         let settings_error = config::store(cx).read(cx).error().cloned();
+        let theme_notices = theme::notices(cx);
 
         let root = v_flex()
             .key_context(SHELL_CONTEXT)
@@ -1190,6 +1218,10 @@ impl Render for AppShell {
                                 settings_error
                                     .as_ref()
                                     .map(|error| Self::settings_error_banner(error, &tokens)),
+                            )
+                            .children(
+                                (!theme_notices.is_empty())
+                                    .then(|| Self::theme_notice_banner(&theme_notices, &tokens)),
                             )
                             .children(self.account_banner(&tokens, cx))
                             .child(self.main_area(&tokens, cx))

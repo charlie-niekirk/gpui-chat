@@ -128,7 +128,7 @@ impl SignInSheet {
     }
 
     fn failed(&self, message: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger;
+        let danger = cx.global::<crate::theme::Tokens>().danger_text;
         let hub = self.hub.clone();
         v_flex()
             .gap_3()

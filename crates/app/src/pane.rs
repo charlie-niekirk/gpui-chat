@@ -20,7 +20,7 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::{
     Action, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight,
     Hsla, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
-    Styled, Subscription, Window, canvas, div, px, rgb,
+    Styled, Subscription, Window, canvas, div, px,
 };
 
 use crate::actions::{ClosePane, SplitDown, SplitRight};
@@ -129,13 +129,10 @@ pub fn room_chips(room: &RoomState) -> Vec<String> {
 /// right never shrink; the channel name truncates.
 const COMPACT_BELOW: f32 = 480.0;
 
-const OK: u32 = 0x2fbf71;
-const WARN: u32 = 0xe0a030;
-
 fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
     match status {
-        LinkStatus::Connected => rgb(OK).into(),
-        LinkStatus::Connecting | LinkStatus::Reconnecting { .. } => rgb(WARN).into(),
+        LinkStatus::Connected => tokens.success,
+        LinkStatus::Connecting | LinkStatus::Reconnecting { .. } => tokens.warning,
         LinkStatus::Error { .. } => tokens.danger,
     }
 }
@@ -143,7 +140,7 @@ fn status_color(status: &LinkStatus, tokens: &Tokens) -> Hsla {
 /// The "LIVE" / "Offline" marker next to the channel name.
 fn live_badge(live: bool, compact: bool, tokens: &Tokens) -> impl IntoElement {
     let (color, label) = if live {
-        (stream_info::live_color(), "LIVE")
+        (tokens.danger, "LIVE")
     } else {
         (tokens.text_muted.opacity(0.6), "Offline")
     };
@@ -161,7 +158,11 @@ fn live_badge(live: bool, compact: bool, tokens: &Tokens) -> impl IntoElement {
                 } else {
                     FontWeight::NORMAL
                 })
-                .text_color(if live { color } else { tokens.text_muted })
+                .text_color(if live {
+                    tokens.danger_text
+                } else {
+                    tokens.text_muted
+                })
                 .child(label)
         }))
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
@@ -215,7 +216,7 @@ fn stream_row(info: &StreamInfo, compact: bool, tokens: &Tokens) -> impl IntoEle
                 .max_w(px(220.0))
                 .truncate()
                 .text_xs()
-                .text_color(tokens.accent)
+                .text_color(tokens.accent_link)
                 .child(info.category.clone())
         }))
         .child(fact(format!("{viewers} viewers")))
@@ -553,7 +554,7 @@ impl ChannelPane {
                         .min_w_0()
                         .truncate()
                         .text_xs()
-                        .text_color(tokens.danger)
+                        .text_color(tokens.danger_text)
                         .child(message),
                 )
                 .child(

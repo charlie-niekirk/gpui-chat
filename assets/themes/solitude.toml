@@ -1,0 +1,10 @@
+# Solitude. Palette transcribed from Omarchy's `solitude` theme (MIT).
+name = "Solitude"
+
+[dark]
+background = "#101315"
+window = "#0c0e10"
+sidebar = "#0c0e10"
+border = "#343d41"
+text = "#cacccc"
+accent = "#798186"

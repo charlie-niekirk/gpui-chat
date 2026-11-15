@@ -1,0 +1,15 @@
+# Ristretto. Palette transcribed from Omarchy's `ristretto` theme (MIT).
+name = "Ristretto"
+
+[dark]
+background = "#2c2525"
+window = "#211b1b"
+sidebar = "#211b1b"
+title_bar = "#3d2f2a"
+border = "#403e41"
+surface = "#3d2f2a"
+text = "#e6d9db"
+accent = "#f38d70"
+danger = "#fd6883"
+success = "#adda78"
+warning = "#f9cc6c"

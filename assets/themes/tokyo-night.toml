@@ -1,0 +1,15 @@
+# Tokyo Night. Palette transcribed from Omarchy's `tokyo-night` theme (MIT).
+name = "Tokyo Night"
+
+[dark]
+background = "#1a1b26"
+window = "#13141c"
+sidebar = "#13141c"
+title_bar = "#24283b"
+border = "#292e42"
+surface = "#24283b"
+text = "#a9b1d6"
+accent = "#7aa2f7"
+danger = "#f7768e"
+success = "#9ece6a"
+warning = "#e0af68"
