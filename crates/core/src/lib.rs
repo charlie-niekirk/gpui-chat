@@ -8,6 +8,7 @@
 //! * [`ChatEvent`]: what network backends send to the UI.
 //! * [`APP_NAME`] / [`APP_ID`]: the one place the application identity lives.
 
+pub mod complete;
 pub mod compose;
 pub mod emote;
 pub mod event;
@@ -16,6 +17,10 @@ pub mod message;
 pub mod store;
 pub mod tokenizer;
 
+pub use complete::{
+    COMMANDS, Chatter, CommandInfo, Edit, MIN_COLON_QUERY, RECENT_EMOTES, Recents, Tier, Trigger,
+    TriggerKind, apply, find_trigger, match_tier, rank, recent_chatters, word_insertion,
+};
 pub use compose::{
     HISTORY_CAPACITY, Input, InputError, InputHistory, MAX_MESSAGE_CHARS, Outgoing, parse_input,
     sanitize_line,

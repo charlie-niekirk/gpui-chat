@@ -22,7 +22,7 @@ use macos as imp;
 use other as imp;
 
 /// Human-readable label of the Toggle Sidebar shortcut (kept in sync with `bindings()`).
-pub use imp::{ADD_CHANNEL_LABEL, TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
+pub use imp::{ADD_CHANNEL_LABEL, EMOTE_PICKER_LABEL, TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
 
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
@@ -33,6 +33,9 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("up", ComposerHistoryPrevious, Some(COMPOSER_INPUT)),
         KeyBinding::new("down", ComposerHistoryNext, Some(COMPOSER_INPUT)),
     ]);
+    // Completion (Tab, Esc) and the emote picker: after the above, so the picker's ↑/↓ win in its
+    // own search field.
+    bindings.extend(crate::completion::bindings());
     bindings
 }
 

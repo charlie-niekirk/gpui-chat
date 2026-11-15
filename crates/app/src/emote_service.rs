@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use gpui_chat_core::{
     ChannelId, ChatEvent, ConnectionState, Message, MessageKind, resolve_fragments,
 };
-use gpui_chat_emotes::{EmoteLoader, EmoteRegistry, Providers};
+use gpui_chat_emotes::{EmoteLoader, EmoteRegistry, EmoteSet, Providers};
 use gpui_chat_settings::EmoteSettings;
 use gpui_kit::App;
 use tokio::runtime::Handle;
@@ -231,6 +231,12 @@ impl EmoteService {
         if providers.gains_over(before) {
             self.reload();
         }
+    }
+
+    /// The sets `channel` resolves words against right now, in precedence order (what the input box
+    /// completes from and the emote picker lists).
+    pub fn sets(&self, channel: &ChannelId) -> Vec<Arc<EmoteSet>> {
+        self.inner.registry.resolver(channel).sets().to_vec()
     }
 
     /// The channel was closed: forget its room and sets.

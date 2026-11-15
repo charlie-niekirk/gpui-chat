@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, Timestamp};
-use gpui_chat_emotes::Providers;
+use gpui_chat_emotes::{EmoteSet, Providers};
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::{
     Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, SendError, TwitchClient,
-    echo_message, irc_login, settled_state,
+    UserEmote, echo_message, irc_login, settled_state,
 };
 use gpui_kit::App;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -129,6 +129,43 @@ impl LiveSource {
         let (done, result) = oneshot::channel();
         drop(runtime::spawn_backend(cx, async move {
             let outcome = post(&helix, &sender, emotes.as_ref(), request).await;
+            // The composer may be gone (pane closed): nobody to tell.
+            let _ = done.send(outcome);
+        }));
+        Some(result)
+    }
+
+    /// The third-party emote sets `channel` currently resolves words against, in precedence order
+    /// (empty without the emote service, or before anything loaded).
+    pub fn emote_sets(&self, channel: &ChannelId) -> Vec<Arc<EmoteSet>> {
+        self.emotes
+            .as_ref()
+            .map_or_else(Vec::new, |emotes| emotes.sets(channel))
+    }
+
+    /// Asks Helix for the Twitch emotes `user_id` can use in the room `room_id` (`Get User
+    /// Emotes`). The outcome arrives on the returned channel, a failure as the sentence to show.
+    /// `None` without a login owner.
+    pub fn user_emotes(
+        &self,
+        user_id: String,
+        room_id: String,
+        cx: &App,
+    ) -> Option<oneshot::Receiver<Result<Vec<UserEmote>, String>>> {
+        let (_, helix) = self.account.clone()?;
+        let (done, result) = oneshot::channel();
+        drop(runtime::spawn_backend(cx, async move {
+            let outcome = helix
+                .get_user_emotes(&user_id, Some(&room_id))
+                .await
+                .map_err(|error| {
+                    tracing::info!(%error, "could not load the user's Twitch emotes");
+                    if error.is_missing_scope() {
+                        "Log in again to use your Twitch emotes.".to_owned()
+                    } else {
+                        format!("Could not load your Twitch emotes: {error}")
+                    }
+                });
             // The composer may be gone (pane closed): nobody to tell.
             let _ = done.send(outcome);
         }));
