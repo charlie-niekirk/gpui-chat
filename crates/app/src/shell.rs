@@ -1,8 +1,11 @@
-//! The root view: custom title bar, collapsible channel sidebar and the main area (one pane).
+//! The root view: custom title bar, collapsible channel sidebar and the main area (split panes).
 //!
-//! The shell owns the [`ChannelList`] (what is open, in which order, which is selected). Every
-//! change to it goes through [`AppShell::list_changed`], which makes sure the selected channel
-//! has a pane, joins/parts on the live client and schedules a write of `state.toml`.
+//! The shell owns the [`ChannelList`] (what is open, in which order, which is selected) and the
+//! split [`Layout`] (which pane shows which channel, which pane has focus). The sidebar selection
+//! is the focused pane's channel. Every change to either goes through [`AppShell::list_changed`],
+//! which makes sure every shown channel has a pane, keeps the selection on the focused pane and
+//! schedules a write of `state.toml`; joins/parts on the live client happen where channels are
+//! opened and closed.
 //!
 //! The title bar's right end is the account control (PR 3.1): "Log in" when logged out, the user's
 //! name with a menu (log in again, log out) when logged in. A strip above the content says why the
@@ -18,8 +21,7 @@ use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-    SidebarToggleButton,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenuItem, SidebarToggleButton,
 };
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -34,8 +36,9 @@ use gpui_kit::{
 
 use crate::account::AccountHub;
 use crate::actions::{
-    About, AddChannel, CloseWindow, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    ReloadEmotes, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel,
+    About, AddChannel, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
+    FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp, ReloadEmotes,
+    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
     ToggleDebugHud, ToggleSidebar,
 };
 use crate::add_channel;
@@ -51,7 +54,9 @@ use crate::live::LiveSource;
 use crate::pane::ChannelPane;
 use crate::platform;
 use crate::sign_in;
-use crate::state::{self, Mode, SavedChannels, WindowPlacement};
+use crate::splits::view::{ChannelRows, Splits};
+use crate::splits::{Direction, DropZone, Layout, PaneId};
+use crate::state::{self, Mode, SavedChannels, SavedLayout, WindowPlacement};
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::StreamHub;
 use crate::theme::{self, Tokens};
@@ -59,7 +64,8 @@ use crate::theme::{self, Tokens};
 const SIDEBAR_WIDTH: Pixels = px(240.0);
 /// Disk writes while dragging/resizing are coalesced into one write after this pause.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
-/// Channel list edits are rare, so they are written almost at once.
+/// Channel list and layout edits are rare, so they are written almost at once (a divider drag
+/// writes once it pauses).
 const CHANNELS_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 pub const DEFAULT_SIZE: (f32, f32) = (1100.0, 700.0);
@@ -107,13 +113,26 @@ pub fn bounds_from_placement(placement: &WindowPlacement) -> WindowBounds {
 struct LatestChannels(SavedChannels);
 impl gpui_kit::Global for LatestChannels {}
 
-/// Writes the most recent placement and channel list to disk, if there are any.
+/// Latest split layout, flushed to disk on quit. Only set when the list is persisted.
+#[derive(Clone)]
+struct LatestLayout(SavedLayout);
+impl gpui_kit::Global for LatestLayout {}
+
+/// Writes the most recent placement, channel list and layout to disk, if there are any.
 pub fn flush_state(cx: &App) {
     if let Some(LatestPlacement(placement)) = cx.try_global::<LatestPlacement>() {
         state::save_window(placement.clone());
     }
-    if let Some(LatestChannels(channels)) = cx.try_global::<LatestChannels>() {
-        state::save_channels(channels.clone());
+    match (
+        cx.try_global::<LatestChannels>(),
+        cx.try_global::<LatestLayout>(),
+    ) {
+        (Some(LatestChannels(channels)), Some(LatestLayout(layout))) => {
+            state::save_channels_and_layout(channels.clone(), layout.clone());
+        }
+        (Some(LatestChannels(channels)), None) => state::save_channels(channels.clone()),
+        (None, Some(LatestLayout(layout))) => state::save_layout(layout.clone()),
+        (None, None) => {}
     }
 }
 
@@ -146,9 +165,18 @@ pub struct AppShell {
     stream_info: Option<Entity<StreamInfoHub>>,
     /// Streamlink processes and their play state; ended on quit and when a channel is closed.
     streams: Entity<StreamHub>,
-    /// Panes are created when a channel is first selected and kept (with their scroll position)
-    /// until it is closed.
+    /// Panes are created when a channel is first shown and kept (with their scroll position)
+    /// until it is closed, also while no split shows it.
     panes: HashMap<ChannelId, Entity<ChannelPane>>,
+    /// Which pane shows which channel, and which one has focus (PR 4.1).
+    layout: Layout,
+    /// The pane and zone under the pointer while a pane or a channel is dragged.
+    drop_target: Option<(PaneId, DropZone)>,
+    /// The focused pane (or its channel) changed: give it keyboard focus after the next frame,
+    /// once a new pane's input exists.
+    focus_pending: bool,
+    /// What [`Self::focus_pending`] compares against.
+    last_focus: (PaneId, Option<ChannelId>),
     save_task: Option<Task<()>>,
     channels_save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -210,6 +238,10 @@ impl AppShell {
         window.set_window_title(APP_NAME);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        // Read here rather than passed in like the channel list: only the live source keeps one.
+        let saved_layout = live.as_ref().and_then(|_| state::load().layout);
+        let layout = Layout::from_saved(saved_layout.as_ref(), &channels);
+        let last_focus = (layout.focused(), None);
         let mut shell = Self {
             focus_handle,
             sidebar_collapsed: false,
@@ -222,6 +254,10 @@ impl AppShell {
             stream_info,
             streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
+            layout,
+            drop_target: None,
+            focus_pending: true,
+            last_focus,
             save_task: None,
             channels_save_task: None,
             _subscriptions: subscriptions,
@@ -234,7 +270,7 @@ impl AppShell {
             }
         }
         shell.hub_changed(cx);
-        shell.ensure_selected_pane(cx);
+        shell.sync_layout(cx);
         shell.watch_open_channels(cx);
         shell
     }
@@ -271,22 +307,24 @@ impl AppShell {
         for channel in appeared {
             self.list.append(channel);
         }
-        if self.list.selected().is_none() {
-            self.list.select_first();
+        // An empty focused pane shows the first channel to appear.
+        if self.layout.focused_channel().is_none()
+            && let Some(channel) = self.layout.next_unshown(self.list.channels())
+        {
+            let focused = self.layout.focused();
+            self.layout.show(focused, Some(channel));
         }
-        self.ensure_selected_pane(cx);
+        self.sync_layout(cx);
         self.watch_open_channels(cx);
         cx.notify();
     }
 
-    /// Creates the pane of the selected channel if it has none yet.
-    fn ensure_selected_pane(&mut self, cx: &mut Context<Self>) {
-        let Some(channel) = self.list.selected().cloned() else {
-            return;
-        };
-        if self.panes.contains_key(&channel) {
+    /// Creates the pane of `channel` if it has none yet.
+    fn ensure_pane(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if self.panes.contains_key(channel) {
             return;
         }
+        let channel = channel.clone();
         let hub = self.hub.clone();
         let store = hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
         let live = self.live.is_some();
@@ -307,39 +345,104 @@ impl AppShell {
         self.panes.insert(channel, pane);
     }
 
-    /// Every edit of the channel list ends here.
-    fn list_changed(&mut self, cx: &mut Context<Self>) {
-        self.ensure_selected_pane(cx);
-        self.watch_open_channels(cx);
-        if self.persists() {
-            let saved = self.list.to_saved();
-            cx.set_global(LatestChannels(saved.clone()));
-            // Replacing the task drops (cancels) a write that has not started yet.
-            self.channels_save_task = Some(cx.spawn(async move |_, cx| {
-                cx.background_executor().timer(CHANNELS_SAVE_DEBOUNCE).await;
-                cx.background_executor()
-                    .spawn(async move { state::save_channels(saved) })
-                    .await;
-            }));
+    /// Every shown channel has a pane, the sidebar selection is the focused pane's channel, and
+    /// panes know whether the window is split.
+    fn sync_layout(&mut self, cx: &mut Context<Self>) {
+        let shown: Vec<ChannelId> = self
+            .layout
+            .leaves()
+            .iter()
+            .filter_map(|leaf| leaf.channel.clone())
+            .collect();
+        for channel in &shown {
+            self.ensure_pane(channel, cx);
         }
+        match self.layout.focused_channel().cloned() {
+            Some(channel) => {
+                self.list.select(&channel);
+            }
+            None => self.list.deselect(),
+        }
+        let in_split = self.layout.is_split();
+        for channel in &shown {
+            if let Some(pane) = self.panes.get(channel) {
+                pane.update(cx, |pane, cx| pane.set_in_split(in_split, cx));
+            }
+        }
+        let focus = (
+            self.layout.focused(),
+            self.layout.focused_channel().cloned(),
+        );
+        if focus != self.last_focus {
+            self.last_focus = focus;
+            self.focus_pending = true;
+        }
+    }
+
+    /// Every edit of the channel list or the layout ends here.
+    fn list_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_layout(cx);
+        self.watch_open_channels(cx);
+        self.persist(cx);
         cx.notify();
     }
 
-    fn add_channel(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+    /// Schedules a write of the channel list and the layout (live source only).
+    fn persist(&mut self, cx: &mut Context<Self>) {
+        if !self.persists() {
+            return;
+        }
+        let channels = self.list.to_saved();
+        let layout = self.layout.to_saved();
+        cx.set_global(LatestChannels(channels.clone()));
+        cx.set_global(LatestLayout(layout.clone()));
+        // Replacing the task drops (cancels) a write that has not started yet.
+        self.channels_save_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(CHANNELS_SAVE_DEBOUNCE).await;
+            cx.background_executor()
+                .spawn(async move { state::save_channels_and_layout(channels, layout) })
+                .await;
+        }));
+    }
+
+    /// Adds `channel` to the sidebar (joining it) if it is not open yet; `true` if it was not.
+    fn open_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) -> bool {
         let newly_added = self.list.add(channel.clone());
         if newly_added {
-            self.hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
+            self.hub.update(cx, |hub, cx| hub.ensure(channel, cx));
             if let Some(live) = &self.live {
-                live.join(&channel);
+                live.join(channel);
             }
         }
+        newly_added
+    }
+
+    /// Focuses the pane showing `channel`, or shows it in the focused pane.
+    fn show_channel(&mut self, channel: &ChannelId) {
+        match self.layout.pane_showing(channel) {
+            Some(pane) => {
+                self.layout.focus(pane);
+            }
+            None => {
+                let focused = self.layout.focused();
+                self.layout.show(focused, Some(channel.clone()));
+            }
+        }
+    }
+
+    fn add_channel(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        self.open_channel(&channel, cx);
+        self.show_channel(&channel);
         self.list_changed(cx);
     }
 
     fn remove_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
-        if !self.list.remove(channel) {
+        let Some(index) = self.list.index_of(channel) else {
             return;
-        }
+        };
+        self.list.remove(channel);
+        self.layout
+            .channel_closed(channel, self.list.channels(), index);
         self.panes.remove(channel);
         self.streams
             .update(cx, |streams, cx| streams.forget(channel, cx));
@@ -351,8 +454,147 @@ impl AppShell {
     }
 
     fn select_channel(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
-        if self.list.selected() != Some(channel) && self.list.select(channel) {
+        if self.list.contains(channel) && self.list.selected() != Some(channel) {
+            self.show_channel(channel);
             self.list_changed(cx);
+        }
+    }
+
+    fn split(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let channel = self.layout.next_unshown(self.list.channels());
+        if self
+            .layout
+            .split(self.layout.focused(), direction, channel)
+            .is_some()
+        {
+            self.list_changed(cx);
+        }
+    }
+
+    pub(crate) fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.layout.close(pane) {
+            self.list_changed(cx);
+        }
+    }
+
+    fn focus_neighbour(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        if let Some(pane) = self.layout.neighbour(self.layout.focused(), direction)
+            && self.layout.focus(pane)
+        {
+            self.list_changed(cx);
+        }
+    }
+
+    /// A press anywhere in a pane focuses it.
+    pub(crate) fn pane_pressed(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.layout.focus(pane) {
+            self.list_changed(cx);
+        }
+    }
+
+    /// Shows (or, with `None`, hides) where a drop would land.
+    fn set_drop_target(&mut self, target: Option<(PaneId, DropZone)>, cx: &mut Context<Self>) {
+        if self.drop_target != target {
+            self.drop_target = target;
+            cx.notify();
+        }
+    }
+
+    /// The pointer is over `zone` of `pane` while dragging the pane showing `channel`: nothing to
+    /// show over the dragged pane itself.
+    pub(crate) fn drag_pane_over(
+        &mut self,
+        channel: &ChannelId,
+        pane: PaneId,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let accepted = self
+            .layout
+            .pane_showing(channel)
+            .is_some_and(|src| self.layout.accepts_pane(src, pane));
+        self.set_drop_target(accepted.then_some((pane, zone)), cx);
+    }
+
+    /// The pointer is over `zone` of `pane` while dragging a sidebar channel: only zones where a
+    /// drop would do something are shown (no new pane at the limit).
+    pub(crate) fn drag_channel_over(
+        &mut self,
+        channel: &ChannelId,
+        pane: PaneId,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let accepted = self.layout.accepts_channel(channel, pane, zone);
+        self.set_drop_target(accepted.then_some((pane, zone)), cx);
+    }
+
+    /// Where a drop on `pane` lands: the zone last seen under the pointer.
+    fn take_drop_zone(&mut self, pane: PaneId) -> DropZone {
+        match self.drop_target.take() {
+            Some((target, zone)) if target == pane => zone,
+            _ => DropZone::Center,
+        }
+    }
+
+    /// The pane showing `channel` was dropped on `target`.
+    pub(crate) fn drop_pane(
+        &mut self,
+        channel: &ChannelId,
+        target: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        let zone = self.take_drop_zone(target);
+        if let Some(src) = self.layout.pane_showing(channel)
+            && self.layout.move_pane(src, target, zone)
+        {
+            self.list_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// A sidebar channel was dropped on `target` (a followed one is opened first).
+    pub(crate) fn drop_channel(
+        &mut self,
+        channel: ChannelId,
+        target: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        let zone = self.take_drop_zone(target);
+        // A followed channel is opened only when the drop takes it (not at the pane limit).
+        if self.layout.accepts_channel(&channel, target, zone) {
+            self.open_channel(&channel, cx);
+            self.layout.drop_channel(channel, target, zone);
+            self.list_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// A divider was dragged; see [`Layout::resize`].
+    pub(crate) fn resize_split(
+        &mut self,
+        path: &[usize],
+        handle: usize,
+        at: f32,
+        min: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout.resize(path, handle, at, min) {
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
+    /// Gives the focused pane keyboard focus (the shell itself when it shows nothing).
+    fn apply_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self
+            .layout
+            .focused_channel()
+            .and_then(|channel| self.panes.get(channel))
+            .cloned();
+        match pane {
+            Some(pane) => pane.update(cx, |pane, cx| pane.focus(window, cx)),
+            None => window.focus(&self.focus_handle, cx),
         }
     }
 
@@ -559,45 +801,54 @@ impl AppShell {
                 }
                 None => (HashMap::new(), None),
             };
-        let items: Vec<SidebarMenuItem> = if self.list.is_empty() {
-            vec![
+        // Open and followed rows can be dragged into a split (PR 4.1).
+        let items: Vec<(SidebarMenuItem, Option<ChannelId>)> = if self.list.is_empty() {
+            vec![(
                 SidebarMenuItem::new(format!("No channels yet: {}", platform::ADD_CHANNEL_LABEL))
                     .disable(true),
-            ]
+                None,
+            )]
         } else {
             self.list
                 .channels()
                 .iter()
                 .enumerate()
                 .map(|(index, channel)| {
-                    channel_item(
+                    let item = channel_item(
                         channel,
                         self.list.selected() == Some(channel),
                         index > 0,
                         index + 1 < count,
                         live.get(channel),
                         &shell,
-                    )
+                    );
+                    (item, Some(channel.clone()))
                 })
                 .collect()
         };
-        let mut groups = vec![SidebarGroup::new("Open").child(SidebarMenu::new().children(items))];
+        let mut groups = vec![SidebarGroup::new("Open").child(ChannelRows::new(items))];
         if let Some(followed) = followed {
-            let rows: Vec<SidebarMenuItem> = if followed.is_empty() {
-                vec![SidebarMenuItem::new("No one you follow is live").disable(true)]
+            let rows: Vec<(SidebarMenuItem, Option<ChannelId>)> = if followed.is_empty() {
+                vec![(
+                    SidebarMenuItem::new("No one you follow is live").disable(true),
+                    None,
+                )]
             } else {
                 followed
                     .iter()
                     .map(|info| {
-                        followed_item(info, self.list.selected() == Some(&info.channel), &shell)
+                        let item = followed_item(
+                            info,
+                            self.list.selected() == Some(&info.channel),
+                            &shell,
+                        );
+                        (item, Some(info.channel.clone()))
                     })
                     .collect()
             };
-            groups.push(
-                SidebarGroup::new("Followed — live").child(SidebarMenu::new().children(rows)),
-            );
+            groups.push(SidebarGroup::new("Followed — live").child(ChannelRows::new(rows)));
         }
-        Sidebar::<SidebarGroup<SidebarMenu>>::new("channel-sidebar")
+        Sidebar::<SidebarGroup<ChannelRows>>::new("channel-sidebar")
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(self.sidebar_collapsed)
             .w(SIDEBAR_WIDTH)
@@ -652,27 +903,31 @@ impl AppShell {
             .child(div().text_sm().child(error.to_string()))
     }
 
-    fn main_area(&self, tokens: &Tokens) -> impl IntoElement {
-        let area = div().flex_1().min_h_0().w_full().bg(tokens.main_bg);
-        let pane = self
-            .list
-            .selected()
-            .and_then(|channel| self.panes.get(channel));
-        match pane {
-            Some(pane) => area.child(pane.clone()),
-            None => area.flex().items_center().justify_center().child(
-                v_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xl().child(APP_NAME))
-                    .child(div().text_sm().text_color(tokens.text_muted).child(format!(
-                        "Press {} to add a channel, {} to toggle the sidebar, {} for the debug HUD.",
-                        platform::ADD_CHANNEL_LABEL,
-                        platform::TOGGLE_SIDEBAR_LABEL,
-                        platform::TOGGLE_HUD_LABEL
-                    ))),
-            ),
+    fn main_area(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let area = div().flex().flex_1().min_h_0().w_full().bg(tokens.main_bg);
+        // Nothing open and nothing split: the welcome text instead of an empty pane.
+        let welcome = self.list.is_empty() && !self.layout.is_split();
+        if !welcome {
+            let splits = Splits {
+                layout: &self.layout,
+                panes: &self.panes,
+                drop: self.drop_target,
+                tokens: *tokens,
+            };
+            return area.child(splits.render(cx));
         }
+        area.items_center().justify_center().child(
+            v_flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_xl().child(APP_NAME))
+                .child(div().text_sm().text_color(tokens.text_muted).child(format!(
+                    "Press {} to add a channel, {} to toggle the sidebar, {} for the debug HUD.",
+                    platform::ADD_CHANNEL_LABEL,
+                    platform::TOGGLE_SIDEBAR_LABEL,
+                    platform::TOGGLE_HUD_LABEL
+                ))),
+        )
     }
 }
 
@@ -821,8 +1076,16 @@ impl Focusable for AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
+        if self.focus_pending {
+            self.focus_pending = false;
+            cx.on_next_frame(window, |this, window, cx| this.apply_focus(window, cx));
+        }
+        // A drag that ended outside every pane leaves no drop target behind.
+        if !cx.has_active_drag() {
+            self.drop_target = None;
+        }
         let font = cx.global::<FontConfig>().clone();
         let settings_error = config::store(cx).read(cx).error().cloned();
 
@@ -862,6 +1125,27 @@ impl Render for AppShell {
             }))
             .on_action(cx.listener(|this, _: &LogIn, window, cx| this.log_in(window, cx)))
             .on_action(cx.listener(|this, _: &LogOut, _, cx| this.log_out(cx)))
+            .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
+                this.split(Direction::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
+                this.split(Direction::Down, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, _, cx| {
+                this.close_pane(this.layout.focused(), cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneLeft, _, cx| {
+                this.focus_neighbour(Direction::Left, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneRight, _, cx| {
+                this.focus_neighbour(Direction::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneUp, _, cx| {
+                this.focus_neighbour(Direction::Up, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
+                this.focus_neighbour(Direction::Down, cx);
+            }))
             .on_action(cx.listener(|this, _: &ReloadEmotes, _, _| {
                 if let Some(live) = &this.live {
                     live.reload_emotes();
@@ -908,7 +1192,7 @@ impl Render for AppShell {
                                     .map(|error| Self::settings_error_banner(error, &tokens)),
                             )
                             .children(self.account_banner(&tokens, cx))
-                            .child(self.main_area(&tokens))
+                            .child(self.main_area(&tokens, cx))
                             .child(self.hud.clone()),
                     ),
             );

@@ -5,9 +5,10 @@ use gpui_kit::{KeyBinding, Menu, MenuItem, SystemMenuType};
 
 use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
 use crate::actions::{
-    AddChannel, COMPOSER_CONTEXT, CloseWindow, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    Quit, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
-    ToggleSidebar,
+    AddChannel, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft,
+    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
+    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
+    ToggleDebugHud, ToggleSidebar,
 };
 use crate::completion::ComposerToggleEmotePicker;
 
@@ -30,6 +31,14 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-alt-down", MoveChannelDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("cmd-shift-]", SelectNextChannel, Some(SHELL_CONTEXT)),
         KeyBinding::new("cmd-shift-[", SelectPreviousChannel, Some(SHELL_CONTEXT)),
+        // Split panes (PR 4.1). Not ⌥⌘D: macOS takes it for "Turn Dock hiding on/off".
+        KeyBinding::new("cmd-d", SplitRight, Some(SHELL_CONTEXT)),
+        KeyBinding::new("cmd-alt-shift-d", SplitDown, Some(SHELL_CONTEXT)),
+        KeyBinding::new("cmd-shift-w", ClosePane, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-cmd-left", FocusPaneLeft, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-cmd-right", FocusPaneRight, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-cmd-up", FocusPaneUp, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-cmd-down", FocusPaneDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("cmd-e", ComposerToggleEmotePicker, Some(COMPOSER_CONTEXT)),
     ]
 }

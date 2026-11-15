@@ -82,11 +82,6 @@ impl ChannelList {
         true
     }
 
-    /// Selects the first channel, if there is one.
-    pub fn select_first(&mut self) {
-        self.selected = self.channels.first().cloned();
-    }
-
     /// Appends `channel` at the end and selects it. A channel that is already open is only
     /// selected (not moved). Returns whether it was newly added.
     pub fn add(&mut self, channel: ChannelId) -> bool {
@@ -103,6 +98,16 @@ impl ChannelList {
         } else {
             false
         }
+    }
+
+    /// Clears the selection (the focused pane shows no channel, PR 4.1).
+    pub fn deselect(&mut self) {
+        self.selected = None;
+    }
+
+    /// Where `channel` is in the sidebar.
+    pub fn index_of(&self, channel: &ChannelId) -> Option<usize> {
+        self.channels.iter().position(|c| c == channel)
     }
 
     /// Removes `channel`. If it was selected, the channel that takes its place (the next one,
@@ -202,6 +207,17 @@ mod tests {
         list.select(&ch("c"));
         list.remove(&ch("a"));
         assert_eq!(list.selected(), Some(&ch("c")));
+    }
+
+    #[test]
+    fn deselecting_leaves_the_channels() {
+        let mut list = list(&["a", "b"]);
+        list.deselect();
+        assert_eq!(list.selected(), None);
+        assert_eq!(list.index_of(&ch("b")), Some(1));
+        assert_eq!(list.to_saved().selected, None);
+        // Stepping from no selection starts at the first channel.
+        assert_eq!(list.neighbour(1), Some(&ch("b")));
     }
 
     #[test]
