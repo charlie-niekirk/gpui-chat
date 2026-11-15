@@ -221,7 +221,11 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> Self {
         // The login state decides whether the box is usable.
-        let subscriptions = vec![cx.observe(&account, |_, _, cx| cx.notify())];
+        let subscriptions = vec![
+            cx.observe(&account, |_, _, cx| cx.notify()),
+            // The emote button's label names its shortcut: follow a keymap reload.
+            cx.observe_global::<crate::keymap::KeymapState>(|_, cx| cx.notify()),
+        ];
         Self {
             store,
             live,

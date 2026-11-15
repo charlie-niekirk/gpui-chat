@@ -25,8 +25,10 @@ mod firehose;
 mod fonts;
 mod hud;
 mod images;
+mod keymap;
 mod live;
 mod login;
+mod palette;
 mod pane;
 mod platform;
 mod replay;
@@ -217,8 +219,8 @@ fn main() {
             let theme_events = theme::init(cx);
             theme::apply_settings(&appearance, None, cx);
 
-            cx.bind_keys(platform::default_bindings());
-            cx.set_menus(platform::menus());
+            // Kit's bindings, the app's defaults and the user's `keymap.toml`, and the menu bar.
+            let keymap_events = keymap::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
             // Persist the last window placement and channel list on the way out (⌘Q and last-window close).
@@ -262,6 +264,9 @@ fn main() {
                 }
                 if let Some(events) = theme_events {
                     theme::attach_reloads(events, window.window_handle(), cx);
+                }
+                if let Some(events) = keymap_events {
+                    keymap::attach_reloads(events, window.window_handle(), cx);
                 }
                 let parts = start_chat(&cli, replay_log.clone(), window, cx);
                 cx.new(|cx| AppShell::new(window, parts, cx))
