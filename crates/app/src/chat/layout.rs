@@ -332,6 +332,9 @@ pub struct ReplyLine {
     /// One atom per grapheme cluster of the text, which ends in the `…` drawn only when the text
     /// does not fit; the last atom is that `…`.
     pub atoms: Vec<Atom>,
+    /// X of each atom, which are laid end to end (the same for every width: cutting only drops
+    /// the atoms from some point on).
+    pub offsets: Vec<f32>,
     pub glyphs: Vec<GlyphRef>,
     pub ascent: Pixels,
     pub descent: Pixels,
@@ -350,10 +353,19 @@ impl ReplyLine {
     ) -> Self {
         let atoms = cut_atoms(text, layout);
         let glyphs = glyph_refs(layout, &atoms);
+        let offsets = atoms
+            .iter()
+            .scan(0.0, |x, atom| {
+                let at = *x;
+                *x += atom.width;
+                Some(at)
+            })
+            .collect();
         Self {
             root,
             font_size,
             atoms,
+            offsets,
             glyphs,
             ascent: layout.ascent,
             descent: layout.descent,
@@ -405,17 +417,6 @@ impl ReplyLine {
             ellipsis_x: Some(x),
             width: x + self.ellipsis_width(),
         }
-    }
-
-    /// X of every atom (relative to the content origin) for `fit`: laid end to end.
-    pub fn positions(&self, fit: ReplyFit) -> Vec<f32> {
-        let mut x = 0.0;
-        let mut out = Vec::with_capacity(fit.atoms);
-        for atom in &self.atoms[..fit.atoms] {
-            out.push(x);
-            x += atom.width;
-        }
-        out
     }
 }
 
@@ -1238,14 +1239,16 @@ mod tests {
         // Nothing fits but the `…`; and not even that.
         let fit = line.fit(5.0);
         assert_eq!(fit.atoms, 0);
-        assert!(line.positions(fit).is_empty());
     }
 
     #[test]
     fn reply_atoms_are_laid_end_to_end() {
         let line = reply_line("↳ ab");
-        let fit = line.fit(1000.0);
-        assert_eq!(line.positions(fit), [0.0, 10.0, 20.0, 30.0]);
+        assert_eq!(
+            line.offsets,
+            [0.0, 10.0, 20.0, 30.0, 40.0],
+            "the `…` follows the text"
+        );
     }
 
     #[test]

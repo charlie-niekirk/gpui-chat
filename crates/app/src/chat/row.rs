@@ -1,9 +1,11 @@
-//! One row of chat with its reply action (PR 3.4): the [`MessageElement`], a Reply button that
-//! shows while the pointer is over the row, and a right-click menu (Reply, View thread).
+//! One row of chat with its reply action (PR 3.4): the [`MessageElement`], a Reply button on the
+//! row the pointer is over, and one right-click menu per chat (or popover) that resolves the row
+//! under the pointer.
 //!
-//! The message element itself paints everything (and stays a single custom element); the actions
-//! live in a thin wrapper around it so the layout cache and the measuring are the same for rows
-//! that can be replied to and rows that cannot (notices, the offline sources).
+//! The message element itself paints everything (and stays a single custom element). Rows
+//! report the pointer through [`MessageStyle::hovered_row`]; only the hovered row is wrapped and
+//! carries a button, so the other rows cost nothing extra, and the menu is a single element
+//! around all of them ([`row_menu`] reads the hovered row when it opens).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,36 +13,34 @@ use std::sync::Arc;
 
 use gpui_chat_core::Message;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::{
-    AnyElement, App, Entity, InteractiveElement as _, IntoElement as _, ParentElement as _,
-    Styled as _, WeakEntity, div, px,
+    AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement as _, MouseButton,
+    ParentElement as _, Styled as _, WeakEntity, Window, div, px,
 };
 
-use super::element::{MessageElement, MessageStyle};
+use super::element::{HoveredRow, MessageElement, MessageStyle};
 use super::layout::LayoutCache;
 use super::view::ChatView;
 use crate::channels::ChannelStore;
 use crate::reply::can_reply_to;
 use crate::theme::Tokens;
 
-/// The group the Reply button shows with: hovering anywhere over its row.
-const ROW_GROUP: &str = "chat-row";
-
 /// What a row needs besides its message.
 pub struct RowContext {
-    /// Element-id prefix, so the list's rows and the thread popover's (same message, same
+    /// Element-id prefix, so the list's buttons and the thread popover's (same message, same
     /// sequence number) have ids of their own.
     pub id: &'static str,
     pub view: WeakEntity<ChatView>,
-    pub store: Entity<ChannelStore>,
     pub tokens: Tokens,
-    /// Whether this chat has a composer to reply with.
-    pub can_reply: bool,
+    /// The row the pointer is over, if rows can be replied to (there is a composer): only that
+    /// one gets a button.
+    pub hovered: Option<u64>,
 }
 
-/// The row for `message`: the plain element, or with the reply actions when it can be replied to.
+/// The row for `message`: the plain element, or with the Reply button when the pointer is over it
+/// and it can be replied to.
 pub fn message_row(
     seq: u64,
     message: &Arc<Message>,
@@ -49,7 +49,7 @@ pub fn message_row(
     row: &RowContext,
 ) -> AnyElement {
     let element = MessageElement::new(seq, message.clone(), style, cache);
-    if !row.can_reply || !can_reply_to(message) {
+    if row.hovered != Some(seq) || !can_reply_to(message) {
         return element.into_any_element();
     }
     let reply_button = {
@@ -60,33 +60,11 @@ pub fn message_row(
             .icon(Icon::new(gpui_kit::assets::IconName::Undo2))
             .tooltip("Reply")
             .accessibility_label("Reply")
+            .tab_stop(false)
             .on_click(move |_, _, cx| request_reply(&view, &message, cx))
     };
     let tokens = row.tokens;
-    let menu = {
-        let (view, store, message) = (row.view.clone(), row.store.clone(), message.clone());
-        move |menu: PopupMenu, _: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<PopupMenu>| {
-            let in_thread = in_thread(store.read(cx), &message);
-            let (reply_view, reply_message) = (view.clone(), message.clone());
-            let (thread_view, root) = (view.clone(), message.thread_root().clone());
-            menu.item(
-                PopupMenuItem::new("Reply")
-                    .on_click(move |_, _, cx| request_reply(&reply_view, &reply_message, cx)),
-            )
-            .item(
-                PopupMenuItem::new("View thread")
-                    .disabled(!in_thread)
-                    .on_click(move |_, window, cx| {
-                        thread_view
-                            .update(cx, |view, cx| view.open_thread(root.clone(), window, cx))
-                            .ok();
-                    }),
-            )
-        }
-    };
     div()
-        .id((row.id, seq))
-        .group(ROW_GROUP)
         .relative()
         .w_full()
         .child(element)
@@ -99,12 +77,52 @@ pub fn message_row(
                 .border_1()
                 .border_color(tokens.border)
                 .bg(tokens.window_bg)
-                .opacity(0.0)
-                .group_hover(ROW_GROUP, |style| style.opacity(1.0))
+                // The context line of a reply row sits under the button: a press on the button
+                // must not reach it (and open the thread).
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(reply_button),
         )
-        .context_menu(menu)
         .into_any_element()
+}
+
+/// The right-click menu for the row under the pointer when it opens (Reply, View thread), or an
+/// empty menu (which Kit does not show) when the pointer is over no row that can be replied to.
+/// `hovered` is the cell the rows keep current; `store` is where its message is looked up.
+pub fn row_menu(
+    view: WeakEntity<ChatView>,
+    store: Entity<ChannelStore>,
+    hovered: HoveredRow,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, cx| {
+        let Some(seq) = hovered.get() else {
+            return menu;
+        };
+        let store = store.read(cx);
+        let Some(message) = store
+            .messages()
+            .get_by_seq(seq)
+            .filter(|message| can_reply_to(message))
+            .cloned()
+        else {
+            return menu;
+        };
+        let in_thread = in_thread(store, &message);
+        let (reply_view, reply_message) = (view.clone(), message.clone());
+        let (thread_view, root) = (view.clone(), message.thread_root().clone());
+        menu.item(
+            PopupMenuItem::new("Reply")
+                .on_click(move |_, _, cx| request_reply(&reply_view, &reply_message, cx)),
+        )
+        .item(
+            PopupMenuItem::new("View thread")
+                .disabled(!in_thread)
+                .on_click(move |_, window, cx| {
+                    thread_view
+                        .update(cx, |view, cx| view.open_thread(root.clone(), window, cx))
+                        .ok();
+                }),
+        )
+    }
 }
 
 fn request_reply(view: &WeakEntity<ChatView>, message: &Arc<Message>, cx: &mut App) {

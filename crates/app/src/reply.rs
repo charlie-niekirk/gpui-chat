@@ -34,11 +34,12 @@ impl ReplyTarget {
             return None;
         }
         let reference = ReplyRef::to(message)?;
-        let prefill = format!("@{} ", reference.parent_name());
+        let prefill = format!("@{} ", mention_name(&reference));
         Some(Self { reference, prefill })
     }
 
     /// The `@name ` the box starts with.
+    #[cfg(test)]
     pub fn prefill(&self) -> &str {
         &self.prefill
     }
@@ -53,11 +54,39 @@ impl ReplyTarget {
         }
     }
 
+    /// What starting this reply puts in a box holding `typed` while `previous` was the reply
+    /// target: the `@name ` prefill when the box is empty or still holds only the previous
+    /// target's untouched prefill, `None` to leave what the user typed alone.
+    pub fn text_to_start(&self, typed: &str, previous: Option<&Self>) -> Option<&str> {
+        let untouched = previous.is_some_and(|previous| previous.clears_on_cancel(typed));
+        (typed.is_empty() || untouched).then_some(self.prefill.as_str())
+    }
+
     /// Whether cancelling should also empty the box: it still holds exactly the prefill, which the
     /// user never made their own.
     pub fn clears_on_cancel(&self, typed: &str) -> bool {
         typed == self.prefill
     }
+}
+
+/// The name `@`-mentioning the parent's author uses: the login, so a localised display name still
+/// mentions the right user, except when the display name is only the login in another
+/// capitalisation (`Alice` for `alice`), which reads better.
+pub fn mention_name(reference: &ReplyRef) -> &str {
+    let display = reference.parent_display_name.trim();
+    if !display.is_empty() && display.eq_ignore_ascii_case(&reference.parent_login) {
+        display
+    } else if reference.parent_login.is_empty() {
+        reference.parent_name()
+    } else {
+        &reference.parent_login
+    }
+}
+
+/// The reply mode after a send failed: the target the failed send had, unless the user already
+/// chose another message to reply to meanwhile.
+pub fn restored(current: Option<ReplyTarget>, failed: Option<ReplyTarget>) -> Option<ReplyTarget> {
+    current.or(failed)
 }
 
 /// `text` with every run of whitespace and control characters as one space, trimmed; the U+E0000
@@ -142,6 +171,67 @@ mod tests {
         assert_eq!(target.label(), "Replying to Alice: first second third");
         let target = ReplyTarget::new(&chat("m1", "")).unwrap();
         assert_eq!(target.label(), "Replying to Alice");
+    }
+
+    #[test]
+    fn the_mention_is_the_login_unless_the_display_name_only_capitalises_it() {
+        let named = |login: &str, display: &str| ReplyRef {
+            parent_id: "p".into(),
+            parent_login: login.into(),
+            parent_display_name: display.into(),
+            parent_body: String::new(),
+            thread_parent_id: None,
+        };
+        assert_eq!(mention_name(&named("alice", "Alice")), "Alice");
+        assert_eq!(mention_name(&named("alice", "alice")), "alice");
+        // A localised display name is not something chat can mention.
+        assert_eq!(mention_name(&named("hello_kr", "안녕")), "hello_kr");
+        assert_eq!(mention_name(&named("alice", "")), "alice");
+        assert_eq!(mention_name(&named("", "Alice")), "Alice");
+        let mut localised = chat("m1", "hi");
+        localised.author = Some(Author::new("hello_kr", "안녕"));
+        assert_eq!(
+            ReplyTarget::new(&localised).unwrap().prefill(),
+            "@hello_kr "
+        );
+        // The strip still shows the name as chat does.
+        assert_eq!(
+            ReplyTarget::new(&localised).unwrap().label(),
+            "Replying to 안녕: hi"
+        );
+    }
+
+    #[test]
+    fn starting_a_reply_replaces_an_untouched_prefill_but_keeps_typed_text() {
+        let first = ReplyTarget::new(&chat("m1", "a")).unwrap();
+        let mut other = chat("m2", "b");
+        other.author = Some(Author::new("bob", "Bob"));
+        let second = ReplyTarget::new(&other).unwrap();
+        // An empty box starts with the prefill.
+        assert_eq!(second.text_to_start("", None), Some("@Bob "));
+        // Another reply replaces the previous one's untouched `@name `...
+        assert_eq!(second.text_to_start("@Alice ", Some(&first)), Some("@Bob "));
+        // ...but never what the user typed, with or without a previous reply.
+        assert_eq!(second.text_to_start("@Alice well", Some(&first)), None);
+        assert_eq!(second.text_to_start("something", None), None);
+        // A prefill-looking text that was not a reply's is the user's.
+        assert_eq!(second.text_to_start("@Alice ", None), None);
+    }
+
+    #[test]
+    fn a_failed_send_restores_its_reply_unless_another_was_chosen() {
+        let failed = ReplyTarget::new(&chat("m1", "a")).unwrap();
+        let mut other = chat("m2", "b");
+        other.author = Some(Author::new("bob", "Bob"));
+        let newer = ReplyTarget::new(&other).unwrap();
+        assert_eq!(restored(None, Some(failed.clone())), Some(failed.clone()));
+        assert_eq!(
+            restored(Some(newer.clone()), Some(failed.clone())),
+            Some(newer)
+        );
+        assert_eq!(restored(None, None), None);
+        // A send that was not a reply restores nothing.
+        assert_eq!(restored(None, None), None);
     }
 
     #[test]

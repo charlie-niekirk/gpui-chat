@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    ChannelId, Input as Parsed, InputHistory, Message, Outgoing, parse_input, sanitize_line,
+    ChannelId, Input as Parsed, InputHistory, Message, Outgoing, ReplyRef, parse_input,
+    sanitize_line,
 };
 use gpui_chat_twitch::SendError;
 use gpui_chat_twitch::auth::AuthState;
@@ -39,7 +40,7 @@ use crate::account::AccountHub;
 use crate::actions::{COMPOSER_CONTEXT, ComposerHistoryNext, ComposerHistoryPrevious};
 use crate::channels::ChannelStore;
 use crate::live::{LiveSource, SendRequest};
-use crate::reply::ReplyTarget;
+use crate::reply::{ReplyTarget, restored};
 use crate::sign_in;
 use crate::theme::Tokens;
 
@@ -105,13 +106,22 @@ pub enum Plan {
     Nothing,
     /// Not sent; the reason goes in the error strip and the text stays.
     Refuse(String),
-    /// Send `outgoing` to the room.
-    Send { room_id: String, outgoing: Outgoing },
+    /// Send `outgoing` to the room, as a reply when `reply` is set.
+    Send {
+        room_id: String,
+        outgoing: Outgoing,
+        reply: Option<ReplyRef>,
+    },
 }
 
 /// Decides what to do with `text` typed in `channel`, whose Twitch room id is `room_id` once its
 /// `ROOMSTATE` has arrived.
-pub fn plan_submit(text: &str, channel: &ChannelId, room_id: Option<&str>) -> Plan {
+pub fn plan_submit(
+    text: &str,
+    channel: &ChannelId,
+    room_id: Option<&str>,
+    reply: Option<&ReplyTarget>,
+) -> Plan {
     match parse_input(text) {
         Parsed::Empty => Plan::Nothing,
         Parsed::Invalid(error) => Plan::Refuse(error.to_string()),
@@ -119,6 +129,7 @@ pub fn plan_submit(text: &str, channel: &ChannelId, room_id: Option<&str>) -> Pl
             Some(room_id) => Plan::Send {
                 room_id: room_id.to_owned(),
                 outgoing,
+                reply: reply.map(|target| target.reference.clone()),
             },
             None => Plan::Refuse(format!(
                 "Not connected to #{} yet. Try again in a moment.",
@@ -227,18 +238,22 @@ impl Composer {
             let store = self.store.read(cx);
             (store.channel().clone(), store.room().room_id.clone())
         };
-        match plan_submit(&typed, &channel, room_id.as_deref()) {
+        match plan_submit(&typed, &channel, room_id.as_deref(), self.reply.as_ref()) {
             Plan::Nothing => {}
             Plan::Refuse(reason) => {
                 self.error = Some(reason.into());
                 cx.notify();
             }
-            Plan::Send { room_id, outgoing } => {
+            Plan::Send {
+                room_id,
+                outgoing,
+                reply,
+            } => {
                 let request = SendRequest {
                     channel,
                     room_id,
                     outgoing,
-                    reply: self.reply.as_ref().map(|target| target.reference.clone()),
+                    reply,
                 };
                 let Some(result) = self.live.send(request, cx) else {
                     return;
@@ -287,9 +302,7 @@ impl Composer {
         tracing::info!(%error, "message not sent");
         self.error = Some(error.to_string().into());
         // Still a reply, unless the user already chose another message to reply to.
-        if self.reply.is_none() {
-            self.reply = reply;
-        }
+        self.reply = restored(self.reply.take(), reply);
         // Give the text back for editing, unless the user has already started something else.
         if let Some(input) = &self.input {
             input.update(cx, |input, cx| {
@@ -322,13 +335,8 @@ impl Composer {
         let input = self.input(window, cx);
         input.update(cx, |input, cx| {
             // A previous reply's untouched `@name ` gives way to this one's; typed text stays.
-            let typed = input.value();
-            let untouched = self
-                .reply
-                .as_ref()
-                .is_some_and(|previous| previous.clears_on_cancel(&typed));
-            if typed.is_empty() || untouched {
-                input.set_value(target.prefill(), window, cx);
+            if let Some(text) = target.text_to_start(&input.value(), self.reply.as_ref()) {
+                input.set_value(text, window, cx);
             }
             input.focus(window, cx);
         });
@@ -573,16 +581,18 @@ mod tests {
     fn enter_sends_to_the_room_once_it_is_known() {
         let channel = ChannelId::new("forsen");
         assert_eq!(
-            plan_submit("hello", &channel, Some("22484632")),
+            plan_submit("hello", &channel, Some("22484632"), None),
             Plan::Send {
                 room_id: "22484632".into(),
                 outgoing: Outgoing {
                     text: "hello".into(),
                     action: false
-                }
+                },
+                reply: None,
             }
         );
-        let Plan::Send { outgoing, .. } = plan_submit("/me waves", &channel, Some("1")) else {
+        let Plan::Send { outgoing, .. } = plan_submit("/me waves", &channel, Some("1"), None)
+        else {
             panic!("an action is sent")
         };
         assert!(outgoing.action);
@@ -590,16 +600,48 @@ mod tests {
     }
 
     #[test]
+    fn a_message_typed_in_reply_mode_is_sent_as_a_reply_to_that_message() {
+        use gpui_chat_core::{Author, Fragment, Message, Timestamp};
+        let channel = ChannelId::new("forsen");
+        let parent = Message::chat(
+            "parent-1",
+            Timestamp(0),
+            Author::new("alice", "Alice"),
+            vec![Fragment::Text("what is the game".into())],
+        );
+        let target = ReplyTarget::new(&parent).unwrap();
+        let Plan::Send {
+            outgoing, reply, ..
+        } = plan_submit("@Alice chess", &channel, Some("1"), Some(&target))
+        else {
+            panic!("a reply is sent")
+        };
+        assert_eq!(outgoing.text, "@Alice chess");
+        let reply = reply.expect("the request carries the reply");
+        assert_eq!(reply.parent_id.as_str(), "parent-1");
+        assert_eq!(reply.parent_body, "what is the game");
+        // Without reply mode there is none, and a refused message carries nothing.
+        let Plan::Send { reply, .. } = plan_submit("chess", &channel, Some("1"), None) else {
+            panic!()
+        };
+        assert_eq!(reply, None);
+        assert!(matches!(
+            plan_submit("/ban x", &channel, Some("1"), Some(&target)),
+            Plan::Refuse(_)
+        ));
+    }
+
+    #[test]
     fn enter_on_a_blank_box_does_nothing() {
         let channel = ChannelId::new("forsen");
-        assert_eq!(plan_submit("   ", &channel, Some("1")), Plan::Nothing);
-        assert_eq!(plan_submit("", &channel, None), Plan::Nothing);
+        assert_eq!(plan_submit("   ", &channel, Some("1"), None), Plan::Nothing);
+        assert_eq!(plan_submit("", &channel, None, None), Plan::Nothing);
     }
 
     #[test]
     fn a_channel_that_is_not_joined_yet_is_not_sent_to() {
         let channel = ChannelId::new("forsen");
-        let Plan::Refuse(reason) = plan_submit("hello", &channel, None) else {
+        let Plan::Refuse(reason) = plan_submit("hello", &channel, None, None) else {
             panic!("no room id, no send")
         };
         assert!(reason.contains("#forsen"), "{reason}");
@@ -608,12 +650,12 @@ mod tests {
     #[test]
     fn bad_input_is_refused_with_the_reason() {
         let channel = ChannelId::new("forsen");
-        let Plan::Refuse(reason) = plan_submit("/ban x", &channel, Some("1")) else {
+        let Plan::Refuse(reason) = plan_submit("/ban x", &channel, Some("1"), None) else {
             panic!("unknown command")
         };
         assert!(reason.contains("Unknown command /ban"), "{reason}");
         let long = "a".repeat(501);
-        let Plan::Refuse(reason) = plan_submit(&long, &channel, Some("1")) else {
+        let Plan::Refuse(reason) = plan_submit(&long, &channel, Some("1"), None) else {
             panic!("too long")
         };
         assert!(reason.contains("501/500"), "{reason}");
@@ -629,7 +671,7 @@ mod tests {
         // Flattened, it is one message for the user to confirm.
         let channel = ChannelId::new("forsen");
         let flat = flatten_paste("a\nb\nc").unwrap();
-        let Plan::Send { outgoing, .. } = plan_submit(&flat, &channel, Some("1")) else {
+        let Plan::Send { outgoing, .. } = plan_submit(&flat, &channel, Some("1"), None) else {
             panic!("one message")
         };
         assert_eq!(outgoing.text, "a b c");

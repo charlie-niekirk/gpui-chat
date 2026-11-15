@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_chat_core::{Message, MessageId};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, Context, Entity, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
     ListState, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -39,10 +40,10 @@ use gpui_kit::{
 };
 
 use super::display::DisplayOptions;
-use super::element::{BadgeStyle, EmoteStyle, MessageStyle, OpenThread, Palette};
+use super::element::{BadgeStyle, EmoteStyle, HoveredRow, MessageStyle, OpenThread, Palette};
 use super::layout::LayoutCache;
 use super::list_sync::ListMirror;
-use super::row::{RowContext, message_row};
+use super::row::{RowContext, message_row, row_menu};
 use super::thread::{self, ThreadPanel};
 use super::tooltip::EmoteHover;
 use crate::badges::Badges;
@@ -114,6 +115,8 @@ pub struct ChatView {
     hover: Rc<RefCell<EmoteHover>>,
     /// Whether rows offer Reply (there is a composer to reply with).
     can_reply: bool,
+    /// The list's row the pointer is over (kept current by the rows when `can_reply`).
+    hovered: HoveredRow,
     /// The thread popover, while one is open.
     thread: Option<ThreadPanel>,
     _subscriptions: Vec<Subscription>,
@@ -154,6 +157,7 @@ impl ChatView {
             images: Rc::default(),
             hover: Rc::default(),
             can_reply: false,
+            hovered: Rc::default(),
             thread: None,
             _subscriptions: subscriptions,
         }
@@ -437,14 +441,14 @@ impl Render for ChatView {
                         .ok();
                 }) as OpenThread
             }),
+            hovered_row: self.can_reply.then(|| self.hovered.clone()),
         });
         let handle = cx.entity().downgrade();
-        let rows = |id| RowContext {
+        let rows = |id, hovered: &HoveredRow| RowContext {
             id,
             view: handle.clone(),
-            store: self.store.clone(),
             tokens,
-            can_reply: self.can_reply,
+            hovered: self.can_reply.then(|| hovered.get()).flatten(),
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -452,15 +456,17 @@ impl Render for ChatView {
                 reply_line: false,
                 on_open_thread: None,
                 hover: panel.hover.clone(),
+                hovered_row: self.can_reply.then(|| panel.hovered.clone()),
                 ..(*style).clone()
             });
             let view = thread::thread_view(self.store.read(cx).messages(), panel.root.as_str());
-            thread::render(panel, &view, &style, &rows("thread-row"), cx)
+            let rows = rows("thread-row", &panel.hovered);
+            thread::render(panel, &view, &style, &rows, self.store.clone(), cx)
         });
         let store = self.store.clone();
         let cache = self.cache.clone();
         let first = self.mirror.first_seq();
-        let list_rows = rows("chat-row");
+        let list_rows = rows("chat-row", &self.hovered);
         let messages = list(self.list.clone(), move |ix, _window, cx| {
             let seq = first + ix as u64;
             match store.read(cx).messages().get_by_seq(seq) {
@@ -520,6 +526,12 @@ impl Render for ChatView {
         });
 
         // The channel name and state are shown by the pane header (`crate::pane`).
+        // One right-click menu for the whole list: it resolves the row under the pointer.
+        let menu = row_menu(
+            cx.entity().downgrade(),
+            self.store.clone(),
+            self.hovered.clone(),
+        );
         div().size_full().flex().flex_col().child(
             div()
                 .relative()
@@ -528,7 +540,8 @@ impl Render for ChatView {
                 .child(messages)
                 .child(probe)
                 .children(pill)
-                .children(thread_panel),
+                .children(thread_panel)
+                .context_menu(menu),
         )
     }
 }
@@ -745,6 +758,35 @@ mod tests {
         h.view.update(cx, |view, cx| view.close_thread(cx));
         cx.run_until_parked();
         assert!(h.view.read_with(cx, |v, _| v.open_thread_root().is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn the_row_under_the_pointer_is_tracked_only_when_replying_is_possible(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(3, "hello", cx);
+        // The newest row is at the bottom of the (800x600) window.
+        let over_newest = point(px(400.0), px(595.0));
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.hovered.get()),
+            None,
+            "nothing tracks the pointer in a chat that cannot reply"
+        );
+
+        h.view.update(cx, |view, cx| view.set_can_reply(true, cx));
+        cx.run_until_parked();
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(h.view.read_with(cx, |v, _| v.hovered.get()), Some(2));
+
+        // Pointing at an older row moves it; leaving the rows clears it.
+        cx.simulate_mouse_move(point(px(400.0), px(570.0)), None, Default::default());
+        cx.run_until_parked();
+        let hovered = h.view.read_with(cx, |v, _| v.hovered.get());
+        assert!(matches!(hovered, Some(seq) if seq < 2), "{hovered:?}");
     }
 
     #[gpui_kit::test]

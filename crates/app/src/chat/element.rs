@@ -20,7 +20,7 @@
 //! own. They are looked up when the message is shaped, in the channel's badge sets and then the
 //! global ones ([`crate::badges`]); a badge with no definition or no usable image is not shown.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +111,11 @@ pub struct BadgeStyle {
 /// What the context line of a reply does when it is clicked: open the thread with this root.
 pub type OpenThread = Rc<dyn Fn(&MessageId, &mut Window, &mut App)>;
 
+/// The row the pointer is over (its store sequence number), shared by a view's rows: each row
+/// that has it in its style keeps it current, and the view shows the Reply button on that row
+/// only and resolves the right-click menu against it.
+pub type HoveredRow = Rc<Cell<Option<u64>>>;
+
 /// The reply context line is a fraction of the text's size: it is a quotation, not the message.
 const REPLY_SCALE: f32 = 0.85;
 /// Space above the reply line, so it reads as belonging to the message under it, not to the one
@@ -142,6 +147,9 @@ pub struct MessageStyle {
     pub reply_line: bool,
     /// Clicking a reply's context line; without it the line is not interactive.
     pub on_open_thread: Option<OpenThread>,
+    /// Where each row reports whether the pointer is over it; `None` when nothing needs to know
+    /// (a chat without a composer).
+    pub hovered_row: Option<HoveredRow>,
 }
 
 /// One message in the chat list.
@@ -436,6 +444,37 @@ impl MessageElement {
 }
 
 impl MessageElement {
+    /// Keeps [`MessageStyle::hovered_row`] pointing at this row while the pointer is over it (not
+    /// over something drawn above it, such as the thread popover), and wakes the view when that
+    /// changes. Checked at paint (rows move under a still pointer when the list scrolls) and on
+    /// every mouse move.
+    fn track_hover(&self, hitbox: &Hitbox, window: &mut Window, cx: &mut App) {
+        let Some(cell) = self.style.hovered_row.clone() else {
+            return;
+        };
+        let (seq, view) = (self.seq, window.current_view());
+        let sync = move |over: bool, cx: &mut App| match (over, cell.get()) {
+            (true, current) if current != Some(seq) => {
+                cell.set(Some(seq));
+                cx.notify(view);
+            }
+            (false, Some(current)) if current == seq => {
+                cell.set(None);
+                cx.notify(view);
+            }
+            _ => {}
+        };
+        sync(hitbox.is_hovered(window), cx);
+        let moved = hitbox.clone();
+        let on_move = sync.clone();
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+            if phase.bubble() {
+                on_move(moved.is_hovered(window), cx);
+            }
+        });
+        window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| sync(false, cx));
+    }
+
     /// Where the flowed text starts: inside the padding, under the reply line.
     fn content_origin(&self, bounds: Bounds<Pixels>, layout: &MessageLayout) -> Point<Pixels> {
         bounds.origin + self.style.padding + point(px(0.0), px(layout.reply_height()))
@@ -480,7 +519,6 @@ impl MessageElement {
         let baseline = (text_height - line.ascent.as_f32() - line.descent.as_f32()) / 2.0
             + line.ascent.as_f32();
         let fit = prepared.fit;
-        let positions = line.positions(fit);
         let last = line.atoms.len().saturating_sub(1);
         for glyph in &line.glyphs {
             let index = glyph.atom as usize;
@@ -490,9 +528,9 @@ impl MessageElement {
             if atom.kind != AtomKind::Glyphs {
                 continue;
             }
-            let x = match (positions.get(index), fit.ellipsis_x) {
-                (Some(x), _) => *x,
-                (None, Some(x)) if index == last => x,
+            let x = match fit.ellipsis_x {
+                _ if index < fit.atoms => line.offsets[index],
+                Some(x) if index == last => x,
                 _ => continue,
             };
             let position = point(
@@ -601,7 +639,7 @@ impl Element for MessageElement {
             .reply
             .as_ref()
             .map(|line| self.prepare_reply(line, bounds, window));
-        if layout.shaped.inlines.is_empty() {
+        if layout.shaped.inlines.is_empty() && self.style.hovered_row.is_none() {
             return Prepainted {
                 layout,
                 hitbox: None,
@@ -645,6 +683,10 @@ impl Element for MessageElement {
         let message = &*self.message;
         let flags = message.flags;
         let MessageLayout { shaped, flow } = &prepainted.layout;
+
+        if let Some(hitbox) = &prepainted.hitbox {
+            self.track_hover(hitbox, window, cx);
+        }
 
         window.paint_layer(bounds, |window| {
             if flags.mention {

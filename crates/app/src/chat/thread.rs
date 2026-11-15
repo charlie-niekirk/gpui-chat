@@ -14,17 +14,20 @@ use std::sync::Arc;
 
 use gpui_chat_core::{Message, MessageId, MessageStore};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Context, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    AnyElement, Context, Entity, InteractiveElement as _, IntoElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
 
+use super::element::HoveredRow;
 use super::element::MessageStyle;
 use super::layout::LayoutCache;
-use super::row::{RowContext, message_row};
+use super::row::{RowContext, message_row, row_menu};
 use super::tooltip::EmoteHover;
 use super::view::ChatView;
+use crate::channels::ChannelStore;
 use crate::reply::single_line;
 
 /// Replies shown at most: the newest ones, so a very long thread stays cheap to draw (the rows are
@@ -37,6 +40,8 @@ pub struct ThreadPanel {
     pub root: MessageId,
     pub cache: Rc<RefCell<LayoutCache>>,
     pub hover: Rc<RefCell<EmoteHover>>,
+    /// The popover's row the pointer is over.
+    pub hovered: HoveredRow,
 }
 
 impl ThreadPanel {
@@ -45,6 +50,7 @@ impl ThreadPanel {
             root,
             cache: Rc::default(),
             hover: Rc::default(),
+            hovered: Rc::default(),
         }
     }
 }
@@ -98,12 +104,14 @@ fn stub(replies: &[&Arc<Message>], root: &str) -> Option<String> {
     })
 }
 
-/// The panel. `style` is the list's, adapted by the caller; `rows` says how its rows are built.
+/// The panel. `style` is the list's, adapted by the caller; `rows` says how its rows are built and
+/// `store` is where the right-click menu looks the row under the pointer up.
 pub fn render(
     panel: &ThreadPanel,
     thread: &ThreadView,
     style: &Rc<MessageStyle>,
     rows: &RowContext,
+    store: Entity<ChannelStore>,
     cx: &mut Context<ChatView>,
 ) -> AnyElement {
     let tokens = rows.tokens;
@@ -184,6 +192,10 @@ pub fn render(
         .child(
             v_flex()
                 .id("thread-panel")
+                // Everything behind the panel is hidden from the pointer: wheel events, clicks and
+                // hover belong to it, not to the chat rows underneath (the empty part of the
+                // overlay stays pass-through).
+                .occlude()
                 .w(px(400.0))
                 .max_w_full()
                 .max_h_full()
@@ -201,7 +213,8 @@ pub fn render(
                         .min_h_0()
                         .overflow_y_scroll()
                         .child(body),
-                ),
+                )
+                .context_menu(row_menu(rows.view.clone(), store, panel.hovered.clone())),
         )
         .into_any_element()
 }

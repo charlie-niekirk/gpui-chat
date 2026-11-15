@@ -141,41 +141,32 @@ async fn an_action_goes_out_as_me_text_and_a_reply_names_its_parent() {
 }
 
 #[tokio::test]
-async fn a_reply_carries_its_parent_and_a_message_without_one_does_not() {
+async fn a_reply_that_twitch_drops_still_names_its_parent_and_comes_back_as_a_drop() {
+    // What the composer relies on to restore reply mode: the request did carry the parent (the
+    // mock only matches that exact body), and the refusal is the ordinary drop error.
     let server = MockServer::start().await;
     let (_, helix) = logged_in(&server).await;
-    let mut reply = send_body("@Alice the Italian is solid");
+    let mut reply = send_body("@Alice chess");
     reply["reply_parent_message_id"] = json!("33333333-0000-4000-8000-000000000001");
-    // Matched on the exact body: the plain message below would not match this mock, nor this
-    // reply the plain one.
     Mock::given(method("POST"))
         .and(path("/helix/chat/messages"))
         .and(body_json(reply))
-        .respond_with(accepted("reply-1"))
+        .respond_with(dropped(
+            "msg_duplicate",
+            "Your message was not sent because it is identical to the previous one you sent.",
+        ))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/helix/chat/messages"))
-        .and(body_json(send_body("no parent")))
-        .respond_with(accepted("plain-1"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let sent = helix
+    let error = helix
         .send_chat_message(
             "1000",
-            "@Alice the Italian is solid",
+            "@Alice chess",
             Some("33333333-0000-4000-8000-000000000001"),
         )
         .await
-        .unwrap();
-    assert_eq!(sent.message_id, "reply-1");
-    let plain = helix
-        .send_chat_message("1000", "no parent", None)
-        .await
-        .unwrap();
-    assert_eq!(plain.message_id, "plain-1");
+        .unwrap_err();
+    assert!(matches!(error, SendError::Dropped { ref code, .. } if code == "msg_duplicate"));
 }
 
 #[tokio::test]

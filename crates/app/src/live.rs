@@ -16,8 +16,8 @@ use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, ReplyRef, Timestamp
 use gpui_chat_emotes::Providers;
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::{
-    Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, SendError, TwitchClient,
-    echo_message, irc_login, settled_state,
+    Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, SendError, SentMessage,
+    TwitchClient, echo_message, irc_login, settled_state,
 };
 use gpui_kit::App;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -180,6 +180,19 @@ async fn post(
     let sent = helix
         .send_chat_message(&request.room_id, &request.outgoing.wire_text(), parent)
         .await?;
+    let event = echo_event(sent, request, now());
+    let event = match emotes {
+        Some(emotes) => emotes.process(event),
+        None => event,
+    };
+    // A closed bridge means the UI is gone; the send itself succeeded.
+    let _ = sender.send(event).await;
+    Ok(())
+}
+
+/// The chat event for a message Twitch accepted: the echo of `request` as the account that sent it
+/// (`sent`), under the id Twitch gave it, carrying the reply reference when it was a reply.
+fn echo_event(sent: SentMessage, request: SendRequest, timestamp: Timestamp) -> ChatEvent {
     let author = Author {
         user_id: Some(sent.user_id),
         ..Author::new(&sent.login, &sent.login)
@@ -189,20 +202,13 @@ async fn post(
         author,
         &request.outgoing.text,
         request.outgoing.action,
-        now(),
+        timestamp,
     );
     message.reply = request.reply;
-    let event = ChatEvent::Message {
+    ChatEvent::Message {
         channel: request.channel,
-        message: std::sync::Arc::new(message),
-    };
-    let event = match emotes {
-        Some(emotes) => emotes.process(event),
-        None => event,
-    };
-    // A closed bridge means the UI is gone; the send itself succeeded.
-    let _ = sender.send(event).await;
-    Ok(())
+        message: Arc::new(message),
+    }
 }
 
 fn now() -> Timestamp {
@@ -332,6 +338,58 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.reconnects.load(Ordering::SeqCst)
         }
+    }
+
+    fn request(reply: Option<ReplyRef>) -> SendRequest {
+        SendRequest {
+            channel: ChannelId::new("testchan"),
+            room_id: "1000".into(),
+            outgoing: Outgoing {
+                text: "@Alice chess".into(),
+                action: false,
+            },
+            reply,
+        }
+    }
+
+    fn sent() -> SentMessage {
+        SentMessage {
+            message_id: "reply-1".into(),
+            user_id: "42".into(),
+            login: "viewer".into(),
+        }
+    }
+
+    #[test]
+    fn the_echo_of_a_reply_carries_the_reply_reference() {
+        let reference = ReplyRef {
+            parent_id: "parent-1".into(),
+            parent_login: "alice".into(),
+            parent_display_name: "Alice".into(),
+            parent_body: "what is the game".into(),
+            thread_parent_id: Some("root-1".into()),
+        };
+        let ChatEvent::Message { channel, message } =
+            echo_event(sent(), request(Some(reference.clone())), Timestamp(7))
+        else {
+            panic!("a chat message")
+        };
+        assert_eq!(channel, ChannelId::new("testchan"));
+        assert_eq!(message.id.as_str(), "reply-1");
+        assert_eq!(message.reply, Some(reference));
+        assert_eq!(message.thread_root().as_str(), "root-1");
+        assert!(message.flags.echo);
+        assert_eq!(message.author.as_ref().unwrap().login, "viewer");
+        assert_eq!(message.plain_text(), "@Alice chess");
+    }
+
+    #[test]
+    fn the_echo_of_a_plain_message_is_not_a_reply() {
+        let ChatEvent::Message { message, .. } = echo_event(sent(), request(None), Timestamp(7))
+        else {
+            panic!("a chat message")
+        };
+        assert_eq!(message.reply, None);
     }
 
     #[tokio::test(start_paused = true)]
