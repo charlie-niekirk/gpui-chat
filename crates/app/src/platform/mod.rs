@@ -5,9 +5,9 @@
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
-    About, AddChannel, CloseWindow, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    Quit, ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ToggleDebugHud,
-    ToggleSidebar,
+    About, AddChannel, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious, LogIn, LogOut,
+    MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit, ReloadEmotes, RemoveChannel,
+    SelectNextChannel, SelectPreviousChannel, ToggleDebugHud, ToggleSidebar,
 };
 
 pub mod keychain;
@@ -26,8 +26,18 @@ pub use imp::{ADD_CHANNEL_LABEL, TOGGLE_HUD_LABEL, TOGGLE_SIDEBAR_LABEL};
 
 /// Default key bindings for the current platform.
 pub fn default_bindings() -> Vec<KeyBinding> {
-    imp::bindings()
+    let mut bindings = imp::bindings();
+    // Registered after the input's own bindings and matching at the same depth, so ↑/↓ recall the
+    // sent lines instead of moving the cursor of the one-line input.
+    bindings.extend([
+        KeyBinding::new("up", ComposerHistoryPrevious, Some(COMPOSER_INPUT)),
+        KeyBinding::new("down", ComposerHistoryNext, Some(COMPOSER_INPUT)),
+    ]);
+    bindings
 }
+
+/// The text input inside a composer (see `actions::COMPOSER_CONTEXT`).
+const COMPOSER_INPUT: &str = "ChatComposer > Input";
 
 /// The application menu bar (the native menu on macOS).
 pub fn menus() -> Vec<Menu> {

@@ -277,6 +277,7 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
             highlighted: tag(msg, "msg-id") == Some("highlighted-message"),
             deleted: false,
             history: tag(msg, "historical") == Some("1"),
+            echo: false,
         },
         reply: reply(msg),
     };

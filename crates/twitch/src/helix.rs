@@ -1,4 +1,4 @@
-//! Helix (`api.twitch.tv/helix`) plumbing: authenticated GETs with one retry after a refresh, and
+//! Helix (`api.twitch.tv/helix`) plumbing: authenticated GETs and JSON POSTs with one retry after a refresh, and
 //! Twitch's rate-limit headers respected.
 //!
 //! Every request carries `Client-Id` and `Authorization: Bearer <user token>` from [`Auth`]. A 401
@@ -8,13 +8,16 @@
 //! bucket is empty, requests wait for the reset (up to [`HelixClient::max_wait`]); a 429 is retried
 //! once after that wait.
 //!
+//! [`HelixClient::post_json`] is the same for a JSON body (PR 3.2, Send Chat Message).
+//!
 //! Endpoint-specific parsing lives with the caller; this returns status and body. The base URL is
 //! injectable, so tests run against a local mock server.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, HeaderMap};
+use reqwest::Method;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use thiserror::Error;
 
 use crate::auth::{Auth, AuthError, TokenLease, describe, unix_now, user_agent};
@@ -198,18 +201,67 @@ impl HelixClient {
         Ok(response)
     }
 
+    /// POSTs `body` as JSON to `path` (relative to the base) as the logged-in user.
+    ///
+    /// Retries exactly like [`HelixClient::get`]: once after a refresh when the token was
+    /// rejected, once after the rate-limit reset on a 429. The body is sent again as it is, so
+    /// only use this for requests that are safe to repeat after such a failure (a request that was
+    /// answered 401 or 429 was not processed).
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<HelixResponse, HelixError> {
+        let body = serde_json::to_vec(body)
+            .map_err(|error| HelixError::Network(format!("cannot encode request: {error}")))?;
+        let auth = &self.inner.auth;
+        let mut lease = auth.access_token().await?;
+        let mut response = self
+            .send_request(Method::POST, path, Some(&body), &lease)
+            .await?;
+        if response.status == 401 && token_rejected(&response.body) {
+            lease = auth.refresh_after_unauthorized(lease.generation).await?;
+            response = self
+                .send_request(Method::POST, path, Some(&body), &lease)
+                .await?;
+        }
+        if response.status == 429 {
+            let lease = auth.access_token().await?;
+            response = self
+                .send_request(Method::POST, path, Some(&body), &lease)
+                .await?;
+        }
+        Ok(response)
+    }
+
     async fn send(&self, path: &str, lease: &TokenLease) -> Result<HelixResponse, HelixError> {
+        self.send_request(Method::GET, path, None, lease).await
+    }
+
+    async fn send_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+        lease: &TokenLease,
+    ) -> Result<HelixResponse, HelixError> {
         let wait = self.rate_limit().wait(unix_now()).min(self.inner.max_wait);
         if !wait.is_zero() {
             tracing::debug!(?wait, "Helix rate limit exhausted; waiting for the reset");
             tokio::time::sleep(wait).await;
         }
-        let response = self
+        let mut request = self
             .inner
             .http
-            .get(self.url(path))
+            .request(method, self.url(path))
             .header("Client-Id", self.inner.auth.client_id())
-            .header(AUTHORIZATION, format!("Bearer {}", lease.token.expose()))
+            .header(AUTHORIZATION, format!("Bearer {}", lease.token.expose()));
+        if let Some(body) = body {
+            request = request
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.to_vec());
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| HelixError::Network(describe(error)))?;

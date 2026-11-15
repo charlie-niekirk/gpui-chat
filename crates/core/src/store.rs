@@ -199,6 +199,17 @@ impl MessageStore {
         self.entries.range(start..).map(|e| (e.seq, &e.message))
     }
 
+    /// Replaces the message with the same id as `message` by `message`, keeping its place (and
+    /// sequence number) in the store. Returns that sequence number, or `None` if no retained
+    /// message has the id. Used to swap a local echo for the real message.
+    pub fn replace(&mut self, message: Arc<Message>) -> Option<u64> {
+        let seq = self.by_id.get(message.id.as_str()).copied()?;
+        let index = self.index_of_seq(seq)?;
+        self.entries[index].message = message;
+        self.generation += 1;
+        Some(seq)
+    }
+
     /// Marks the message with this id as deleted (replacing it with a copy that has
     /// `flags.deleted` set). Returns `false` if the id is unknown or already deleted.
     pub fn mark_deleted(&mut self, id: &str) -> bool {
@@ -369,6 +380,24 @@ mod tests {
         assert_eq!(store.len(), 1_000);
         assert_eq!(store.get_index(0).unwrap().id.as_str(), "500");
         assert_eq!(store.iter().next_back().unwrap().id.as_str(), "1499");
+    }
+
+    #[test]
+    fn replace_keeps_the_place_and_the_sequence_number() {
+        let mut store = MessageStore::with_capacity(5);
+        for id in ["a", "b", "c"] {
+            store.push(msg(id));
+        }
+        let generation = store.generation();
+        let newer = msg_by("b", "someone-else");
+        assert_eq!(store.replace(newer.clone()), Some(1));
+        assert!(Arc::ptr_eq(store.get("b").unwrap(), &newer));
+        assert!(Arc::ptr_eq(store.get_by_seq(1).unwrap(), &newer));
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.next_seq(), 3, "nothing was appended");
+        assert_eq!(store.generation(), generation + 1);
+        assert_eq!(store.replace(msg("unknown")), None);
+        assert_eq!(store.generation(), generation + 1, "a miss changes nothing");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! One chat pane: a header (channel name, connection state, room-mode chips) over a chat view.
+//! One chat pane: a header (channel name, connection state, room-mode chips) over a chat view and,
+//! with the live source, the input box ([`crate::composer`]).
 //!
 //! The formatting rules live in plain functions ([`link_status`], [`room_chips`]) so they are
 //! unit-tested; [`ChannelPane`] is the thin view on top. Splits arrive in PR 4.1; until then the
@@ -21,6 +22,7 @@ use gpui_kit::{
 
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
+use crate::composer::Composer;
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
 use crate::theme::Tokens;
@@ -235,6 +237,8 @@ pub struct ChannelPane {
     stream_info: Option<Entity<StreamInfoHub>>,
     store: Entity<ChannelStore>,
     chat: Entity<ChatView>,
+    /// The input box; `None` for the offline sources (and when there is no login owner).
+    composer: Option<Entity<Composer>>,
     /// `false` for the offline sources, which have no connection to report.
     live: bool,
     _subscriptions: Vec<Subscription>,
@@ -247,6 +251,7 @@ impl ChannelPane {
         streams: Entity<StreamHub>,
         stream_info: Option<Entity<StreamInfoHub>>,
         live: bool,
+        composer: Option<Entity<Composer>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let chat = cx.new(|cx| ChatView::new(store.clone(), cx));
@@ -265,6 +270,7 @@ impl ChannelPane {
             stream_info,
             store,
             chat,
+            composer,
             live,
             _subscriptions: subscriptions,
         }
@@ -471,6 +477,7 @@ impl Render for ChannelPane {
             .size_full()
             .child(self.header(&tokens, cx))
             .child(div().flex_1().min_h_0().w_full().child(self.chat.clone()))
+            .children(self.composer.clone())
     }
 }
 

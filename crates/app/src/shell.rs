@@ -41,6 +41,7 @@ use crate::actions::{
 use crate::add_channel;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
+use crate::composer::Composer;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::emote_service;
@@ -290,8 +291,19 @@ impl AppShell {
         let store = hub.update(cx, |hub, cx| hub.ensure(&channel, cx));
         let live = self.live.is_some();
         let streams = self.streams.clone();
+        // Only the live source can send, and only when there is a login owner to send as.
+        let composer = self
+            .live
+            .clone()
+            .filter(LiveSource::can_send)
+            .zip(self.account.clone())
+            .map(|(live, account)| {
+                let store = store.clone();
+                cx.new(|cx| Composer::new(store, live, account, cx))
+            });
         let stream_info = self.stream_info.clone();
-        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, cx));
+        let pane =
+            cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, composer, cx));
         self.panes.insert(channel, pane);
     }
 

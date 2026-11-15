@@ -108,6 +108,9 @@ pub struct MessageFlags {
     pub deleted: bool,
     /// Came from recent-messages history rather than live chat.
     pub history: bool,
+    /// The app's own stand-in for a message the user just sent, shown until Twitch's copy of it
+    /// (same id, with the real emotes, colour and badges) arrives and replaces it.
+    pub echo: bool,
 }
 
 /// The message this one replies to.
