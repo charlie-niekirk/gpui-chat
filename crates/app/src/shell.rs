@@ -37,9 +37,9 @@ use gpui_kit::{
 use crate::account::AccountHub;
 use crate::actions::{
     About, AddChannel, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp, ReloadEmotes,
-    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
-    ToggleDebugHud, ToggleSidebar,
+    FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    OpenChannelSwitcher, OpenPalette, ReloadEmotes, RemoveChannel, SHELL_CONTEXT,
+    SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::add_channel;
 use crate::channel_list::{ChannelList, Move};
@@ -50,9 +50,10 @@ use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::emote_service;
 use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
+use crate::keymap::{self, KeymapState};
 use crate::live::LiveSource;
+use crate::palette;
 use crate::pane::ChannelPane;
-use crate::platform;
 use crate::sign_in;
 use crate::splits::view::{ChannelRows, Splits};
 use crate::splits::{Direction, DropZone, Layout, PaneId};
@@ -214,6 +215,9 @@ impl AppShell {
                 }
                 cx.notify();
             }),
+            // A keymap reload (or a problem with the file appearing or clearing) re-renders the
+            // strip and every shortcut hint.
+            cx.observe_global::<KeymapState>(|_, cx| cx.notify()),
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.placement_changed(window, cx);
             }),
@@ -623,6 +627,73 @@ impl AppShell {
         );
     }
 
+    /// ⌘K: every action with its shortcut, fuzzy filtered; the chosen one runs as its key would.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (entries, actions) = palette::palette_entries(cx);
+        palette::open(
+            entries,
+            "Type a command…",
+            "No matching command",
+            move |index, window, cx| {
+                if let Some(info) = actions.get(index) {
+                    window.dispatch_action(info.build(), cx);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// ⌘T: the open channels, fuzzy filtered; the chosen one is shown in the focused pane.
+    fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let channels = self.list.channels().to_vec();
+        let focused = self.layout.focused_channel().cloned();
+        let entries = channels
+            .iter()
+            .map(|channel| palette::Entry {
+                label: channel.to_string().into(),
+                detail: if focused.as_ref() == Some(channel) {
+                    Some("this pane".into())
+                } else if self.layout.is_shown(channel) {
+                    Some("in another pane".into())
+                } else {
+                    None
+                },
+                shortcut: None,
+                keywords: String::new(),
+            })
+            .collect();
+        let shell = cx.entity().downgrade();
+        palette::open(
+            entries,
+            "Go to channel…",
+            "No open channel matches",
+            move |index, _, cx| {
+                if let Some(channel) = channels.get(index) {
+                    shell
+                        .update(cx, |shell, cx| shell.show_in_focused_pane(channel, cx))
+                        .ok();
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Shows `channel` in the focused pane (swapping with the pane that has it, if any) and gives
+    /// that pane keyboard focus.
+    fn show_in_focused_pane(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if !self.list.contains(channel) {
+            return;
+        }
+        let focused = self.layout.focused();
+        self.layout.show(focused, Some(channel.clone()));
+        self.list_changed(cx);
+        // The pane may show the same channel as before: focus still goes back to its input.
+        self.focus_pending = true;
+        cx.notify();
+    }
+
     fn log_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(account) = self.account.clone() {
             sign_in::open(account, window, cx);
@@ -804,8 +875,11 @@ impl AppShell {
         // Open and followed rows can be dragged into a split (PR 4.1).
         let items: Vec<(SidebarMenuItem, Option<ChannelId>)> = if self.list.is_empty() {
             vec![(
-                SidebarMenuItem::new(format!("No channels yet: {}", platform::ADD_CHANNEL_LABEL))
-                    .disable(true),
+                SidebarMenuItem::new(match keymap::shortcut_of(AddChannel, cx) {
+                    Some(keys) => format!("No channels yet: {keys}"),
+                    None => "No channels yet".to_owned(),
+                })
+                .disable(true),
                 None,
             )]
         } else {
@@ -907,8 +981,29 @@ impl AppShell {
     /// duplicate name, unreadable colours, or a `theme_name` that matches no theme. The theme
     /// in effect keeps working; the strip goes when the problem is fixed.
     fn theme_notice_banner(notices: &[String], tokens: &Tokens) -> impl IntoElement {
+        Self::notice_banner("theme-notice-banner", "Theme problem", notices, tokens)
+    }
+
+    /// The same strip for `keymap.toml` (PR 4.3): an entry naming no action, a keystroke that
+    /// does not parse, two actions on one key, or a file that is not TOML (the previous bindings
+    /// stay in effect). It goes when the file is fixed.
+    fn keymap_notice_banner(notices: &[String], tokens: &Tokens) -> impl IntoElement {
+        Self::notice_banner(
+            "keymap-notice-banner",
+            "Keymap problem (keymap.toml)",
+            notices,
+            tokens,
+        )
+    }
+
+    fn notice_banner(
+        id: &'static str,
+        title: &'static str,
+        notices: &[String],
+        tokens: &Tokens,
+    ) -> impl IntoElement {
         v_flex()
-            .id("theme-notice-banner")
+            .id(id)
             .w_full()
             .flex_none()
             .px_3()
@@ -917,12 +1012,7 @@ impl AppShell {
             .bg(tokens.warning.opacity(0.14))
             .border_b_1()
             .border_color(tokens.warning)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .child("Theme problem"),
-            )
+            .child(div().text_sm().font_weight(FontWeight::BOLD).child(title))
             .children(
                 notices
                     .iter()
@@ -948,13 +1038,38 @@ impl AppShell {
                 .items_center()
                 .gap_2()
                 .child(div().text_xl().child(APP_NAME))
-                .child(div().text_sm().text_color(tokens.text_muted).child(format!(
-                    "Press {} to add a channel, {} to toggle the sidebar, {} for the debug HUD.",
-                    platform::ADD_CHANNEL_LABEL,
-                    platform::TOGGLE_SIDEBAR_LABEL,
-                    platform::TOGGLE_HUD_LABEL
-                ))),
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(tokens.text_muted)
+                        .child(welcome_hint(cx)),
+                ),
         )
+    }
+}
+
+/// "Press ⌘N to add a channel, ⌘K for the command palette, …": the shortcuts as they are bound now
+/// (an unbound action is left out).
+fn welcome_hint(cx: &App) -> String {
+    let hints: Vec<String> = [
+        (keymap::shortcut_of(AddChannel, cx), "to add a channel"),
+        (
+            keymap::shortcut_of(OpenPalette, cx),
+            "for the command palette",
+        ),
+        (
+            keymap::shortcut_of(ToggleSidebar, cx),
+            "to toggle the sidebar",
+        ),
+        (keymap::shortcut_of(ToggleDebugHud, cx), "for the debug HUD"),
+    ]
+    .into_iter()
+    .filter_map(|(keys, what)| keys.map(|keys| format!("{keys} {what}")))
+    .collect();
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!("Press {}.", hints.join(", "))
     }
 }
 
@@ -1116,6 +1231,7 @@ impl Render for AppShell {
         let font = cx.global::<FontConfig>().clone();
         let settings_error = config::store(cx).read(cx).error().cloned();
         let theme_notices = theme::notices(cx);
+        let keymap_notices = keymap::notices(cx);
 
         let root = v_flex()
             .key_context(SHELL_CONTEXT)
@@ -1129,6 +1245,12 @@ impl Render for AppShell {
             }))
             .on_action(cx.listener(|this, _: &AddChannel, window, cx| {
                 this.open_add_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                this.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChannelSwitcher, window, cx| {
+                this.open_switcher(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RemoveChannel, _, cx| {
                 if let Some(channel) = this.list.selected().cloned() {
@@ -1222,6 +1344,10 @@ impl Render for AppShell {
                             .children(
                                 (!theme_notices.is_empty())
                                     .then(|| Self::theme_notice_banner(&theme_notices, &tokens)),
+                            )
+                            .children(
+                                (!keymap_notices.is_empty())
+                                    .then(|| Self::keymap_notice_banner(&keymap_notices, &tokens)),
                             )
                             .children(self.account_banner(&tokens, cx))
                             .child(self.main_area(&tokens, cx))

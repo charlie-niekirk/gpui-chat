@@ -10,7 +10,7 @@ pub const CACHE_DIR_ENV: &str = "GPUI_CHAT_CACHE_DIR";
 
 /// File name of the settings file inside the config dir.
 pub const SETTINGS_FILE_NAME: &str = "settings.toml";
-/// File name of the keymap file inside the config dir (used from PR 4.3).
+/// File name of the keymap file inside the config dir.
 pub const KEYMAP_FILE_NAME: &str = "keymap.toml";
 /// Directory of user themes inside the config dir (used from PR 4.4).
 pub const THEMES_DIR_NAME: &str = "themes";

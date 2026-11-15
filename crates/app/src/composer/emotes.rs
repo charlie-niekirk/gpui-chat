@@ -375,10 +375,15 @@ impl Composer {
                         .ghost()
                         .small()
                         .label("🙂")
-                        .accessibility_label(format!(
-                            "Emote picker ({})",
-                            crate::platform::EMOTE_PICKER_LABEL
-                        ))
+                        .accessibility_label(
+                            match crate::keymap::shortcut_of(
+                                crate::completion::ComposerToggleEmotePicker,
+                                cx,
+                            ) {
+                                Some(keys) => format!("Emote picker ({keys})"),
+                                None => "Emote picker".to_owned(),
+                            },
+                        )
                         .on_click(
                             cx.listener(|this, _, window, cx| this.toggle_picker(window, cx)),
                         ),

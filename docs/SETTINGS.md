@@ -9,7 +9,7 @@ atomic save, hot reload and paths. No GPUI, no async runtime.
 |---|---|
 | Config dir | `$GPUI_CHAT_CONFIG_DIR`, else `$XDG_CONFIG_HOME/<APP_NAME>` (absolute only), else `~/.config/<APP_NAME>/` (macOS and Linux alike) |
 | Settings | `<config>/settings.toml` |
-| Keymap | `<config>/keymap.toml` (PR 4.3) |
+| Keymap | `<config>/keymap.toml`, watched (see `docs/KEYMAP.md`) |
 | Themes | `<config>/themes/*.toml`, watched (see `docs/THEMES.md`) |
 | Cache | `$GPUI_CHAT_CACHE_DIR`, else `dirs::cache_dir()/<APP_NAME>` |
 
