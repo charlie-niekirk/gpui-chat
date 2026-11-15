@@ -13,8 +13,8 @@
 
 use gpui_chat_settings::{
     AppearanceSettings, Color, LoadReport, Palette, SettingsPaths, ThemeError,
-    ThemeMode as ThemeSetting, ThemeRegistry, ThemeVariant, ThemeWatcher, WatchOptions,
-    load_user_themes, watch_themes,
+    ThemeMode as ThemeSetting, ThemeOrigin, ThemeRegistry, ThemeVariant, ThemeWatcher,
+    WatchOptions, load_user_themes, watch_themes,
 };
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, AppContext as _, Entity, Global, Hsla, Window, rgb};
@@ -206,6 +206,43 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
             None
         }
     }
+}
+
+/// A theme the user can pick: its `theme_name` id, its display name and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeChoice {
+    pub id: String,
+    pub name: String,
+    /// A file in the user's `themes/` directory (possibly replacing a bundled one).
+    pub user: bool,
+}
+
+/// Every theme that can be selected: the bundled pack and the user's `themes/` files, the
+/// default first, then by name. Reflects the directory as last loaded.
+pub fn choices(cx: &App) -> Vec<ThemeChoice> {
+    let bundled;
+    let registry = match cx.try_global::<Themes>() {
+        Some(themes) => &themes.registry,
+        None => {
+            bundled = ThemeRegistry::bundled();
+            &bundled
+        }
+    };
+    registry
+        .iter()
+        .map(|theme| ThemeChoice {
+            id: theme.id.clone(),
+            name: theme.name.clone(),
+            user: matches!(theme.origin, ThemeOrigin::User(_)),
+        })
+        .collect()
+}
+
+/// The id of the theme `name` (a `theme_name` setting) selects, if there is one: case, spaces
+/// and `_` vs `-` do not matter.
+pub fn choice_id(name: &str, cx: &App) -> Option<String> {
+    let id = gpui_chat_settings::normalize_id(name);
+    choices(cx).into_iter().find(|c| c.id == id).map(|c| c.id)
 }
 
 /// Problems with the theme setup that the user should see (the app has no log viewer): bad or
@@ -538,6 +575,21 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             fonts::init(&AppearanceSettings::default(), cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn theme_choices_list_the_pack_with_the_default_first(cx: &mut gpui_kit::TestAppContext) {
+        setup(cx);
+        cx.update(|cx| {
+            let choices = choices(cx);
+            assert_eq!(choices[0].id, gpui_chat_settings::DEFAULT_THEME_ID);
+            assert!(choices.iter().any(|c| c.id == "tokyo-night"));
+            assert!(choices.iter().all(|c| !c.user), "no user themes loaded");
+            // A `theme_name` as typed by hand finds its theme; nonsense finds none.
+            assert_eq!(choice_id("Tokyo Night", cx).as_deref(), Some("tokyo-night"));
+            assert_eq!(choice_id("tokyo_night", cx).as_deref(), Some("tokyo-night"));
+            assert_eq!(choice_id("no such theme", cx), None);
         });
     }
 

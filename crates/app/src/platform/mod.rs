@@ -7,8 +7,8 @@ use gpui_kit::{KeyBinding, Menu, MenuItem};
 use crate::actions::{
     About, AddChannel, ClosePane, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious,
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow,
-    MoveChannelDown, MoveChannelUp, Quit, ReloadEmotes, RemoveChannel, SelectNextChannel,
-    SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
+    MoveChannelDown, MoveChannelUp, OpenSettings, Quit, ReloadEmotes, RemoveChannel,
+    SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 
 pub mod keychain;
@@ -93,6 +93,11 @@ fn account_items() -> [MenuItem; 2] {
         MenuItem::action("Log In to Twitch…", LogIn),
         MenuItem::action("Log Out", LogOut),
     ]
+}
+
+/// Opens the settings window (the application menu).
+fn settings_item() -> MenuItem {
+    MenuItem::action("Settings…", OpenSettings)
 }
 
 fn about_item() -> MenuItem {

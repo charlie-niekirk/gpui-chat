@@ -11,6 +11,7 @@ publish.workspace = true
 gpui-chat-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 notify = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }

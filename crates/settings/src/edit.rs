@@ -1,0 +1,449 @@
+//! Format-preserving edits of `settings.toml` for the settings window.
+//!
+//! [`Settings::save`] rewrites the whole file from the typed struct, which drops comments and
+//! keys this build does not know. The settings window must not do that to a hand-edited file, so
+//! it changes single keys through [`Settings::update_file`] instead: the file is parsed with
+//! `toml_edit`, the keys are set (or removed) in place, and everything else (comments, blank
+//! lines, key order, unknown keys and sections, the trailing comment of an edited value) stays as
+//! it was.
+//!
+//! Nothing is written unless the *result* is a valid settings file. A file that is not valid TOML
+//! is therefore never touched, and a file with one out-of-range value only accepts an edit that
+//! fixes it. The caller gets the error to show.
+
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+
+use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
+use crate::error::SettingsError;
+use crate::schema::Settings;
+use crate::store::atomic_write;
+
+/// A value to write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    StrList(Vec<String>),
+}
+
+impl EditValue {
+    /// A float as the user would type it: `1.4_f32` is written `1.4`, not `1.399999976158142`.
+    pub fn float(value: f32) -> Self {
+        Self::Float(value.to_string().parse().unwrap_or(f64::from(value)))
+    }
+
+    fn into_toml(self) -> Value {
+        match self {
+            Self::Bool(v) => Value::from(v),
+            Self::Int(v) => Value::from(v),
+            Self::Float(v) => Value::from(v),
+            Self::Str(v) => Value::from(v),
+            Self::StrList(items) => Value::Array(items.into_iter().collect::<Array>()),
+        }
+    }
+}
+
+/// One key to change: set it, or remove it so the default (or "unset") applies again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingEdit {
+    /// `"section.key"`, as in the file: `"appearance.font_size"`.
+    pub field: &'static str,
+    /// `None` removes the key.
+    pub value: Option<EditValue>,
+}
+
+impl SettingEdit {
+    pub fn set(field: &'static str, value: EditValue) -> Self {
+        Self {
+            field,
+            value: Some(value),
+        }
+    }
+
+    pub fn remove(field: &'static str) -> Self {
+        Self { field, value: None }
+    }
+}
+
+impl Settings {
+    /// Applies `edits` to the settings file at `path` and writes it back atomically, keeping
+    /// everything the edits do not touch. A missing file is created. Returns the settings the new
+    /// file holds.
+    ///
+    /// Fails, writing nothing, when the file cannot be read, is not valid TOML, or would not be
+    /// valid settings after the edits (see the module docs). When the edits change nothing, the
+    /// file is not rewritten.
+    pub fn update_file(path: &Path, edits: &[SettingEdit]) -> Result<Settings, SettingsError> {
+        let old = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(SettingsError::Read {
+                    path: path.to_owned(),
+                    source: Arc::new(e),
+                });
+            }
+        };
+        let (text, settings) = apply_edits(&old, path, edits)?;
+        if text != old {
+            atomic_write(path, text.as_bytes()).map_err(|source| SettingsError::Write {
+                path: path.to_owned(),
+                source: Arc::new(source),
+            })?;
+        }
+        Ok(settings)
+    }
+}
+
+/// [`Settings::update_file`] on text: the edited text and the settings it parses to. `path` is
+/// for error messages only.
+pub fn apply_edits(
+    text: &str,
+    path: &Path,
+    edits: &[SettingEdit],
+) -> Result<(String, Settings), SettingsError> {
+    let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        let (line, column) = e
+            .span()
+            .map(|span| crate::store::line_col(text, span.start))
+            .unzip();
+        SettingsError::Parse {
+            path: path.to_owned(),
+            message: e.message().to_owned(),
+            line,
+            column,
+        }
+    })?;
+    for edit in edits {
+        apply_one(&mut doc, path, edit)?;
+    }
+    let edited = doc.to_string();
+    let settings = Settings::parse(&edited, path)?;
+    Ok((edited, settings))
+}
+
+fn apply_one(doc: &mut DocumentMut, path: &Path, edit: &SettingEdit) -> Result<(), SettingsError> {
+    let (section, key) = edit
+        .field
+        .split_once('.')
+        .expect("a field is written `section.key`");
+    let wrong_shape = |what: &str| SettingsError::Invalid {
+        path: path.to_owned(),
+        field: edit.field,
+        reason: format!("cannot be changed here: {what}"),
+    };
+    let Some(value) = edit.value.clone() else {
+        if let Some(table) = doc.get_mut(section).and_then(Item::as_table_like_mut) {
+            table.remove(key);
+        }
+        return Ok(());
+    };
+    let table = doc
+        .entry(section)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_like_mut()
+        .ok_or_else(|| wrong_shape(&format!("`{section}` is not a table")))?;
+    let mut new = value.into_toml();
+    match table.get_mut(key) {
+        Some(item) => {
+            // Keep the comment after the old value (`font_size = 14.0  # 6 to 72`).
+            if let Some(old) = item.as_value() {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *item = Item::Value(new);
+        }
+        None => {
+            table.insert(key, Item::Value(new));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::ThemeMode;
+
+    fn p() -> &'static Path {
+        Path::new("settings.toml")
+    }
+
+    const HAND_EDITED: &str = "\
+# My chat settings. Do not lose this comment.
+schema_version = 1
+future_top_level = \"kept\"
+
+[appearance]
+font_size = 14.0   # 6 to 72
+theme = \"dark\"
+# a note about the theme
+theme_name = \"nord\"
+future_key = [1, 2]
+
+# the chat section
+[chat]
+timestamps = true
+
+[from_the_future]
+x = 1
+";
+
+    fn edit(text: &str, edits: &[SettingEdit]) -> (String, Settings) {
+        apply_edits(text, p(), edits).unwrap()
+    }
+
+    #[test]
+    fn comments_unknown_keys_and_order_survive() {
+        let (out, settings) = edit(
+            HAND_EDITED,
+            &[
+                SettingEdit::set("appearance.font_size", EditValue::float(18.0)),
+                SettingEdit::set("chat.timestamps", EditValue::Bool(false)),
+            ],
+        );
+        assert_eq!(settings.appearance.font_size, 18.0);
+        assert!(!settings.chat.timestamps);
+        // Exactly the two values differ; nothing else moved.
+        let expected = HAND_EDITED
+            .replace(
+                "font_size = 14.0   # 6 to 72",
+                "font_size = 18.0   # 6 to 72",
+            )
+            .replace("timestamps = true", "timestamps = false");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn new_keys_and_sections_are_added_and_the_rest_kept() {
+        let (out, settings) = edit(
+            HAND_EDITED,
+            &[
+                SettingEdit::set("emotes.scale", EditValue::float(1.5)),
+                SettingEdit::set("appearance.line_height", EditValue::float(1.6)),
+                SettingEdit::set(
+                    "streamlink.extra_args",
+                    EditValue::StrList(vec!["--twitch-low-latency".into()]),
+                ),
+            ],
+        );
+        assert_eq!(settings.emotes.scale, 1.5);
+        assert_eq!(settings.appearance.line_height, 1.6);
+        assert_eq!(settings.streamlink.extra_args, ["--twitch-low-latency"]);
+        assert!(out.contains("1.6") && !out.contains("1.59999"), "{out}");
+        for kept in [
+            "# My chat settings. Do not lose this comment.",
+            "future_top_level = \"kept\"",
+            "# a note about the theme",
+            "future_key = [1, 2]",
+            "# the chat section",
+            "[from_the_future]",
+        ] {
+            assert!(out.contains(kept), "lost {kept:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_missing_file_gets_just_the_edited_keys() {
+        let (out, settings) = edit(
+            "",
+            &[SettingEdit::set(
+                "appearance.theme",
+                EditValue::Str("light".into()),
+            )],
+        );
+        assert_eq!(out, "[appearance]\ntheme = \"light\"\n");
+        assert_eq!(settings.appearance.theme, ThemeMode::Light);
+    }
+
+    #[test]
+    fn removing_a_key_keeps_the_rest_of_the_section() {
+        let (out, settings) = edit(
+            "[appearance]\ntheme_name_light = \"rose-pine\" # pair\ntheme = \"light\"\n",
+            &[SettingEdit::remove("appearance.theme_name_light")],
+        );
+        assert_eq!(settings.appearance.theme_name_light, None);
+        assert_eq!(out, "[appearance]\ntheme = \"light\"\n");
+        // Removing what is not there is fine.
+        edit("", &[SettingEdit::remove("appearance.theme_name_light")]);
+    }
+
+    #[test]
+    fn a_float_is_written_the_way_it_is_typed() {
+        for (value, text) in [(1.4_f32, "1.4"), (0.7, "0.7"), (3.0, "3.0"), (2.35, "2.35")] {
+            let (out, _) = edit(
+                "",
+                &[SettingEdit::set("emotes.scale", EditValue::float(value))],
+            );
+            assert_eq!(out, format!("[emotes]\nscale = {text}\n"));
+        }
+    }
+
+    #[test]
+    fn an_integer_where_a_float_is_wanted_is_replaced() {
+        let (out, settings) = edit(
+            "[appearance]\nfont_size = 14\n",
+            &[SettingEdit::set(
+                "appearance.font_size",
+                EditValue::float(15.0),
+            )],
+        );
+        assert_eq!(out, "[appearance]\nfont_size = 15.0\n");
+        assert_eq!(settings.appearance.font_size, 15.0);
+    }
+
+    #[test]
+    fn inline_tables_are_edited_in_place() {
+        let (out, settings) = edit(
+            "chat = { scrollback = 500, timestamps = true }\n",
+            &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))],
+        );
+        assert!(!settings.chat.timestamps);
+        assert_eq!(settings.chat.scrollback, 500);
+        assert!(out.contains("scrollback = 500"), "{out}");
+    }
+
+    #[test]
+    fn invalid_toml_is_an_error_with_a_position() {
+        let err = apply_edits(
+            "[appearance\nfont_size = 1",
+            p(),
+            &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SettingsError::Parse { line: Some(_), .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_would_make_the_file_invalid_is_refused() {
+        let err = apply_edits(
+            "",
+            p(),
+            &[SettingEdit::set(
+                "appearance.font_size",
+                EditValue::Float(500.0),
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SettingsError::Invalid {
+                field: "appearance.font_size",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_section_that_is_not_a_table_is_an_error_not_a_panic() {
+        let err = apply_edits(
+            "chat = 5\n",
+            p(),
+            &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))],
+        )
+        .unwrap_err();
+        // `chat = 5` is not valid settings, whatever is edited.
+        assert!(matches!(
+            err,
+            SettingsError::Invalid { .. } | SettingsError::Parse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_file_with_a_bad_value_only_accepts_the_edit_that_fixes_it() {
+        let bad = "[appearance]\nfont_size = 500 # too big\n\n[chat]\nscrollback = 200\n";
+        // Another key: still invalid, so refused and the text is what the caller keeps.
+        assert!(
+            apply_edits(
+                bad,
+                p(),
+                &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))]
+            )
+            .is_err()
+        );
+        // The bad key itself: accepted, comment kept.
+        let (out, settings) = edit(
+            bad,
+            &[SettingEdit::set(
+                "appearance.font_size",
+                EditValue::float(16.0),
+            )],
+        );
+        assert_eq!(settings.appearance.font_size, 16.0);
+        assert!(out.contains("font_size = 16.0 # too big"), "{out}");
+    }
+
+    #[test]
+    fn update_file_writes_only_when_the_result_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+
+        let settings = Settings::update_file(
+            &path,
+            &[SettingEdit::set("emotes.animate", EditValue::Bool(false))],
+        )
+        .unwrap();
+        assert!(!settings.emotes.animate);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# My chat settings."));
+        assert!(on_disk.contains("animate = false"));
+
+        // A refused edit leaves the file byte for byte as it was.
+        let before = on_disk;
+        let err = Settings::update_file(
+            &path,
+            &[SettingEdit::set("emotes.scale", EditValue::Float(99.0))],
+        );
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Invalid TOML is never touched.
+        std::fs::write(&path, "oops = = 1\n").unwrap();
+        assert!(
+            Settings::update_file(
+                &path,
+                &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))]
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "oops = = 1\n");
+    }
+
+    #[test]
+    fn update_file_creates_the_file_and_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("settings.toml");
+        Settings::update_file(
+            &path,
+            &[SettingEdit::set("chat.scrollback", EditValue::Int(300))],
+        )
+        .unwrap();
+        assert_eq!(Settings::try_load(&path).unwrap().chat.scrollback, 300);
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_does_not_rewrite_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[chat]\ntimestamps = true\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Settings::update_file(
+            &path,
+            &[SettingEdit::set("chat.timestamps", EditValue::Bool(true))],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    }
+}

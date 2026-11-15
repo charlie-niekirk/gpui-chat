@@ -77,6 +77,21 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `theme_name_light` and the OS appearance, live via `observe_window_appearance`) and mirrored into
   Kit's `Theme` colours so Kit components match. The user's `themes/` directory is watched and
   re-applied (`attach_reloads`). See `docs/THEMES.md`.
+- `settings_window.rs` (PR 4.2) — the settings window (⌘, / the app menu's "Settings…", `OpenSettings`;
+  one window, a second ⌘, focuses it, and the app quits when the last *chat* window closes, not when
+  only settings remain). A Kit `Settings` (sidebar with search, pages Appearance / Chat / Emote
+  providers / Streamlink / Account) over `settings.toml`: every control writes through
+  `config::edit`, which calls `Settings::update_file` (`gpui-chat-settings`, `toml_edit`: only the
+  edited keys change, comments and unknown keys stay, nothing is written unless the *result* is valid
+  settings) and then puts the result in the `SettingsStore` at once; the file watcher reports the same
+  file and changes nothing. Controls read `config::current`, so a hand edit of the file (watcher →
+  store) updates the open window, and a file that fails to load is shown in a banner while the controls
+  keep the last good values. `settings_window/fields.rs` has text, number and one-per-line fields that
+  commit on Enter / blur / stepping (Kit's own fields write per keystroke) and show a refusal under the
+  field; switches and menus show it in the banner. The page's reset button removes the keys (switches
+  and menus write the default). The Account page shows `AccountHub`'s state (`account::current`, a
+  global set by `AccountHub::start`) and dispatches `LogIn` / `LogOut`, which the window handles with
+  the same `sign_in::open` / `log_out` as the main window.
 - `fonts.rs` / `assets.rs` — bundled JetBrains Mono TTFs (`assets/fonts/`, OFL in `OFL.txt`) are
   embedded, registered with the text system at startup and the family is resolved against the
   installed list (GPUI panics on unknown families, so there is no blind fallback).

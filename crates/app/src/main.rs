@@ -32,6 +32,7 @@ mod platform;
 mod replay;
 mod reply;
 mod runtime;
+mod settings_window;
 mod shell;
 mod sign_in;
 mod splits;
@@ -48,7 +49,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::account::AccountHub;
-use crate::actions::Quit;
+use crate::actions::{OpenSettings, Quit};
 use crate::channel_list::ChannelList;
 use crate::channels::ChannelHub;
 use crate::cli::{Cli, Parsed};
@@ -220,6 +221,7 @@ fn main() {
             cx.bind_keys(platform::default_bindings());
             cx.set_menus(platform::menus());
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
 
             // Persist the last window placement and channel list on the way out (⌘Q and last-window close).
             cx.on_app_quit(|cx| {
@@ -228,9 +230,9 @@ fn main() {
             })
             .detach();
 
-            // Quit when the last window closes (single-window app for now).
+            // Quit when the last chat window closes (the settings window does not keep the app open).
             cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
+                if settings_window::only_settings_left(cx) {
                     cx.quit();
                 }
             })

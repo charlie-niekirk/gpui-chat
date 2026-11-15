@@ -9,6 +9,8 @@
 //! Observers see equal settings as a no-op in effect: a reload that leaves the file's content
 //! unchanged re-applies the same values.
 
+use std::path::PathBuf;
+
 use gpui_chat_settings::{
     LoadOutcome, Settings, SettingsError, SettingsEvent, SettingsPaths, SettingsWatcher,
     WatchOptions, watch,
@@ -70,12 +72,24 @@ impl SettingsStore {
                 self.error.as_ref().map(ToString::to_string),
             )
     }
+
+    /// Takes `settings` as in effect now, ahead of the watcher reporting the same file (the
+    /// settings window writes the file and shows the result at once). The file just loaded
+    /// fine, so any load error is cleared. Returns whether anything changed.
+    fn apply_written(&mut self, settings: Settings) -> bool {
+        self.apply_events([SettingsEvent::Reloaded(settings)])
+    }
 }
 
 #[derive(Clone)]
 struct SettingsHandle(Entity<SettingsStore>);
 
 impl Global for SettingsHandle {}
+
+/// Where `settings.toml` is, for the settings window's writes.
+struct SettingsFile(PathBuf);
+
+impl Global for SettingsFile {}
 
 /// Keeps the file watcher alive; dropped on quit.
 struct WatcherGuard(Option<SettingsWatcher>);
@@ -90,6 +104,35 @@ pub fn store(cx: &App) -> Entity<SettingsStore> {
 /// The settings currently in effect.
 pub fn current(cx: &App) -> &Settings {
     cx.global::<SettingsHandle>().0.read(cx).settings()
+}
+
+/// Changes single keys of `settings.toml` in place (comments, unknown keys and everything else
+/// stay; see [`Settings::update_file`]) and puts the result in effect at once. The watcher then
+/// reports the same file, which changes nothing.
+///
+/// Refused, with the file untouched, when the file is not valid TOML or would not be valid
+/// settings afterwards (e.g. another value in it is out of range and `edits` does not fix it):
+/// the error says what to fix. Does blocking file I/O on the calling thread; the file is tiny.
+pub fn edit(edits: &[gpui_chat_settings::SettingEdit], cx: &mut App) -> Result<(), SettingsError> {
+    let Some(file) = cx.try_global::<SettingsFile>() else {
+        return Err(SettingsError::Watch {
+            path: PathBuf::new(),
+            message: "there is no settings location (no home directory)".to_owned(),
+        });
+    };
+    let settings = Settings::update_file(&file.0, edits)?;
+    let store = store(cx);
+    store.update(cx, |store, cx| {
+        if store.apply_written(settings) {
+            cx.notify();
+        }
+    });
+    Ok(())
+}
+
+/// Where `settings.toml` is, when there is a settings location.
+pub fn file(cx: &App) -> Option<PathBuf> {
+    cx.try_global::<SettingsFile>().map(|file| file.0.clone())
 }
 
 /// The baseline handed to the watcher. It never equals a loaded file (`Settings::parse`
@@ -156,6 +199,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<SettingsEvent>> {
         }
     };
     let file = paths.settings_file();
+    cx.set_global(SettingsFile(file.clone()));
     let outcome = Settings::load_or_default(&file);
     if let Some(error) = &outcome.error {
         tracing::warn!(%error, "settings file not loaded; using defaults");
@@ -194,6 +238,54 @@ mod tests {
             settings,
             error: None,
         })
+    }
+
+    #[test]
+    fn a_written_file_replaces_the_settings_and_clears_the_error() {
+        let mut store = SettingsStore::new(LoadOutcome {
+            settings: Settings::default(),
+            error: Some(failure()),
+        });
+        assert!(store.apply_written(with_size(21.0)));
+        assert_eq!(store.settings().appearance.font_size, 21.0);
+        assert!(store.error().is_none());
+        // The watcher then reports the same file: nothing to do.
+        assert!(!store.apply_events([SettingsEvent::Reloaded(with_size(21.0))]));
+    }
+
+    #[gpui_kit::test]
+    fn edit_changes_the_file_in_place_and_the_store(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_chat_settings::{EditValue, SettingEdit};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "# keep\n[chat]\nscrollback = 300 # mine\nx = 1\n").unwrap();
+        cx.update(|cx| {
+            let store = install_for_test(Settings::load_or_default(&path).settings, cx);
+            cx.set_global(SettingsFile(path.clone()));
+
+            edit(
+                &[SettingEdit::set("chat.timestamps", EditValue::Bool(false))],
+                cx,
+            )
+            .unwrap();
+            assert!(!current(cx).chat.timestamps);
+            assert_eq!(current(cx).chat.scrollback, 300);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                text,
+                "# keep\n[chat]\nscrollback = 300 # mine\nx = 1\ntimestamps = false\n"
+            );
+
+            // A refused edit changes neither the file nor the store.
+            let refused = edit(
+                &[SettingEdit::set("chat.scrollback", EditValue::Int(1))],
+                cx,
+            );
+            assert!(refused.is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(current(cx).chat.scrollback, 300);
+            assert!(store.read(cx).error().is_none());
+        });
     }
 
     fn failure() -> SettingsError {

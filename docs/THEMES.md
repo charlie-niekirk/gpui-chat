@@ -31,6 +31,9 @@ theme_name_light = "rose-pine"  # optional: use this theme whenever the light va
   3:1 contrast on its background, and a `theme_name` that matches nothing. The strip goes when
   the problem is fixed.
 
+The settings window (⌘, → Appearance → Theme) lists the bundled pack and the files in `themes/`
+(marked "custom") and writes `theme_name` / `theme_name_light` for you; see `docs/SETTINGS.md`.
+
 ## File format (`<config>/themes/<name>.toml`)
 
 ```toml

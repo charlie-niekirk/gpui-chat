@@ -53,8 +53,9 @@ default_quality = "best"                   # best, 1080p60, 720p, audio_only, "7
 - **Every key is optional.** All structs are `#[serde(default)]`; an empty or
   absent file means defaults. Adding a field is never a breaking change.
 - **Unknown keys are ignored** on load, so a file written by a newer build still
-  loads in an older one. They are *not* preserved when the app saves (saving
-  rewrites the whole file from the typed struct, dropping comments too).
+  loads in an older one. The settings window keeps them (and comments) when it
+  changes a value (see "Editing from the settings window"); only
+  `Settings::save`, which rewrites the whole file from the typed struct, drops them.
 - `schema_version` is bumped only for changes a default cannot express (rename,
   changed meaning). A file with a *newer* version still loads (with a
   `tracing` warning).
@@ -77,6 +78,30 @@ default_quality = "best"                   # best, 1080p60, 720p, audio_only, "7
 it, renames it over the target, then fsyncs the directory. A symlinked
 `settings.toml` is written through, not replaced. **Do not save over a file that
 failed to load** unless the user asked for it; see `docs/BACKLOG.md`.
+
+## Editing from the settings window (PR 4.2)
+
+`Settings::update_file(path, &[SettingEdit])` (`edit.rs`) is how the UI changes the file. It parses
+the file with `toml_edit`, sets or removes just the named keys (`"appearance.font_size"`), and writes
+the result with the same atomic write as `save`. Everything else stays byte for byte: comments,
+blank lines, key order, unknown keys and sections, and the comment after an edited value. A section
+that does not exist is added; a missing file is created.
+
+Nothing is written unless the **result** is valid settings, so:
+
+- a file that is not valid TOML is never touched (the error has line and column);
+- a file with one out-of-range value only accepts an edit that fixes that value; any other edit is
+  refused with the reason, and the file is left alone;
+- a value outside its range (`font_size = 500`) is refused before it reaches the file.
+
+The settings window shows a file that does not load in a banner (the controls keep the last good
+values) and shows a refused change next to the control or in the banner. Edits made while the file
+is open elsewhere are a read-modify-write: an editor saving in the few milliseconds between our
+read and rename is overwritten by our (otherwise identical) text.
+
+`appearance.theme`, `theme_name` and `theme_name_light` are written as plain strings; the theme list
+is `theme::choices` (bundled pack plus `themes/`), and "Same as Theme" for the light theme removes
+`theme_name_light`.
 
 ## Watching
 

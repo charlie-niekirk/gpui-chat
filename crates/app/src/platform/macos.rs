@@ -3,12 +3,14 @@
 use gpui_chat_core::APP_NAME;
 use gpui_kit::{KeyBinding, Menu, MenuItem, SystemMenuType};
 
-use super::{about_item, account_items, channel_menu, quit_item, view_menu, window_menu};
+use super::{
+    about_item, account_items, channel_menu, quit_item, settings_item, view_menu, window_menu,
+};
 use crate::actions::{
     AddChannel, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft,
-    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp, Quit,
-    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
-    ToggleDebugHud, ToggleSidebar,
+    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp, OpenSettings,
+    Quit, RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, SplitDown,
+    SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::completion::ComposerToggleEmotePicker;
 
@@ -20,6 +22,7 @@ pub const ADD_CHANNEL_LABEL: &str = "⌘N";
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
@@ -46,8 +49,9 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub fn menus() -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items(
-            [about_item(), MenuItem::separator()]
+            [about_item(), MenuItem::separator(), settings_item()]
                 .into_iter()
+                .chain([MenuItem::separator()])
                 .chain(account_items())
                 .chain([
                     MenuItem::separator(),

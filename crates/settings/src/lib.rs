@@ -23,6 +23,7 @@
 //!
 //! See `docs/SETTINGS.md` for the file format and the compatibility rules.
 
+mod edit;
 mod error;
 mod paths;
 mod schema;
@@ -32,14 +33,16 @@ mod theme_watch;
 mod themes;
 mod watch;
 
+pub use edit::{EditValue, SettingEdit, apply_edits};
 pub use error::SettingsError;
 pub use paths::{
     CACHE_DIR_ENV, CONFIG_DIR_ENV, KEYMAP_FILE_NAME, PathsError, SETTINGS_FILE_NAME, SettingsPaths,
     THEMES_DIR_NAME,
 };
 pub use schema::{
-    AppearanceSettings, ChatSettings, EmoteSettings, SCHEMA_VERSION, Settings, StreamlinkSettings,
-    ThemeMode, UNVERSIONED_SCHEMA_VERSION,
+    AppearanceSettings, ChatSettings, EMOTE_SCALE_RANGE, EmoteSettings, FONT_SIZE_RANGE,
+    LINE_HEIGHT_RANGE, SCHEMA_VERSION, SCROLLBACK_RANGE, Settings, StreamlinkSettings, ThemeMode,
+    UNVERSIONED_SCHEMA_VERSION,
 };
 pub use store::LoadOutcome;
 pub use theme::{
