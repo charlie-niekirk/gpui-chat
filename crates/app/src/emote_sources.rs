@@ -36,8 +36,9 @@ pub struct EmoteSources {
     /// Bumped whenever `own` changes, so the catalog knows to rebuild.
     generation: u64,
     catalog: Arc<EmoteCatalog>,
-    /// What `catalog` was built from: the sets (by identity) and `generation`.
-    built_from: Option<(Vec<usize>, u64)>,
+    /// What `catalog` was built from: the sets (held, compared by identity, so a freed set's
+    /// address cannot be mistaken for a new one) and `generation`.
+    built_from: Option<(Vec<Arc<EmoteSet>>, u64)>,
 }
 
 impl Default for EmoteSources {
@@ -78,7 +79,12 @@ impl EmoteSources {
         }
         match outcome {
             Ok(emotes) => {
-                self.own = emotes.into_iter().map(|e| Arc::new(e.emote)).collect();
+                // Follower emotes of other channels are listed by Helix but do not work here.
+                self.own = emotes
+                    .into_iter()
+                    .filter(|e| e.usable_in(&key.room_id))
+                    .map(|e| Arc::new(e.emote))
+                    .collect();
                 self.generation += 1;
                 self.status = Status::Loaded;
             }
@@ -123,11 +129,14 @@ impl EmoteSources {
     /// The catalog for the current sets, rebuilt if they (or the user's emotes) changed since the
     /// last call. Cheap otherwise: it compares the sets' identities.
     pub fn catalog(&mut self, sets: &[Arc<EmoteSet>]) -> Arc<EmoteCatalog> {
-        let signature: Vec<usize> = sets.iter().map(|set| Arc::as_ptr(set) as usize).collect();
-        let wanted = Some((signature, self.generation));
-        if self.built_from != wanted {
+        let unchanged = self.built_from.as_ref().is_some_and(|(built, generation)| {
+            *generation == self.generation
+                && built.len() == sets.len()
+                && built.iter().zip(sets).all(|(a, b)| Arc::ptr_eq(a, b))
+        });
+        if !unchanged {
             self.catalog = Arc::new(EmoteCatalog::build(&self.own, sets));
-            self.built_from = wanted;
+            self.built_from = Some((sets.to_vec(), self.generation));
         }
         self.catalog.clone()
     }
@@ -150,6 +159,41 @@ mod tests {
             user_id: user.into(),
             room_id: room.into(),
         }
+    }
+
+    #[test]
+    fn follower_emotes_of_other_channels_are_left_out() {
+        let mut sources = EmoteSources::default();
+        let k = key("1", "7");
+        sources.begin(&k);
+        let entry = |name: &str, kind: &str, owner: &str| UserEmote {
+            emote: Emote::twitch(name, name),
+            owner_id: owner.into(),
+            kind: kind.into(),
+        };
+        sources.finish(
+            &k,
+            Ok(vec![
+                entry("Here", "follower", "7"),
+                entry("Elsewhere", "follower", "8"),
+                entry("Sub", "subscriptions", "8"),
+                entry("Global", "globals", "0"),
+            ]),
+        );
+        assert_eq!(sources.own_names(), ["Here", "Sub", "Global"]);
+    }
+
+    #[test]
+    fn a_set_that_was_freed_cannot_be_mistaken_for_a_new_one() {
+        // The cache holds the sets it was built from, so another set can never take their address.
+        let mut sources = EmoteSources::default();
+        let first = [set("Old")];
+        let before = sources.catalog(&first);
+        drop(first);
+        let next = [set("New")];
+        let after = sources.catalog(&next);
+        assert_eq!(&*after.all()[0].name, "New");
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     fn user_emotes(names: &[&str]) -> Vec<UserEmote> {

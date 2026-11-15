@@ -58,6 +58,15 @@ impl Raw {
     }
 }
 
+impl UserEmote {
+    /// Whether the emote can be used in the room `room_id`. Twitch lists the follower emotes of
+    /// every channel the user follows, but a follower emote only works in its own channel;
+    /// subscriber emotes work everywhere.
+    pub fn usable_in(&self, room_id: &str) -> bool {
+        self.kind != "follower" || self.owner_id == room_id
+    }
+}
+
 impl HelixClient {
     /// The emotes `user_id` can use, in Twitch's order, each once. With `broadcaster_id`, that
     /// channel's follower emotes are included. Needs [`SCOPE`]; a login without it fails with
@@ -184,6 +193,20 @@ mod tests {
             emotes[0].emote.urls.get(ImageScale::X1),
             Some("https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/1.0")
         );
+    }
+
+    #[test]
+    fn a_follower_emote_is_only_usable_in_its_own_channel() {
+        let entry = |kind: &str, owner: &str| UserEmote {
+            emote: Emote::twitch("1", "Emote"),
+            owner_id: owner.into(),
+            kind: kind.into(),
+        };
+        assert!(entry("follower", "7").usable_in("7"));
+        assert!(!entry("follower", "8").usable_in("7"));
+        // Subscriber and global emotes work in every room.
+        assert!(entry("subscriptions", "8").usable_in("7"));
+        assert!(entry("globals", "0").usable_in("7"));
     }
 
     #[tokio::test]

@@ -16,8 +16,8 @@ use gpui_chat_twitch::auth::AuthState;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::{
-    Anchor, AnyElement, Context, IntoElement, ParentElement as _, Window, anchored, deferred,
-    point, px,
+    Anchor, AnyElement, Context, IntoElement, ParentElement as _, Styled as _, Window, anchored,
+    canvas, deferred, div, point, px,
 };
 
 use super::Composer;
@@ -70,11 +70,13 @@ impl Composer {
         explicit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if self.recompute_completion(explicit, cx) == Outcome::Single {
+    ) -> Outcome {
+        let outcome = self.recompute_completion(explicit, cx);
+        if outcome == Outcome::Single {
             self.accept_completion(Some(0), window, cx);
         }
         cx.notify();
+        outcome
     }
 
     /// Called while rendering: a caret moved by the arrow keys or a click no longer belongs to the
@@ -137,26 +139,48 @@ impl Composer {
     }
 
     /// Tab: takes the highlighted candidate, or opens the list for the word before the caret.
-    pub(super) fn complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `false` when there was nothing to do (the key then falls through to the input).
+    pub(super) fn complete(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.mode(cx).can_send() {
-            return;
+            return false;
         }
         if self.completion.is_open() {
             self.accept_completion(None, window, cx);
+            true
         } else {
-            self.refresh_completion(true, window, cx);
+            self.refresh_completion(true, window, cx) != Outcome::Closed
         }
     }
 
-    /// Shift-Tab: one up in the list.
-    pub(super) fn complete_previous(&mut self, cx: &mut Context<Self>) {
-        self.move_completion(-1, cx);
+    /// Shift-Tab: one up in the list. `false` when there is no list.
+    pub(super) fn complete_previous(&mut self, cx: &mut Context<Self>) -> bool {
+        self.move_completion(-1, cx)
     }
 
-    /// Esc.
-    pub(super) fn dismiss_completion(&mut self, cx: &mut Context<Self>) {
+    /// Esc. `false` when there is no list: the key then falls through (to the input's own Escape,
+    /// or a parent's such as cancelling a reply).
+    pub(super) fn dismiss_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.completion.is_open() {
+            return false;
+        }
+        self.completion.dismiss();
+        cx.notify();
+        true
+    }
+
+    /// The input lost the focus: a list over it has nothing to complete into. (While the picker is
+    /// open the focus is meant to be elsewhere.)
+    pub(super) fn input_blurred(&mut self, cx: &mut Context<Self>) {
+        if self.picker.is_none() && self.completion.is_open() {
+            self.completion.close();
+            cx.notify();
+        }
+    }
+
+    /// A press outside the list.
+    fn close_completion(&mut self, cx: &mut Context<Self>) {
         if self.completion.is_open() {
-            self.completion.dismiss();
+            self.completion.close();
             cx.notify();
         }
     }
@@ -247,7 +271,8 @@ impl Composer {
         let catalog = self.catalog(cx);
         let recents = completion::recent_emotes(cx);
         let note = self.emotes.note();
-        let picker = cx.new(|cx| EmotePicker::new(catalog, recents, note, window, cx));
+        let button = self.picker_button_bounds.clone();
+        let picker = cx.new(|cx| EmotePicker::new(catalog, recents, note, button, window, cx));
         self._picker_subscription = Some(cx.subscribe_in(
             &picker,
             window,
@@ -314,30 +339,173 @@ impl Composer {
         }
         let light = tokens.main_bg.l > 0.5;
         let (owner, composer) = (cx.entity_id(), cx.entity());
+        let outside = cx.entity();
         self.completion
-            .render(tokens, light, owner, window, move |index, window, cx| {
-                composer.update(cx, |this, cx| {
-                    this.accept_completion(Some(index), window, cx)
-                });
-            })
+            .render(
+                tokens,
+                light,
+                owner,
+                window,
+                move |index, window, cx| {
+                    composer.update(cx, |this, cx| {
+                        this.accept_completion(Some(index), window, cx);
+                    });
+                },
+                move |_, cx| outside.update(cx, |this, cx| this.close_completion(cx)),
+            )
             .map(place)
             .into_iter()
             .collect()
     }
 
-    /// The button that opens the picker; none while the box cannot be used.
+    /// The button that opens the picker; none while the box cannot be used. Its bounds are kept
+    /// so a press on it does not count as "outside" for the open picker (it toggles instead).
     pub(super) fn picker_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.mode(cx).can_send().then(|| {
-            Button::new("composer-emotes")
-                .ghost()
-                .small()
-                .label("🙂")
-                .accessibility_label(format!(
-                    "Emote picker ({})",
-                    crate::platform::EMOTE_PICKER_LABEL
-                ))
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx)))
+            let bounds = self.picker_button_bounds.clone();
+            div()
+                .relative()
+                .child(
+                    Button::new("composer-emotes")
+                        .ghost()
+                        .small()
+                        .label("🙂")
+                        .accessibility_label(format!(
+                            "Emote picker ({})",
+                            crate::platform::EMOTE_PICKER_LABEL
+                        ))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_picker(window, cx)),
+                        ),
+                )
+                .child(
+                    canvas(move |b, _, _| bounds.set(b), |_, (), _, _| {})
+                        .absolute()
+                        .inset_0(),
+                )
                 .into_any_element()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui_kit::component::input::{Input, InputState};
+    use gpui_kit::{
+        Entity, InteractiveElement as _, IntoElement, Render, TestAppContext, VisualTestContext,
+    };
+
+    use crate::actions::{COMPOSER_CONTEXT, ComposerHistoryNext, ComposerHistoryPrevious};
+    use crate::completion::{
+        ComposerComplete, ComposerCompletePrevious, ComposerCompletionDismiss,
+    };
+
+    use super::*;
+
+    /// The composer's key wiring without its backend: the same context, the same actions, the same
+    /// "act only when there is a list, else propagate" rule as `Composer::render`, around a real
+    /// Kit input. `list_open` stands for a completion list being open.
+    struct Probe {
+        input: Entity<InputState>,
+        log: Rc<RefCell<Vec<&'static str>>>,
+        list_open: bool,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .key_context(COMPOSER_CONTEXT)
+                .on_action(cx.listener(|this, _: &ComposerHistoryPrevious, _, _| {
+                    this.log.borrow_mut().push("history-previous");
+                }))
+                .on_action(cx.listener(|this, _: &ComposerHistoryNext, _, _| {
+                    this.log.borrow_mut().push("history-next");
+                }))
+                .on_action(acts_typed::<ComposerComplete>(cx, "complete"))
+                .on_action(acts_typed::<ComposerCompletePrevious>(
+                    cx,
+                    "complete-previous",
+                ))
+                .on_action(acts_typed::<ComposerCompletionDismiss>(cx, "dismiss"))
+                .child(Input::new(&self.input))
+        }
+    }
+
+    fn acts_typed<A: gpui_kit::Action>(
+        cx: &mut Context<Probe>,
+        name: &'static str,
+    ) -> impl Fn(&A, &mut Window, &mut gpui_kit::App) + 'static {
+        cx.listener(move |this: &mut Probe, _: &A, _, cx| {
+            this.log.borrow_mut().push(name);
+            if !this.list_open {
+                cx.propagate();
+            }
+        })
+    }
+
+    fn probe(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Probe>,
+        Rc<RefCell<Vec<&'static str>>>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.bind_keys(crate::platform::default_bindings());
+        });
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let shared = log.clone();
+        let (probe, cx) = cx.add_window_view(move |window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+            input.update(cx, |input, cx| input.focus(window, cx));
+            Probe {
+                input,
+                log: shared,
+                list_open: false,
+            }
+        });
+        cx.run_until_parked();
+        (probe, log, cx)
+    }
+
+    #[gpui_kit::test]
+    fn tab_escape_and_the_arrows_in_the_input_reach_the_composer_actions(cx: &mut TestAppContext) {
+        let (probe, log, cx) = probe(cx);
+        probe.update(cx, |p, _| p.list_open = true);
+        cx.simulate_keystrokes("tab shift-tab escape up down");
+        assert_eq!(
+            *log.borrow(),
+            [
+                "complete",
+                "complete-previous",
+                "dismiss",
+                "history-previous",
+                "history-next"
+            ]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn escape_with_no_list_open_falls_through_to_the_input(cx: &mut TestAppContext) {
+        let (probe, log, cx) = probe(cx);
+        cx.simulate_input("abc");
+        let text =
+            |cx: &mut VisualTestContext| probe.read_with(cx, |p, cx| p.input.read(cx).value());
+        assert_eq!(text(cx), "abc");
+
+        // A list is open: Esc is the list's, and the input keeps its text.
+        probe.update(cx, |p, _| p.list_open = true);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(text(cx), "abc");
+
+        // No list: the action propagates and the input's own Escape (clean on escape) runs.
+        probe.update(cx, |p, _| p.list_open = false);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(*log.borrow(), ["dismiss", "dismiss"]);
+        assert_eq!(text(cx), "", "the input saw the Escape");
     }
 }

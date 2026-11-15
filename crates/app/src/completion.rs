@@ -79,6 +79,11 @@ pub fn recent_emotes(cx: &mut App) -> Recents {
     cx.global::<RecentEmotes>().0.clone()
 }
 
+/// The newest recents list, waiting to be written. One writer at a time takes it *and* writes it
+/// under this lock, so saves cannot land out of order: whichever runs last writes the newest list.
+#[cfg(not(test))]
+static PENDING_SAVE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
 /// `name` was just inserted: it moves to the front, and the list is saved.
 pub fn remember_emote(name: &str, cx: &mut App) {
     let mut recents = recent_emotes(cx);
@@ -86,13 +91,23 @@ pub fn remember_emote(name: &str, cx: &mut App) {
     cx.set_global(RecentEmotes(recents.clone()));
     // Tests do not write the real state file.
     #[cfg(not(test))]
-    cx.background_executor()
-        .spawn(async move {
-            crate::state::save_emotes(crate::state::SavedEmotes {
-                recent: recents.names().to_vec(),
-            });
-        })
-        .detach();
+    {
+        *PENDING_SAVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(recents.names().to_vec());
+        cx.background_executor()
+            .spawn(async move {
+                let mut pending = PENDING_SAVE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(recent) = pending.take() {
+                    crate::state::save_emotes(crate::state::SavedEmotes { recent });
+                }
+            })
+            .detach();
+    }
+    #[cfg(test)]
+    drop(recents);
 }
 
 /// One candidate.
@@ -175,6 +190,9 @@ pub struct Popup {
     selected: usize,
     /// First row shown.
     top: usize,
+    /// The user moved through the list (arrow or Shift-Tab): they chose from it, so Enter takes
+    /// the highlighted candidate instead of sending the message as typed.
+    moved: bool,
 }
 
 impl Popup {
@@ -185,7 +203,15 @@ impl Popup {
             explicit,
             selected: 0,
             top: 0,
+            moved: false,
         }
+    }
+
+    /// Whether Enter should take the highlighted candidate: the list was asked for with Tab or the
+    /// user has moved through it. A list that merely opened as they typed (`gg @bob⏎`) does not
+    /// capture Enter.
+    pub fn engaged(&self) -> bool {
+        self.explicit || self.moved
     }
 
     pub fn selected(&self) -> usize {
@@ -203,6 +229,7 @@ impl Popup {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        self.moved = true;
         self.scroll_to_selection();
     }
 
@@ -271,6 +298,11 @@ impl Autocomplete {
         self.popup.is_some()
     }
 
+    /// Whether Enter belongs to the list (see [`Popup::engaged`]).
+    pub fn engaged(&self) -> bool {
+        self.popup.as_ref().is_some_and(Popup::engaged)
+    }
+
     pub fn close(&mut self) {
         self.popup = None;
     }
@@ -326,6 +358,7 @@ impl Autocomplete {
             .and_then(Popup::selected_item)
             .map(|item| item.text().to_owned());
         let mut popup = Popup::new(trigger, items, explicit);
+        popup.moved = self.popup.as_ref().is_some_and(|p| p.moved);
         if let Some(previous) = previous
             && let Some(index) = popup.items.iter().position(|i| i.text() == previous)
         {
@@ -343,6 +376,7 @@ impl Autocomplete {
         owner: EntityId,
         window: &mut Window,
         pick: impl Fn(usize, &mut Window, &mut gpui_kit::App) + Clone + 'static,
+        outside: impl Fn(&mut Window, &mut gpui_kit::App) + 'static,
     ) -> Option<AnyElement> {
         let popup = self.popup.as_ref()?;
         self.frame.borrow_mut().begin_frame();
@@ -434,6 +468,8 @@ impl Autocomplete {
             div()
                 .id("completion-list")
                 .occlude()
+                // A press anywhere else (the chat, another control) closes it.
+                .on_mouse_down_out(move |_, window, cx| outside(window, cx))
                 .flex()
                 .flex_col()
                 .w(px(320.0))
@@ -621,6 +657,30 @@ mod tests {
         assert_eq!(edit.applied_to("mon").0, "monkaW ");
         // Nothing to complete after a space.
         assert_eq!(refresh(&mut auto, "mon ", true, &catalog), Outcome::Closed);
+    }
+
+    #[test]
+    fn enter_belongs_to_a_list_only_once_the_user_chose_from_it() {
+        let catalog = catalog(&["Kappa", "KappaPride"]);
+        let mut auto = Autocomplete::default();
+        // Opened by itself while typing: Enter still sends what was typed.
+        refresh(&mut auto, "gg :kap", false, &catalog);
+        assert!(auto.is_open());
+        assert!(!auto.engaged());
+        refresh(&mut auto, "gg :kapp", false, &catalog);
+        assert!(!auto.engaged(), "typing on does not engage it");
+        // An arrow does, and typing on keeps it.
+        auto.popup_mut().unwrap().move_by(1);
+        assert!(auto.engaged());
+        refresh(&mut auto, "gg :kappa", false, &catalog);
+        assert!(auto.engaged());
+        // Tab asked for it: engaged from the start.
+        let mut auto = Autocomplete::default();
+        refresh(&mut auto, "Kap", true, &catalog);
+        assert!(auto.engaged());
+        // Closed: nothing to engage.
+        auto.close();
+        assert!(!auto.engaged());
     }
 
     #[test]

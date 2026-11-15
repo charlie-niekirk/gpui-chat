@@ -27,9 +27,12 @@ use gpui_chat_twitch::auth::AuthState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::{
-    AppContext as _, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, div, px,
+    AppContext as _, Bounds, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, Styled, Subscription, Window, div, px,
 };
 use tokio::sync::oneshot;
 
@@ -160,6 +163,8 @@ pub struct Composer {
     emotes: EmoteSources,
     /// The open emote picker, if any (PR 3.3).
     picker: Option<Entity<EmotePicker>>,
+    /// Where the picker's button is, so a press on it does not dismiss the picker as an outside click.
+    picker_button_bounds: Rc<Cell<Bounds<Pixels>>>,
     _subscriptions: Vec<Subscription>,
     _input_subscription: Option<Subscription>,
     _picker_subscription: Option<Subscription>,
@@ -185,6 +190,7 @@ impl Composer {
             completion: Autocomplete::default(),
             emotes: EmoteSources::default(),
             picker: None,
+            picker_button_bounds: Rc::default(),
             _subscriptions: subscriptions,
             _input_subscription: None,
             _picker_subscription: None,
@@ -215,7 +221,8 @@ impl Composer {
                         cx.notify();
                     }
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
+                InputEvent::Blur => this.input_blurred(cx),
+                InputEvent::Focus => {}
             },
         ));
         if self.mode(cx).can_send() {
@@ -232,8 +239,9 @@ impl Composer {
         if !self.mode(cx).can_send() {
             return;
         }
-        // Enter takes the highlighted candidate while the list is open.
-        if self.completion.is_open() {
+        // Enter takes the highlighted candidate once the user has chosen from the list (moved in it,
+        // or asked for it with Tab); a list that just opened as they typed does not capture it.
+        if self.completion.engaged() {
             self.accept_completion(None, window, cx);
             return;
         }
@@ -259,6 +267,8 @@ impl Composer {
                 };
                 self.history.push(&typed);
                 input.update(cx, |input, cx| input.set_value("", window, cx));
+                // `set_value` emits no change, so a list over the old text is closed here.
+                self.completion.close();
                 self.error = None;
                 cx.notify();
                 self.await_result(typed.to_string(), result, window, cx);
@@ -427,14 +437,23 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &ComposerHistoryNext, window, cx| {
                 this.history_next(window, cx);
             }))
+            // Tab, Shift-Tab and Esc only act while there is something to complete; otherwise they
+            // propagate, so the input's own handling (and a parent's, such as cancelling a reply)
+            // still sees the key.
             .on_action(cx.listener(|this, _: &ComposerComplete, window, cx| {
-                this.complete(window, cx);
+                if !this.complete(window, cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &ComposerCompletePrevious, _, cx| {
-                this.complete_previous(cx);
+                if !this.complete_previous(cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &ComposerCompletionDismiss, _, cx| {
-                this.dismiss_completion(cx);
+                if !this.dismiss_completion(cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &ComposerToggleEmotePicker, window, cx| {

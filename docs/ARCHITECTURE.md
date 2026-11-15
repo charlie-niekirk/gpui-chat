@@ -173,8 +173,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   substring, subsequence) then recency, shorter name, alphabetical; `apply` makes the edit (token replaced,
   sigil added for users and commands, a space after). `Autocomplete` (`completion.rs`) holds the open list
   (candidates, selection, an 8-row scroll window) and draws it; `Composer` routes keys to it through actions
-  bound to `ChatComposer > Input` (Tab / Shift-Tab / Esc; ↑/↓ go to the list while it is open, else to history;
-  Enter accepts instead of sending while it is open). Tab opens the list for a plain word (a lone candidate is
+  bound to `ChatComposer > Input` (Tab / Shift-Tab / Esc act only while there is something to complete and otherwise
+  `cx.propagate()`, so the input's own Escape and a parent's, e.g. cancelling a reply, still see the key; ↑/↓ go to the
+  list while it is open, else to history; Enter accepts only once the user has moved in the list or asked for it
+  with Tab, otherwise it sends the text as typed). A press outside the list, or the input losing focus, closes it. Tab opens the list for a plain word (a lone candidate is
   taken at once); Esc keeps it shut for that word. The caret is re-checked at render (arrow keys and clicks emit
   no change event). Candidates: the channel's `EmoteCatalog` (`crates/emotes`: the user's own Twitch emotes, then
   channel 7TV → BTTV → FFZ, then global, each name once; plus per-provider lists), `core::recent_chatters` over the
@@ -184,11 +186,12 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (empty third-party tabs hidden, Twitch always, to say why it is empty), a Kit `Input` for search (a search spans
   every provider, best match first), a `uniform_list` grid of 9 emotes per row so only visible rows build and
   request images. Keys, bound to `EmotePicker > Input` after the composer's so they win in the search field:
-  arrows move, Tab / Shift-Tab change tab, Enter inserts and closes, Esc closes, a click inserts. Thumbnails
+  arrows move, Tab / Shift-Tab change tab, Enter inserts and closes, Esc closes, a click inserts; a press outside it
+  closes it (not on its 🙂 button, whose bounds the composer tracks, so that toggles); clicking a tab ends a search. Thumbnails
   (`emote_thumb.rs`) go through the chat's `Images` store (de-duplicated, cached, pinned per view in a
   `FrameImages`), the first frame of an animated emote. `EmoteSources` owns the user's own Twitch emotes (asked from
   Helix `Get User Emotes` once per user and room as soon as the room id is known and the login has
-  `user:read:emotes`; a failure shows on the Twitch tab and is asked again when the picker opens) and rebuilds the
+  `user:read:emotes`; follower emotes of other channels are dropped (`UserEmote::usable_in`); a failure shows on the Twitch tab and is asked again when the picker opens) and rebuilds the
   catalog only when a set's identity or those emotes changed. Recently used emotes (40, by name, shared by every
   pane) are kept in `state.toml` under `[emotes] recent`, so the Recent tab shows those the current channel can
   still use. Nothing here applies to the offline sources (they have no composer).

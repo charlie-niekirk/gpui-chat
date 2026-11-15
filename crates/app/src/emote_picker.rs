@@ -9,7 +9,7 @@
 //! The grid is a `uniform_list` of rows, so only what is on screen is built and its images
 //! requested, however many emotes a channel has. Thumbnails go through [`crate::emote_thumb`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,10 +19,10 @@ use gpui_chat_emotes::EmoteCatalog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Render,
-    ScrollStrategy, SharedString, Styled as _, Subscription, UniformListScrollHandle, Window,
-    actions, div, px, uniform_list,
+    AnyElement, AppContext as _, Bounds, Context, Entity, EventEmitter, FontWeight,
+    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Styled as _, Subscription,
+    UniformListScrollHandle, Window, actions, div, px, uniform_list,
 };
 
 use crate::emote_thumb;
@@ -176,6 +176,8 @@ pub struct EmotePicker {
     note: Option<SharedString>,
     scroll: UniformListScrollHandle,
     frame: Rc<RefCell<FrameImages>>,
+    /// The button that opens the picker: a press there is the owner's toggle, not an outside click.
+    opener: Rc<Cell<Bounds<Pixels>>>,
     _search: Subscription,
 }
 
@@ -184,6 +186,7 @@ impl EmotePicker {
         catalog: Arc<EmoteCatalog>,
         recents: Recents,
         note: Option<SharedString>,
+        opener: Rc<Cell<Bounds<Pixels>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -217,6 +220,7 @@ impl EmotePicker {
             note,
             scroll: UniformListScrollHandle::new(),
             frame: Rc::default(),
+            opener,
             _search: search,
         };
         picker.results = results_for(&picker.catalog, &picker.recents, picker.tab, &picker.query);
@@ -276,6 +280,17 @@ impl EmotePicker {
             (at + tabs.len() - 1) % tabs.len()
         };
         self.set_tab(tabs[next], cx);
+    }
+
+    /// A click on a tab: it ends a search (the user wants to look there now) and shows the tab.
+    fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.searching() {
+            self.query.clear();
+            self.input
+                .clone()
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.set_tab(tab, cx);
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -395,14 +410,7 @@ impl EmotePicker {
                     .when(searching, |t| t.opacity(0.5))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            // Clicking a tab ends a search: it is where the user wants to look now.
-                            if this.searching() {
-                                let input = this.input.clone();
-                                input.update(cx, |_, cx| cx.notify());
-                            }
-                            this.set_tab(tab, cx);
-                        }),
+                        cx.listener(move |this, _, window, cx| this.open_tab(tab, window, cx)),
                     )
                     .child(tab.label())
             }))
@@ -467,6 +475,12 @@ impl Render for EmotePicker {
             .id("emote-picker")
             .key_context(PICKER_CONTEXT)
             .occlude()
+            // A press anywhere else closes it, except on the button that toggles it.
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if !this.opener.get().contains(&event.position) {
+                    cx.emit(PickerEvent::Dismissed);
+                }
+            }))
             .on_action(cx.listener(|this, _: &EmotePickerLeft, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &EmotePickerRight, _, cx| this.move_selection(1, cx)))
             .on_action(cx.listener(|this, _: &EmotePickerUp, _, cx| {
@@ -663,7 +677,14 @@ mod tests {
             cx.bind_keys(bindings());
         });
         let (picker, cx) = cx.add_window_view(|window, cx| {
-            EmotePicker::new(Arc::new(catalog()), recents, None, window, cx)
+            EmotePicker::new(
+                Arc::new(catalog()),
+                recents,
+                None,
+                Rc::default(),
+                window,
+                cx,
+            )
         });
         cx.simulate_resize(gpui_kit::size(px(800.0), px(600.0)));
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -700,6 +721,40 @@ mod tests {
         cx.simulate_keystrokes("left");
         cx.simulate_keystrokes("enter");
         assert_eq!(*events.borrow(), ["picked Kappa"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_press_outside_closes_but_not_on_the_opening_button(cx: &mut gpui_kit::TestAppContext) {
+        let (_picker, events, cx) = open(cx, Recents::default());
+        // The test window is 800 x 600; the picker is at its top left. Press far from it.
+        cx.simulate_click(
+            gpui_kit::point(px(780.0), px(590.0)),
+            gpui_kit::Modifiers::none(),
+        );
+        assert_eq!(*events.borrow(), ["dismissed"]);
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_tab_ends_the_search(cx: &mut gpui_kit::TestAppContext) {
+        let (picker, _events, cx) = open(cx, Recents::default());
+        cx.simulate_input("ka");
+        cx.run_until_parked();
+        assert!(picker.read_with(cx, |p, _| p.searching()));
+        picker.update_in(cx, |p, window, cx| {
+            p.open_tab(Tab::Provider(EmoteProvider::Bttv), window, cx);
+        });
+        let (searching, tab, shown, text) = picker.read_with(cx, |p, cx| {
+            (
+                p.searching(),
+                p.tab,
+                names(&p.results).join(","),
+                p.input.read(cx).value(),
+            )
+        });
+        assert!(!searching);
+        assert_eq!(tab, Tab::Provider(EmoteProvider::Bttv));
+        assert_eq!(shown, "Kappa,KEKW");
+        assert_eq!(text, "");
     }
 
     #[gpui_kit::test]
