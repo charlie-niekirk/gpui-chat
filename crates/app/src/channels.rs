@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use gpui_chat_core::{
     ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageKind,
-    MessageStore, RoomState,
+    MessageStore, Moderation, RoomState,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
 
@@ -33,7 +33,14 @@ pub struct ChannelStore {
     /// `(serial, seq)`, newest last and bounded; see [`ChannelStore::replaced_since`].
     replaced: VecDeque<(u64, u64)>,
     replaced_serial: u64,
+    /// The latest live deletions and clears, so that recent-messages history that arrives *after*
+    /// them (a fetch that was in flight, a gap answer) is struck through too, see
+    /// [`ChannelStore::apply`].
+    live_moderation: VecDeque<Moderation>,
 }
+
+/// How many live moderation actions [`ChannelStore`] remembers for history that arrives later.
+const MODERATION_LOG: usize = 128;
 
 /// How many replacements [`ChannelStore`] remembers for its views.
 const REPLACED_LOG: usize = 64;
@@ -48,6 +55,7 @@ impl ChannelStore {
             notices: 0,
             replaced: VecDeque::new(),
             replaced_serial: 0,
+            live_moderation: VecDeque::new(),
         }
     }
 
@@ -101,12 +109,16 @@ impl ChannelStore {
     pub fn apply(&mut self, event: ChatEvent) -> bool {
         match event {
             ChatEvent::Message { message, .. } => {
-                // The user's own message can arrive twice (PR 3.2): as the echo made when Twitch
-                // accepted it and, if Twitch also delivers it over IRC, as a chat line with the
-                // same id. The IRC copy is the real thing (native emotes, colour, badges) and
-                // takes the echo's place; any other repeat of an id already shown is dropped.
-                if matches!(message.kind, MessageKind::Chat | MessageKind::Action)
-                    && let Some(shown) = self.messages.get(message.id.as_str())
+                // A message with an id already shown is not shown twice (PR 3.2, PR 5.5): the
+                // user's own message can arrive as the echo made when Twitch accepted it and
+                // again as a chat line with the same id; a chat line or user notice can be in
+                // recent-messages history and arrive live. The IRC copy of an echo is the real
+                // thing (native emotes, colour, badges) and takes the echo's place; any other
+                // repeat is dropped, history copy or live.
+                if matches!(
+                    message.kind,
+                    MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
+                ) && let Some(shown) = self.messages.get(message.id.as_str())
                 {
                     if shown.flags.echo
                         && !message.flags.echo
@@ -124,11 +136,42 @@ impl ChannelStore {
                 self.messages.push(message);
                 true
             }
-            ChatEvent::ClearChat { target, .. } => match target {
-                ClearTarget::Channel => self.messages.mark_all_deleted() > 0,
-                ClearTarget::User { login, .. } => self.messages.mark_user_deleted(&login) > 0,
-            },
+            // Recent messages (PR 5.5) take their place by time among what is shown, and what
+            // moderators removed (in the answer, and live while it was being fetched) is
+            // applied to everything shown, messages from before a reconnect included.
+            ChatEvent::History {
+                messages,
+                moderation,
+                ..
+            } => {
+                let rebuilds = self.messages.rebuild_serial();
+                let mut changed = self.messages.merge_history(messages) > 0;
+                if self.messages.rebuild_serial() != rebuilds {
+                    // The replaced-in-place log names sequence numbers that no longer exist.
+                    self.replaced.clear();
+                }
+                for action in moderation.iter().chain(&self.live_moderation) {
+                    changed |= self.messages.apply_moderation(action) > 0;
+                }
+                changed
+            }
+            ChatEvent::ClearChat { target, at, .. } => {
+                let at = at.or_else(|| self.messages.iter().map(|m| m.timestamp).max());
+                if let Some(at) = at {
+                    self.remember(Moderation::Clear {
+                        target: target.clone(),
+                        at,
+                    });
+                }
+                match target {
+                    ClearTarget::Channel => self.messages.mark_all_deleted() > 0,
+                    ClearTarget::User { login, .. } => self.messages.mark_user_deleted(&login) > 0,
+                }
+            }
             ChatEvent::DeleteMessage { message_id, .. } => {
+                self.remember(Moderation::Delete {
+                    message_id: message_id.clone(),
+                });
                 self.messages.mark_deleted(message_id.as_str())
             }
             ChatEvent::RoomState { update, .. } => {
@@ -146,6 +189,13 @@ impl ChannelStore {
                 changed
             }
         }
+    }
+
+    fn remember(&mut self, moderation: Moderation) {
+        if self.live_moderation.len() >= MODERATION_LOG {
+            self.live_moderation.pop_front();
+        }
+        self.live_moderation.push_back(moderation);
     }
 
     /// Applies `events` in order; returns whether anything visible changed.
@@ -386,6 +436,257 @@ mod tests {
         assert_eq!(store.messages().len(), 3);
     }
 
+    fn stamped(id: &str, ts: i64, history: bool) -> Arc<Message> {
+        let mut message = Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new("someone", "someone"),
+            vec![gpui_chat_core::Fragment::Text(id.to_owned())],
+        );
+        message.flags.history = history;
+        Arc::new(message)
+    }
+
+    fn live_at(channel: &str, id: &str, ts: i64) -> ChatEvent {
+        ChatEvent::Message {
+            channel: ChannelId::new(channel),
+            message: stamped(id, ts, false),
+        }
+    }
+
+    fn history_of(channel: &str, items: &[(&str, i64)]) -> ChatEvent {
+        ChatEvent::History {
+            channel: ChannelId::new(channel),
+            messages: items
+                .iter()
+                .map(|(id, ts)| stamped(id, *ts, true))
+                .collect(),
+            moderation: Vec::new(),
+        }
+    }
+
+    fn order(store: &ChannelStore) -> Vec<(String, bool)> {
+        store
+            .messages()
+            .iter()
+            .map(|m| (m.id.to_string(), m.flags.history))
+            .collect()
+    }
+
+    #[test]
+    fn history_lands_before_live_messages_that_arrived_while_it_was_fetched() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        assert!(store.apply(live_at("a", "l1", 100)));
+        assert!(store.apply(history_of("a", &[("h1", 10), ("h2", 20)])));
+        assert_eq!(
+            order(&store),
+            [
+                ("h1".into(), true),
+                ("h2".into(), true),
+                ("l1".into(), false)
+            ]
+        );
+        // Live chat carries on after it.
+        assert!(store.apply(live_at("a", "l2", 110)));
+        assert_eq!(store.messages().len(), 4);
+    }
+
+    #[test]
+    fn a_message_is_never_shown_twice_whichever_copy_comes_first() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        // Live first, then history repeating it: nothing changes.
+        store.apply(live_at("a", "m1", 10));
+        assert!(
+            !store.apply(history_of("a", &[("m1", 10)])),
+            "no visible change"
+        );
+        // History first, then the live copy of the same id: dropped, the history one stays.
+        store.apply(history_of("a", &[("m2", 20)]));
+        assert!(!store.apply(live_at("a", "m2", 20)));
+        assert_eq!(order(&store), [("m1".into(), false), ("m2".into(), true)]);
+    }
+
+    #[test]
+    fn after_a_reconnect_only_the_gap_is_filled_in_place() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        for (id, ts) in [("a1", 10), ("a2", 20)] {
+            store.apply(live_at("a", id, ts));
+        }
+        // Disconnected; what chat said meanwhile (a3, a4) is only in the service. After the
+        // re-join live messages resume (a5), and the gap fetch (which overlaps a2) arrives later.
+        store.apply(live_at("a", "a5", 50));
+        assert!(store.apply(history_of("a", &[("a2", 20), ("a3", 30), ("a4", 40)])));
+        let ids: Vec<String> = order(&store).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["a1", "a2", "a3", "a4", "a5"]);
+        // The same answer again (a second reconnect) changes nothing.
+        assert!(!store.apply(history_of("a", &[("a3", 30), ("a4", 40)])));
+    }
+
+    fn by_login(id: &str, login: &str, ts: i64, history: bool) -> Arc<Message> {
+        let mut message = Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new(login, login),
+            vec![gpui_chat_core::Fragment::Text(id.to_owned())],
+        );
+        message.flags.history = history;
+        Arc::new(message)
+    }
+
+    fn history_with(
+        messages: Vec<Arc<Message>>,
+        moderation: Vec<gpui_chat_core::Moderation>,
+    ) -> ChatEvent {
+        ChatEvent::History {
+            channel: ChannelId::new("a"),
+            messages,
+            moderation,
+        }
+    }
+
+    fn deleted(store: &ChannelStore) -> Vec<(String, bool)> {
+        store
+            .messages()
+            .iter()
+            .map(|m| (m.id.to_string(), m.flags.deleted))
+            .collect()
+    }
+
+    #[test]
+    fn a_live_delete_that_came_before_the_history_still_strikes_its_copy() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(live_at("a", "l1", 100));
+        // The join fetch is in flight; a moderator deletes m2, which the fetch will bring.
+        store.apply(ChatEvent::DeleteMessage {
+            channel: ChannelId::new("a"),
+            message_id: MessageId::from("m2"),
+            login: None,
+        });
+        assert!(store.apply(history_with(
+            vec![stamped("m1", 10, true), stamped("m2", 20, true)],
+            vec![]
+        )));
+        assert_eq!(
+            deleted(&store),
+            [
+                ("m1".into(), false),
+                ("m2".into(), true),
+                ("l1".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_live_timeout_reaches_history_sent_before_it_but_not_after() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::User {
+                login: "Spam".into(),
+                duration: None,
+            },
+            at: Some(Timestamp(500)),
+        });
+        store.apply(history_with(
+            vec![
+                by_login("s1", "spam", 400, true),
+                by_login("o1", "other", 450, true),
+                by_login("s2", "spam", 600, true),
+            ],
+            vec![],
+        ));
+        assert_eq!(
+            deleted(&store),
+            [
+                ("s1".into(), true),
+                ("o1".into(), false),
+                ("s2".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gap_answers_moderation_reaches_messages_seen_before_the_drop() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(by_login_live("a", "spam1", "spam", 100));
+        store.apply(by_login_live("a", "ok1", "fine", 110));
+        let moderation = vec![
+            gpui_chat_core::Moderation::Delete {
+                message_id: "ok1".into(),
+            },
+            gpui_chat_core::Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "spam".into(),
+                    duration: None,
+                },
+                at: Timestamp(300),
+            },
+        ];
+        // The answer holds nothing we do not have, only what happened to it.
+        assert!(store.apply(history_with(
+            vec![stamped("spam1", 100, true)],
+            moderation.clone()
+        )));
+        assert_eq!(
+            deleted(&store),
+            [("spam1".into(), true), ("ok1".into(), true)]
+        );
+        assert!(
+            !store.apply(history_with(vec![], moderation)),
+            "again: nothing changes"
+        );
+    }
+
+    fn by_login_live(channel: &str, id: &str, login: &str, ts: i64) -> ChatEvent {
+        ChatEvent::Message {
+            channel: ChannelId::new(channel),
+            message: by_login(id, login, ts, false),
+        }
+    }
+
+    #[test]
+    fn a_user_notice_in_history_and_live_is_shown_once() {
+        let notice = |history: bool| {
+            let mut message =
+                Message::chat("sub-1", Timestamp(10), Author::new("dave", "Dave"), vec![]);
+            message.kind = MessageKind::UserNotice;
+            message.flags.history = history;
+            Arc::new(message)
+        };
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(history_with(vec![notice(true)], vec![]));
+        assert!(!store.apply(ChatEvent::Message {
+            channel: ChannelId::new("a"),
+            message: notice(false),
+        }));
+        assert_eq!(store.messages().len(), 1);
+        // And the other way round.
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(ChatEvent::Message {
+            channel: ChannelId::new("a"),
+            message: notice(false),
+        });
+        assert!(!store.apply(history_with(vec![notice(true)], vec![])));
+        assert_eq!(store.messages().len(), 1);
+    }
+
+    #[test]
+    fn history_is_flagged_so_notifications_can_skip_it() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(history_of("a", &[("h", 1)]));
+        store.apply(live_at("a", "l", 2));
+        let flags: Vec<bool> = store.messages().iter().map(|m| m.flags.history).collect();
+        assert_eq!(flags, [true, false]);
+    }
+
+    #[test]
+    fn a_history_batch_reaches_only_its_channels_store() {
+        let mut groups =
+            split_by_channel(vec![history_of("a", &[("h", 1)]), live_at("b", "l", 2)]).0;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.remove(0).0, ChannelId::new("a"));
+    }
+
     #[test]
     fn the_irc_copy_replaces_the_echo_in_place() {
         let echo = |id: &str| {
@@ -504,11 +805,13 @@ mod tests {
                 login: "Alice".into(),
                 duration: None,
             },
+            at: None,
         }));
         assert!(store.messages().iter().all(|m| m.flags.deleted));
         assert!(!store.apply(ChatEvent::ClearChat {
             channel: ch,
             target: ClearTarget::Channel,
+            at: None,
         }));
         assert_eq!(
             store.messages().len(),

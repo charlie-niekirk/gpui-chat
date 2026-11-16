@@ -136,6 +136,9 @@ pub struct ChatSettings {
     pub scrollback: usize,
     /// Show a timestamp before each message.
     pub timestamps: bool,
+    /// Load recent messages when a channel is joined and after a reconnect, from the public
+    /// recent-messages service (the channel name is sent to it; see `docs/SETTINGS.md`).
+    pub history: bool,
 }
 
 impl Default for ChatSettings {
@@ -143,6 +146,7 @@ impl Default for ChatSettings {
         Self {
             scrollback: 1000,
             timestamps: true,
+            history: true,
         }
     }
 }
@@ -288,6 +292,7 @@ mod tests {
         assert_eq!(s.appearance.font_family, "JetBrainsMono Nerd Font");
         assert_eq!(s.appearance.theme, ThemeMode::System);
         assert_eq!(s.chat.scrollback, 1000);
+        assert!(s.chat.history, "recent messages are on by default");
         assert_eq!((s.emotes.scale, s.emotes.animate), (1.0, true));
         assert_eq!(s.streamlink.default_quality, "best");
         assert!(s.streamlink.path.is_none() && s.streamlink.player.is_none());

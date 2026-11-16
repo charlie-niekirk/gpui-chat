@@ -54,8 +54,18 @@ pub fn message_row(
     row: &RowContext,
 ) -> AnyElement {
     let element = MessageElement::new(seq, message.clone(), style, cache);
+    // Recent-messages history (PR 5.5) is shown dimmer than live chat.
+    let element = if message.flags.history {
+        div()
+            .w_full()
+            .opacity(row.tokens.history_opacity)
+            .child(element)
+            .into_any_element()
+    } else {
+        element.into_any_element()
+    };
     if row.hovered != Some(seq) || !can_reply_to(message) {
-        return element.into_any_element();
+        return element;
     }
     let reply_button = {
         let (view, message) = (row.view.clone(), message.clone());

@@ -26,6 +26,7 @@ use crate::badges::BadgeService;
 use crate::bridge::BridgeSender;
 use crate::config;
 use crate::emote_service::{self, EmoteService};
+use crate::history_service::HistoryService;
 use crate::runtime;
 
 /// Handle to the running client; the shell owns it.
@@ -37,6 +38,8 @@ pub struct LiveSource {
     /// Channel badges (the global ones are bundled and need no service); `None` if it could not
     /// start.
     badges: Option<BadgeService>,
+    /// Recent messages on join and after a reconnect (PR 5.5); `None` if it could not start.
+    history: Option<HistoryService>,
     /// The login owner and its Helix client; `None` if they could not be built (no sending).
     account: Option<(Auth, HelixClient)>,
     /// Where a sent message's echo goes: the same path as every incoming event.
@@ -98,16 +101,29 @@ impl LiveSource {
         let enabled = emote_service::providers(&config::current(cx).emotes);
         let emotes = EmoteService::start(enabled, cx);
         let badges = BadgeService::start(account.clone(), cx);
+        let history = HistoryService::start(
+            config::current(cx).chat.history,
+            sender.clone(),
+            emotes.clone(),
+            cx,
+        );
         // Dropped on purpose: the task ends when the client's event channel closes or the UI
         // side of the bridge is gone, and the runtime stops on quit.
         drop(runtime::spawn_backend(
             cx,
-            forward(events, sender.clone(), emotes.clone(), badges.clone()),
+            forward(
+                events,
+                sender.clone(),
+                emotes.clone(),
+                badges.clone(),
+                history.clone(),
+            ),
         ));
         Self {
             client,
             emotes,
             badges,
+            history,
             account,
             sender,
         }
@@ -187,6 +203,16 @@ impl LiveSource {
         if let Some(badges) = &self.badges {
             badges.forget(channel);
         }
+        if let Some(history) = &self.history {
+            history.forget(channel);
+        }
+    }
+
+    /// Applies `chat.history`: whether the joins that follow load recent messages.
+    pub fn set_history(&self, enabled: bool) {
+        if let Some(history) = &self.history {
+            history.set_enabled(enabled);
+        }
     }
 
     /// Fetches the global and every open channel's emote sets again (`Reload Emotes`).
@@ -248,7 +274,7 @@ fn echo_event(sent: SentMessage, request: SendRequest, timestamp: Timestamp) -> 
     }
 }
 
-fn now() -> Timestamp {
+pub(crate) fn now() -> Timestamp {
     Timestamp::from_unix_millis(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -304,7 +330,8 @@ async fn follow_login(
 }
 
 /// Moves events from the client into the bridge, resolving third-party emotes on the way (and
-/// starting a channel's emote and badge loads when its room id shows up). `send().await` is the
+/// starting a channel's emote and badge loads when its room id shows up, and its recent-messages
+/// fetch when its join is confirmed). `send().await` is the
 /// backpressure: while the UI is behind, the client's own buffers fill and it sheds chat
 /// messages, never state changes.
 async fn forward(
@@ -312,10 +339,14 @@ async fn forward(
     sender: BridgeSender<ChatEvent>,
     emotes: Option<EmoteService>,
     badges: Option<BadgeService>,
+    history: Option<HistoryService>,
 ) {
     while let Some(event) = events.recv().await {
         if let Some(badges) = &badges {
             badges.observe(&event);
+        }
+        if let Some(history) = &history {
+            history.observe(&event);
         }
         let event = match &emotes {
             Some(emotes) => emotes.process(event),
@@ -482,7 +513,7 @@ mod tests {
     async fn forward_passes_events_in_order_and_stops_when_the_ui_is_gone() {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (sender, mut receiver) = bridge::channel(8, 8);
-        let task = tokio::spawn(forward(events_rx, sender, None, None));
+        let task = tokio::spawn(forward(events_rx, sender, None, None, None));
         let connection = |state| ChatEvent::Connection {
             channel: None,
             state,

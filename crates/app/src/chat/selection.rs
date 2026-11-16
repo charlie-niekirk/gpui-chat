@@ -85,6 +85,25 @@ impl Selection {
         true
     }
 
+    /// Moves the selection to the sequence numbers `map` gives (the store renumbered its messages,
+    /// see [`gpui_chat_core::Rebuild`]); byte offsets are into display texts, which a renumbering
+    /// does not change. `false` when the message of an end is gone: the selection is then unchanged
+    /// and no longer means anything, and the caller drops it.
+    pub fn remap(&mut self, map: impl Fn(u64) -> Option<u64>) -> bool {
+        let moved = |unit: &Range<TextPos>| {
+            Some(
+                TextPos::new(map(unit.start.seq)?, unit.start.offset)
+                    ..TextPos::new(map(unit.end.seq)?, unit.end.offset),
+            )
+        };
+        let (Some(anchor), Some(head)) = (moved(&self.anchor), moved(&self.head)) else {
+            return false;
+        };
+        self.anchor = anchor;
+        self.head = head;
+        true
+    }
+
     pub fn start(&self) -> TextPos {
         self.anchor.start.min(self.head.start)
     }
@@ -743,5 +762,27 @@ mod tests {
         assert!(!openable("javascript:alert(1)"));
         assert!(!openable("file:///etc/passwd"));
         assert!(!openable("http"));
+    }
+
+    #[test]
+    fn a_selection_is_moved_to_new_sequence_numbers_or_refused_when_an_end_is_gone() {
+        let pos = TextPos::new;
+        let mut selection = Selection::new(pos(3, 2)..pos(3, 2), Granularity::Char);
+        selection.extend_to(pos(5, 4)..pos(5, 4));
+        // Everything moved up by ten (history inserted before it).
+        assert!(selection.remap(|seq| Some(seq + 10)));
+        assert_eq!(
+            (selection.start(), selection.end()),
+            (pos(13, 2), pos(15, 4))
+        );
+        assert_eq!(selection.seqs(), 13..=15);
+        // A whole-message unit keeps its "end of text" marker.
+        let mut message = Selection::new(pos(1, 0)..pos(1, usize::MAX), Granularity::Message);
+        assert!(message.remap(|seq| Some(seq * 2)));
+        assert_eq!(message.end(), pos(2, usize::MAX));
+        // One end dropped by the rebuild: refused, and left as it was.
+        let before = selection.clone();
+        assert!(!selection.remap(|seq| (seq != 15).then_some(seq)));
+        assert_eq!(selection, before);
     }
 }

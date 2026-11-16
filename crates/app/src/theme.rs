@@ -75,6 +75,10 @@ pub struct Tokens {
     pub success: Hsla,
     /// Connecting / reconnecting.
     pub warning: Hsla,
+    /// How opaque recent-messages history is drawn (PR 5.5): the theme's own idea of "quieter
+    /// text", i.e. how far its muted text colour sits between background and text (see
+    /// [`history_opacity`]), so every theme dims history as much as it dims its muted text.
+    pub history_opacity: f32,
     /// Whether the resolved variant is light. Use this, not the luminance of a colour, to pick
     /// light or dark assets (a dark theme can have a mid-tone background).
     pub light: bool,
@@ -84,6 +88,17 @@ impl Global for Tokens {}
 
 fn hsla(color: Color) -> Hsla {
     rgb(color.to_u32()).into()
+}
+
+/// The opacity at which `text` on `background` looks as quiet as `muted` does: where `muted`'s
+/// lightness lies between the background's and the text's. Kept within 0.45 to 0.75 so history
+/// stays readable in a theme whose muted colour is very faint (or nearly the text colour).
+fn history_opacity(text: Hsla, muted: Hsla, background: Hsla) -> f32 {
+    let span = text.l - background.l;
+    if span.abs() < 0.05 {
+        return 0.6;
+    }
+    ((muted.l - background.l) / span).clamp(0.45, 0.75)
 }
 
 impl Tokens {
@@ -104,6 +119,11 @@ impl Tokens {
             accent_link: hsla(palette.accent_link),
             success: hsla(palette.success),
             warning: hsla(palette.warning),
+            history_opacity: history_opacity(
+                hsla(palette.text),
+                hsla(palette.text_muted),
+                hsla(palette.background),
+            ),
             light: variant == ThemeVariant::Light,
         }
     }
@@ -551,6 +571,43 @@ fn contrast_text(fill: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_is_dimmed_by_what_the_theme_dims_its_muted_text() {
+        let registry = ThemeRegistry::bundled();
+        let mut checked = 0;
+        for theme in registry.iter() {
+            for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+                let (_, palette) = theme.palette(variant);
+                let opacity = Tokens::from_palette(&palette, variant).history_opacity;
+                assert!(
+                    (0.45..=0.75).contains(&opacity),
+                    "{} {variant:?}: {opacity}",
+                    theme.id
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "{checked} palettes checked");
+        // The formula: muted halfway between background and text is half-way opacity.
+        let (text, muted, bg) = (
+            gpui_kit::hsla(0.0, 0.0, 1.0, 1.0),
+            gpui_kit::hsla(0.0, 0.0, 0.6, 1.0),
+            gpui_kit::hsla(0.0, 0.0, 0.0, 1.0),
+        );
+        assert!((history_opacity(text, muted, bg) - 0.6).abs() < 1e-6);
+        // A theme whose text barely differs from its background falls back.
+        assert_eq!(history_opacity(bg, muted, bg), 0.6);
+        // Extremes are clamped.
+        assert_eq!(
+            history_opacity(text, gpui_kit::hsla(0.0, 0.0, 0.1, 1.0), bg),
+            0.45
+        );
+        assert_eq!(
+            history_opacity(text, gpui_kit::hsla(0.0, 0.0, 0.99, 1.0), bg),
+            0.75
+        );
+    }
 
     #[test]
     fn dark_and_light_differ() {

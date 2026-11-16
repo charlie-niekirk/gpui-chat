@@ -27,11 +27,11 @@ pub use compose::{
 };
 pub use emote::{Badge, BadgeId, Emote, EmoteProvider, ImageScale, ImageUrls};
 pub use event::{
-    ChatEvent, ClearTarget, ConnectionState, FollowersOnly, RoomState, RoomStateUpdate,
+    ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState, RoomStateUpdate,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
 pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
-pub use store::{DEFAULT_CAPACITY, MessageStore, Thread};
+pub use store::{DEFAULT_CAPACITY, MessageStore, Rebuild, Thread};
 pub use tokenizer::{
     DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,
     WordResolver, parse_emotes_tag, resolve_fragments, twitch_emote_ranges,

@@ -242,6 +242,68 @@ impl Surface {
         *self.members.borrow_mut() = members;
     }
 
+    /// Moves everything keyed by a message's sequence number to the number `map` gives, after the
+    /// store renumbered its messages (history merged before them, see [`gpui_chat_core::Rebuild`]):
+    /// the selection and the display texts of its two ends, the link a press is on, the context
+    /// menu's target and the rows of the thread popover. A selection one of whose ends is gone
+    /// is cleared (and the menu target dropped); one that stays still covers whatever lies
+    /// between its ends, new rows included.
+    pub fn remap(&self, map: &dyn Fn(u64) -> Option<u64>) {
+        // The geometry was measured under the old numbers; the next paint measures it again.
+        self.rows.borrow_mut().clear();
+        let kept = self
+            .selection
+            .borrow_mut()
+            .as_mut()
+            .is_none_or(|selection| selection.remap(map));
+        if !kept {
+            self.clear();
+            self.menu_target.borrow_mut().take();
+            self.ends
+                .borrow_mut()
+                .iter_mut()
+                .for_each(|end| *end = None);
+            return;
+        }
+        for end in self.ends.borrow_mut().iter_mut() {
+            *end = end
+                .take()
+                .and_then(|(seq, shaped)| Some((map(seq)?, shaped)));
+        }
+        if let Some(drag) = self.drag.borrow_mut().as_mut() {
+            drag.link = drag
+                .link
+                .take()
+                .and_then(|(seq, url)| Some((map(seq)?, url)));
+        }
+        let moved = |target: &mut Option<MenuTarget>| {
+            *target = target.take().and_then(|target| {
+                Some(MenuTarget {
+                    seq: map(target.seq)?,
+                    ..target
+                })
+            });
+        };
+        moved(&mut self.menu_target.borrow_mut());
+        #[cfg(test)]
+        moved(&mut self.last_aimed.borrow_mut());
+        if let Some(members) = self.members.borrow_mut().as_mut() {
+            *members = members.iter().filter_map(|seq| map(*seq)).collect();
+        }
+    }
+
+    /// Drops everything keyed by sequence numbers that no longer mean what they did (the list
+    /// replaced every row): the selection, the menu target, the press in progress.
+    pub fn reset(&self) {
+        self.rows.borrow_mut().clear();
+        self.clear();
+        self.menu_target.borrow_mut().take();
+        self.ends
+            .borrow_mut()
+            .iter_mut()
+            .for_each(|end| *end = None);
+    }
+
     /// Whether something is selected.
     pub fn has_selection(&self) -> bool {
         self.selection
@@ -331,6 +393,12 @@ impl Surface {
     #[cfg(test)]
     pub fn menu_target(&self) -> Option<MenuTarget> {
         self.menu_target.borrow().clone()
+    }
+
+    /// The messages the selection touches.
+    #[cfg(test)]
+    pub fn selection_seqs(&self) -> Option<std::ops::RangeInclusive<u64>> {
+        self.selection.borrow().as_ref().map(Selection::seqs)
     }
 
     /// What the last right-click was aimed at (kept after the menu took it).
@@ -801,5 +869,74 @@ impl Surface {
             *self.last_aimed.borrow_mut() = target.clone();
         }
         *self.menu_target.borrow_mut() = target;
+    }
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    fn surface() -> Rc<Surface> {
+        Surface::new(None, Rc::default())
+    }
+
+    fn select(surface: &Surface, from: u64, to: u64) {
+        let mut selection = Selection::new(
+            TextPos::new(from, 1)..TextPos::new(from, 1),
+            Granularity::Char,
+        );
+        selection.extend_to(TextPos::new(to, 3)..TextPos::new(to, 3));
+        *surface.selection.borrow_mut() = Some(selection);
+    }
+
+    fn aim(surface: &Surface, seq: u64) {
+        *surface.menu_target.borrow_mut() = Some(MenuTarget {
+            seq,
+            link: Some("https://example.com".into()),
+        });
+    }
+
+    #[test]
+    fn the_selection_and_the_menu_target_follow_their_messages() {
+        let surface = surface();
+        select(&surface, 2, 4);
+        aim(&surface, 3);
+        surface.remap(&|seq| Some(seq + 7));
+        assert_eq!(surface.selection_seqs(), Some(9..=11));
+        let target = surface.take_menu_target().expect("still aimed");
+        assert_eq!(
+            (target.seq, target.link.as_deref()),
+            (10, Some("https://example.com"))
+        );
+    }
+
+    #[test]
+    fn a_selection_whose_message_is_gone_is_cleared_with_the_menu_target() {
+        let surface = surface();
+        select(&surface, 2, 4);
+        aim(&surface, 3);
+        surface.remap(&|seq| (seq != 4).then_some(seq + 1));
+        assert_eq!(surface.selection_seqs(), None);
+        assert!(surface.take_menu_target().is_none());
+    }
+
+    #[test]
+    fn a_menu_target_whose_message_is_gone_is_dropped_but_the_selection_stays() {
+        let surface = surface();
+        select(&surface, 2, 4);
+        aim(&surface, 3);
+        surface.remap(&|seq| (seq != 3).then_some(seq));
+        assert_eq!(surface.selection_seqs(), Some(2..=4));
+        assert!(surface.take_menu_target().is_none());
+    }
+
+    #[test]
+    fn reset_drops_selection_and_target() {
+        let surface = surface();
+        select(&surface, 2, 4);
+        aim(&surface, 3);
+        surface.reset();
+        assert_eq!(surface.selection_seqs(), None);
+        assert!(surface.take_menu_target().is_none());
     }
 }

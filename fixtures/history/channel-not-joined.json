@@ -1,0 +1,5 @@
+{
+ "messages": [],
+ "error": "The bot is currently not joined to this channel (in progress or failed previously)",
+ "error_code": "channel_not_joined"
+}

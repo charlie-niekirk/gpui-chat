@@ -627,6 +627,17 @@ impl LayoutCache {
         dropped
     }
 
+    /// Moves every cached layout to its message's new sequence number after the store renumbered
+    /// its messages (`MessageStore::merge_history` placing history before retained messages);
+    /// `map` gives the new number, or `None` for a message that is gone.
+    pub fn remap(&mut self, map: impl Fn(u64) -> Option<u64>) {
+        let old = std::mem::take(&mut self.entries);
+        self.entries = old
+            .into_iter()
+            .filter_map(|(seq, entry)| Some((map(seq)?, entry)))
+            .collect();
+    }
+
     /// Drops the layouts of messages before `first_seq` (evicted from the store).
     pub fn evict_before(&mut self, first_seq: u64) {
         self.entries = self.entries.split_off(&first_seq);

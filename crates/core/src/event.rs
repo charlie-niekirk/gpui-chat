@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ids::{ChannelId, MessageId};
-use crate::message::Message;
+use crate::message::{Message, Timestamp};
 
 /// Followers-only mode of a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,6 +80,17 @@ pub enum ClearTarget {
     },
 }
 
+/// A moderation action reported by recent-messages history (PR 5.5): something that happened to
+/// the chat *before* the history was fetched, applied by `MessageStore::apply_moderation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Moderation {
+    /// One message was deleted (`CLEARMSG`).
+    Delete { message_id: MessageId },
+    /// A timeout, ban or chat clear at `at` (`tmi-sent-ts`): it removed the messages sent at or
+    /// before that time, not the ones the user (or anyone) sent afterwards.
+    Clear { target: ClearTarget, at: Timestamp },
+}
+
 /// State of the chat connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -102,10 +113,23 @@ pub enum ChatEvent {
         channel: ChannelId,
         message: Arc<Message>,
     },
-    /// `CLEARCHAT`: whole channel, or one user's messages (timeout / ban).
+    /// Recent messages fetched for a channel (PR 5.5), oldest first, every one flagged
+    /// [`crate::MessageFlags::history`]. They are *merged* into what the channel already shows
+    /// ([`crate::MessageStore::merge_history`]: ordered by time, nothing shown twice), not
+    /// appended, because live messages may have arrived while they were being fetched.
+    /// `moderation` is what the answer said was removed, in order; it is applied to the merged
+    /// store (messages from before a reconnect included), not only to `messages`.
+    History {
+        channel: ChannelId,
+        messages: Vec<Arc<Message>>,
+        moderation: Vec<Moderation>,
+    },
+    /// `CLEARCHAT`: whole channel, or one user's messages (timeout / ban). `at` is its
+    /// `tmi-sent-ts` when the line had one.
     ClearChat {
         channel: ChannelId,
         target: ClearTarget,
+        at: Option<Timestamp>,
     },
     /// `CLEARMSG`: one message was deleted. `login` is the author when reported.
     DeleteMessage {
@@ -138,6 +162,7 @@ impl ChatEvent {
     pub fn channel(&self) -> Option<&ChannelId> {
         match self {
             Self::Message { channel, .. }
+            | Self::History { channel, .. }
             | Self::ClearChat { channel, .. }
             | Self::DeleteMessage { channel, .. }
             | Self::RoomState { channel, .. } => Some(channel),
@@ -181,6 +206,7 @@ mod tests {
         let e = ChatEvent::ClearChat {
             channel: ch.clone(),
             target: ClearTarget::Channel,
+            at: None,
         };
         assert_eq!(e.channel(), Some(&ch));
         let e = ChatEvent::Connection {

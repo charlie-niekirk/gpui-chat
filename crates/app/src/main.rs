@@ -23,6 +23,7 @@ mod emote_sources;
 mod emote_thumb;
 mod firehose;
 mod fonts;
+mod history_service;
 mod hud;
 mod images;
 mod keymap;

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use crate::event::{ClearTarget, Moderation};
 use crate::ids::MessageId;
 use crate::message::Message;
 
@@ -41,6 +42,52 @@ pub struct MessageStore {
     capacity: usize,
     next_seq: u64,
     generation: u64,
+    rebuild_serial: u64,
+    rebuilds: VecDeque<(u64, Rebuild)>,
+}
+
+/// How many [`Rebuild`]s the store remembers for its views.
+const REBUILD_LOG: usize = 8;
+
+/// What [`MessageStore::merge_history`] did when it had to place messages before retained ones:
+/// every retained message got a new sequence number, and these say how the list of messages
+/// changed, in terms a view can apply as splices.
+///
+/// Before: items `old_first..old_next`. After: items `new_first..new_next`. Going from one to the
+/// other: drop the first `removed_front` items, then insert new items at the given positions of
+/// the *resulting* list (`inserts`, ascending by index, applied one after another).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebuild {
+    pub old_first: u64,
+    pub old_next: u64,
+    pub new_first: u64,
+    pub new_next: u64,
+    /// Retained messages dropped from the front (over capacity).
+    pub removed_front: usize,
+    /// `(index in the new list, how many)` runs of messages that were not there before.
+    pub inserts: Vec<(usize, usize)>,
+}
+
+impl Rebuild {
+    /// The new sequence number of the message that had `old` (`None` if it was not retained or
+    /// was dropped by the rebuild).
+    pub fn map_seq(&self, old: u64) -> Option<u64> {
+        if old < self.old_first || old >= self.old_next {
+            return None;
+        }
+        let kept = usize::try_from(old - self.old_first)
+            .ok()?
+            .checked_sub(self.removed_front)?;
+        let mut index = kept;
+        for &(at, count) in &self.inserts {
+            if at <= index {
+                index += count;
+            } else {
+                break;
+            }
+        }
+        Some(self.new_first + index as u64)
+    }
 }
 
 impl Default for MessageStore {
@@ -64,6 +111,8 @@ impl MessageStore {
             capacity,
             next_seq: 0,
             generation: 0,
+            rebuild_serial: 0,
+            rebuilds: VecDeque::new(),
         }
     }
 
@@ -110,6 +159,157 @@ impl MessageStore {
         self.entries.push_back(Entry { seq, message });
         self.generation += 1;
         evicted
+    }
+
+    /// Merges recent-messages `history` (PR 5.5) into the store by time and returns how many
+    /// messages were added.
+    ///
+    /// * A history message whose id is already retained is skipped (the live copy wins), as is a
+    ///   repeat of an id within `history`, so overlap between a fetch and what was already seen
+    ///   (a reconnect refetching part of it, a message that arrived live meanwhile) shows nothing
+    ///   twice. When nothing is new the store is not touched at all (the common case of a
+    ///   reconnect after a short blip).
+    /// * The new messages take their place by timestamp among the retained ones, each side keeping
+    ///   its own order; on equal timestamps history goes first. Messages newer than everything
+    ///   retained are simply pushed.
+    /// * Placing a message *before* a retained one (the usual case on join: live messages arrived
+    ///   while the fetch ran) rebuilds the buffer, which gives every retained message a **new
+    ///   sequence number**. The change is described by a [`Rebuild`] (see
+    ///   [`MessageStore::rebuilds_since`]) that tells a view exactly which items were inserted
+    ///   where and how old numbers map to new ones, so it can insert rows (keeping measurements
+    ///   and the reader's scroll position) instead of starting over. When the result exceeds the
+    ///   capacity the oldest messages go, as with `push`.
+    ///
+    /// Assumes the retained messages are in time order, which holds for Twitch-stamped messages;
+    /// a locally stamped one (an echo, a system line) under clock skew can sit out of place.
+    pub fn merge_history(&mut self, history: Vec<Arc<Message>>) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut fresh: Vec<Arc<Message>> = history
+            .into_iter()
+            .filter(|m| !self.by_id.contains_key(&m.id) && seen.insert(m.id.clone()))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        fresh.sort_by_key(|m| m.timestamp);
+        let newest = self.entries.back().map(|e| e.message.timestamp);
+        if newest.is_none_or(|newest| fresh[0].timestamp >= newest) {
+            let added = fresh.len();
+            for message in fresh {
+                self.push(message);
+            }
+            return added;
+        }
+
+        // Merge, remembering which items are retained and which are new. Nothing is touched until
+        // it is known that a new message survives the capacity.
+        let (old_first, old_next) = (self.first_seq(), self.next_seq);
+        let mut merged: Vec<(Arc<Message>, bool)> =
+            Vec::with_capacity(self.entries.len() + fresh.len());
+        let mut old = self.entries.iter().map(|e| &e.message).peekable();
+        let mut new = fresh.into_iter().peekable();
+        loop {
+            let take_new = match (old.peek(), new.peek()) {
+                (Some(o), Some(n)) => n.timestamp <= o.timestamp,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => break,
+            };
+            if take_new {
+                merged.extend(new.next().map(|m| (m, true)));
+            } else {
+                merged.extend(old.next().map(|m| (Arc::clone(m), false)));
+            }
+        }
+        // The oldest go when over capacity; count the retained ones among them.
+        let dropped = merged.len().saturating_sub(self.capacity);
+        let added = merged[dropped..].iter().filter(|(_, new)| *new).count();
+        if added == 0 {
+            // Everything new is older than what the capacity keeps.
+            return 0;
+        }
+        let removed_front = merged[..dropped].iter().filter(|(_, new)| !new).count();
+        let mut inserts: Vec<(usize, usize)> = Vec::new();
+        for (index, (_, is_new)) in merged[dropped..].iter().enumerate() {
+            if !is_new {
+                continue;
+            }
+            match inserts.last_mut() {
+                Some((start, count)) if *start + *count == index => *count += 1,
+                _ => inserts.push((index, 1)),
+            }
+        }
+        self.entries.clear();
+        self.by_id.clear();
+        let new_first = self.next_seq;
+        for (message, _) in merged.drain(dropped..) {
+            self.push(message);
+        }
+        self.rebuild_serial += 1;
+        if self.rebuilds.len() >= REBUILD_LOG {
+            self.rebuilds.pop_front();
+        }
+        self.rebuilds.push_back((
+            self.rebuild_serial,
+            Rebuild {
+                old_first,
+                old_next,
+                new_first,
+                new_next: self.next_seq,
+                removed_front,
+                inserts,
+            },
+        ));
+        added
+    }
+
+    /// How many rebuilds ([`MessageStore::merge_history`]) there have been.
+    pub fn rebuild_serial(&self) -> u64 {
+        self.rebuild_serial
+    }
+
+    /// The rebuilds ([`MessageStore::merge_history`]) after `seen` (a serial returned earlier;
+    /// start with 0), oldest first, and the serial to pass next time. `None` instead of the list
+    /// when more happened than are remembered: the caller then has to treat the whole buffer as
+    /// replaced.
+    pub fn rebuilds_since(&self, seen: u64) -> (Option<Vec<Rebuild>>, u64) {
+        let pending = self.rebuild_serial - seen;
+        if pending == 0 {
+            return (Some(Vec::new()), self.rebuild_serial);
+        }
+        if pending > self.rebuilds.len() as u64 {
+            return (None, self.rebuild_serial);
+        }
+        let list = self
+            .rebuilds
+            .iter()
+            .filter(|(serial, _)| *serial > seen)
+            .map(|(_, rebuild)| rebuild.clone())
+            .collect();
+        (Some(list), self.rebuild_serial)
+    }
+
+    /// Applies one moderation action from recent-messages history; returns how many retained
+    /// messages it marked as deleted. A `Clear` reaches only messages sent at or before its time,
+    /// so what a timed-out user said after it survives.
+    pub fn apply_moderation(&mut self, moderation: &Moderation) -> usize {
+        match moderation {
+            Moderation::Delete { message_id } => {
+                usize::from(self.mark_deleted(message_id.as_str()))
+            }
+            Moderation::Clear { target, at } => {
+                let at = *at;
+                match target {
+                    ClearTarget::Channel => self.mark_where(|m| m.timestamp <= at),
+                    ClearTarget::User { login, .. } => self.mark_where(|m| {
+                        m.timestamp <= at
+                            && m.author
+                                .as_ref()
+                                .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
+                    }),
+                }
+            }
+        }
     }
 
     /// Changes the capacity (minimum 1). Shrinking evicts the oldest messages;
@@ -552,5 +752,356 @@ mod tests {
             "200k pushes took {:?}",
             start.elapsed()
         );
+    }
+
+    fn at(id: &str, ts: i64) -> Arc<Message> {
+        let mut m = Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new("someone", "someone"),
+            vec![Fragment::Text(id.to_owned())],
+        );
+        m.flags.history = true;
+        Arc::new(m)
+    }
+
+    fn live(id: &str, ts: i64) -> Arc<Message> {
+        let mut m = (*at(id, ts)).clone();
+        m.flags.history = false;
+        Arc::new(m)
+    }
+
+    #[test]
+    fn history_on_an_empty_store_is_just_appended() {
+        let mut store = MessageStore::new();
+        assert_eq!(store.merge_history(vec![at("a", 1), at("b", 2)]), 2);
+        assert_eq!(ids(&store), ["a", "b"]);
+        assert_eq!((store.first_seq(), store.next_seq()), (0, 2));
+    }
+
+    #[test]
+    fn history_goes_before_live_messages_that_arrived_first() {
+        let mut store = MessageStore::new();
+        store.push(live("l1", 100));
+        store.push(live("l2", 110));
+        let before = store.next_seq();
+        assert_eq!(store.merge_history(vec![at("h1", 10), at("h2", 20)]), 2);
+        assert_eq!(ids(&store), ["h1", "h2", "l1", "l2"]);
+        assert!(store.get("h1").unwrap().flags.history);
+        assert!(!store.get("l1").unwrap().flags.history);
+        // Everything got a new sequence number: no old one means something else now.
+        assert!(store.first_seq() >= before);
+        assert_eq!(store.get_by_seq(0), None);
+    }
+
+    #[test]
+    fn history_interleaves_by_time_and_keeps_each_sides_order() {
+        let mut store = MessageStore::new();
+        store.push(live("l1", 10));
+        store.push(live("l2", 50));
+        // Out of order on the way in: the merge sorts the history itself.
+        assert_eq!(
+            store.merge_history(vec![at("h2", 30), at("h1", 5), at("h3", 70)]),
+            3
+        );
+        assert_eq!(ids(&store), ["h1", "l1", "h2", "l2", "h3"]);
+    }
+
+    #[test]
+    fn a_message_already_shown_is_not_shown_again() {
+        let mut store = MessageStore::new();
+        store.push(live("m1", 10));
+        store.push(live("m2", 20));
+        let generation = store.generation();
+        // Overlap with what is retained, and a repeat inside the history itself.
+        assert_eq!(
+            store.merge_history(vec![at("m1", 10), at("m2", 20), at("m2", 20)]),
+            0
+        );
+        assert_eq!(store.generation(), generation, "nothing changed");
+        assert_eq!(
+            store.merge_history(vec![at("m2", 20), at("m3", 30), at("m3", 30)]),
+            1
+        );
+        assert_eq!(ids(&store), ["m1", "m2", "m3"]);
+        assert!(
+            !store.get("m2").unwrap().flags.history,
+            "the live copy stays"
+        );
+    }
+
+    #[test]
+    fn a_gap_is_filled_between_what_was_seen_before_and_after() {
+        let mut store = MessageStore::new();
+        for (id, ts) in [("a", 10), ("b", 20), ("e", 60), ("f", 70)] {
+            store.push(live(id, ts));
+        }
+        // Reconnect: the service returns from a bit before the last message seen.
+        assert_eq!(
+            store.merge_history(vec![at("b", 20), at("c", 30), at("d", 40), at("e", 60)]),
+            2
+        );
+        assert_eq!(ids(&store), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn merged_history_respects_the_capacity() {
+        let mut store = MessageStore::with_capacity(3);
+        store.push(live("l1", 100));
+        store.push(live("l2", 110));
+        store.merge_history(vec![at("h1", 1), at("h2", 2), at("h3", 3)]);
+        // The oldest go first, as with `push`; the live ones survive.
+        assert_eq!(ids(&store), ["h3", "l1", "l2"]);
+        assert!(!store.contains("h1"));
+        assert_eq!(
+            store
+                .seq_of("l2")
+                .and_then(|s| store.get_by_seq(s))
+                .unwrap()
+                .id
+                .as_str(),
+            "l2"
+        );
+    }
+
+    /// Applies a rebuild to a model of the list (old sequence numbers; `None` for a new item)
+    /// the way a view does, and checks it against the store afterwards.
+    fn check_rebuild(before: &[(u64, String)], rebuild: &Rebuild, store: &MessageStore) {
+        let mut model: Vec<Option<u64>> = before.iter().map(|(seq, _)| Some(*seq)).collect();
+        assert_eq!(model.len() as u64, rebuild.old_next - rebuild.old_first);
+        model.drain(..rebuild.removed_front);
+        for &(at, count) in &rebuild.inserts {
+            for _ in 0..count {
+                model.insert(at, None);
+            }
+        }
+        // Inserting `count` at `at` one by one keeps them together at `at..at + count`.
+        assert_eq!(model.len() as u64, rebuild.new_next - rebuild.new_first);
+        assert_eq!(
+            (store.first_seq(), store.next_seq()),
+            (rebuild.new_first, rebuild.new_next)
+        );
+        for (index, item) in model.iter().enumerate() {
+            let new_seq = rebuild.new_first + index as u64;
+            match item {
+                Some(old_seq) => {
+                    assert_eq!(rebuild.map_seq(*old_seq), Some(new_seq), "old {old_seq}");
+                    let id = &before.iter().find(|(s, _)| s == old_seq).unwrap().1;
+                    assert_eq!(store.get_by_seq(new_seq).unwrap().id.as_str(), id);
+                }
+                None => assert!(store.get_by_seq(new_seq).unwrap().flags.history),
+            }
+        }
+        for (old_seq, _) in &before[..rebuild.removed_front] {
+            assert_eq!(rebuild.map_seq(*old_seq), None, "dropped");
+        }
+        assert_eq!(rebuild.map_seq(rebuild.old_first.wrapping_sub(1)), None);
+        assert_eq!(rebuild.map_seq(rebuild.old_next), None);
+    }
+
+    fn snapshot(store: &MessageStore) -> Vec<(u64, String)> {
+        store
+            .iter_with_seq()
+            .map(|(seq, m)| (seq, m.id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_rebuild_describes_exactly_what_moved() {
+        let mut store = MessageStore::new();
+        for (id, ts) in [("a", 10), ("b", 20), ("e", 60), ("f", 70)] {
+            store.push(live(id, ts));
+        }
+        let before = snapshot(&store);
+        assert_eq!(store.rebuilds_since(0), (Some(vec![]), 0));
+        store.merge_history(vec![at("c", 30), at("d", 40), at("0", 1)]);
+        let (rebuilds, serial) = store.rebuilds_since(0);
+        let rebuilds = rebuilds.unwrap();
+        assert_eq!(serial, 1);
+        assert_eq!(rebuilds.len(), 1);
+        // "0" at the very front, then c and d between b and e.
+        assert_eq!(rebuilds[0].inserts, [(0, 1), (3, 2)]);
+        assert_eq!(rebuilds[0].removed_front, 0);
+        check_rebuild(&before, &rebuilds[0], &store);
+        assert_eq!(store.rebuilds_since(1), (Some(vec![]), 1), "nothing since");
+    }
+
+    #[test]
+    fn a_merge_that_adds_nothing_or_only_appends_is_no_rebuild_and_no_change() {
+        let mut store = MessageStore::new();
+        store.push(live("a", 10));
+        store.push(live("b", 20));
+        let generation = store.generation();
+        assert_eq!(store.merge_history(vec![at("a", 10), at("b", 20)]), 0);
+        assert_eq!(store.generation(), generation);
+        assert_eq!(
+            store.merge_history(vec![at("c", 30)]),
+            1,
+            "newer than everything"
+        );
+        assert_eq!(
+            store.rebuilds_since(0),
+            (Some(vec![]), 0),
+            "pushes are no rebuild"
+        );
+        assert_eq!(
+            (store.first_seq(), store.next_seq()),
+            (0, 3),
+            "numbers untouched"
+        );
+    }
+
+    #[test]
+    fn rebuilds_over_capacity_report_what_fell_off_the_front() {
+        let mut store = MessageStore::with_capacity(4);
+        for (id, ts) in [("a", 100), ("b", 110), ("c", 120)] {
+            store.push(live(id, ts));
+        }
+        let before = snapshot(&store);
+        store.merge_history(vec![at("h1", 1), at("h2", 2), at("m", 115)]);
+        let rebuild = store.rebuilds_since(0).0.unwrap().remove(0);
+        // Merged: h1 h2 a b m c → the 2 oldest (h1, h2) fall off, so none of a/b/c is dropped.
+        assert_eq!(rebuild.removed_front, 0);
+        assert_eq!(
+            store.iter().map(|m| m.id.to_string()).collect::<Vec<_>>(),
+            ["a", "b", "m", "c"]
+        );
+        check_rebuild(&before, &rebuild, &store);
+        // Now one that costs retained ones: capacity 4 holds a b m c.
+        let before = snapshot(&store);
+        assert_eq!(
+            store.merge_history(vec![at("x", 90), at("y", 105), at("z", 118)]),
+            1
+        );
+        let rebuild = store.rebuilds_since(1).0.unwrap().remove(0);
+        // Merged: x a y b m z c → x, a, y fall off the front (a was retained), z survives.
+        assert_eq!(rebuild.removed_front, 1);
+        assert_eq!(rebuild.inserts, [(2, 1)]);
+        assert_eq!(
+            store.iter().map(|m| m.id.to_string()).collect::<Vec<_>>(),
+            ["b", "m", "z", "c"]
+        );
+        check_rebuild(&before, &rebuild, &store);
+    }
+
+    #[test]
+    fn history_older_than_everything_a_full_store_keeps_is_not_merged_at_all() {
+        let mut store = MessageStore::with_capacity(2);
+        store.push(live("a", 100));
+        store.push(live("b", 110));
+        let generation = store.generation();
+        assert_eq!(store.merge_history(vec![at("old1", 1), at("old2", 2)]), 0);
+        assert_eq!(
+            store.generation(),
+            generation,
+            "untouched, not even renumbered"
+        );
+        assert_eq!(store.rebuilds_since(0), (Some(vec![]), 0));
+    }
+
+    #[test]
+    fn random_merges_always_agree_with_their_rebuild_script() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..300 {
+            let capacity = 5 + next(20) as usize;
+            let mut store = MessageStore::with_capacity(capacity);
+            let live_count = next(25);
+            let mut ts = 100;
+            for n in 0..live_count {
+                ts += next(5);
+                store.push(live(&format!("l{round}-{n}"), ts as i64));
+            }
+            let history: Vec<Arc<Message>> = (0..next(25))
+                .map(|n| at(&format!("h{round}-{n}"), next(ts + 20) as i64))
+                .collect();
+            let before = snapshot(&store);
+            let serial = store.rebuilds_since(0).1;
+            let added = store.merge_history(history);
+            let (rebuilds, _) = store.rebuilds_since(serial);
+            let rebuilds = rebuilds.unwrap();
+            if let Some(rebuild) = rebuilds.first() {
+                check_rebuild(&before, rebuild, &store);
+            } else {
+                // Appended or nothing: the old numbers still mean the same messages.
+                for (seq, id) in &before {
+                    if let Some(m) = store.get_by_seq(*seq) {
+                        assert_eq!(m.id.as_str(), id);
+                    }
+                }
+                let _ = added;
+            }
+            // Always ordered by time (live and history were generated in order / sorted).
+            let times: Vec<i64> = store.iter().map(|m| m.timestamp.unix_millis()).collect();
+            assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+            assert!(store.len() <= capacity);
+        }
+    }
+
+    fn by(id: &str, login: &str, ts: i64) -> Arc<Message> {
+        Arc::new(Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new(login, login),
+            vec![Fragment::Text(id.to_owned())],
+        ))
+    }
+
+    #[test]
+    fn moderation_reaches_only_messages_sent_at_or_before_it() {
+        let mut store = MessageStore::new();
+        for m in [
+            by("1", "spam", 10),
+            by("2", "other", 20),
+            by("3", "Spam", 30),
+            by("4", "spam", 50),
+        ] {
+            store.push(m);
+        }
+        let timeout = Moderation::Clear {
+            target: ClearTarget::User {
+                login: "SPAM".into(),
+                duration: None,
+            },
+            at: Timestamp(40),
+        };
+        assert_eq!(store.apply_moderation(&timeout), 2);
+        let deleted: Vec<bool> = store.iter().map(|m| m.flags.deleted).collect();
+        assert_eq!(
+            deleted,
+            [true, false, true, false],
+            "the later message survives"
+        );
+        assert_eq!(store.apply_moderation(&timeout), 0, "again: nothing new");
+        let delete = Moderation::Delete {
+            message_id: "2".into(),
+        };
+        assert_eq!(store.apply_moderation(&delete), 1);
+        assert_eq!(
+            store.apply_moderation(&Moderation::Delete {
+                message_id: "nope".into()
+            }),
+            0
+        );
+        let clear = Moderation::Clear {
+            target: ClearTarget::Channel,
+            at: Timestamp(45),
+        };
+        assert_eq!(
+            store.apply_moderation(&clear),
+            0,
+            "all those were already deleted"
+        );
+        let clear = Moderation::Clear {
+            target: ClearTarget::Channel,
+            at: Timestamp(60),
+        };
+        assert_eq!(store.apply_moderation(&clear), 1);
+        assert!(store.iter().all(|m| m.flags.deleted));
     }
 }

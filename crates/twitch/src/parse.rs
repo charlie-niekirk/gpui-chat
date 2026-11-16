@@ -327,7 +327,14 @@ fn clearchat(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
             duration: number::<u64>(msg, "ban-duration").map(Duration::from_secs),
         },
     };
-    Ok(ChatEvent::ClearChat { channel, target })
+    let at = tag(msg, "tmi-sent-ts")
+        .and_then(|ts| ts.parse().ok())
+        .map(Timestamp::from_unix_millis);
+    Ok(ChatEvent::ClearChat {
+        channel,
+        target,
+        at,
+    })
 }
 
 fn clearmsg(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
