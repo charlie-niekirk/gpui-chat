@@ -1,0 +1,19 @@
+{
+ "messages": [
+  "@badge-info=subscriber/13;badges=subscriber/12,moderator/1;color=#FF4500;display-name=Alice;emotes=25:11-15;first-msg=0;flags=;historical=1;id=11111111-0000-4000-8000-000000000001;mod=0;returning-chatter=0;rm-received-ts=1794826001180;room-id=22484632;subscriber=1;tmi-sent-ts=1794826001000;turbo=0;user-id=16954429;user-type= :alice!alice@alice.tmi.twitch.tv PRIVMSG #forsen :hello chat Kappa",
+  "@badge-info=subscriber/13;badges=subscriber/12,moderator/1;color=#FF4500;display-name=Bob;emotes=;first-msg=0;flags=;historical=1;id=11111111-0000-4000-8000-000000000002;mod=0;returning-chatter=0;rm-received-ts=1794826002180;room-id=22484632;subscriber=1;tmi-sent-ts=1794826002000;turbo=0;user-id=17356379;user-type= :bob!bob@bob.tmi.twitch.tv PRIVMSG #forsen :\u0001ACTION waves\u0001",
+  "@badge-info=;badges=;color=#1E90FF;display-name=Carol;emotes=;first-msg=0;historical=1;id=11111111-0000-4000-8000-000000000003;mod=0;reply-parent-display-name=Alice;reply-parent-msg-body=hello\\schat\\sKappa;reply-parent-msg-id=11111111-0000-4000-8000-000000000001;reply-parent-user-id=1;reply-parent-user-login=alice;reply-thread-parent-msg-id=11111111-0000-4000-8000-000000000001;rm-received-ts=1794826003180;room-id=22484632;subscriber=0;tmi-sent-ts=1794826003000;turbo=0;user-id=3;user-type= :carol!carol@carol.tmi.twitch.tv PRIVMSG #forsen :@Alice hi!",
+  "@badge-info=subscriber/1;badges=subscriber/0;color=#00FF7F;display-name=Dave;emotes=;flags=;historical=1;id=11111111-0000-4000-8000-000000000004;login=dave;mod=0;msg-id=sub;msg-param-cumulative-months=1;msg-param-sub-plan=1000;room-id=22484632;rm-received-ts=1794826004180;subscriber=1;system-msg=Dave\\ssubscribed\\sat\\sTier\\s1.;tmi-sent-ts=1794826004000;user-id=4;user-type= :tmi.twitch.tv USERNOTICE #forsen :first sub!",
+  "@badge-info=subscriber/13;badges=subscriber/12,moderator/1;color=#FF4500;display-name=Spammer;emotes=;first-msg=0;flags=;historical=1;id=11111111-0000-4000-8000-000000000005;mod=0;returning-chatter=0;rm-received-ts=1794826005180;room-id=22484632;subscriber=1;tmi-sent-ts=1794826005000;turbo=0;user-id=15665862;user-type= :spammer!spammer@spammer.tmi.twitch.tv PRIVMSG #forsen :buy followers at spam.example",
+  "@badge-info=subscriber/13;badges=subscriber/12,moderator/1;color=#FF4500;display-name=Trouble;emotes=;first-msg=0;flags=;historical=1;id=11111111-0000-4000-8000-000000000006;mod=0;returning-chatter=0;rm-received-ts=1794826006180;room-id=22484632;subscriber=1;tmi-sent-ts=1794826006000;turbo=0;user-id=16431797;user-type= :trouble!trouble@trouble.tmi.twitch.tv PRIVMSG #forsen :something rude",
+  "@historical=1;login=spammer;rm-received-ts=1794826006500;room-id=22484632;target-msg-id=11111111-0000-4000-8000-000000000005;tmi-sent-ts=1794826006400 :tmi.twitch.tv CLEARMSG #forsen :buy followers at spam.example",
+  "@ban-duration=600;historical=1;room-id=22484632;rm-received-ts=1794826007100;target-user-id=9;tmi-sent-ts=1794826007000 :tmi.twitch.tv CLEARCHAT #forsen :trouble",
+  "@emote-only=0;followers-only=-1;historical=1;r9k=0;rm-received-ts=1794826007200;room-id=22484632;slow=0;subs-only=0 :tmi.twitch.tv ROOMSTATE #forsen",
+  "@historical=1;msg-id=slow_off;rm-received-ts=1794826007300 :tmi.twitch.tv NOTICE #forsen :This room is no longer in slow mode.",
+  "@id=broken :this-is-not!irc",
+  "@historical=1;tmi-sent-ts=1794826007400 :erin!erin@erin.tmi.twitch.tv PRIVMSG #forsen :a line with no id tag",
+  "@badge-info=subscriber/13;badges=subscriber/12,moderator/1;color=#FF4500;display-name=Alice;emotes=;first-msg=0;flags=;historical=1;id=11111111-0000-4000-8000-000000000007;mod=0;returning-chatter=0;rm-received-ts=1794826008180;room-id=22484632;subscriber=1;tmi-sent-ts=1794826008000;turbo=0;user-id=16954429;user-type= :alice!alice@alice.tmi.twitch.tv PRIVMSG #forsen :last one"
+ ],
+ "error": null,
+ "error_code": null
+}

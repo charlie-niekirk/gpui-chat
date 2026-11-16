@@ -33,6 +33,7 @@ theme_name = "default"                     # colour theme: bundled id or themes/
 [chat]
 scrollback = 1000                          # 10 to 100000
 timestamps = true
+history = true                             # load recent messages on join / reconnect (sends the channel name to a third party)
 
 [emotes]
 scale = 1.0                                # 0.5 to 4.0; a Twitch emote is 28 px at 1.0
@@ -158,6 +159,23 @@ own emotes are always on. Files without these keys read as all on.
 
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
 messages). `chat.scrollback` is read once at startup.
+
+### Message history (`chat.history`, PR 5.5)
+
+With `chat.history = true` (the default) a channel shows its recent messages as soon as it is joined,
+and after a reconnect the messages missed meanwhile are filled in. They come from the public
+[recent-messages service](https://recent-messages.robotty.de/) (`recent-messages.robotty.de`, run by a
+third party, not by Twitch or by this app), which keeps the last few hundred messages of the channels
+it has been asked about. They are shown dimmed so they are not mistaken for live chat, and never
+raise a notification.
+
+**Privacy:** to get them the app sends *the name of the channel you joined* (and your IP address, as
+any web request does) to that service. It sends no account, token or message of yours. Set
+`chat.history = false` (or switch off *Chat → Load recent messages*) to never contact it; chat then
+starts empty at the moment you join, as on twitch.tv. The setting is read when a channel is joined or
+re-joined, so changing it affects the next join or reconnect, not channels already open. If the service
+is slow, down or refuses (it is a volunteer-run service), joining is not delayed and the channel shows a
+single quiet line saying history could not be loaded.
 
 ## Twitch account (PR 3.1)
 

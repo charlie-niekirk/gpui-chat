@@ -102,6 +102,14 @@ pub enum ChatEvent {
         channel: ChannelId,
         message: Arc<Message>,
     },
+    /// Recent messages fetched for a channel (PR 5.5), oldest first, every one flagged
+    /// [`crate::MessageFlags::history`]. They are *merged* into what the channel already shows
+    /// ([`crate::MessageStore::merge_history`]: ordered by time, nothing shown twice), not
+    /// appended, because live messages may have arrived while they were being fetched.
+    History {
+        channel: ChannelId,
+        messages: Vec<Arc<Message>>,
+    },
     /// `CLEARCHAT`: whole channel, or one user's messages (timeout / ban).
     ClearChat {
         channel: ChannelId,
@@ -138,6 +146,7 @@ impl ChatEvent {
     pub fn channel(&self) -> Option<&ChannelId> {
         match self {
             Self::Message { channel, .. }
+            | Self::History { channel, .. }
             | Self::ClearChat { channel, .. }
             | Self::DeleteMessage { channel, .. }
             | Self::RoomState { channel, .. } => Some(channel),

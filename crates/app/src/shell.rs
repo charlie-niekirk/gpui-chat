@@ -208,10 +208,12 @@ impl AppShell {
             cx.observe_in(&config::store(cx), window, |this, store, window, cx| {
                 let settings = store.read(cx).settings();
                 let (appearance, emotes) = (settings.appearance.clone(), settings.emotes.clone());
+                let history = settings.chat.history;
                 theme::apply_settings_if_changed(&appearance, Some(window), cx);
                 // The provider switches are idempotent: nothing happens unless one changed.
                 if let Some(live) = &this.live {
                     live.set_emote_providers(emote_service::providers(&emotes));
+                    live.set_history(history);
                 }
                 cx.notify();
             }),

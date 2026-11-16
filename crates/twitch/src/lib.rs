@@ -11,12 +11,15 @@
 //!   rate limits); [`HelixClient::send_chat_message`] sends chat (PR 3.2).
 //! * [`streams`]: `Get Streams` / `Get Followed Streams` and the [`streams::StreamPoller`] behind
 //!   the live dot, the header stream info and the followed-live sidebar.
+//! * [`history`]: [`HistoryClient`], the recent-messages service behind the history shown on join
+//!   and after a reconnect (PR 5.5).
 //! * [`user_emotes`]: `Get User Emotes`, the Twitch emotes the logged-in user may use (PR 3.3).
 
 pub mod auth;
 mod chat_send;
 mod client;
 pub mod helix;
+pub mod history;
 mod limits;
 mod parse;
 pub mod streams;
@@ -28,6 +31,9 @@ pub use client::{
     ClientConfig, Credentials, CredentialsProvider, TwitchClient, irc_login, settled_state,
 };
 pub use helix::{HelixClient, HelixError, HelixListError, HelixResponse};
+pub use history::{
+    Fetch, HistoryClient, HistoryError, HistoryRequest, HistoryTracker, gap_start, parse_history,
+};
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
 pub use user_emotes::UserEmote;

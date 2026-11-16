@@ -197,6 +197,23 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `BadgeRegistry::version(channel)` moved, so subscriber badges that arrive a few hundred ms after a join
   appear without a new message having to push them. A source failing is a `warn` and no badge (global ones
   still show). Not wired to `Reload Emotes`.
+- `history_service.rs` (PR 5.5) — `HistoryService`, the live source's message history. Every event passes
+  `observe` on its way to the UI (next to `BadgeService`): a channel's join confirmation
+  (`Connection { channel: Some(_), Connected }`, repeated for every channel after a reconnect) starts a fetch on the
+  backend runtime, never delaying the join. *What* to ask for is `gpui_chat_twitch::HistoryTracker` (pure, tested
+  there): the first join asks for the newest 100 messages, every later one for the gap since the newest message seen
+  (live or fetched, minus a 10 s overlap; the whole history again if no earlier fetch ever succeeded), only the latest
+  fetch of a channel is still wanted when it finishes, and `chat.history = false` plans nothing so the channel name is
+  never sent. `HistoryClient` (`crates/twitch/src/history.rs`) calls `recent-messages.robotty.de/api/v2/recent-messages/<login>`
+  (`limit`, `after`; 8 s timeout, no account or token sent) and `parse_history` maps the raw IRC lines with the live
+  parser (`parse_line_with`), flags them `history`, applies the `CLEARMSG` / `CLEARCHAT` lines in the answer to the messages before
+  them and drops `ROOMSTATE` / `NOTICE` lines (they describe the room as it was). The answer is one `ChatEvent::History`; third-party emotes
+  are resolved as for live messages. A failure is a `warn` plus one quiet system line in the channel. `ChannelStore::apply`
+  merges the batch with `MessageStore::merge_history`: by timestamp, de-duplicated by message id (the live copy wins), and
+  when it has to go *before* retained messages the buffer is rebuilt with fresh sequence numbers (so every view sees "all
+  replaced" through the ordinary list sync, never a reused number). History rows are drawn at 60 % opacity (`chat/row.rs`),
+  and `flags.history` stays on the message for notifications (PR 5.3) to skip. The setting is read when a channel is joined, so
+  a change applies to the next join or reconnect.
 - `account.rs` / `sign_in.rs` / `platform/keychain.rs` (PR 3.1) — the Twitch account. `AccountHub` (GPUI
   entity, live source only: offline runs never touch the keychain) mirrors `gpui_chat_twitch::Auth`'s
   `AuthState` (a `watch` channel) into the UI: on start the backend restores the stored login and then

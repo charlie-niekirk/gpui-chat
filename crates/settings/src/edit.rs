@@ -445,6 +445,25 @@ x = 1
     }
 
     #[test]
+    fn the_history_switch_writes_only_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "# mine\n[chat]\nscrollback = 500 # keep\n").unwrap();
+        Settings::update_file(
+            &path,
+            &[SettingEdit::set("chat.history", EditValue::Bool(false))],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# mine") && text.contains("scrollback = 500 # keep"),
+            "{text}"
+        );
+        assert!(text.contains("history = false"), "{text}");
+        assert!(!Settings::try_load(&path).unwrap().chat.history);
+    }
+
+    #[test]
     fn update_file_creates_the_file_and_its_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("settings.toml");

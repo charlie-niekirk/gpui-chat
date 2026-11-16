@@ -27,6 +27,9 @@ use crate::channels::ChannelStore;
 use crate::reply::can_reply_to;
 use crate::theme::Tokens;
 
+/// How opaque a history row is drawn: subtle, still easily readable in every bundled theme.
+const HISTORY_OPACITY: f32 = 0.6;
+
 /// What a row needs besides its message.
 pub struct RowContext {
     /// Element-id prefix, so the list's buttons and the thread popover's (same message, same
@@ -49,8 +52,18 @@ pub fn message_row(
     row: &RowContext,
 ) -> AnyElement {
     let element = MessageElement::new(seq, message.clone(), style, cache);
+    // Recent-messages history (PR 5.5) is shown dimmer than live chat.
+    let element = if message.flags.history {
+        div()
+            .w_full()
+            .opacity(HISTORY_OPACITY)
+            .child(element)
+            .into_any_element()
+    } else {
+        element.into_any_element()
+    };
     if row.hovered != Some(seq) || !can_reply_to(message) {
-        return element.into_any_element();
+        return element;
     }
     let reply_button = {
         let (view, message) = (row.view.clone(), message.clone());

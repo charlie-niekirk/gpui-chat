@@ -205,7 +205,7 @@ impl SettingsView {
         let this = cx.entity().downgrade();
         vec![
             appearance_page(&this, cx),
-            chat_page(),
+            chat_page(&this),
             emotes_page(&this),
             streamlink_page(),
             account_page(),
@@ -570,9 +570,23 @@ fn bool_writer(
     }
 }
 
-fn chat_page() -> SettingPage {
+fn chat_page(this: &WeakEntity<SettingsView>) -> SettingPage {
     SettingPage::new("Chat").icon(IconName::Inbox).group(
-        SettingGroup::new().title("History").item(
+        SettingGroup::new().title("History").items([
+            SettingItem::new(
+                "Load recent messages",
+                SettingField::switch(
+                    |cx| current(cx).chat.history,
+                    bool_writer(this, "chat.history"),
+                )
+                .default_value(true),
+            )
+            .description(
+                "Show a channel's recent messages when you join it and fill in what you missed \
+                 after a reconnect, dimmed. Privacy: this sends the channel's name (and your IP \
+                 address) to the third-party recent-messages service, recent-messages.robotty.de; \
+                 off, nothing is sent. Applies the next time a channel is joined.",
+            ),
             SettingItem::new(
                 "Scrollback",
                 fields::number(
@@ -599,7 +613,7 @@ fn chat_page() -> SettingPage {
                 ),
             )
             .description("Messages kept per channel. Takes effect the next time the app starts."),
-        ),
+        ]),
     )
 }
 

@@ -124,6 +124,9 @@ impl ChannelStore {
                 self.messages.push(message);
                 true
             }
+            // Recent messages (PR 5.5) take their place by time among what is shown; one already
+            // shown (live, or from an earlier fetch) is not added again.
+            ChatEvent::History { messages, .. } => self.messages.merge_history(messages) > 0,
             ChatEvent::ClearChat { target, .. } => match target {
                 ClearTarget::Channel => self.messages.mark_all_deleted() > 0,
                 ClearTarget::User { login, .. } => self.messages.mark_user_deleted(&login) > 0,
@@ -384,6 +387,108 @@ mod tests {
         // Different ids are different messages.
         assert!(store.apply(chat("a", "third", "me")));
         assert_eq!(store.messages().len(), 3);
+    }
+
+    fn stamped(id: &str, ts: i64, history: bool) -> Arc<Message> {
+        let mut message = Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new("someone", "someone"),
+            vec![gpui_chat_core::Fragment::Text(id.to_owned())],
+        );
+        message.flags.history = history;
+        Arc::new(message)
+    }
+
+    fn live_at(channel: &str, id: &str, ts: i64) -> ChatEvent {
+        ChatEvent::Message {
+            channel: ChannelId::new(channel),
+            message: stamped(id, ts, false),
+        }
+    }
+
+    fn history_of(channel: &str, items: &[(&str, i64)]) -> ChatEvent {
+        ChatEvent::History {
+            channel: ChannelId::new(channel),
+            messages: items
+                .iter()
+                .map(|(id, ts)| stamped(id, *ts, true))
+                .collect(),
+        }
+    }
+
+    fn order(store: &ChannelStore) -> Vec<(String, bool)> {
+        store
+            .messages()
+            .iter()
+            .map(|m| (m.id.to_string(), m.flags.history))
+            .collect()
+    }
+
+    #[test]
+    fn history_lands_before_live_messages_that_arrived_while_it_was_fetched() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        assert!(store.apply(live_at("a", "l1", 100)));
+        assert!(store.apply(history_of("a", &[("h1", 10), ("h2", 20)])));
+        assert_eq!(
+            order(&store),
+            [
+                ("h1".into(), true),
+                ("h2".into(), true),
+                ("l1".into(), false)
+            ]
+        );
+        // Live chat carries on after it.
+        assert!(store.apply(live_at("a", "l2", 110)));
+        assert_eq!(store.messages().len(), 4);
+    }
+
+    #[test]
+    fn a_message_is_never_shown_twice_whichever_copy_comes_first() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        // Live first, then history repeating it: nothing changes.
+        store.apply(live_at("a", "m1", 10));
+        assert!(
+            !store.apply(history_of("a", &[("m1", 10)])),
+            "no visible change"
+        );
+        // History first, then the live copy of the same id: dropped, the history one stays.
+        store.apply(history_of("a", &[("m2", 20)]));
+        assert!(!store.apply(live_at("a", "m2", 20)));
+        assert_eq!(order(&store), [("m1".into(), false), ("m2".into(), true)]);
+    }
+
+    #[test]
+    fn after_a_reconnect_only_the_gap_is_filled_in_place() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        for (id, ts) in [("a1", 10), ("a2", 20)] {
+            store.apply(live_at("a", id, ts));
+        }
+        // Disconnected; what chat said meanwhile (a3, a4) is only in the service. After the
+        // re-join live messages resume (a5), and the gap fetch (which overlaps a2) arrives later.
+        store.apply(live_at("a", "a5", 50));
+        assert!(store.apply(history_of("a", &[("a2", 20), ("a3", 30), ("a4", 40)])));
+        let ids: Vec<String> = order(&store).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["a1", "a2", "a3", "a4", "a5"]);
+        // The same answer again (a second reconnect) changes nothing.
+        assert!(!store.apply(history_of("a", &[("a3", 30), ("a4", 40)])));
+    }
+
+    #[test]
+    fn history_is_flagged_so_notifications_can_skip_it() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(history_of("a", &[("h", 1)]));
+        store.apply(live_at("a", "l", 2));
+        let flags: Vec<bool> = store.messages().iter().map(|m| m.flags.history).collect();
+        assert_eq!(flags, [true, false]);
+    }
+
+    #[test]
+    fn a_history_batch_reaches_only_its_channels_store() {
+        let mut groups =
+            split_by_channel(vec![history_of("a", &[("h", 1)]), live_at("b", "l", 2)]).0;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.remove(0).0, ChannelId::new("a"));
     }
 
     #[test]

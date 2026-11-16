@@ -112,6 +112,59 @@ impl MessageStore {
         evicted
     }
 
+    /// Merges recent-messages `history` (PR 5.5) into the store by time and returns how many
+    /// messages were added.
+    ///
+    /// * A history message whose id is already retained is skipped (the live copy wins), as is a
+    ///   repeat of an id within `history`, so overlap between a fetch and what was already seen
+    ///   (a reconnect refetching part of it, a message that arrived live meanwhile) shows nothing
+    ///   twice.
+    /// * The new messages take their place by timestamp among the retained ones, each side keeping
+    ///   its own order; on equal timestamps history goes first. Messages newer than everything
+    ///   retained are simply pushed.
+    /// * Placing a message *before* a retained one (the usual case on join: live messages arrived
+    ///   while the fetch ran) rebuilds the buffer, which gives every retained message a **new
+    ///   sequence number**: views see all of it replaced, never a gap or a changed meaning of an
+    ///   old number. When the result exceeds the capacity the oldest messages go, as with `push`.
+    pub fn merge_history(&mut self, history: Vec<Arc<Message>>) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut fresh: Vec<Arc<Message>> = history
+            .into_iter()
+            .filter(|m| !self.by_id.contains_key(&m.id) && seen.insert(m.id.clone()))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        fresh.sort_by_key(|m| m.timestamp);
+        let added = fresh.len();
+        let newest = self.entries.back().map(|e| e.message.timestamp);
+        if newest.is_none_or(|newest| fresh[0].timestamp >= newest) {
+            for message in fresh {
+                self.push(message);
+            }
+            return added;
+        }
+        let retained: Vec<Arc<Message>> = self.entries.drain(..).map(|e| e.message).collect();
+        self.by_id.clear();
+        let (mut old, mut new) = (
+            retained.into_iter().peekable(),
+            fresh.into_iter().peekable(),
+        );
+        loop {
+            let take_new = match (old.peek(), new.peek()) {
+                (Some(o), Some(n)) => n.timestamp <= o.timestamp,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => break,
+            };
+            let next = if take_new { new.next() } else { old.next() };
+            if let Some(message) = next {
+                self.push(message);
+            }
+        }
+        added
+    }
+
     /// Changes the capacity (minimum 1). Shrinking evicts the oldest messages;
     /// returns how many were evicted.
     pub fn set_capacity(&mut self, capacity: usize) -> usize {
@@ -551,6 +604,116 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "200k pushes took {:?}",
             start.elapsed()
+        );
+    }
+
+    fn at(id: &str, ts: i64) -> Arc<Message> {
+        let mut m = Message::chat(
+            id,
+            Timestamp(ts),
+            Author::new("someone", "someone"),
+            vec![Fragment::Text(id.to_owned())],
+        );
+        m.flags.history = true;
+        Arc::new(m)
+    }
+
+    fn live(id: &str, ts: i64) -> Arc<Message> {
+        let mut m = (*at(id, ts)).clone();
+        m.flags.history = false;
+        Arc::new(m)
+    }
+
+    #[test]
+    fn history_on_an_empty_store_is_just_appended() {
+        let mut store = MessageStore::new();
+        assert_eq!(store.merge_history(vec![at("a", 1), at("b", 2)]), 2);
+        assert_eq!(ids(&store), ["a", "b"]);
+        assert_eq!((store.first_seq(), store.next_seq()), (0, 2));
+    }
+
+    #[test]
+    fn history_goes_before_live_messages_that_arrived_first() {
+        let mut store = MessageStore::new();
+        store.push(live("l1", 100));
+        store.push(live("l2", 110));
+        let before = store.next_seq();
+        assert_eq!(store.merge_history(vec![at("h1", 10), at("h2", 20)]), 2);
+        assert_eq!(ids(&store), ["h1", "h2", "l1", "l2"]);
+        assert!(store.get("h1").unwrap().flags.history);
+        assert!(!store.get("l1").unwrap().flags.history);
+        // Everything got a new sequence number: no old one means something else now.
+        assert!(store.first_seq() >= before);
+        assert_eq!(store.get_by_seq(0), None);
+    }
+
+    #[test]
+    fn history_interleaves_by_time_and_keeps_each_sides_order() {
+        let mut store = MessageStore::new();
+        store.push(live("l1", 10));
+        store.push(live("l2", 50));
+        // Out of order on the way in: the merge sorts the history itself.
+        assert_eq!(
+            store.merge_history(vec![at("h2", 30), at("h1", 5), at("h3", 70)]),
+            3
+        );
+        assert_eq!(ids(&store), ["h1", "l1", "h2", "l2", "h3"]);
+    }
+
+    #[test]
+    fn a_message_already_shown_is_not_shown_again() {
+        let mut store = MessageStore::new();
+        store.push(live("m1", 10));
+        store.push(live("m2", 20));
+        let generation = store.generation();
+        // Overlap with what is retained, and a repeat inside the history itself.
+        assert_eq!(
+            store.merge_history(vec![at("m1", 10), at("m2", 20), at("m2", 20)]),
+            0
+        );
+        assert_eq!(store.generation(), generation, "nothing changed");
+        assert_eq!(
+            store.merge_history(vec![at("m2", 20), at("m3", 30), at("m3", 30)]),
+            1
+        );
+        assert_eq!(ids(&store), ["m1", "m2", "m3"]);
+        assert!(
+            !store.get("m2").unwrap().flags.history,
+            "the live copy stays"
+        );
+    }
+
+    #[test]
+    fn a_gap_is_filled_between_what_was_seen_before_and_after() {
+        let mut store = MessageStore::new();
+        for (id, ts) in [("a", 10), ("b", 20), ("e", 60), ("f", 70)] {
+            store.push(live(id, ts));
+        }
+        // Reconnect: the service returns from a bit before the last message seen.
+        assert_eq!(
+            store.merge_history(vec![at("b", 20), at("c", 30), at("d", 40), at("e", 60)]),
+            2
+        );
+        assert_eq!(ids(&store), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn merged_history_respects_the_capacity() {
+        let mut store = MessageStore::with_capacity(3);
+        store.push(live("l1", 100));
+        store.push(live("l2", 110));
+        store.merge_history(vec![at("h1", 1), at("h2", 2), at("h3", 3)]);
+        // The oldest go first, as with `push`; the live ones survive.
+        assert_eq!(ids(&store), ["h3", "l1", "l2"]);
+        assert!(!store.contains("h1"));
+        assert_eq!(
+            store
+                .seq_of("l2")
+                .and_then(|s| store.get_by_seq(s))
+                .unwrap()
+                .id
+                .as_str(),
+            "l2"
         );
     }
 }

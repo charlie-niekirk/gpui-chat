@@ -257,6 +257,18 @@ mod tests {
     }
 
     #[test]
+    fn chat_history_defaults_on_reads_off_and_a_file_without_the_key_means_on() {
+        // A file from before PR 5.5 has no `history` key: on.
+        let old = Settings::parse("[chat]\nscrollback = 500\n", Path::new("x")).unwrap();
+        assert!(old.chat.history);
+        let off = Settings::parse("[chat]\nhistory = false\n", Path::new("x")).unwrap();
+        assert!(!off.chat.history);
+        assert_eq!(off.chat.scrollback, Settings::default().chat.scrollback);
+        let bad = Settings::parse("[chat]\nhistory = \"no\"\n", Path::new("x"));
+        assert!(bad.is_err(), "a non-boolean is refused, not guessed");
+    }
+
+    #[test]
     fn a_file_from_before_the_streamlink_section_still_loads() {
         let old = "schema_version = 1\n\n[appearance]\nfont_size = 15.0\n\n[chat]\nscrollback = 500\n\n[emotes]\nscale = 2.0\n";
         let s = Settings::parse(old, Path::new("x")).unwrap();
