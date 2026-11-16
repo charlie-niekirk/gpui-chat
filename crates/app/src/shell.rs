@@ -11,7 +11,7 @@
 //! name with a menu (log in again, log out) when logged in. A strip above the content says why the
 //! user was logged out, or that the login needs new permissions.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -179,8 +179,10 @@ pub struct AppShell {
     /// A line shown for a few seconds above the panes (a jump to a message that is gone).
     notice: Option<&'static str>,
     notice_task: Option<Task<()>>,
-    /// The panel's rows, with the log generation they were built from.
-    mentions_rows: RefCell<Option<(u64, Rc<Vec<mentions::Row>>)>>,
+    /// The panel's rows (held still while the pointer is on it).
+    mentions_feed: RefCell<mentions::Feed>,
+    /// The pointer is on the Mentions panel.
+    mentions_hover: Rc<Cell<bool>>,
     mentions_scroll: UniformListScrollHandle,
     /// Whether this window is the active one (a channel is only being watched while it is).
     window_active: bool,
@@ -299,7 +301,8 @@ impl AppShell {
             mentions_open: false,
             notice: None,
             notice_task: None,
-            mentions_rows: RefCell::new(None),
+            mentions_feed: RefCell::default(),
+            mentions_hover: Rc::default(),
             mentions_scroll: UniformListScrollHandle::new(),
             window_active: window.is_window_active(),
             hud,
@@ -521,6 +524,7 @@ impl AppShell {
     /// Opens or closes the Mentions panel.
     fn toggle_mentions(&mut self, cx: &mut Context<Self>) {
         self.mentions_open = !self.mentions_open;
+        self.mentions_hover.set(false);
         cx.notify();
     }
 
@@ -1206,22 +1210,20 @@ impl AppShell {
         if !self.mentions_open {
             return None;
         }
-        // Rebuilt only when the log changed, not on every frame or every sidebar change.
-        let rows = {
+        // Rebuilt only when the log changed (not on every frame or sidebar change), and not at all
+        // while the pointer is on the panel: the entry under it must not slide away.
+        let (rows, waiting) = {
             let activity = self.attention.read(cx).activity();
-            let mut cache = self.mentions_rows.borrow_mut();
-            match &*cache {
-                Some((generation, rows)) if *generation == activity.generation() => rows.clone(),
-                _ => {
-                    let rows = Rc::new(mentions::rows(activity.mentions()));
-                    *cache = Some((activity.generation(), rows.clone()));
-                    rows
-                }
-            }
+            self.mentions_feed.borrow_mut().update(
+                self.mentions_hover.get(),
+                activity.generation(),
+                activity.added(),
+                || mentions::rows(activity.mentions()),
+            )
         };
         let shell = cx.entity().downgrade();
-        let close = shell.clone();
-        let pick: mentions::Pick = Rc::new(move |channel, id, window, cx| {
+        let (close, hover, reveal) = (shell.clone(), shell.clone(), shell.clone());
+        let on_pick: mentions::Pick = Rc::new(move |channel, id, window, cx| {
             let (channel, id) = (channel.clone(), id.clone());
             shell
                 .update(cx, |shell, cx| {
@@ -1229,18 +1231,36 @@ impl AppShell {
                 })
                 .ok();
         });
+        let flag = self.mentions_hover.clone();
         Some(mentions::panel(
             rows,
+            waiting,
             &self.mentions_scroll,
             tokens,
-            pick,
-            move |_, cx| {
-                close
-                    .update(cx, |shell, cx| {
-                        shell.mentions_open = false;
-                        cx.notify();
-                    })
-                    .ok();
+            mentions::PanelActions {
+                on_pick,
+                on_close: Rc::new(move |_, cx| {
+                    close
+                        .update(cx, |shell, cx| {
+                            shell.mentions_open = false;
+                            shell.mentions_hover.set(false);
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+                on_hover: Rc::new(move |hovered, _, cx| {
+                    flag.set(hovered);
+                    // Letting go (or taking hold) changes what the panel shows.
+                    hover.update(cx, |_, cx| cx.notify()).ok();
+                }),
+                on_reveal: Rc::new(move |_, cx| {
+                    reveal
+                        .update(cx, |shell, cx| {
+                            shell.mentions_feed.borrow_mut().reveal();
+                            cx.notify();
+                        })
+                        .ok();
+                }),
             },
         ))
     }

@@ -62,17 +62,87 @@ pub fn rows<'a>(entries: impl Iterator<Item = &'a MentionEntry>) -> Vec<Row> {
         .collect()
 }
 
+/// The rows the panel shows, held still while the pointer is over it. The log is newest first and
+/// grows at the top, so a row under the pointer would slide away between seeing it and clicking it:
+/// while held, the rows stay as they were and the hits that arrive meanwhile are only counted (the
+/// panel offers "N new" to show them); leaving the panel lets go.
+#[derive(Default)]
+pub struct Feed {
+    shown: Option<Rc<Vec<Row>>>,
+    /// The log generation `shown` was built from.
+    generation: u64,
+    /// [`crate::activity::Activity::added`] when `shown` was built.
+    added: u64,
+    /// The pointer is over the panel and the rows are pinned.
+    pinned: bool,
+}
+
+impl Feed {
+    /// The rows to show this frame and how many hits are waiting behind them. `held`: the pointer
+    /// is on the panel. `build` makes the rows from the log; it only runs when the rows change.
+    pub fn update(
+        &mut self,
+        held: bool,
+        generation: u64,
+        added: u64,
+        build: impl FnOnce() -> Vec<Row>,
+    ) -> (Rc<Vec<Row>>, usize) {
+        self.pinned = held && self.shown.is_some();
+        let stale = self.shown.is_none() || (!self.pinned && self.generation != generation);
+        if stale {
+            self.shown = Some(Rc::new(build()));
+            self.generation = generation;
+            self.added = added;
+            self.pinned = held;
+        }
+        let rows = self.shown.clone().unwrap_or_default();
+        let waiting = if self.pinned {
+            usize::try_from(added.saturating_sub(self.added)).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        (rows, waiting)
+    }
+
+    /// "N new" was clicked: show what is waiting (the rows are rebuilt at the next frame and the
+    /// pointer, still on the panel, holds that list).
+    pub fn reveal(&mut self) {
+        self.shown = None;
+    }
+}
+
 /// Shows a row's message in its channel.
 pub type Pick = Rc<dyn Fn(&ChannelId, &MessageId, &mut Window, &mut App)>;
 
-/// The panel. `on_close` hides it.
+/// A button's action.
+pub type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
+/// The pointer entering (`true`) or leaving the panel.
+pub type HoverCallback = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+
+/// What the panel's controls do.
+pub struct PanelActions {
+    pub on_pick: Pick,
+    pub on_close: Callback,
+    /// The pointer entered (`true`) or left the panel.
+    pub on_hover: HoverCallback,
+    /// "N new" was clicked.
+    pub on_reveal: Callback,
+}
+
+/// The panel. `waiting` hits are held back behind the rows (see [`Feed`]).
 pub fn panel(
     rows: Rc<Vec<Row>>,
+    waiting: usize,
     scroll: &UniformListScrollHandle,
     tokens: &Tokens,
-    on_pick: Pick,
-    on_close: impl Fn(&mut Window, &mut App) + 'static,
+    actions: PanelActions,
 ) -> AnyElement {
+    let PanelActions {
+        on_pick,
+        on_close,
+        on_hover,
+        on_reveal,
+    } = actions;
     let palette = Palette::from_tokens(tokens);
     let unseen = rows.iter().filter(|row| row.unseen).count();
     let header = h_flex()
@@ -97,7 +167,7 @@ pub fn panel(
                         .child(if unseen == 0 {
                             format!("{}", rows.len())
                         } else {
-                            format!("{unseen} new of {}", rows.len())
+                            format!("{unseen} unseen of {}", rows.len())
                         }),
                 ),
         )
@@ -109,6 +179,23 @@ pub fn panel(
                 .accessibility_label("Close Mentions")
                 .on_click(move |_, window, cx| on_close(window, cx)),
         );
+    // Hits that came while the pointer was on the panel wait here (see `Feed`).
+    let waiting_bar = (waiting > 0).then(|| {
+        div()
+            .id("mentions-waiting")
+            .flex_none()
+            .w_full()
+            .px_3()
+            .py_1()
+            .flex()
+            .justify_center()
+            .bg(tokens.accent)
+            .text_color(tokens.accent_text)
+            .text_sm()
+            .cursor_pointer()
+            .on_click(move |_, window, cx| on_reveal(window, cx))
+            .child(format!("↑ {waiting} new"))
+    });
     let (muted, surface, border) = (tokens.text_muted, tokens.surface, tokens.border);
     let body = if rows.is_empty() {
         div()
@@ -194,7 +281,9 @@ pub fn panel(
         .bg(tokens.main_bg)
         .border_l_1()
         .border_color(tokens.border)
+        .on_hover(move |hovered, window, cx| on_hover(*hovered, window, cx))
         .child(header)
+        .children(waiting_bar)
         .child(div().flex_1().min_h_0().child(body))
         .into_any_element()
 }
@@ -238,6 +327,78 @@ mod tests {
                 unseen: true,
             }]
         );
+    }
+
+    fn row(id: &str) -> Row {
+        Row {
+            channel: ChannelId::new("a"),
+            id: MessageId::from(id),
+            author: "Alice".into(),
+            time: "00:00".into(),
+            text: id.to_owned().into(),
+            color: HighlightColor::Accent,
+            unseen: true,
+        }
+    }
+
+    fn ids(rows: &[Row]) -> Vec<String> {
+        rows.iter().map(|r| r.id.as_str().to_owned()).collect()
+    }
+
+    #[test]
+    fn the_rows_stay_as_they_were_while_the_pointer_is_on_the_panel() {
+        let mut feed = Feed::default();
+        // Not held: follows the log, rebuilding only when it changed.
+        let (rows, waiting) = feed.update(false, 1, 2, || vec![row("2"), row("1")]);
+        assert_eq!(
+            (ids(&rows), waiting),
+            (vec!["2".to_owned(), "1".to_owned()], 0)
+        );
+        let (_, _) = feed.update(false, 1, 2, || panic!("nothing changed"));
+        // The pointer comes in: what is under it is pinned, and new hits only count.
+        let (rows, waiting) = feed.update(true, 1, 2, || panic!("pinned as it is"));
+        assert_eq!(
+            (ids(&rows), waiting),
+            (vec!["2".to_owned(), "1".to_owned()], 0)
+        );
+        let (rows, waiting) = feed.update(true, 2, 3, || panic!("held"));
+        assert_eq!(
+            (ids(&rows), waiting),
+            (vec!["2".to_owned(), "1".to_owned()], 1)
+        );
+        let (_, waiting) = feed.update(true, 4, 5, || panic!("held"));
+        assert_eq!(
+            waiting, 3,
+            "counted since the hold began, not since the last frame"
+        );
+        // The pointer leaves: the list catches up at once.
+        let (rows, waiting) = feed.update(false, 4, 5, || vec![row("5"), row("4")]);
+        assert_eq!(
+            (ids(&rows), waiting),
+            (vec!["5".to_owned(), "4".to_owned()], 0)
+        );
+    }
+
+    #[test]
+    fn showing_the_new_ones_rebuilds_the_list_and_holds_that_one() {
+        let mut feed = Feed::default();
+        feed.update(false, 1, 1, || vec![row("1")]);
+        feed.update(true, 1, 1, || panic!());
+        let (_, waiting) = feed.update(true, 3, 3, || panic!());
+        assert_eq!(waiting, 2);
+        feed.reveal();
+        let (rows, waiting) = feed.update(true, 3, 3, || vec![row("3"), row("2"), row("1")]);
+        assert_eq!((rows.len(), waiting), (3, 0));
+        // And it is held again from there.
+        let (rows, waiting) = feed.update(true, 4, 4, || panic!());
+        assert_eq!((rows.len(), waiting), (3, 1));
+    }
+
+    #[test]
+    fn a_panel_first_opened_under_the_pointer_still_shows_the_log() {
+        let mut feed = Feed::default();
+        let (rows, waiting) = feed.update(true, 5, 5, || vec![row("5")]);
+        assert_eq!((rows.len(), waiting), (1, 0));
     }
 
     #[test]

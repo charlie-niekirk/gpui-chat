@@ -56,6 +56,9 @@ pub struct Activity {
     /// Bumped whenever the log changes (an entry added, dropped or marked seen), so the Mentions
     /// panel rebuilds its rows only then.
     generation: u64,
+    /// How many hits were ever logged (never goes down), so a view can tell how many are new
+    /// since it last looked even while others leave the log.
+    added: u64,
     /// Channels shown by a pane.
     visible: HashSet<ChannelId>,
     /// The channel of the focused pane.
@@ -128,6 +131,7 @@ impl Activity {
             *self.unseen.entry(channel.clone()).or_insert(0) += 1;
         }
         self.generation += 1;
+        self.added += 1;
         self.mentions.push_back(MentionEntry {
             channel: channel.clone(),
             text: message.plain_text().into(),
@@ -146,6 +150,11 @@ impl Activity {
     /// Mentions of `channel` the user has not looked at.
     pub fn unseen_mentions(&self, channel: &ChannelId) -> usize {
         self.unseen.get(channel).copied().unwrap_or(0)
+    }
+
+    /// Hits logged so far, ever.
+    pub fn added(&self) -> u64 {
+        self.added
     }
 
     /// Changes whenever the Mentions log does; see [`Activity::mentions`].
@@ -405,6 +414,26 @@ mod tests {
         assert_eq!(a.generation(), g2, "nothing changed, nothing to rebuild");
         // The text is read once.
         assert_eq!(&*a.mentions().next().unwrap().text, "hi");
+    }
+
+    #[test]
+    fn the_added_count_only_goes_up() {
+        let mut a = Activity::default();
+        for n in 0..MENTION_LOG + 5 {
+            a.note_hit(
+                &channel("a"),
+                message(&n.to_string(), "x"),
+                HighlightColor::Accent,
+            );
+        }
+        assert_eq!(
+            a.added(),
+            (MENTION_LOG + 5) as u64,
+            "eviction does not lower it"
+        );
+        a.message_removed(&channel("a"), &"100".into());
+        a.forget(&channel("a"));
+        assert_eq!(a.added(), (MENTION_LOG + 5) as u64);
     }
 
     #[test]
