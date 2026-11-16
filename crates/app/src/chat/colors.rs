@@ -7,10 +7,32 @@
 //! Pure `f32` maths, so it is unit-tested without a window.
 
 use gpui_chat_core::Rgb;
+use gpui_chat_emotes::{Paint, PaintColor};
 use gpui_kit::{Hsla, Rgba};
 
 /// Contrast ratio a username must reach against the chat background (WCAG AA, normal text).
 pub const MIN_CONTRAST: f32 = 4.5;
+
+/// The contrast a *painted* name must keep against the chat background at its worst colour (WCAG
+/// AA for large or bold text; names are bold). A paint below it is not drawn: the name gets its
+/// plain colour instead.
+pub const PAINT_MIN_CONTRAST: f32 = 3.0;
+
+/// Whether `paint` stays readable on `background`: every colour it can show (its stops and the
+/// middle of every pair) reaches [`PAINT_MIN_CONTRAST`]. Allocation-free.
+pub fn paint_readable(paint: &Paint, background: Hsla) -> bool {
+    paint.min_contrast(Srgb::from_hsla(background).luminance()) >= PAINT_MIN_CONTRAST
+}
+
+/// A paint colour as a GPUI colour.
+pub fn paint_hsla(color: PaintColor) -> Hsla {
+    Hsla::from(Rgba {
+        r: f32::from(color.r) / 255.0,
+        g: f32::from(color.g) / 255.0,
+        b: f32::from(color.b) / 255.0,
+        a: f32::from(color.a) / 255.0,
+    })
+}
 
 /// Twitch's default name colours, used when a user never picked one. Which one a user gets is a
 /// hash of their login, so it is stable across messages, sessions and machines.
@@ -193,6 +215,45 @@ mod tests {
             ("dark", Tokens::dark().main_bg),
             ("light", Tokens::light().main_bg),
         ]
+    }
+
+    /// A horizontal gradient through evenly spaced `colors` (7TV's signed `0xRRGGBBAA`).
+    fn gradient(colors: &[i32]) -> Paint {
+        let last = (colors.len() - 1) as f32;
+        let stops = colors
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| gpui_chat_emotes::Stop {
+                at: i as f32 / last,
+                color: PaintColor::from_i32(c),
+            })
+            .collect();
+        Paint::new(
+            "P".into(),
+            "P".into(),
+            gpui_chat_emotes::PaintFill::Linear {
+                angle: 90.0,
+                repeat: false,
+                stops,
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_paint_is_readable_only_if_every_colour_of_it_is() {
+        let (dark, light) = (Tokens::dark().main_bg, Tokens::light().main_bg);
+        // Magenta to white: fine on dark, washed out on light.
+        let bright = gradient(&[-65281, -1]);
+        assert!(paint_readable(&bright, dark));
+        assert!(!paint_readable(&bright, light));
+        // Dark navy to black: the other way round.
+        let deep = gradient(&[4194559, 255]);
+        assert!(paint_readable(&deep, light));
+        assert!(!paint_readable(&deep, dark));
+        // One bad stop spoils the paint.
+        let mixed = gradient(&[-1, 255, -1]);
+        assert!(!paint_readable(&mixed, dark) && !paint_readable(&mixed, light));
     }
 
     #[test]

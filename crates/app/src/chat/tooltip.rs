@@ -177,6 +177,17 @@ impl EmoteHover {
     }
 }
 
+/// The muted line under a badge's title: whose badge it is (a third-party badge's set names its
+/// provider, see `gpui_chat_emotes::cosmetics::sets`).
+fn badge_kind(badge: &gpui_chat_core::Badge) -> &'static str {
+    match &*badge.id.set {
+        "seventv" => "7TV badge",
+        "ffz" => "FFZ badge",
+        "chatterino" => "Chatterino badge",
+        _ => "Twitch badge",
+    }
+}
+
 /// One column of the tooltip: preview, bold name and a muted line under it.
 struct Column {
     preview: Option<(ImageKey, (f32, f32))>,
@@ -240,7 +251,7 @@ impl EmoteTooltip {
                 vec![Column {
                     preview,
                     name: badge.title.clone(),
-                    kind: "Twitch badge".to_owned(),
+                    kind: badge_kind(badge).to_owned(),
                 }]
             }
         }
@@ -397,5 +408,18 @@ mod tests {
         assert_eq!(check(moved, cx), Some(false));
         assert_eq!(hover.borrow().target(), None);
         assert_eq!(check(rect, cx), None);
+    }
+
+    #[test]
+    fn a_badge_tooltip_names_whose_badge_it_is() {
+        let badge = |set: &str| gpui_chat_core::Badge {
+            id: gpui_chat_core::BadgeId::new(set, "1"),
+            title: "x".to_owned(),
+            urls: gpui_chat_core::ImageUrls::new(),
+        };
+        assert_eq!(badge_kind(&badge("moderator")), "Twitch badge");
+        assert_eq!(badge_kind(&badge("seventv")), "7TV badge");
+        assert_eq!(badge_kind(&badge("ffz")), "FFZ badge");
+        assert_eq!(badge_kind(&badge("chatterino")), "Chatterino badge");
     }
 }

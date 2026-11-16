@@ -1,0 +1,243 @@
+{
+ "ids": [
+  "01FV8PCSG0000BRBEDNCDBP3DJ",
+  "01GAF95ZTG000E8VNG1S1RMTBB",
+  "01GAFA46M0000E8VNG1S1RMTBG",
+  "01GXP5DNHR000CV9HPMT8GM9JZ",
+  "01KG85VVBYG9KRKFME5E6GACB0",
+  "01M506MW5EVSVT0Q5C5TVRHN0A",
+  "01M76WERH4C0CN7CY7M8SX2HFV"
+ ],
+ "response": {
+  "data": {
+   "cosmetics": {
+    "paints": [
+     {
+      "id": "01FV8PCSG0000BRBEDNCDBP3DJ",
+      "name": "Metallic",
+      "function": "LINEAR_GRADIENT",
+      "color": null,
+      "angle": 45,
+      "shape": "circle",
+      "repeat": true,
+      "image_url": "",
+      "stops": [
+       {
+        "at": 0.01,
+        "color": 2105376127
+       },
+       {
+        "at": 0.15,
+        "color": -421075301
+       },
+       {
+        "at": 0.3,
+        "color": -1330597761
+       }
+      ],
+      "shadows": []
+     },
+     {
+      "id": "01KG85VVBYG9KRKFME5E6GACB0",
+      "name": "Pretty in Pink",
+      "function": "LINEAR_GRADIENT",
+      "color": null,
+      "angle": 0,
+      "shape": "circle",
+      "repeat": false,
+      "image_url": "",
+      "stops": [
+       {
+        "at": 0.0,
+        "color": -16723713
+       },
+       {
+        "at": 0.38,
+        "color": -1
+       },
+       {
+        "at": 0.71,
+        "color": -16723713
+       }
+      ],
+      "shadows": [
+       {
+        "x_offset": 0.0,
+        "y_offset": 0.0,
+        "radius": 0.0,
+        "color": -16732417
+       },
+       {
+        "x_offset": 0.0,
+        "y_offset": 0.0,
+        "radius": 1.0,
+        "color": -1946091521
+       }
+      ]
+     },
+     {
+      "id": "01M76WERH4C0CN7CY7M8SX2HFV",
+      "name": "TwitchCon 2026 San Diego",
+      "function": "URL",
+      "color": null,
+      "angle": 0,
+      "shape": "circle",
+      "repeat": false,
+      "image_url": "https://cdn.7tv.app/paint/01M76WERH4C0CN7CY7M8SX2HFV/layer/01M780V6QP2YP0V5E8PPTBH554/1x.webp",
+      "stops": [],
+      "shadows": [
+       {
+        "x_offset": 1.0,
+        "y_offset": 1.0,
+        "radius": 0.0,
+        "color": -1979690753
+       }
+      ]
+     }
+    ],
+    "badges": [
+     {
+      "id": "01GAF95ZTG000E8VNG1S1RMTBB",
+      "name": "7TV Subscriber - 2 Months",
+      "tooltip": "7TV Subscriber (2 Months)",
+      "tag": "sub2",
+      "host": {
+       "url": "//cdn.7tv.app/badge/01GAF95ZTG000E8VNG1S1RMTBB",
+       "files": [
+        {
+         "name": "1x.webp",
+         "width": 18,
+         "height": 18,
+         "format": "WEBP"
+        },
+        {
+         "name": "2x.webp",
+         "width": 36,
+         "height": 36,
+         "format": "WEBP"
+        },
+        {
+         "name": "3x.webp",
+         "width": 54,
+         "height": 54,
+         "format": "WEBP"
+        },
+        {
+         "name": "4x.webp",
+         "width": 72,
+         "height": 72,
+         "format": "WEBP"
+        }
+       ]
+      }
+     },
+     {
+      "id": "01GAFA46M0000E8VNG1S1RMTBG",
+      "name": "Subscriber - Founder",
+      "tooltip": "7TV Subscriber (Founder)",
+      "tag": "subfounder",
+      "host": {
+       "url": "//cdn.7tv.app/badge/01GAFA46M0000E8VNG1S1RMTBG",
+       "files": [
+        {
+         "name": "1x.webp",
+         "width": 18,
+         "height": 18,
+         "format": "WEBP"
+        },
+        {
+         "name": "2x.webp",
+         "width": 36,
+         "height": 36,
+         "format": "WEBP"
+        },
+        {
+         "name": "3x.webp",
+         "width": 54,
+         "height": 54,
+         "format": "WEBP"
+        },
+        {
+         "name": "4x.webp",
+         "width": 72,
+         "height": 72,
+         "format": "WEBP"
+        }
+       ]
+      }
+     },
+     {
+      "id": "01GXP5DNHR000CV9HPMT8GM9JZ",
+      "name": "7TV Subscriber - 1 Year, 9 Months",
+      "tooltip": "7TV Subscriber (1 Year, 9 Months)",
+      "tag": "sub21",
+      "host": {
+       "url": "//cdn.7tv.app/badge/01GXP5DNHR000CV9HPMT8GM9JZ",
+       "files": [
+        {
+         "name": "1x.webp",
+         "width": 18,
+         "height": 18,
+         "format": "WEBP"
+        },
+        {
+         "name": "2x.webp",
+         "width": 36,
+         "height": 36,
+         "format": "WEBP"
+        },
+        {
+         "name": "3x.webp",
+         "width": 54,
+         "height": 54,
+         "format": "WEBP"
+        },
+        {
+         "name": "4x.webp",
+         "width": 72,
+         "height": 72,
+         "format": "WEBP"
+        }
+       ]
+      }
+     },
+     {
+      "id": "01M506MW5EVSVT0Q5C5TVRHN0A",
+      "name": "Cutely",
+      "tooltip": "A cute fashionista",
+      "tag": "cute",
+      "host": {
+       "url": "//cdn.7tv.app/badge/01M506MW5EVSVT0Q5C5TVRHN0A",
+       "files": [
+        {
+         "name": "1x.webp",
+         "width": 18,
+         "height": 18,
+         "format": "WEBP"
+        },
+        {
+         "name": "2x.webp",
+         "width": 36,
+         "height": 36,
+         "format": "WEBP"
+        },
+        {
+         "name": "3x.webp",
+         "width": 54,
+         "height": 54,
+         "format": "WEBP"
+        },
+        {
+         "name": "4x.webp",
+         "width": 72,
+         "height": 72,
+         "format": "WEBP"
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ }
+}

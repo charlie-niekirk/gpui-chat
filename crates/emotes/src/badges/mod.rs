@@ -130,9 +130,23 @@ fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// The most third-party badge definitions kept (7TV has a few hundred).
+const EXTRA_CAP: usize = 4_096;
+
 /// A set and the registry version at which it was stored.
 struct Stored {
     set: Arc<BadgeSet>,
+    version: u64,
+}
+
+/// Badges that belong to no channel and no Twitch source: the third-party providers' (7TV, FFZ,
+/// Chatterino; see [`crate::cosmetics`]). A set can be hidden without forgetting its
+/// definitions.
+#[derive(Default)]
+struct Extra {
+    set: BadgeSet,
+    hidden: Vec<Arc<str>>,
+    /// The registry counter value at the last change.
     version: u64,
 }
 
@@ -140,6 +154,7 @@ struct Stored {
 struct Sets {
     global: Option<Stored>,
     channels: HashMap<ChannelId, Stored>,
+    extra: Extra,
 }
 
 /// The loaded badge sets, shared between the loaders (writers, on the runtime) and the chat view
@@ -184,6 +199,64 @@ impl BadgeRegistry {
             .remove(channel);
     }
 
+    /// Adds third-party badge definitions (a set name of their own: `seventv`, `ffz`, ...). The
+    /// registry's version moves only if a definition is new or changed, so a chatter whose badge
+    /// is already known costs views nothing.
+    pub fn store_extra(&self, badges: impl IntoIterator<Item = Badge>) {
+        let mut changed = false;
+        let mut sets = self.sets.write().unwrap_or_else(PoisonError::into_inner);
+        for badge in badges {
+            if sets
+                .extra
+                .set
+                .get(&badge.id.set, &badge.id.version)
+                .is_some_and(|old| **old == badge)
+            {
+                continue;
+            }
+            // Definitions come from the network; a sane number is plenty.
+            if sets.extra.set.len() >= EXTRA_CAP
+                && sets
+                    .extra
+                    .set
+                    .get(&badge.id.set, &badge.id.version)
+                    .is_none()
+            {
+                continue;
+            }
+            sets.extra.set.insert(badge);
+            changed = true;
+        }
+        if changed {
+            sets.extra.version = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        }
+    }
+
+    /// Whether a third-party definition of `set/version` is stored (hidden or not).
+    pub fn has_extra(&self, set: &str, version: &str) -> bool {
+        self.sets
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extra
+            .set
+            .get(set, version)
+            .is_some()
+    }
+
+    /// Hides (or shows again) the third-party badges of `set`.
+    pub fn set_extra_hidden(&self, set: &str, hidden: bool) {
+        let mut sets = self.sets.write().unwrap_or_else(PoisonError::into_inner);
+        let at = sets.extra.hidden.iter().position(|name| &**name == set);
+        match (hidden, at) {
+            (true, None) => sets.extra.hidden.push(Arc::from(set)),
+            (false, Some(i)) => {
+                sets.extra.hidden.remove(i);
+            }
+            _ => return,
+        }
+        sets.extra.version = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+    }
+
     fn stored(&self, set: BadgeSet) -> Stored {
         // Built before the lock is taken: the clone-free move is all that happens under it.
         Stored {
@@ -208,6 +281,13 @@ impl BadgeRegistry {
                     .as_ref()
                     .and_then(|stored| stored.set.get(set, version))
             })
+            .or_else(|| {
+                let extra = &sets.extra;
+                if extra.hidden.iter().any(|name| &**name == set) {
+                    return None;
+                }
+                extra.set.get(set, version)
+            })
             .cloned()
     }
 
@@ -221,7 +301,7 @@ impl BadgeRegistry {
             .channels
             .get(channel)
             .map_or(0, |stored| stored.version);
-        global.max(channel)
+        global.max(channel).max(sets.extra.version)
     }
 }
 

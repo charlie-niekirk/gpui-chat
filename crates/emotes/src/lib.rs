@@ -24,10 +24,12 @@
 pub mod badges;
 pub mod bttv;
 pub mod catalog;
+pub mod cosmetics;
 mod error;
 pub mod ffz;
 mod http;
 mod lenient;
+pub mod live;
 mod loader;
 mod resolver;
 mod set;
@@ -41,14 +43,16 @@ pub use badges::{
 };
 pub use bttv::BttvClient;
 pub use catalog::EmoteCatalog;
+pub use cosmetics::{CosmeticOptions, Cosmetics, Paint, PaintColor, PaintFill, Shadow, Stop};
 pub use error::EmoteError;
 pub use ffz::FfzClient;
 pub use http::{
     HttpClient, HttpConfig, HttpError, HttpFuture, HttpResponse, ReqwestHttp, user_agent,
 };
+pub use live::{Backoff, Endpoints, LiveEmotes, LiveSink};
 pub use loader::{EmoteLoader, ProviderResults};
 pub use resolver::{EmoteRegistry, EmoteResolver, Providers};
-pub use set::{EmoteScope, EmoteSet, SetEmote};
+pub use set::{EmoteChange, EmoteScope, EmoteSet, SetEmote, SetOrigin};
 pub use seventv::SevenTvClient;
 
 /// Checks that `id` is a plain Twitch user id (ASCII digits), so it can be put in a URL
@@ -59,6 +63,39 @@ pub(crate) fn validate_user_id(id: &str) -> Result<&str, EmoteError> {
     } else {
         Err(EmoteError::InvalidUserId(id.to_owned()))
     }
+}
+
+/// The hosts image URLs from the providers may point to (and their subdomains): the providers'
+/// own CDNs, Chatterino's badge host and Twitch's CDN. Images come from provider APIs and live
+/// sockets, which are untrusted: an `http` URL, a bare IP or any other host is refused rather
+/// than fetched.
+pub const TRUSTED_IMAGE_HOSTS: [&str; 7] = [
+    "7tv.app",
+    "7tv.io",
+    "betterttv.net",
+    "frankerfacez.com",
+    "chatterino.com",
+    // Where Chatterino's badge list actually serves its images from.
+    "fourtf.com",
+    "jtvnw.net",
+];
+
+/// Whether `url` is an `https` URL on one of [`TRUSTED_IMAGE_HOSTS`] (protocol-relative `//host`
+/// URLs are made `https` first, as [`absolute_url`] does).
+pub fn trusted_image_url(url: &str) -> bool {
+    let absolute = absolute_url(url);
+    let Ok(parsed) = reqwest::Url::parse(&absolute) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    TRUSTED_IMAGE_HOSTS
+        .iter()
+        .any(|trusted| host == *trusted || host.ends_with(&format!(".{trusted}")))
 }
 
 /// Makes a provider URL absolute: protocol-relative (`//cdn...`) gets `https:`.
@@ -78,6 +115,33 @@ mod tests {
         assert!(validate_user_id("11148817").is_ok());
         for bad in ["", "abc", "12/34", "1 2", "-1", "１２"] {
             assert!(validate_user_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_https_on_the_providers_hosts_is_trusted() {
+        for good in [
+            "https://cdn.7tv.app/emote/A/1x.webp",
+            "//cdn.7tv.app/emote/A",
+            "https://cdn.betterttv.net/emote/x/1x.webp",
+            "https://cdn.frankerfacez.com/badge/2/1",
+            "https://fourtf.com/chatterino/badges/topd.png",
+            "https://static-cdn.jtvnw.net/emoticons/v2/1/default/dark/1.0",
+        ] {
+            assert!(trusted_image_url(good), "{good}");
+        }
+        for bad in [
+            "",
+            "http://cdn.7tv.app/emote/A",
+            "https://evil.example/7tv.app",
+            "https://7tv.app.evil.example/x",
+            "https://not7tv.app/x",
+            "https://user@cdn.7tv.app/x",
+            "https://127.0.0.1/x",
+            "ftp://cdn.7tv.app/x",
+            "javascript:alert(1)",
+        ] {
+            assert!(!trusted_image_url(bad), "{bad}");
         }
     }
 

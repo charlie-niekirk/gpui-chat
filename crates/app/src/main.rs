@@ -174,7 +174,13 @@ fn start_chat(
             seed: cli.seed,
             channels: firehose::channel_names(cli.firehose_channels),
             start_ts_ms,
+            cosmetics: cli
+                .cosmetics
+                .then(|| cx.global::<badges::Badges>().cosmetics().clone()),
         };
+        if let Some(cosmetics) = &config.cosmetics {
+            firehose::seed_cosmetics(cosmetics);
+        }
         // The handle is dropped on purpose: the task ends when the bridge closes or on quit.
         drop(runtime::spawn_backend(
             cx,
@@ -237,6 +243,7 @@ fn main() {
             // Settings (a bad file falls back to defaults and is shown in the window), then
             // the font and theme they ask for.
             let settings_events = config::init(cx);
+            badges::Badges::apply_settings(&config::current(cx).badges.clone(), cx);
             let appearance = config::current(cx).appearance.clone();
             fonts::init(&appearance, cx);
             // User themes (`themes/*.toml`) load before the first theme is applied.

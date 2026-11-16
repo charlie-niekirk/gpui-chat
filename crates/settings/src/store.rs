@@ -339,6 +339,14 @@ mod tests {
             Settings::parse("[emotes]\nseventv = false\nffz = false\n", Path::new("x")).unwrap();
         assert!(!s.emotes.seventv && s.emotes.bttv && !s.emotes.ffz);
         assert_eq!(s.emotes.scale, Settings::default().emotes.scale);
+    }
+
+    #[test]
+    fn badge_switches_default_on_and_read_one_by_one() {
+        let s = Settings::parse("", Path::new("x")).unwrap();
+        assert!(s.badges.seventv && s.badges.ffz && s.badges.chatterino && s.badges.paints);
+        let s = Settings::parse("[badges]\nffz = false\npaints = false\n", Path::new("x")).unwrap();
+        assert!(s.badges.seventv && !s.badges.ffz && s.badges.chatterino && !s.badges.paints);
         // And they survive a save.
         let back = Settings::parse(&s.to_toml().unwrap(), Path::new("x")).unwrap();
         assert_eq!(back, s);

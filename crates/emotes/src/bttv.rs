@@ -91,6 +91,9 @@ struct RawEmote {
     animated: bool,
     #[serde(default, deserialize_with = "null_default")]
     modifier: bool,
+    /// `png` or `gif`; the socket's emotes may not carry `animated`.
+    #[serde(rename = "imageType")]
+    image_type: Option<String>,
     width: Option<u16>,
     height: Option<u16>,
     /// Only on shared emotes.
@@ -142,6 +145,18 @@ pub(crate) fn parse_channel(body: &[u8]) -> Result<EmoteSet, EmoteError> {
     ))
 }
 
+/// An emote as BTTV's socket sends it (`id`, `code`, `imageType`, ...). `None` if malformed or an
+/// effect modifier.
+pub(crate) fn parse_live_emote(value: &Value) -> Option<SetEmote> {
+    match serde_json::from_value::<RawEmote>(value.clone()) {
+        Ok(raw) => convert(raw, false),
+        Err(error) => {
+            tracing::warn!(%error, "skipping malformed BTTV emote");
+            None
+        }
+    }
+}
+
 /// `None` for text-effect modifiers (see the module docs).
 fn convert(raw: RawEmote, global: bool) -> Option<SetEmote> {
     if raw.modifier {
@@ -163,7 +178,7 @@ fn convert(raw: RawEmote, global: bool) -> Option<SetEmote> {
             name: raw.code.into(),
             provider: EmoteProvider::Bttv,
             urls,
-            animated: raw.animated,
+            animated: raw.animated || raw.image_type.as_deref() == Some("gif"),
             zero_width,
             width: raw.width,
             height: raw.height,

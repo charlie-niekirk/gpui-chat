@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use gpui_chat_core::{ChannelId, ChatEvent};
 use gpui_chat_emotes::badges::snapshot;
 use gpui_chat_emotes::{
-    AnonymousBadgeSource, BadgeFuture, BadgeRegistry, BadgeSource, HelixBadgeSource, HttpClient,
-    HttpError, HttpFuture, HttpResponse, ReqwestHttp,
+    AnonymousBadgeSource, BadgeFuture, BadgeRegistry, BadgeSource, CosmeticOptions, Cosmetics,
+    HelixBadgeSource, HttpClient, HttpError, HttpFuture, HttpResponse, ReqwestHttp,
 };
+use gpui_chat_settings::BadgeSettings;
 use gpui_chat_twitch::{Auth, HelixClient, HelixError};
 use gpui_kit::{App, Global, Task};
 use tokio::runtime::Handle;
@@ -42,6 +43,8 @@ use crate::runtime;
 /// changed, and read [`Badges::registry`] while shaping.
 pub struct Badges {
     registry: Arc<BadgeRegistry>,
+    /// Third-party badges (definitions are in `registry`) and 7TV paints.
+    cosmetics: Arc<Cosmetics>,
     changed: Arc<Notify>,
     /// Bumped on the UI thread whenever the loader stored a set; only its change matters.
     epoch: u64,
@@ -75,8 +78,10 @@ impl Badges {
                 }
             })
         };
+        let cosmetics = Arc::new(Cosmetics::new(registry.clone(), CosmeticOptions::default()));
         cx.set_global(Self {
             registry,
+            cosmetics,
             changed,
             epoch: 0,
             _pump: Some(pump),
@@ -88,6 +93,25 @@ impl Badges {
         &self.registry
     }
 
+    /// The third-party cosmetics (badges next to a name, paints on it).
+    pub fn cosmetics(&self) -> &Arc<Cosmetics> {
+        &self.cosmetics
+    }
+
+    /// Applies the `[badges]` switches: a provider's badges and the paints appear or disappear
+    /// at once (the registry's version moves, so views lay their messages out again).
+    pub fn apply_settings(settings: &BadgeSettings, cx: &mut App) {
+        let options = cosmetic_options(settings);
+        let Some(badges) = cx.try_global::<Self>() else {
+            return;
+        };
+        if badges.cosmetics.options() != options {
+            badges.cosmetics.set_options(options);
+            // Wakes the views; a change to a switch needs a repaint at least.
+            badges.changed.notify_one();
+        }
+    }
+
     /// The notifier a loader wakes after storing a set (tests drive it by hand).
     #[cfg(test)]
     pub fn changed_handle(&self) -> Arc<Notify> {
@@ -97,6 +121,21 @@ impl Badges {
     /// What a [`BadgeService`] needs to store sets and tell the UI.
     fn handles(&self) -> (Arc<BadgeRegistry>, Arc<Notify>) {
         (self.registry.clone(), self.changed.clone())
+    }
+
+    /// What the emote service needs to keep cosmetics: the store and the notifier.
+    pub fn cosmetics_handles(&self) -> (Arc<Cosmetics>, Arc<Notify>) {
+        (self.cosmetics.clone(), self.changed.clone())
+    }
+}
+
+/// The cosmetics switches `settings` asks for.
+pub fn cosmetic_options(settings: &BadgeSettings) -> CosmeticOptions {
+    CosmeticOptions {
+        seventv_badges: settings.seventv,
+        ffz_badges: settings.ffz,
+        chatterino_badges: settings.chatterino,
+        paints: settings.paints,
     }
 }
 

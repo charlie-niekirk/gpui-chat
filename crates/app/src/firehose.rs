@@ -25,9 +25,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use gpui_chat_core::{
-    Author, BadgeId, ChannelId, ChatEvent, Message, MessageKind, Rgb, Timestamp, Tokenizer,
-    twitch_emote_ranges,
+    Author, Badge, BadgeId, ChannelId, ChatEvent, ImageScale, ImageUrls, Message, MessageKind, Rgb,
+    Timestamp, Tokenizer, twitch_emote_ranges,
 };
+use gpui_chat_emotes::{Cosmetics, Paint, PaintColor, PaintFill, Shadow, Stop};
 use tokio::time::{Instant, sleep_until};
 
 use crate::bridge::{BridgeSender, TrySendError};
@@ -51,6 +52,153 @@ pub struct FirehoseConfig {
     pub channels: Vec<ChannelId>,
     /// Timestamp (Unix ms) of message 0; later messages are spaced `1000 / rate` ms apart.
     pub start_ts_ms: i64,
+    /// `--cosmetics`: the store the users' paints and third-party badges are put in (PR 6.2).
+    pub cosmetics: Option<Arc<Cosmetics>>,
+}
+
+/// Defines the demo paints and badges of `--cosmetics` in `cosmetics`: five paints (two of them
+/// unreadable on a dark or a light theme, to show the fallback) and one badge of each third-party
+/// provider, whose images load from the providers' CDNs.
+pub fn seed_cosmetics(cosmetics: &Cosmetics) {
+    let c = |r, g, b| PaintColor::new(r, g, b, 255);
+    let stops = |colors: &[PaintColor]| -> Vec<Stop> {
+        let last = (colors.len() - 1).max(1) as f32;
+        colors
+            .iter()
+            .enumerate()
+            .map(|(i, &color)| Stop {
+                at: i as f32 / last,
+                color,
+            })
+            .collect()
+    };
+    let shadow = |x, y| Shadow {
+        x,
+        y,
+        radius: 0.0,
+        color: PaintColor::new(0, 0, 0, 160),
+    };
+    let paints = [
+        Paint::new(
+            "demo-sunset".into(),
+            "Sunset".into(),
+            PaintFill::Linear {
+                angle: 90.0,
+                repeat: false,
+                stops: stops(&[c(255, 154, 0), c(255, 45, 85), c(255, 0, 200)]),
+            },
+            vec![shadow(1.0, 1.0)],
+        ),
+        Paint::new(
+            "demo-ocean".into(),
+            "Ocean".into(),
+            PaintFill::Linear {
+                angle: 90.0,
+                repeat: false,
+                stops: stops(&[c(0, 208, 255), c(0, 255, 163), c(138, 255, 0)]),
+            },
+            Vec::new(),
+        ),
+        Paint::new(
+            "demo-neon".into(),
+            "Neon".into(),
+            PaintFill::Radial {
+                ellipse: false,
+                repeat: false,
+                stops: stops(&[c(255, 255, 255), c(255, 0, 255)]),
+            },
+            vec![shadow(1.0, 1.0)],
+        ),
+        Paint::new(
+            "demo-gold".into(),
+            "Gold".into(),
+            PaintFill::Linear {
+                angle: 45.0,
+                repeat: true,
+                stops: stops(&[c(255, 215, 0), c(255, 140, 0), c(255, 215, 0)]),
+            },
+            Vec::new(),
+        ),
+        // Too dark for a dark theme: drawn in the plain colour there.
+        Paint::new(
+            "demo-ink".into(),
+            "Ink".into(),
+            PaintFill::Linear {
+                angle: 90.0,
+                repeat: false,
+                stops: stops(&[c(16, 16, 40), c(48, 20, 80)]),
+            },
+            Vec::new(),
+        ),
+    ];
+    for paint in paints {
+        cosmetics.store_paint(paint);
+    }
+    let badge = |set: &str, version: &str, title: &str, one: &str, two: &str, four: &str| Badge {
+        id: BadgeId::new(set, version),
+        title: title.to_owned(),
+        urls: ImageUrls::new()
+            .with(ImageScale::X1, one)
+            .with(ImageScale::X2, two)
+            .with(ImageScale::X4, four),
+    };
+    cosmetics.store_seventv_badge(badge(
+        "seventv",
+        "demo",
+        "7TV: 7TV Subscriber (2 Months)",
+        "https://cdn.7tv.app/badge/01GAF95ZTG000E8VNG1S1RMTBB/1x.webp",
+        "https://cdn.7tv.app/badge/01GAF95ZTG000E8VNG1S1RMTBB/2x.webp",
+        "https://cdn.7tv.app/badge/01GAF95ZTG000E8VNG1S1RMTBB/4x.webp",
+    ));
+    cosmetics.store_ffz(
+        vec![badge(
+            "ffz",
+            "demo",
+            "FFZ: Bot",
+            "https://cdn.frankerfacez.com/badge/2/1",
+            "https://cdn.frankerfacez.com/badge/2/2",
+            "https://cdn.frankerfacez.com/badge/2/4",
+        )],
+        std::collections::HashMap::new(),
+    );
+    cosmetics.store_chatterino(
+        vec![badge(
+            "chatterino",
+            "demo",
+            "Chatterino Supporter",
+            "https://fourtf.com/chatterino/badges/supporter.png",
+            "https://fourtf.com/chatterino/badges/supporter2x.png",
+            "https://fourtf.com/chatterino/badges/supporter3x.png",
+        )],
+        std::collections::HashMap::new(),
+    );
+}
+
+/// What `--cosmetics` gives user number `index` (no random numbers: the chat stays the same for a
+/// seed): every second user a paint, every third a badge of each provider in turn.
+fn decorate(author: &mut Author, index: usize, cosmetics: &Cosmetics) {
+    const PAINTS: [&str; 5] = [
+        "demo-sunset",
+        "demo-ocean",
+        "demo-neon",
+        "demo-gold",
+        "demo-ink",
+    ];
+    if index.is_multiple_of(2)
+        && let Some(id) = &author.user_id
+    {
+        cosmetics.entitle(
+            id,
+            true,
+            PAINTS[(index / 2) % PAINTS.len()],
+            true,
+            std::time::Instant::now(),
+        );
+    }
+    if index.is_multiple_of(3) {
+        let set = ["seventv", "ffz", "chatterino"][(index / 3) % 3];
+        author.badges.push(BadgeId::new(set, "demo"));
+    }
 }
 
 /// `channel-1 .. channel-n` style names for the synthetic channels (`firehose` when there is one).
@@ -355,7 +503,12 @@ pub struct Generator {
 impl Generator {
     pub fn new(config: &FirehoseConfig) -> Self {
         let mut rng = Rng::new(config.seed);
-        let users = make_users(&mut rng);
+        let mut users = make_users(&mut rng);
+        if let Some(cosmetics) = &config.cosmetics {
+            for (index, user) in users.iter_mut().enumerate() {
+                decorate(&mut user.author, index, cosmetics);
+            }
+        }
         let channels = if config.channels.is_empty() {
             vec![ChannelId::new("firehose")]
         } else {
@@ -604,6 +757,7 @@ mod tests {
             seed,
             channels: channel_names(3),
             start_ts_ms: 1_700_000_000_000,
+            cosmetics: None,
         }
     }
 

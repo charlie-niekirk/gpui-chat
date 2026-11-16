@@ -20,19 +20,34 @@
 //!   never requested. [`EmoteService::reload`] (the `Reload Emotes` action) fetches everything
 //!   again; a provider that fails keeps the sets it had.
 //!
+//! * **Live updates and cosmetics (PR 6.2).** Once a channel's sets have loaded, the channel is
+//!   handed to [`LiveEmotes`] (7TV's EventAPI and BTTV's socket): emotes added, renamed or removed
+//!   while the channel is open change its set at once and leave a quiet system line (see
+//!   `gpui_chat_emotes::live`). The same pass over a message adds the author's third-party badges
+//!   (7TV, FFZ, Chatterino) after Twitch's own as extra badge ids, and asks for the author's 7TV
+//!   style when it is not known yet (batched, off the UI thread); the FFZ and Chatterino holder
+//!   lists load once at start. A provider that is off is neither requested nor connected to.
+//!
 //! Offline sources (`--firehose`, `--replay`) have no service: nothing is fetched.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ConnectionState, Message, MessageKind, resolve_fragments,
+    ChannelId, ChatEvent, ConnectionState, Message, MessageKind, Timestamp, resolve_fragments,
 };
-use gpui_chat_emotes::{EmoteLoader, EmoteRegistry, EmoteSet, Providers};
+use gpui_chat_emotes::cosmetics::{bulk, lookup::StyleLookup};
+use gpui_chat_emotes::{
+    Backoff, CosmeticOptions, Cosmetics, EmoteLoader, EmoteRegistry, EmoteSet, Endpoints,
+    HttpClient, LiveEmotes, LiveSink, Providers, ReqwestHttp,
+};
 use gpui_chat_settings::EmoteSettings;
 use gpui_kit::App;
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 
+use crate::badges::Badges;
+use crate::bridge::BridgeSender;
 use crate::runtime;
 
 /// The providers `settings` asks for.
@@ -81,11 +96,32 @@ impl State {
     }
 }
 
+/// What the service keeps besides emote sets (see the module docs); none in tests that do not
+/// need it.
+#[derive(Default)]
+pub struct Extras {
+    /// Third-party badges and paints, and the batched 7TV lookup that fills them.
+    cosmetics: Option<(Arc<Cosmetics>, StyleLookup)>,
+    /// Live emote updates.
+    live: Option<LiveEmotes>,
+    /// Where the FFZ and Chatterino holder lists come from, and who is told when they land.
+    bulk: Option<(Arc<dyn HttpClient>, Arc<Notify>)>,
+}
+
+/// Which holder lists have loaded (or are loading).
+#[derive(Default)]
+struct BulkState {
+    ffz: bool,
+    chatterino: bool,
+}
+
 struct Inner {
     loader: EmoteLoader,
-    registry: EmoteRegistry,
+    registry: Arc<EmoteRegistry>,
     handle: Handle,
     state: Mutex<State>,
+    extras: Extras,
+    bulk: Mutex<BulkState>,
 }
 
 impl Inner {
@@ -102,12 +138,32 @@ pub struct EmoteService {
 
 impl EmoteService {
     /// A service over `loader` that runs its requests on `handle`. Loads nothing yet.
+    #[cfg(test)]
     pub fn new(loader: EmoteLoader, enabled: Providers, handle: Handle) -> Self {
+        Self::with_extras(
+            loader,
+            enabled,
+            handle,
+            Arc::new(EmoteRegistry::new(enabled)),
+            Extras::default(),
+        )
+    }
+
+    fn with_extras(
+        loader: EmoteLoader,
+        enabled: Providers,
+        handle: Handle,
+        registry: Arc<EmoteRegistry>,
+        extras: Extras,
+    ) -> Self {
+        let _ = enabled;
         Self {
             inner: Arc::new(Inner {
                 loader,
-                registry: EmoteRegistry::new(enabled),
+                registry,
                 handle,
+                extras,
+                bulk: Mutex::default(),
                 state: Mutex::new(State {
                     next_token: 0,
                     global: Attempt {
@@ -120,19 +176,131 @@ impl EmoteService {
         }
     }
 
-    /// Starts the service on the backend runtime and begins loading the global sets. `None` if
+    /// Starts the service on the backend runtime and begins loading the global sets (and the
+    /// holder lists of the third-party badges). `sender` is where live-update lines go. `None` if
     /// the HTTP client cannot be built (emotes are then plain text).
-    pub fn start(enabled: Providers, cx: &App) -> Option<Self> {
-        let loader = match runtime::enter(cx, EmoteLoader::with_default_http) {
-            Ok(loader) => loader,
+    pub fn start(enabled: Providers, sender: BridgeSender<ChatEvent>, cx: &App) -> Option<Self> {
+        let http: Arc<dyn HttpClient> = match runtime::enter(cx, ReqwestHttp::new) {
+            Ok(http) => Arc::new(http),
             Err(error) => {
                 tracing::warn!(%error, "third-party emotes unavailable");
                 return None;
             }
         };
-        let service = Self::new(loader, enabled, cx.global::<runtime::Backend>().handle());
+        let loader = EmoteLoader::new(http.clone());
+        let handle = cx.global::<runtime::Backend>().handle();
+        let registry = Arc::new(EmoteRegistry::new(enabled));
+        let mut extras = Extras::default();
+        if let Some(badges) = cx.try_global::<Badges>() {
+            let (cosmetics, changed) = badges.cosmetics_handles();
+            let poke = changed.clone();
+            let lookup = StyleLookup::start(
+                &handle,
+                http.clone(),
+                cosmetics.clone(),
+                Arc::new(move || poke.notify_one()),
+            );
+            let sink = Arc::new(AppSink {
+                sender,
+                handle: handle.clone(),
+                changed: changed.clone(),
+            });
+            extras.live = Some(LiveEmotes::new(
+                &handle,
+                registry.clone(),
+                cosmetics.clone(),
+                loader.seven_tv.clone(),
+                sink,
+                endpoints(),
+                Backoff::default(),
+            ));
+            extras.cosmetics = Some((cosmetics, lookup));
+            extras.bulk = Some((http, changed));
+        }
+        let service = Self::with_extras(loader, enabled, handle, registry, extras);
         service.load_global();
+        service.load_bulk_badges();
         Some(service)
+    }
+
+    /// Loads the FFZ and Chatterino badge holder lists that are switched on and not loaded yet.
+    /// A failure is a warning; the next `Connected` or a switch being turned on tries again.
+    fn load_bulk_badges(&self) {
+        let (Some((cosmetics, _)), Some((http, changed))) =
+            (&self.inner.extras.cosmetics, &self.inner.extras.bulk)
+        else {
+            return;
+        };
+        let options = cosmetics.options();
+        let (want_ffz, want_chatterino) = {
+            let mut bulk = self
+                .inner
+                .bulk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let want = (
+                options.ffz_badges && !bulk.ffz,
+                options.chatterino_badges && !bulk.chatterino,
+            );
+            bulk.ffz |= want.0;
+            bulk.chatterino |= want.1;
+            want
+        };
+        for (wanted, name) in [(want_ffz, "FFZ"), (want_chatterino, "Chatterino")] {
+            if !wanted {
+                continue;
+            }
+            let (inner, cosmetics, http, changed) = (
+                self.inner.clone(),
+                cosmetics.clone(),
+                http.clone(),
+                changed.clone(),
+            );
+            drop(self.inner.handle.spawn(async move {
+                let loaded = if name == "FFZ" {
+                    bulk::load_ffz(&*http).await
+                } else {
+                    bulk::load_chatterino(&*http).await
+                };
+                match loaded {
+                    Ok(list) => {
+                        tracing::debug!(
+                            badges = list.badges.len(),
+                            holders = list.holders.len(),
+                            "{name} badges loaded"
+                        );
+                        if name == "FFZ" {
+                            cosmetics.store_ffz(list.badges, list.holders);
+                        } else {
+                            cosmetics.store_chatterino(list.badges, list.holders);
+                        }
+                        changed.notify_one();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "{name} badges unavailable");
+                        let mut bulk = inner.bulk.lock().unwrap_or_else(PoisonError::into_inner);
+                        if name == "FFZ" {
+                            bulk.ffz = false;
+                        } else {
+                            bulk.chatterino = false;
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
+    /// Applies the `[badges]` switches (and tells the live connections whether 7TV's cosmetics
+    /// still need one).
+    pub fn set_cosmetic_options(&self, options: CosmeticOptions) {
+        let Some((cosmetics, _)) = &self.inner.extras.cosmetics else {
+            return;
+        };
+        cosmetics.set_options(options);
+        if let Some(live) = &self.inner.extras.live {
+            live.configure(self.inner.registry.enabled(), options);
+        }
+        self.load_bulk_badges();
     }
 
     /// Fetches the global sets now, whatever their state.
@@ -203,6 +371,17 @@ impl EmoteService {
                     Load::Incomplete
                 };
             }
+            // Listen for changes: a channel whose providers failed to load still gets its
+            // cosmetics, and BTTV (keyed by the room id alone). Done while the room is still
+            // known to be open (`state` is held), so a `forget` cannot slip in between and have
+            // its channel re-opened afterwards.
+            if let Some(live) = &inner.extras.live {
+                let origin = inner
+                    .registry
+                    .channel_set(&channel, gpui_chat_core::EmoteProvider::SevenTv)
+                    .and_then(|set| set.origin().cloned());
+                live.open_channel(&channel, &room_id, origin.as_ref());
+            }
         }));
     }
 
@@ -228,6 +407,11 @@ impl EmoteService {
             return;
         }
         self.inner.registry.set_enabled(providers);
+        if let (Some(live), Some((cosmetics, _))) =
+            (&self.inner.extras.live, &self.inner.extras.cosmetics)
+        {
+            live.configure(providers, cosmetics.options());
+        }
         if providers.gains_over(before) {
             self.reload();
         }
@@ -243,6 +427,9 @@ impl EmoteService {
     pub fn forget(&self, channel: &ChannelId) {
         self.inner.state().rooms.remove(channel);
         self.inner.registry.forget_channel(channel);
+        if let Some(live) = &self.inner.extras.live {
+            live.close_channel(channel);
+        }
     }
 
     /// Passes `event` on: a `ROOMSTATE` with a new room id (or repeating one whose last load was
@@ -275,6 +462,7 @@ impl EmoteService {
                 if self.inner.state().global.load == Load::Incomplete {
                     self.load_global();
                 }
+                self.load_bulk_badges();
                 ChatEvent::Connection {
                     channel: None,
                     state: ConnectionState::Connected,
@@ -282,6 +470,37 @@ impl EmoteService {
             }
             other => other,
         }
+    }
+
+    /// `message` with its author's third-party badges added after Twitch's own, and the author's
+    /// 7TV style asked for when it is not known (the answer shows from their next message on, and
+    /// the paint on their name at once). The same message if there is nothing to add.
+    fn with_cosmetics(&self, message: Arc<Message>) -> Arc<Message> {
+        let Some((cosmetics, lookup)) = &self.inner.extras.cosmetics else {
+            return message;
+        };
+        let Some(author) = &message.author else {
+            return message;
+        };
+        let Some(user_id) = author.user_id.as_deref() else {
+            return message;
+        };
+        if cosmetics.options().wants_seventv() {
+            lookup.request(user_id);
+        }
+        let extra = cosmetics.badge_ids(user_id);
+        if extra.is_empty() || extra.iter().all(|id| author.badges.contains(id)) {
+            return message;
+        }
+        let mut message = (*message).clone();
+        if let Some(author) = &mut message.author {
+            for id in extra {
+                if !author.badges.contains(&id) {
+                    author.badges.push(id);
+                }
+            }
+        }
+        Arc::new(message)
     }
 
     /// `message` with its third-party emotes resolved, or the same message if there are none.
@@ -292,6 +511,7 @@ impl EmoteService {
         ) {
             return message;
         }
+        let message = self.with_cosmetics(message);
         let resolver = self.inner.registry.resolver(channel);
         if resolver.is_empty() {
             return message;
@@ -303,6 +523,58 @@ impl EmoteService {
             }),
             None => message,
         }
+    }
+}
+
+/// The live-update endpoints. `GPUI_CHAT_7TV_EVENTS_URL` and `GPUI_CHAT_BTTV_SOCKET_URL` point
+/// them elsewhere (a local server replaying recorded frames, for checking the feature without
+/// waiting for an editor); unset, the providers' own.
+fn endpoints() -> Endpoints {
+    let mut endpoints = Endpoints::default();
+    if let Ok(url) = std::env::var("GPUI_CHAT_7TV_EVENTS_URL") {
+        endpoints.seven_tv = url;
+    }
+    if let Ok(url) = std::env::var("GPUI_CHAT_BTTV_SOCKET_URL") {
+        endpoints.bttv = url;
+    }
+    endpoints
+}
+
+/// Where live emote changes show up: a quiet system line in the channel's chat, through the same
+/// bridge every event takes, and a wake-up of the views when cosmetics changed.
+struct AppSink {
+    sender: BridgeSender<ChatEvent>,
+    handle: Handle,
+    changed: Arc<Notify>,
+}
+
+impl LiveSink for AppSink {
+    fn notice(&self, channel: &ChannelId, text: String) {
+        let sender = self.sender.clone();
+        let event = emote_notice(channel, text, crate::live::now());
+        drop(self.handle.spawn(async move {
+            // A closed bridge means the UI is gone.
+            let _ = sender.send(event).await;
+        }));
+    }
+
+    fn cosmetics_changed(&self) {
+        self.changed.notify_one();
+    }
+}
+
+/// The system line for a live emote change. The id carries a counter so two lines of one
+/// millisecond (7TV and BTTV) are not taken for one message.
+pub fn emote_notice(channel: &ChannelId, text: String, at: Timestamp) -> ChatEvent {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "emote-live:{}:{}",
+        at.unix_millis(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    ChatEvent::Message {
+        channel: channel.clone(),
+        message: Arc::new(Message::plain(id, at, MessageKind::System, text)),
     }
 }
 
@@ -654,5 +926,215 @@ mod tests {
             )),
         };
         assert_eq!(service.process(system.clone()), system);
+    }
+
+    /// A service with cosmetics (no live connections), over the same fake HTTP.
+    fn cosmetic_service(
+        http: Arc<Fixtures>,
+        options: CosmeticOptions,
+    ) -> (EmoteService, Arc<Cosmetics>) {
+        let registry = Arc::new(gpui_chat_emotes::BadgeRegistry::new());
+        let cosmetics = Arc::new(Cosmetics::new(registry, options));
+        let lookup = StyleLookup::start(
+            &Handle::current(),
+            http.clone(),
+            cosmetics.clone(),
+            Arc::new(|| {}),
+        );
+        let extras = Extras {
+            cosmetics: Some((cosmetics.clone(), lookup)),
+            ..Extras::default()
+        };
+        let loader = EmoteLoader::new(http);
+        let enabled = Providers::ALL;
+        let service = EmoteService::with_extras(
+            loader,
+            enabled,
+            Handle::current(),
+            Arc::new(EmoteRegistry::new(enabled)),
+            extras,
+        );
+        (service, cosmetics)
+    }
+
+    fn message_from(user_id: Option<&str>, badges: &[(&str, &str)]) -> ChatEvent {
+        let mut author = Author::new("al", "Al");
+        author.user_id = user_id.map(str::to_owned);
+        author.badges = badges
+            .iter()
+            .map(|(set, version)| gpui_chat_core::BadgeId::new(*set, *version))
+            .collect();
+        ChatEvent::Message {
+            channel: ChannelId::new("c"),
+            message: Arc::new(Message::chat(
+                "1",
+                Timestamp(0),
+                author,
+                Tokenizer::new().tokenize("hi", &[]).fragments,
+            )),
+        }
+    }
+
+    fn badge_names(event: &ChatEvent) -> Vec<String> {
+        let ChatEvent::Message { message, .. } = event else {
+            panic!("not a message");
+        };
+        message
+            .author
+            .as_ref()
+            .unwrap()
+            .badges
+            .iter()
+            .map(|b| format!("{}/{}", b.set, b.version))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn third_party_badges_follow_twitchs_and_each_user_is_looked_up_once() {
+        let http = fixtures();
+        let (service, cosmetics) = cosmetic_service(http.clone(), CosmeticOptions::default());
+        cosmetics.set_style(
+            "42",
+            gpui_chat_emotes::cosmetics::UserStyle {
+                paint_id: None,
+                badge_id: Some("B1".into()),
+            },
+            std::time::Instant::now(),
+        );
+        let out = service.process(message_from(Some("42"), &[("moderator", "1")]));
+        assert_eq!(badge_names(&out), ["moderator/1", "seventv/B1"]);
+        // Twice is no different, and a message that already carries them is not changed.
+        assert_eq!(
+            badge_names(&service.process(out.clone())),
+            ["moderator/1", "seventv/B1"]
+        );
+
+        // An unknown chatter is asked about, once, in one batched 7TV request.
+        service.process(message_from(Some("77"), &[]));
+        service.process(message_from(Some("77"), &[]));
+        eventually(|| {
+            http.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| url.starts_with("https://7tv.io/v3/gql?"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let asked: Vec<String> = http
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.contains("gql"))
+            .cloned()
+            .collect();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("77"), "{}", asked[0]);
+        // Known chatters (42, whose style is stored) were not asked about.
+        assert!(!asked[0].contains("%2242%22"), "{}", asked[0]);
+
+        // Messages without a user id (the offline sources, a system line) are left alone.
+        let anonymous = message_from(None, &[("moderator", "1")]);
+        assert_eq!(service.process(anonymous.clone()), anonymous);
+    }
+
+    #[tokio::test]
+    async fn no_7tv_request_when_neither_paints_nor_7tv_badges_are_on() {
+        let http = fixtures();
+        let options = CosmeticOptions {
+            seventv_badges: false,
+            paints: false,
+            ..CosmeticOptions::default()
+        };
+        let (service, _) = cosmetic_service(http.clone(), options);
+        service.process(message_from(Some("77"), &[]));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            http.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|u| !u.contains("gql"))
+        );
+    }
+
+    #[test]
+    fn the_live_line_is_a_quiet_system_message_with_a_distinct_id() {
+        let at = Timestamp::from_unix_millis(1_000);
+        let (a, b) = (
+            emote_notice(&ChannelId::new("c"), "7TV: added A".into(), at),
+            emote_notice(&ChannelId::new("c"), "BTTV: removed Bee".into(), at),
+        );
+        let (ChatEvent::Message { message: a, .. }, ChatEvent::Message { message: b, .. }) = (a, b)
+        else {
+            panic!("messages");
+        };
+        assert_eq!(a.kind, MessageKind::System);
+        assert!(a.author.is_none());
+        assert_ne!(a.id, b.id, "two lines of one millisecond are two messages");
+    }
+
+    struct Quiet;
+
+    impl LiveSink for Quiet {
+        fn notice(&self, _: &ChannelId, _: String) {}
+        fn cosmetics_changed(&self) {}
+    }
+
+    #[tokio::test]
+    async fn a_channel_is_listened_for_once_its_sets_have_loaded_and_not_after_it_closes() {
+        let http = fixtures();
+        let registry = Arc::new(EmoteRegistry::new(Providers::ALL));
+        let cosmetics = Arc::new(Cosmetics::new(
+            Arc::new(gpui_chat_emotes::BadgeRegistry::new()),
+            CosmeticOptions::default(),
+        ));
+        let loader = EmoteLoader::new(http);
+        // Nothing listens on these ports: the connections fail and are retried, which is not
+        // what this is about.
+        let unreachable = Endpoints {
+            seven_tv: "ws://127.0.0.1:9".into(),
+            bttv: "ws://127.0.0.1:9".into(),
+        };
+        let live = LiveEmotes::new(
+            &Handle::current(),
+            registry.clone(),
+            cosmetics,
+            loader.seven_tv.clone(),
+            Arc::new(Quiet),
+            unreachable,
+            Backoff::default(),
+        );
+        let extras = Extras {
+            live: Some(live),
+            ..Extras::default()
+        };
+        let service =
+            EmoteService::with_extras(loader, Providers::ALL, Handle::current(), registry, extras);
+        let channel = ChannelId::new("pajlada");
+        let is_open = |service: &EmoteService| {
+            service
+                .inner
+                .extras
+                .live
+                .as_ref()
+                .unwrap()
+                .is_open(&channel)
+        };
+        assert!(!is_open(&service));
+        service.process(room("pajlada", "11148817"));
+        eventually(|| is_open(&service)).await;
+        // The 7TV set's ids came with the load: the live connection can subscribe to them.
+        let origin = service
+            .inner
+            .registry
+            .channel_set(&channel, gpui_chat_core::EmoteProvider::SevenTv)
+            .and_then(|set| set.origin().cloned())
+            .expect("the 7TV set's ids");
+        assert_eq!(origin.set_id.as_deref(), Some("01F7GF1ZV8000EFV6JZ29CKEDB"));
+
+        service.forget(&channel);
+        assert!(!is_open(&service));
     }
 }

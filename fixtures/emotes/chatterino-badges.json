@@ -1,0 +1,58 @@
+{
+ "badges": [
+  {
+   "tooltip": "Chatterino Top Donator",
+   "image1": "https://fourtf.com/chatterino/badges/topd.png",
+   "image2": "https://fourtf.com/chatterino/badges/topd2x.png",
+   "image3": "https://fourtf.com/chatterino/badges/topd3x.png",
+   "users": [
+    "241105451"
+   ]
+  },
+  {
+   "tooltip": "Chatterino Contributor",
+   "image1": "https://fourtf.com/chatterino/badges/helper.png",
+   "image2": "https://fourtf.com/chatterino/badges/helper2x.png",
+   "image3": "https://fourtf.com/chatterino/badges/helper3x.png",
+   "users": [
+    "103973901",
+    "25452828",
+    "57019243",
+    "47113426"
+   ]
+  },
+  {
+   "tooltip": "Chatterino Supporter",
+   "image1": "https://fourtf.com/chatterino/badges/supporter.png",
+   "image2": "https://fourtf.com/chatterino/badges/supporter2x.png",
+   "image3": "https://fourtf.com/chatterino/badges/supporter3x.png",
+   "users": [
+    "230654310",
+    "60168804",
+    "178031344",
+    "84992304"
+   ]
+  },
+  {
+   "tooltip": "Chatterino Developer",
+   "image1": "https://fourtf.com/chatterino/badges/dev.png",
+   "image2": "https://fourtf.com/chatterino/badges/dev2x.png",
+   "image3": "https://fourtf.com/chatterino/badges/dev3x.png",
+   "users": [
+    "117691339",
+    "11148817",
+    "54633016",
+    "99631238"
+   ]
+  },
+  {
+   "tooltip": "Chatterino Special Pepe Badge",
+   "image1": "https://fourtf.com/chatterino/badges/pepe.png",
+   "image2": "https://fourtf.com/chatterino/badges/pepe2x.png",
+   "image3": "https://fourtf.com/chatterino/badges/pepe3x.png",
+   "users": [
+    "128518596"
+   ]
+  }
+ ]
+}
