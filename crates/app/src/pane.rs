@@ -10,8 +10,6 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use std::sync::Arc;
-
 use gpui_chat_core::{
     ChannelId, ConnectionState, FOLLOWER_PRESETS, FollowersOnly, Message, ModCommand, RoomChange,
     RoomMode, RoomState, SLOW_PRESETS, format_seconds,
@@ -37,7 +35,7 @@ use crate::chat::ChatView;
 use crate::chat::selection_layer::CopySelection;
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
-use crate::moderation::{ModRequest, Moderator, RowAction, confirmation};
+use crate::moderation::{FailureKind, ModRequest, Moderator, RowAction, confirmation};
 use crate::splits::view::{DragChip, DraggedPane};
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
@@ -394,11 +392,11 @@ pub struct ChannelPane {
     /// Runs moderation commands (PR 5.2): Helix for the live source, a loopback for `--replay`;
     /// `None` when there is nothing to run them with.
     moderator: Option<Moderator>,
-    /// A moderation action chosen on a message, taken up by the next render (it may need a
-    /// dialog, which needs the window).
-    queued_action: Option<(Arc<Message>, RowAction)>,
-    /// Why the last moderation command failed, until dismissed.
-    mod_notice: Option<SharedString>,
+    /// Why the last moderation command failed (and what kind of failure it was), until dismissed.
+    mod_notice: Option<(SharedString, FailureKind)>,
+    /// The subscription to the chat view's events, made by the first render (it needs the window
+    /// a ban's confirmation dialog opens in).
+    chat_events: Option<Subscription>,
     /// `false` for the offline sources, which have no connection to report.
     live: bool,
     /// Keyboard focus for a pane without an input box (the offline sources).
@@ -440,26 +438,6 @@ impl ChannelPane {
         if let Some(stream_info) = &stream_info {
             subscriptions.push(cx.observe(stream_info, |_, _, cx| cx.notify()));
         }
-        subscriptions.push(
-            cx.subscribe(&chat, |this, _, event: &ChatViewEvent, cx| match event {
-                ChatViewEvent::ReplyRequested(message) => {
-                    if let Some(composer) = &this.composer {
-                        composer
-                            .update(cx, |composer, cx| composer.queue_reply(message.clone(), cx));
-                    }
-                }
-                // Esc cleared the chat's selection: back to the input box (at the next frame,
-                // which has a window to focus in).
-                ChatViewEvent::SelectionDismissed => {
-                    this.refocus = true;
-                    cx.notify();
-                }
-                ChatViewEvent::Moderate(message, action) => {
-                    this.queued_action = Some((message.clone(), *action));
-                    cx.notify();
-                }
-            }),
-        );
         Self {
             hub,
             streams,
@@ -468,8 +446,8 @@ impl ChannelPane {
             chat,
             composer,
             moderator,
-            queued_action: None,
             mod_notice: None,
+            chat_events: None,
             live,
             focus_handle: cx.focus_handle(),
             in_split: false,
@@ -513,13 +491,14 @@ impl ChannelPane {
             (store.channel().clone(), store.room().room_id.clone())
         };
         let Some(room_id) = room_id else {
-            self.mod_notice = Some(
+            self.mod_notice = Some((
                 format!(
                     "Not connected to #{} yet. Try again in a moment.",
                     channel.login()
                 )
                 .into(),
-            );
+                FailureKind::Other,
+            ));
             cx.notify();
             return;
         };
@@ -536,11 +515,19 @@ impl ChannelPane {
         cx.notify();
         cx.spawn(async move |this, cx| {
             // A closed channel means the runtime is stopping; nothing to show.
-            let Ok(Err(reason)) = outcome.await else {
+            let Ok(Err(failure)) = outcome.await else {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.mod_notice = Some(reason.into());
+                // Twitch says this user may not moderate here: the controls go away.
+                if failure.kind == FailureKind::Forbidden {
+                    this.store.update(cx, |store, cx| {
+                        if store.drop_role() {
+                            cx.notify();
+                        }
+                    });
+                }
+                this.mod_notice = Some((failure.message.into(), failure.kind));
                 cx.notify();
             })
             .ok();
@@ -606,7 +593,7 @@ impl ChannelPane {
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let notice = self.mod_notice.clone()?;
+        let (notice, kind) = self.mod_notice.clone()?;
         Some(
             h_flex()
                 .id("mod-notice")
@@ -627,6 +614,18 @@ impl ChannelPane {
                         .text_color(tokens.danger_text)
                         .child(notice),
                 )
+                // Moderation needs permissions a normal login does not ask for: enable them.
+                .children((kind == FailureKind::MissingScope).then(|| {
+                    Button::new("mod-notice-enable")
+                        .small()
+                        .primary()
+                        .label("Enable moderation tools")
+                        .on_click(|_, window, cx| {
+                            if let Some(hub) = crate::account::current(cx) {
+                                crate::sign_in::open_for_moderation(hub, window, cx);
+                            }
+                        })
+                }))
                 .child(
                     Button::new("mod-notice-dismiss")
                         .ghost()
@@ -968,8 +967,29 @@ impl Render for ChannelPane {
         if std::mem::take(&mut self.refocus) {
             cx.on_next_frame(window, |this, window, cx| this.focus(window, cx));
         }
-        if let Some((message, action)) = self.queued_action.take() {
-            self.row_action(&message, action, window, cx);
+        if self.chat_events.is_none() {
+            self.chat_events = Some(cx.subscribe_in(
+                &self.chat,
+                window,
+                |this, _, event: &ChatViewEvent, window, cx| match event {
+                    ChatViewEvent::ReplyRequested(message) => {
+                        if let Some(composer) = &this.composer {
+                            composer.update(cx, |composer, cx| {
+                                composer.queue_reply(message.clone(), cx);
+                            });
+                        }
+                    }
+                    // Esc cleared the chat's selection: back to the input box (at the next
+                    // frame).
+                    ChatViewEvent::SelectionDismissed => {
+                        this.refocus = true;
+                        cx.notify();
+                    }
+                    ChatViewEvent::Moderate(message, action) => {
+                        this.row_action(message, *action, window, cx);
+                    }
+                },
+            ));
         }
         v_flex()
             .id("channel-pane")

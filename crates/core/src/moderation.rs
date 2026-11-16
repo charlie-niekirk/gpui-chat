@@ -141,7 +141,7 @@ impl ModCommand {
             Self::RemoveMod { user } => format!("{user} is no longer a moderator."),
             Self::AddVip { user } => format!("{user} is now a VIP."),
             Self::RemoveVip { user } => format!("{user} is no longer a VIP."),
-            Self::Raid { user } => format!("Raiding {user}. Start it from Twitch's raid prompt."),
+            Self::Raid { user } => format!("Raiding {user} in about 90 s. /unraid to cancel."),
             Self::Unraid => "The raid was cancelled.".to_owned(),
             Self::Shoutout { user } => format!("Gave {user} a shoutout."),
             _ => return None,
@@ -228,6 +228,12 @@ pub const COMMANDS: &[CommandInfo] = &[
     ),
     info("ban", "/ban <user> [reason]", "Ban a user", Moderator),
     info("unban", "/unban <user>", "Lift a ban or timeout", Moderator),
+    info(
+        "untimeout",
+        "/untimeout <user>",
+        "Lift a timeout (same as /unban)",
+        Moderator,
+    ),
     info(
         "delete",
         "/delete <message id>",
@@ -321,7 +327,7 @@ pub fn command_hint(line: &str) -> Option<&'static CommandInfo> {
 
 /// Whether `name` (lowercase, no slash) is one of the moderation commands this module parses.
 pub fn is_mod_command(name: &str) -> bool {
-    name == "untimeout" || (name != "me" && command_info(name).is_some())
+    name != "me" && command_info(name).is_some()
 }
 
 fn usage_of(name: &str) -> &'static str {
@@ -339,7 +345,6 @@ pub fn parse_mod_command(name: &str, args: &str) -> Option<Result<ModCommand, Co
 }
 
 fn parse(name: &str, args: &str) -> Result<ModCommand, CommandError> {
-    let name = if name == "untimeout" { "unban" } else { name };
     let usage = || CommandError::new(format!("Usage: {}", usage_of(name)));
     let mut words = args.split_whitespace();
     let no_args = |command: ModCommand| {
@@ -396,7 +401,7 @@ fn parse(name: &str, args: &str) -> Result<ModCommand, CommandError> {
                 reason: reason_of(rest_after(args, 1))?,
             })
         }
-        "unban" => only_user(words).map(|user| ModCommand::Unban { user }),
+        "unban" | "untimeout" => only_user(words).map(|user| ModCommand::Unban { user }),
         "delete" => {
             let id = words.next().ok_or_else(usage)?;
             if words.next().is_some() {
@@ -438,14 +443,14 @@ fn parse(name: &str, args: &str) -> Result<ModCommand, CommandError> {
                         return Err(usage());
                     }
                     parse_duration(word, DurationUnit::Minutes)
-                        // Whole minutes: a few seconds would silently read as "every follower".
-                        .filter(|seconds| *seconds == 0 || *seconds >= 60)
+                        // Whole minutes only: 90s must not silently become 1m (or 30s "everyone").
+                        .filter(|seconds| seconds % 60 == 0)
                         .map(|seconds| seconds / 60)
                         .and_then(|minutes| u32::try_from(minutes).ok())
                         .filter(|minutes| *minutes <= MAX_FOLLOWER_MINUTES)
                         .ok_or_else(|| {
                             CommandError::new(format!(
-                                "Followers-only takes up to 3 months, from 1 minute (like 30m, 1d, 2w or 3mo). {}",
+                                "Followers-only takes whole minutes, up to 3 months (like 30m, 1d, 2w or 3mo). {}",
                                 usage_line(name)
                             ))
                         })?
@@ -709,11 +714,19 @@ impl RowActions {
     }
 }
 
-/// The moderation controls `message` gets in `channel` for a user who is `role` there: none for
-/// viewers, lines nobody wrote and the broadcaster's own messages; no timeout, ban or unban of
-/// another moderator unless the user is the broadcaster (Twitch refuses it); Delete only for a
-/// chat line that is not yet deleted (a ban after an AutoMod delete is still possible).
-pub fn row_actions(role: ChannelRole, channel: &ChannelId, message: &Message) -> RowActions {
+/// The moderation controls `message` gets in `channel` for a user who is `role` there and whose
+/// own login is `own_login` (when known): none for viewers, for lines nobody wrote, for
+/// events (a `USERNOTICE` card is not a chat line), for the user's own messages and for the
+/// broadcaster's; no timeout, ban or unban of another moderator unless the user is the
+/// broadcaster (Twitch refuses it). Delete only for a chat line that is not yet removed; a
+/// timeout or ban stays possible after a delete (the usual order); Unban only for a message
+/// removed by a timeout or ban (Twitch answers "not banned" to an unban after a plain delete).
+pub fn row_actions(
+    role: ChannelRole,
+    channel: &ChannelId,
+    own_login: Option<&str>,
+    message: &Message,
+) -> RowActions {
     if !role.can_moderate() || message.flags.echo {
         return RowActions::default();
     }
@@ -722,10 +735,8 @@ pub fn row_actions(role: ChannelRole, channel: &ChannelId, message: &Message) ->
     };
     if author.login.is_empty()
         || author.login.eq_ignore_ascii_case(channel.login())
-        || !matches!(
-            message.kind,
-            MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
-        )
+        || own_login.is_some_and(|own| author.login.eq_ignore_ascii_case(own))
+        || !matches!(message.kind, MessageKind::Chat | MessageKind::Action)
     {
         return RowActions::default();
     }
@@ -737,12 +748,10 @@ pub fn row_actions(role: ChannelRole, channel: &ChannelId, message: &Message) ->
     });
     let may_punish = role.is_broadcaster() || !author_is_staff;
     RowActions {
-        delete: may_punish
-            && !message.flags.deleted
-            && matches!(message.kind, MessageKind::Chat | MessageKind::Action),
+        delete: may_punish && !message.flags.deleted,
         timeout: may_punish,
         ban: may_punish,
-        unban: may_punish,
+        unban: may_punish && message.flags.removal.is_punishment(),
     }
 }
 
@@ -1092,77 +1101,130 @@ mod tests {
         Message::chat("m1", Timestamp(0), author, Vec::new())
     }
 
+    use crate::message::Removal;
+
+    fn actions(role: ChannelRole, message: &Message) -> RowActions {
+        row_actions(role, &ChannelId::new("streamer"), Some("me"), message)
+    }
+
+    const ALL_LIVE: RowActions = RowActions {
+        delete: true,
+        timeout: true,
+        ban: true,
+        unban: false,
+    };
+
     #[test]
     fn viewers_and_lines_nobody_wrote_get_no_controls() {
-        let channel = ChannelId::new("streamer");
-        let chat = message("alice", &[]);
-        assert!(!row_actions(ChannelRole::Viewer, &channel, &chat).any());
+        assert!(!actions(ChannelRole::Viewer, &message("alice", &[])).any());
         let notice = Message::plain("n", Timestamp(0), MessageKind::System, "hi");
-        assert!(!row_actions(ChannelRole::Moderator, &channel, &notice).any());
+        assert!(!actions(ChannelRole::Moderator, &notice).any());
         let mut echo = message("alice", &[]);
         echo.flags.echo = true;
-        assert!(!row_actions(ChannelRole::Moderator, &channel, &echo).any());
+        assert!(!actions(ChannelRole::Moderator, &echo).any());
     }
 
     #[test]
-    fn a_moderator_may_act_on_viewers_not_on_the_broadcaster_or_other_staff() {
-        let channel = ChannelId::new("streamer");
-        let all = RowActions {
-            delete: true,
-            timeout: true,
-            ban: true,
-            unban: true,
-        };
+    fn a_moderator_may_act_on_viewers_not_on_the_broadcaster_themselves_or_other_staff() {
         assert_eq!(
-            row_actions(ChannelRole::Moderator, &channel, &message("alice", &[])),
-            all
+            actions(ChannelRole::Moderator, &message("alice", &["subscriber"])),
+            ALL_LIVE
         );
+        assert!(!actions(ChannelRole::Moderator, &message("streamer", &[])).any());
+        assert!(!actions(ChannelRole::Broadcaster, &message("Streamer", &[])).any());
+        // Your own messages (from IRC, not only the echo) get no controls.
+        assert!(!actions(ChannelRole::Moderator, &message("Me", &[])).any());
+        assert!(!actions(ChannelRole::Broadcaster, &message("me", &["moderator"])).any());
+        let other_mod = message("modguy", &["moderator"]);
+        assert!(!actions(ChannelRole::Moderator, &other_mod).any());
+        assert_eq!(actions(ChannelRole::Broadcaster, &other_mod), ALL_LIVE);
+        // Without knowing who you are, the rest still applies.
         assert_eq!(
             row_actions(
                 ChannelRole::Moderator,
-                &channel,
-                &message("alice", &["subscriber"])
+                &ChannelId::new("streamer"),
+                None,
+                &message("alice", &[])
             ),
-            all
-        );
-        assert!(!row_actions(ChannelRole::Moderator, &channel, &message("streamer", &[])).any());
-        assert!(
-            !row_actions(
-                ChannelRole::Broadcaster,
-                &channel,
-                &message("Streamer", &[])
-            )
-            .any()
-        );
-        let other_mod = message("modguy", &["moderator"]);
-        assert!(!row_actions(ChannelRole::Moderator, &channel, &other_mod).any());
-        assert_eq!(
-            row_actions(ChannelRole::Broadcaster, &channel, &other_mod),
-            all
+            ALL_LIVE
         );
     }
 
     #[test]
-    fn a_deleted_message_cannot_be_deleted_again_but_its_author_can_still_be_banned() {
-        let channel = ChannelId::new("streamer");
-        let deleted = message("alice", &[]).with_deleted();
+    fn after_a_delete_the_author_can_still_be_timed_out_or_banned_but_not_unbanned() {
+        let deleted = message("alice", &[]).with_removal(Removal::Deleted);
         assert_eq!(
-            row_actions(ChannelRole::Moderator, &channel, &deleted),
+            actions(ChannelRole::Moderator, &deleted),
             RowActions {
                 delete: false,
                 timeout: true,
                 ban: true,
-                unban: true
+                unban: false
             }
+        );
+        let cleared = message("alice", &[]).with_removal(Removal::Cleared);
+        assert!(!actions(ChannelRole::Moderator, &cleared).unban);
+    }
+
+    #[test]
+    fn unban_is_offered_for_what_a_timeout_or_ban_removed() {
+        for removal in [Removal::TimedOut, Removal::Banned] {
+            let removed = message("alice", &[]).with_removal(removal);
+            assert_eq!(
+                actions(ChannelRole::Moderator, &removed),
+                RowActions {
+                    delete: false,
+                    timeout: true,
+                    ban: true,
+                    unban: true
+                },
+                "{removal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_card_is_not_a_chat_line_it_gets_no_controls() {
+        let mut notice = message("alice", &[]);
+        notice.kind = MessageKind::UserNotice;
+        assert!(!actions(ChannelRole::Moderator, &notice).any());
+        assert!(!actions(ChannelRole::Broadcaster, &notice).any());
+    }
+
+    #[test]
+    fn a_followers_requirement_is_whole_minutes() {
+        assert!(parsed("/followers 90s").is_err());
+        assert!(parsed("/followers 30s").is_err());
+        assert_eq!(
+            parsed("/followers 120s"),
+            Ok(ModCommand::Room(RoomChange::Followers(Some(2))))
+        );
+        let error = parsed("/followers 90s").unwrap_err();
+        assert!(error.contains("whole minutes"), "{error}");
+    }
+
+    #[test]
+    fn untimeout_is_listed_and_means_unban() {
+        assert_eq!(
+            command_info("untimeout").unwrap().usage,
+            "/untimeout <user>"
+        );
+        assert_eq!(command_hint("/untimeout bob").unwrap().name, "untimeout");
+        assert_eq!(
+            parsed("/untimeout bob"),
+            Ok(ModCommand::Unban { user: "bob".into() })
+        );
+        assert_eq!(
+            parsed("/untimeout").unwrap_err(),
+            "Usage: /untimeout <user>"
         );
     }
 
     #[test]
-    fn a_user_notice_can_be_punished_but_not_deleted_by_id() {
-        let channel = ChannelId::new("streamer");
-        let mut notice = message("alice", &[]);
-        notice.kind = MessageKind::UserNotice;
-        let actions = row_actions(ChannelRole::Moderator, &channel, &notice);
-        assert!(actions.timeout && actions.ban && !actions.delete);
+    fn the_raid_says_it_starts_a_countdown() {
+        let line = ModCommand::Raid { user: "bob".into() }
+            .confirmation()
+            .unwrap();
+        assert!(line.contains("90 s") && line.contains("/unraid"), "{line}");
     }
 }

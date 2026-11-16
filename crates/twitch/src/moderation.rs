@@ -41,8 +41,11 @@ pub enum ModError {
     /// Not logged in, the login ended, or the request never completed.
     #[error("{}", helix_message(.0))]
     Helix(#[from] HelixError),
-    /// The login predates the OAuth scope the command needs.
-    #[error("Log in again to grant {scope} (account menu → Log in again).")]
+    /// The login was not granted the OAuth scope the command needs: moderation is enabled by a
+    /// login that asks for it (account menu → *Enable moderation tools…*).
+    #[error(
+        "Log in again to enable moderation (grants {scope}): account menu → Enable moderation tools."
+    )]
     MissingScope { scope: String },
     /// No Twitch account has that login.
     #[error("No Twitch user is called {0}.")]
@@ -53,6 +56,13 @@ pub enum ModError {
     /// Too many requests; Twitch asked to wait.
     #[error("Twitch is rate limiting you. Try again in a moment.")]
     RateLimited,
+}
+
+impl ModError {
+    /// Twitch answered 403: the user is not (or no longer) allowed to moderate here.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Rejected { status: 403, .. })
+    }
 }
 
 /// The OAuth scope `command` needs.
@@ -124,20 +134,18 @@ pub fn build_request(command: &ModCommand, ids: Ids<'_>) -> Result<ModRequest, M
             Method::POST,
             "moderation/bans",
             &as_moderator,
-            Some(json!({ "data": {
+            Some(json!({ "data": with_reason(json!({
                 "user_id": target_id()?,
                 "duration": seconds,
-                "reason": reason.as_deref().unwrap_or(""),
-            } })),
+            }), reason.as_deref()) })),
         ),
         ModCommand::Ban { reason, .. } => request(
             Method::POST,
             "moderation/bans",
             &as_moderator,
-            Some(json!({ "data": {
+            Some(json!({ "data": with_reason(json!({
                 "user_id": target_id()?,
-                "reason": reason.as_deref().unwrap_or(""),
-            } })),
+            }), reason.as_deref()) })),
         ),
         ModCommand::Unban { .. } => request(
             Method::DELETE,
@@ -222,6 +230,14 @@ pub fn build_request(command: &ModCommand, ids: Ids<'_>) -> Result<ModRequest, M
             None,
         ),
     })
+}
+
+/// `body` with `reason` when there is one: an empty reason is left out, not sent as `""`.
+fn with_reason(mut body: Value, reason: Option<&str>) -> Value {
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
+        body["reason"] = json!(reason);
+    }
+    body
 }
 
 /// The `PATCH chat/settings` body for one change. Only the changed mode is sent.
@@ -312,10 +328,7 @@ impl HelixClient {
     ) -> Result<(), ModError> {
         let scope = required_scope(command);
         if let AuthState::LoggedIn(account) = self.auth().state()
-            && account
-                .missing_scopes
-                .iter()
-                .any(|missing| missing == scope)
+            && !account.has_moderation_scope(scope)
         {
             return Err(ModError::MissingScope {
                 scope: scope.to_owned(),

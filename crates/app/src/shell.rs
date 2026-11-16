@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent};
 use gpui_chat_settings::SettingsError;
-use gpui_chat_twitch::auth::{AuthState, MODERATION_SCOPES};
+use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -187,17 +187,6 @@ pub struct AppShell {
     save_task: Option<Task<()>>,
     channels_save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
-}
-
-/// The missing scopes the account banner asks the user to log in again for: all but the
-/// moderation ones (PR 5.2), which only matter to moderators and are asked for when a moderation
-/// tool is used ("Log in again to grant …") instead of nagging every viewer.
-fn banner_scopes(missing: &[String]) -> Vec<&str> {
-    missing
-        .iter()
-        .map(String::as_str)
-        .filter(|scope| !MODERATION_SCOPES.contains(scope))
-        .collect()
 }
 
 impl AppShell {
@@ -732,6 +721,13 @@ impl AppShell {
         }
     }
 
+    /// *Enable moderation tools…*: a login that also asks for the moderation scopes.
+    fn enable_moderation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(account) = self.account.clone() {
+            sign_in::open_for_moderation(account, window, cx);
+        }
+    }
+
     fn log_out(&mut self, cx: &mut Context<Self>) {
         if let Some(account) = &self.account {
             account.update(cx, |account, cx| account.log_out(cx));
@@ -755,6 +751,7 @@ impl AppShell {
             AuthState::LoggedIn(user) => {
                 let login = user.login.clone();
                 let needs_relogin = user.needs_relogin();
+                let can_enable_moderation = !user.moderation_enabled();
                 Button::new("account-menu")
                     .ghost()
                     .small()
@@ -767,17 +764,31 @@ impl AppShell {
                     .dropdown_caret(true)
                     .accessibility_label("Account")
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, _, _| {
-                        let (again, out) = (shell.clone(), shell.clone());
-                        menu.label(format!("Logged in to Twitch as {login}"))
+                        let (again, moderation, out) =
+                            (shell.clone(), shell.clone(), shell.clone());
+                        let menu = menu
+                            .label(format!("Logged in to Twitch as {login}"))
                             .separator()
                             .item(PopupMenuItem::new("Log In Again…").on_click(
                                 move |_, window, cx| {
                                     again.update(cx, |shell, cx| shell.log_in(window, cx)).ok();
                                 },
+                            ));
+                        // Moderation needs extra permissions, asked for only when wanted.
+                        let menu = if can_enable_moderation {
+                            menu.item(PopupMenuItem::new("Enable Moderation Tools…").on_click(
+                                move |_, window, cx| {
+                                    moderation
+                                        .update(cx, |shell, cx| shell.enable_moderation(window, cx))
+                                        .ok();
+                                },
                             ))
-                            .item(PopupMenuItem::new("Log Out").on_click(move |_, _, cx| {
-                                out.update(cx, |shell, cx| shell.log_out(cx)).ok();
-                            }))
+                        } else {
+                            menu
+                        };
+                        menu.item(PopupMenuItem::new("Log Out").on_click(move |_, _, cx| {
+                            out.update(cx, |shell, cx| shell.log_out(cx)).ok();
+                        }))
                     })
                     .into_any_element()
             }
@@ -792,13 +803,12 @@ impl AppShell {
         let (message, action, colour) = if let Some(notice) = account.notice() {
             (notice.to_owned(), "Log in", tokens.danger)
         } else if let AuthState::LoggedIn(user) = account.state()
-            && let missing = banner_scopes(&user.missing_scopes)
-            && !missing.is_empty()
+            && user.needs_relogin()
         {
             (
                 format!(
                     "Log in again to grant the new Twitch permissions ({}).",
-                    missing.join(", ")
+                    user.missing_scopes.join(", ")
                 ),
                 "Log in again",
                 tokens.accent,
@@ -1389,24 +1399,5 @@ impl Render for AppShell {
             );
         // Times the draw of everything above for the HUD.
         frame_probe(self.diagnostics.clone(), root)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::banner_scopes;
-
-    #[test]
-    fn the_banner_does_not_ask_every_viewer_to_log_in_again_for_moderation_scopes() {
-        let missing: Vec<String> = [
-            "user:read:follows",
-            "moderator:manage:banned_users",
-            "channel:manage:raids",
-        ]
-        .map(str::to_owned)
-        .into();
-        assert_eq!(banner_scopes(&missing), ["user:read:follows"]);
-        let only_moderation: Vec<String> = vec!["moderator:manage:chat_settings".to_owned()];
-        assert!(banner_scopes(&only_moderation).is_empty());
     }
 }

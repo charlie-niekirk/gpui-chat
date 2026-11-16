@@ -117,6 +117,7 @@ fn userstate_is_the_local_users_role_in_the_channel() {
             ("modchan".to_owned(), ChannelRole::Moderator),
             ("tagchan".to_owned(), ChannelRole::Moderator),
             ("ownchan".to_owned(), ChannelRole::Broadcaster),
+            ("staffchan".to_owned(), ChannelRole::Viewer),
         ]
     );
     // Without a channel there is nothing to say; GLOBALUSERSTATE is not about a channel.

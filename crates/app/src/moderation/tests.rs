@@ -215,3 +215,46 @@ fn the_loopback_says_what_a_command_without_an_echo_did() {
         .is_empty()
     );
 }
+
+#[test]
+fn an_event_card_is_never_collapsed() {
+    let mut card = chat().with_deleted();
+    card.kind = MessageKind::UserNotice;
+    assert!(!is_collapsed(&card, DeletedMessages::Collapse, false));
+    let mut action = chat().with_deleted();
+    action.kind = MessageKind::Action;
+    assert!(is_collapsed(&action, DeletedMessages::Collapse, false));
+}
+
+#[test]
+fn failures_say_what_to_do_about_them() {
+    let missing = describe(&ModError::MissingScope {
+        scope: "moderator:manage:banned_users".into(),
+    });
+    assert_eq!(missing.kind, FailureKind::MissingScope);
+    assert!(
+        missing
+            .message
+            .starts_with("Log in again to enable moderation")
+    );
+    let forbidden = describe(&ModError::Rejected {
+        status: 403,
+        message: "You are not a moderator.".into(),
+    });
+    assert_eq!(forbidden.kind, FailureKind::Forbidden);
+    assert!(forbidden.message.starts_with("You are not a moderator."));
+    assert!(
+        forbidden.message.contains("hidden"),
+        "{}",
+        forbidden.message
+    );
+    let other = describe(&ModError::Rejected {
+        status: 400,
+        message: "nope".into(),
+    });
+    assert_eq!(
+        (other.kind, other.message.as_str()),
+        (FailureKind::Other, "nope")
+    );
+    assert_eq!(describe(&ModError::RateLimited).kind, FailureKind::Other);
+}

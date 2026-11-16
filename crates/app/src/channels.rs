@@ -31,19 +31,62 @@ pub struct ChannelStore {
     connection: Option<ConnectionState>,
     /// Channel notices seen so far (kept as plain counts until the view shows them).
     notices: u64,
-    /// Which messages were replaced in place (an echo swapped for Twitch's copy), as
-    /// `(serial, seq)`, newest last and bounded; see [`ChannelStore::replaced_since`].
-    replaced: VecDeque<(u64, u64)>,
-    replaced_serial: u64,
+    /// Which messages were replaced in place (an echo swapped for Twitch's copy); see
+    /// [`ChannelStore::replaced_since`].
+    replaced: SeqLog,
+    /// Which messages were struck out (deleted, timed out, banned, cleared; PR 5.2), so a view
+    /// lays out only those rows again when removed messages draw at another height; see
+    /// [`ChannelStore::struck_since`].
+    struck: SeqLog,
     /// The latest live deletions and clears, so that recent-messages history that arrives *after*
     /// them (a fetch that was in flight, a gap answer) is struck through too, see
     /// [`ChannelStore::apply`].
     live_moderation: VecDeque<Moderation>,
     /// What the logged-in user is in this channel (`USERSTATE`, PR 5.2).
     role: ChannelRole,
-    /// Bumped whenever a message was struck out (deleted, timed out, banned, cleared): the chat
-    /// view lays its rows out again when removed messages draw at another height (PR 5.2).
-    deletions: u64,
+}
+
+/// A bounded log of sequence numbers with a serial per entry: what a view asks "what changed since
+/// I last looked?" of. `since` is the changed numbers, or `None` when more changed than are kept.
+#[derive(Default)]
+struct SeqLog {
+    entries: VecDeque<(u64, u64)>,
+    serial: u64,
+}
+
+impl SeqLog {
+    fn push(&mut self, seq: u64, keep: usize) {
+        self.serial += 1;
+        if self.entries.len() >= keep {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((self.serial, seq));
+    }
+
+    /// Forgets the entries (the numbers no longer exist) but keeps counting, so no view mistakes
+    /// the log for unchanged.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn since(&self, seen: u64) -> (Option<Vec<u64>>, u64) {
+        let pending = self.serial - seen;
+        if pending == 0 {
+            return (Some(Vec::new()), self.serial);
+        }
+        if pending > self.entries.len() as u64 {
+            return (None, self.serial);
+        }
+        let mut seqs: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(serial, _)| *serial > seen)
+            .map(|(_, seq)| *seq)
+            .collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        (Some(seqs), self.serial)
+    }
 }
 
 /// How many live moderation actions [`ChannelStore`] remembers for history that arrives later.
@@ -51,6 +94,10 @@ const MODERATION_LOG: usize = 128;
 
 /// How many replacements [`ChannelStore`] remembers for its views.
 const REPLACED_LOG: usize = 64;
+
+/// How many struck-out messages [`ChannelStore`] remembers for its views (a ban of a talkative
+/// user strikes many; past this a view lays every row out again once).
+const STRUCK_LOG: usize = 512;
 
 impl ChannelStore {
     pub fn new(channel: ChannelId, capacity: usize) -> Self {
@@ -60,11 +107,10 @@ impl ChannelStore {
             room: RoomState::default(),
             connection: None,
             notices: 0,
-            replaced: VecDeque::new(),
-            replaced_serial: 0,
+            replaced: SeqLog::default(),
+            struck: SeqLog::default(),
             live_moderation: VecDeque::new(),
             role: ChannelRole::Viewer,
-            deletions: 0,
         }
     }
 
@@ -74,31 +120,28 @@ impl ChannelStore {
         self.role
     }
 
-    /// How many times messages were struck out so far (see [`ChannelStore`]).
-    pub fn deletions(&self) -> u64 {
-        self.deletions
+    /// The user is not allowed to moderate here after all (Twitch answered 403): no controls until
+    /// the next join says otherwise.
+    pub fn drop_role(&mut self) -> bool {
+        std::mem::replace(&mut self.role, ChannelRole::Viewer) != ChannelRole::Viewer
     }
 
     /// The sequence numbers of the messages replaced since `seen` (a serial returned earlier; start
     /// with 0), and the serial to pass next time. `None` instead of the list when more were
     /// replaced than are remembered: the view then has to treat every row as changed.
     pub fn replaced_since(&self, seen: u64) -> (Option<Vec<u64>>, u64) {
-        let pending = self.replaced_serial - seen;
-        if pending == 0 {
-            return (Some(Vec::new()), self.replaced_serial);
-        }
-        if pending > self.replaced.len() as u64 {
-            return (None, self.replaced_serial);
-        }
-        let mut seqs: Vec<u64> = self
-            .replaced
-            .iter()
-            .filter(|(serial, _)| *serial > seen)
-            .map(|(_, seq)| *seq)
-            .collect();
-        seqs.sort_unstable();
-        seqs.dedup();
-        (Some(seqs), self.replaced_serial)
+        self.replaced.since(seen)
+    }
+
+    /// Like [`ChannelStore::replaced_since`] for the messages struck out.
+    pub fn struck_since(&self, seen: u64) -> (Option<Vec<u64>>, u64) {
+        self.struck.since(seen)
+    }
+
+    /// How many messages were struck out so far.
+    #[cfg(test)]
+    pub fn struck_count(&self) -> u64 {
+        self.struck.serial
     }
 
     pub fn channel(&self) -> &ChannelId {
@@ -144,11 +187,7 @@ impl ChannelStore {
                         && !message.flags.echo
                         && let Some(seq) = self.messages.replace(message)
                     {
-                        self.replaced_serial += 1;
-                        if self.replaced.len() >= REPLACED_LOG {
-                            self.replaced.pop_front();
-                        }
-                        self.replaced.push_back((self.replaced_serial, seq));
+                        self.replaced.push(seq, REPLACED_LOG);
                         return true;
                     }
                     return false;
@@ -170,11 +209,14 @@ impl ChannelStore {
                 if self.messages.rebuild_serial() != rebuilds {
                     // The replaced-in-place log names sequence numbers that no longer exist.
                     self.replaced.clear();
+                    self.struck.clear();
                 }
                 for action in moderation.iter().chain(&self.live_moderation) {
                     let struck = self.messages.apply_moderation(action);
-                    self.deletions += u64::from(struck > 0);
-                    changed |= struck > 0;
+                    changed |= !struck.is_empty();
+                    for seq in struck {
+                        self.struck.push(seq, STRUCK_LOG);
+                    }
                 }
                 changed
             }
@@ -191,9 +233,14 @@ impl ChannelStore {
                 }
                 let struck = match &target {
                     ClearTarget::Channel => self.messages.mark_all_deleted(),
-                    ClearTarget::User { login, .. } => self.messages.mark_user_deleted(login),
+                    ClearTarget::User { login, duration } => {
+                        self.messages.mark_user_deleted(login, *duration)
+                    }
                 };
-                self.deletions += u64::from(struck > 0);
+                let any_struck = !struck.is_empty();
+                for seq in struck {
+                    self.struck.push(seq, STRUCK_LOG);
+                }
                 // Chat says what happened ("alice was timed out for 10m"), once: the same event
                 // in recent-messages history has the same id.
                 let line = stamped.map(|at| clear_line(&target, at, false));
@@ -204,15 +251,17 @@ impl ChannelStore {
                     }
                     new
                 });
-                struck > 0 || shown
+                any_struck || shown
             }
             ChatEvent::DeleteMessage { message_id, .. } => {
                 self.remember(Moderation::Delete {
                     message_id: message_id.clone(),
                 });
                 let struck = self.messages.mark_deleted(message_id.as_str());
-                self.deletions += u64::from(struck);
-                struck
+                if let Some(seq) = struck {
+                    self.struck.push(seq, STRUCK_LOG);
+                }
+                struck.is_some()
             }
             ChatEvent::UserState { role, .. } => {
                 let changed = self.role != role;
@@ -799,19 +848,49 @@ mod tests {
     }
 
     #[test]
-    fn deletions_are_counted_so_views_can_lay_out_again() {
+    fn struck_out_messages_are_logged_so_views_measure_only_those_rows() {
         let mut store = ChannelStore::new(ChannelId::new("a"), 10);
         store.apply(by_login_live("a", "m1", "spam", 100));
-        assert_eq!(store.deletions(), 0);
+        store.apply(by_login_live("a", "m2", "other", 110));
+        store.apply(by_login_live("a", "m3", "spam", 120));
+        assert_eq!(store.struck_since(0), (Some(vec![]), 0));
         store.apply(ChatEvent::DeleteMessage {
             channel: ChannelId::new("a"),
-            message_id: "m1".into(),
+            message_id: "m2".into(),
             login: None,
         });
-        assert_eq!(store.deletions(), 1);
-        // Nothing left to strike: no change.
+        assert_eq!(store.struck_since(0), (Some(vec![1]), 1));
+        // A timeout strikes the rest of that user's messages; the log names exactly those.
         store.apply(timeout("spam", 60, 200));
-        assert_eq!(store.deletions(), 1);
+        let (seqs, serial) = store.struck_since(1);
+        assert_eq!(seqs, Some(vec![0, 2]));
+        assert_eq!(serial, 3);
+        // Nothing left to strike: nothing logged.
+        store.apply(timeout("spam", 60, 201));
+        assert_eq!(store.struck_since(serial).0, Some(vec![]));
+        // A ban after the timeout says more, so those two rows are logged again.
+        store.apply(ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::User {
+                login: "spam".into(),
+                duration: None,
+            },
+            at: Some(Timestamp(300)),
+        });
+        assert_eq!(store.struck_since(serial).0, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn a_role_that_twitch_refuses_is_dropped_until_the_next_join() {
+        use gpui_chat_core::ChannelRole;
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        store.apply(ChatEvent::UserState {
+            channel: ChannelId::new("a"),
+            role: ChannelRole::Moderator,
+        });
+        assert!(store.drop_role());
+        assert_eq!(store.role(), ChannelRole::Viewer);
+        assert!(!store.drop_role(), "nothing to drop twice");
     }
 
     /// Applies every event of a recorded IRC log (a fixture of `fixtures/irc`) to a fresh store.

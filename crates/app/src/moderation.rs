@@ -43,8 +43,24 @@ pub struct ModRequest {
     pub target_id: Option<String>,
 }
 
-/// The outcome of a command, as the sentence to show when it failed.
-pub type ModOutcome = Result<(), String>;
+/// Why a command failed, as the sentence to show and what the UI should do besides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModFailure {
+    pub message: String,
+    pub kind: FailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The login was not granted the scope: offer to enable moderation (a login that asks for it).
+    MissingScope,
+    /// Twitch answered 403: the user is not (or no longer) a moderator here; the controls go away.
+    Forbidden,
+    Other,
+}
+
+/// The outcome of a command.
+pub type ModOutcome = Result<(), ModFailure>;
 
 /// Whoever runs moderation commands for a pane.
 #[derive(Clone)]
@@ -91,10 +107,24 @@ impl Moderator {
     }
 }
 
-/// The sentence for a failed command: Twitch's own wording, plus where to look for a login that
-/// lacks a scope.
-pub fn describe(error: &ModError) -> String {
-    error.to_string()
+/// The failure of a command: Twitch's own wording (or the "enable moderation" sentence for a login
+/// that lacks a scope) and what kind it is.
+pub fn describe(error: &ModError) -> ModFailure {
+    let kind = if matches!(error, ModError::MissingScope { .. }) {
+        FailureKind::MissingScope
+    } else if error.is_forbidden() {
+        FailureKind::Forbidden
+    } else {
+        FailureKind::Other
+    };
+    ModFailure {
+        message: if kind == FailureKind::Forbidden {
+            format!("{error} (Moderation controls are hidden here until you rejoin the channel.)")
+        } else {
+            error.to_string()
+        },
+        kind,
+    }
 }
 
 /// The chat events the server would send for `request`, for the offline loopback.
@@ -227,15 +257,13 @@ pub fn confirmation(command: &ModCommand) -> Option<(String, String)> {
 }
 
 /// Whether `message` is drawn as "<message deleted>" instead of its text: it was removed, the
-/// setting asks for collapsing, the user has not revealed it, and it is something a person wrote.
+/// setting asks for collapsing, the user has not revealed it, and it is a chat line (an event card
+/// such as a sub is never collapsed).
 pub fn is_collapsed(message: &Message, mode: DeletedMessages, revealed: bool) -> bool {
     mode == DeletedMessages::Collapse
         && message.flags.deleted
         && !revealed
-        && matches!(
-            message.kind,
-            MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
-        )
+        && matches!(message.kind, MessageKind::Chat | MessageKind::Action)
 }
 
 #[cfg(test)]

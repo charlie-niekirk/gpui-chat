@@ -2,7 +2,11 @@
 //! row the pointer is over, and one right-click menu per chat (or popover) that resolves the row
 //! under the pointer. For a moderator (PR 5.2) the same hover strip also holds Delete, Timeout
 //! 10m, Ban (and Unban on a removed message) and the menu adds Delete / Timeout… / Ban / Unban;
-//! a removed message is a [`collapsed_row`] when `chat.deleted_messages` says so.
+//! a removed message is the collapsed line of [`MessageElement::collapsed`] when
+//! `chat.deleted_messages` says so (same element, so selecting, copying and the right-click menu work on it).
+//! The strip has the same four slots on every row (the ones that do not apply are disabled), and the
+//! chat view holds the list while the pointer is on it ([`ChatView::hold_for_strip`]), so a click
+//! always lands on the button, and the row, that was aimed at.
 //!
 //! The message element itself paints everything (and stays a single custom element). Rows
 //! report the pointer through [`MessageStyle::hovered_row`]; only the hovered row is wrapped and
@@ -23,14 +27,13 @@ use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable as _, h_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex};
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement as _,
-    MouseButton, ParentElement as _, StatefulInteractiveElement as _, Styled as _, WeakEntity,
-    Window, div, px,
+    MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    WeakEntity, Window, div, px,
 };
 
-use super::display;
 use super::element::{MessageElement, MessageStyle};
 use super::layout::LayoutCache;
 use super::selection::{self, one_line};
@@ -60,7 +63,9 @@ pub struct RowContext {
     /// How removed messages are drawn (`chat.deleted_messages`).
     pub deleted: DeletedMessages,
     /// Removed messages the user clicked open.
-    pub revealed: Rc<HashSet<MessageId>>,
+    pub revealed: Rc<RefCell<HashSet<MessageId>>>,
+    /// The logged-in user's login: no moderation controls on their own messages.
+    pub own_login: Option<Arc<str>>,
 }
 
 /// The row for `message`: the plain element, or with the hover buttons (Reply, and for a
@@ -73,10 +78,12 @@ pub fn message_row(
     cache: Rc<RefCell<LayoutCache>>,
     row: &RowContext,
 ) -> AnyElement {
-    if is_collapsed(message, row.deleted, row.revealed.contains(&message.id)) {
-        return collapsed_row(seq, message, &style, row);
-    }
-    let element = MessageElement::new(seq, message.clone(), style, cache);
+    let collapsed = is_collapsed(
+        message,
+        row.deleted,
+        row.revealed.borrow().contains(&message.id),
+    );
+    let element = MessageElement::new(seq, message.clone(), style, cache).collapsed(collapsed);
     // Recent-messages history (PR 5.5) is shown dimmer than live chat.
     let element = if message.flags.history {
         div()
@@ -87,11 +94,27 @@ pub fn message_row(
     } else {
         element.into_any_element()
     };
+    // A collapsed line shows the message when clicked.
+    let element = if collapsed {
+        let (view, id) = (row.view.clone(), message.id.clone());
+        div()
+            .id(row_id(row, "collapsed", seq))
+            .w_full()
+            .cursor_pointer()
+            .tooltip(|window, cx| Tooltip::new("Click to show the message").build(window, cx))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |view, cx| view.reveal(&id, cx)).ok();
+            })
+            .child(element)
+            .into_any_element()
+    } else {
+        element
+    };
     if row.hovered != Some(seq) {
         return element;
     }
     let reply = row.can_reply && can_reply_to(message);
-    let actions = row_actions(row.role, &row.channel, message);
+    let actions = row_actions(row.role, &row.channel, row.own_login.as_deref(), message);
     if !reply && !actions.any() {
         return element;
     }
@@ -100,7 +123,7 @@ pub fn message_row(
     if reply {
         let (view, message) = (row.view.clone(), message.clone());
         buttons = buttons.child(
-            Button::new((row.id, seq))
+            Button::new(row_id(row, "reply", seq))
                 .ghost()
                 .xsmall()
                 .icon(Icon::new(gpui_kit::assets::IconName::Undo2))
@@ -110,28 +133,35 @@ pub fn message_row(
                 .on_click(move |_, _, cx| request_reply(&view, &message, cx)),
         );
     }
-    // Moderation (PR 5.2): a compact strip beside Reply, only for moderators.
-    for (id, action, icon, label) in mod_buttons(actions, message) {
-        let (view, message) = (row.view.clone(), message.clone());
-        let button = Button::new((id, seq)).ghost().xsmall();
-        let button = match icon {
-            Some(icon) => button.icon(Icon::new(icon)),
-            None => button.label(label.clone()),
-        };
-        buttons = buttons.child(
-            button
-                .tooltip(action.label())
-                .accessibility_label(action.label())
-                .tab_stop(false)
-                .on_click(move |_, _, cx| request_moderation(&view, &message, action, cx)),
-        );
+    // Moderation (PR 5.2): the same four slots on every row, in the same places, the ones that do
+    // not apply disabled, so what is aimed at is what a click does.
+    if actions.any() {
+        for slot in mod_slots(actions) {
+            let (view, message) = (row.view.clone(), message.clone());
+            let action = slot.action;
+            let button = Button::new(row_id(row, slot.name, seq)).ghost().xsmall();
+            let button = match slot.icon {
+                Some(icon) => button.icon(Icon::new(icon)),
+                None => button.label(slot.label),
+            };
+            buttons = buttons.child(
+                button
+                    .disabled(!slot.enabled)
+                    .tooltip(action.label())
+                    .accessibility_label(action.label())
+                    .tab_stop(false)
+                    .on_click(move |_, _, cx| request_moderation(&view, &message, action, cx)),
+            );
+        }
     }
+    let view = row.view.clone();
     div()
         .relative()
         .w_full()
         .child(element)
         .child(
             div()
+                .id(row_id(row, "strip", seq))
                 .absolute()
                 .top(px(-2.0))
                 .right(px(10.0))
@@ -139,6 +169,12 @@ pub fn message_row(
                 .border_1()
                 .border_color(tokens.border)
                 .bg(tokens.surface)
+                // While the pointer is on the strip the list stands still: a message arriving
+                // cannot slide another row (and its buttons) under the pointer before the click.
+                .on_hover(move |on, _, cx| {
+                    view.update(cx, |view, cx| view.hold_for_strip(*on, cx))
+                        .ok();
+                })
                 // The context line of a reply row sits under the buttons: a press on them must
                 // not reach it (and open the thread).
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -147,84 +183,53 @@ pub fn message_row(
         .into_any_element()
 }
 
-/// The moderation buttons of the hover strip: `(element id prefix, action, icon, label)`. Delete,
-/// a ten-minute timeout and Ban on a live message; Ban and Unban once it was removed. The icon is
-/// `None` for the ones that are text.
-fn mod_buttons(
-    actions: RowActions,
-    message: &Message,
-) -> Vec<(
-    &'static str,
-    RowAction,
-    Option<gpui_kit::assets::IconName>,
-    String,
-)> {
-    let mut buttons = Vec::new();
-    if actions.delete {
-        buttons.push((
-            "mod-delete",
-            RowAction::Delete,
-            Some(gpui_kit::assets::IconName::Delete),
-            String::new(),
-        ));
-    }
-    if actions.timeout && !message.flags.deleted {
-        let action = RowAction::Timeout(DEFAULT_TIMEOUT_SECS);
-        buttons.push(("mod-timeout", action, None, "10m".to_owned()));
-    }
-    if actions.ban {
-        buttons.push((
-            "mod-ban",
-            RowAction::Ban,
-            Some(gpui_kit::assets::IconName::Ban),
-            String::new(),
-        ));
-    }
-    if actions.unban && message.flags.deleted {
-        buttons.push(("mod-unban", RowAction::Unban, None, "Unban".to_owned()));
-    }
-    buttons
+/// An element id for part of a row: the list's and the thread popover's rows share sequence
+/// numbers, so every id carries the row's own prefix.
+fn row_id(row: &RowContext, part: &str, seq: u64) -> SharedString {
+    SharedString::from(format!("{}-{part}-{seq}", row.id))
 }
 
-/// A removed message under `chat.deleted_messages = "collapse"`: one muted line, `name:
-/// <message deleted>`, that shows the message when clicked.
-fn collapsed_row(
-    seq: u64,
-    message: &Arc<Message>,
-    style: &MessageStyle,
-    row: &RowContext,
-) -> AnyElement {
-    let clock = style
-        .options
-        .timestamps
-        .then(|| format!("{} ", display::clock(message.timestamp.unix_millis())));
-    let name = message
-        .author
-        .as_ref()
-        .map(|author| format!("{}: ", selection::username(author)))
-        .unwrap_or_default();
-    let label = format!("{}{name}<message deleted>", clock.unwrap_or_default());
-    let (view, id) = (row.view.clone(), message.id.clone());
-    let (muted, text) = (style.palette.muted, style.palette.text);
-    div()
-        .id((row.id, seq))
-        .w_full()
-        .px(style.padding.x)
-        .py(style.padding.y)
-        .font_family(style.font.family.clone())
-        .text_size(style.font_size)
-        .line_height(style.line_height)
-        .text_color(muted)
-        .italic()
-        .truncate()
-        .cursor_pointer()
-        .hover(move |row| row.text_color(text))
-        .tooltip(|window, cx| Tooltip::new("Click to show the message").build(window, cx))
-        .on_click(move |_, _, cx| {
-            view.update(cx, |view, cx| view.reveal(&id, cx)).ok();
-        })
-        .child(label)
-        .into_any_element()
+/// One slot of the moderation strip.
+struct ModSlot {
+    name: &'static str,
+    action: RowAction,
+    icon: Option<gpui_kit::assets::IconName>,
+    label: String,
+    enabled: bool,
+}
+
+/// The four slots of the strip, always in this order: Delete, a ten-minute timeout, Ban, Unban.
+fn mod_slots(actions: RowActions) -> [ModSlot; 4] {
+    [
+        ModSlot {
+            name: "mod-delete",
+            action: RowAction::Delete,
+            icon: Some(gpui_kit::assets::IconName::Delete),
+            label: String::new(),
+            enabled: actions.delete,
+        },
+        ModSlot {
+            name: "mod-timeout",
+            action: RowAction::Timeout(DEFAULT_TIMEOUT_SECS),
+            icon: None,
+            label: "10m".to_owned(),
+            enabled: actions.timeout,
+        },
+        ModSlot {
+            name: "mod-ban",
+            action: RowAction::Ban,
+            icon: Some(gpui_kit::assets::IconName::Ban),
+            label: String::new(),
+            enabled: actions.ban,
+        },
+        ModSlot {
+            name: "mod-unban",
+            action: RowAction::Unban,
+            icon: None,
+            label: "Unban".to_owned(),
+            enabled: actions.unban,
+        },
+    ]
 }
 
 /// The right-click menu for the row the right-click was over (resolved by `surface` at the click):
@@ -294,7 +299,8 @@ pub fn row_menu(
         if !moderation {
             return menu;
         }
-        let actions = row_actions(store.role(), store.channel(), &message);
+        let own = crate::account::own_login(cx);
+        let actions = row_actions(store.role(), store.channel(), own.as_deref(), &message);
         if !actions.any() {
             return menu;
         }

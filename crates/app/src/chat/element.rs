@@ -162,6 +162,8 @@ pub struct MessageElement {
     message: Arc<Message>,
     style: Rc<MessageStyle>,
     cache: Rc<RefCell<LayoutCache>>,
+    /// Drawn as `name: <message deleted>` (PR 5.2): same element, selection and copy, another text.
+    collapsed: bool,
 }
 
 impl MessageElement {
@@ -176,7 +178,15 @@ impl MessageElement {
             message,
             style,
             cache,
+            collapsed: false,
         }
+    }
+
+    /// Draws a removed message as its collapsed line (`chat.deleted_messages = "collapse"`).
+    #[must_use]
+    pub fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
     }
 }
 
@@ -249,9 +259,19 @@ fn shape_reply(reply: &ReplyRef, style: &MessageStyle, window: &Window) -> Reply
 }
 
 /// Shapes `message` as one line with the window text system.
-fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App) -> ShapedMessage {
-    let slots = badge_slots(message, style, window, cx);
-    let display = display::build(message, style.options, &slots);
+fn shape(
+    message: &Message,
+    collapsed: bool,
+    style: &MessageStyle,
+    window: &Window,
+    cx: &mut App,
+) -> ShapedMessage {
+    let display = if collapsed {
+        display::build_collapsed(message, style.options)
+    } else {
+        let slots = badge_slots(message, style, window, cx);
+        display::build(message, style.options, &slots)
+    };
     let boxes = emote_boxes(&display.emotes, style, window, cx);
     let runs: Vec<TextRun> = display
         .spans
@@ -275,29 +295,44 @@ fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App)
         .layout_line(&display.text, style.font_size, &runs, None);
     let shaped = ShapedMessage::from_layout(display, &layout, &boxes);
     match &message.reply {
-        Some(reply) if style.reply_line => shaped.with_reply(shape_reply(reply, style, window)),
+        Some(reply) if style.reply_line && !collapsed => {
+            shaped.with_reply(shape_reply(reply, style, window))
+        }
         _ => shaped,
     }
 }
 
-/// The cached layout of message `seq` for a content width (width minus padding).
+/// The message a layout is asked for: its sequence number, the message and whether it is shown
+/// collapsed (PR 5.2).
+#[derive(Clone, Copy)]
+struct Subject<'a> {
+    seq: u64,
+    message: &'a Arc<Message>,
+    collapsed: bool,
+}
+
+/// The cached layout of a message for a content width (width minus padding).
 fn layout_for(
     cache: &RefCell<LayoutCache>,
-    seq: u64,
-    message: &Arc<Message>,
+    subject: Subject<'_>,
     style: &MessageStyle,
     content_width: Pixels,
     window: &Window,
     cx: &mut App,
 ) -> MessageLayout {
-    let key = LayoutKey::new(style.generation, window.scale_factor());
+    let Subject {
+        seq,
+        message,
+        collapsed,
+    } = subject;
+    let key = LayoutKey::new(style.generation, window.scale_factor()).collapsed(collapsed);
     cache.borrow_mut().layout(
         seq,
         message,
         key,
         content_width.as_f32(),
         style.line_height.as_f32(),
-        || shape(message, style, window, cx),
+        || shape(message, collapsed, style, window, cx),
     )
 }
 
@@ -595,11 +630,12 @@ impl Element for MessageElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let (seq, message, style, cache) = (
+        let (seq, message, style, cache, collapsed) = (
             self.seq,
             self.message.clone(),
             self.style.clone(),
             self.cache.clone(),
+            self.collapsed,
         );
         let layout_id = window.request_measured_layout(
             Style::default(),
@@ -609,7 +645,18 @@ impl Element for MessageElement {
                     AvailableSpace::MinContent | AvailableSpace::MaxContent => px(f32::INFINITY),
                 });
                 let content = width - style.padding.x * 2.0;
-                let layout = layout_for(&cache, seq, &message, &style, content, window, cx);
+                let layout = layout_for(
+                    &cache,
+                    Subject {
+                        seq,
+                        message: &message,
+                        collapsed,
+                    },
+                    &style,
+                    content,
+                    window,
+                    cx,
+                );
                 let width = if width.as_f32().is_finite() {
                     width
                 } else {
@@ -633,8 +680,11 @@ impl Element for MessageElement {
         let content = bounds.size.width - self.style.padding.x * 2.0;
         let layout = layout_for(
             &self.cache,
-            self.seq,
-            &self.message,
+            Subject {
+                seq: self.seq,
+                message: &self.message,
+                collapsed: self.collapsed,
+            },
             &self.style,
             content,
             window,
@@ -696,7 +746,9 @@ impl Element for MessageElement {
         let style = &*self.style;
         let palette = &style.palette;
         let message = &*self.message;
-        let flags = message.flags;
+        let mut flags = message.flags;
+        // A collapsed line is muted text, not struck-through text.
+        flags.deleted &= !self.collapsed;
         let MessageLayout { shaped, flow } = &prepainted.layout;
 
         if let Some(hitbox) = &prepainted.hitbox {

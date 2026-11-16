@@ -440,16 +440,24 @@ impl Composer {
     fn await_command(
         &mut self,
         typed: String,
-        result: oneshot::Receiver<Result<(), String>>,
+        result: oneshot::Receiver<crate::moderation::ModOutcome>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Err(reason)) = result.await else {
+            let Ok(Err(failure)) = result.await else {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.error = Some(reason.into());
+                // Twitch says this user may not moderate here: the commands go away.
+                if failure.kind == crate::moderation::FailureKind::Forbidden {
+                    this.store.update(cx, |store, cx| {
+                        if store.drop_role() {
+                            cx.notify();
+                        }
+                    });
+                }
+                this.error = Some(failure.message.into());
                 if let Some(input) = &this.input {
                     input.update(cx, |input, cx| {
                         if input.value().is_empty() {
@@ -802,6 +810,7 @@ mod tests {
             login: "viewer".into(),
             user_id: "42".into(),
             missing_scopes: missing.iter().map(|s| (*s).to_owned()).collect(),
+            missing_moderation_scopes: Vec::new(),
         })
     }
 

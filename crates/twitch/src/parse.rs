@@ -25,7 +25,7 @@ use std::time::Duration;
 use gpui_chat_core::message::RawTags;
 use gpui_chat_core::{
     Author, BadgeId, ChannelId, ChannelRole, ChatEvent, ClearTarget, DEFAULT_CHEERMOTE_PREFIXES,
-    FollowersOnly, Fragment, Message, MessageFlags, MessageId, MessageKind, ReplyRef, Rgb,
+    FollowersOnly, Fragment, Message, MessageFlags, MessageId, MessageKind, Removal, ReplyRef, Rgb,
     RoomStateUpdate, Timestamp, Tokenizer, twitch_emote_ranges,
 };
 use twitch_irc::message::{IRCMessage, IRCParseError, IRCPrefix};
@@ -278,6 +278,7 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
             first_message: flag(msg, "first-msg").unwrap_or(false),
             highlighted: tag(msg, "msg-id") == Some("highlighted-message"),
             deleted: false,
+            removal: Removal::None,
             history: tag(msg, "historical") == Some("1"),
             echo: false,
         },
@@ -367,17 +368,14 @@ fn roomstate(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
 }
 
 /// `USERSTATE`: the local user's role in the channel, from the `mod` tag and the badges (the
-/// broadcaster has neither `mod=1` nor a moderator badge, only `broadcaster/1`).
+/// broadcaster has neither `mod=1` nor a moderator badge, only `broadcaster/1`). Staff, admin and
+/// global-mod badges are not moderator status *in this channel*, so they stay viewers.
 fn userstate(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
     let badges = badges(msg);
     let has = |set: &str| badges.iter().any(|badge| &*badge.set == set);
     let role = if has("broadcaster") {
         ChannelRole::Broadcaster
-    } else if flag(msg, "mod") == Some(true)
-        || ["moderator", "staff", "admin", "global_mod"]
-            .iter()
-            .any(|set| has(set))
-    {
+    } else if flag(msg, "mod") == Some(true) || has("moderator") {
         ChannelRole::Moderator
     } else {
         ChannelRole::Viewer

@@ -49,6 +49,44 @@ fn a_timeout_posts_the_duration_and_reason_to_bans() {
 }
 
 #[test]
+fn an_empty_reason_is_left_out_of_the_body() {
+    let ban = |reason: Option<&str>| {
+        request(
+            &ModCommand::Ban {
+                user: user("bob"),
+                reason: reason.map(str::to_owned),
+            },
+            Some("7"),
+        )
+        .body
+        .unwrap()
+    };
+    assert_eq!(ban(Some("")), json!({ "data": { "user_id": "7" } }));
+    assert_eq!(ban(None), json!({ "data": { "user_id": "7" } }));
+    assert_eq!(
+        ban(Some("spam")),
+        json!({ "data": { "user_id": "7", "reason": "spam" } })
+    );
+}
+
+#[test]
+fn a_403_says_the_user_may_not_moderate_here() {
+    let forbidden = ModError::Rejected {
+        status: 403,
+        message: "x".into(),
+    };
+    assert!(forbidden.is_forbidden());
+    assert!(
+        !ModError::Rejected {
+            status: 400,
+            message: "x".into()
+        }
+        .is_forbidden()
+    );
+    assert!(!ModError::RateLimited.is_forbidden());
+}
+
+#[test]
 fn a_ban_has_no_duration() {
     let command = ModCommand::Ban {
         user: user("bob"),
@@ -56,7 +94,7 @@ fn a_ban_has_no_duration() {
     };
     assert_eq!(
         request(&command, Some("7")).body,
-        Some(json!({ "data": { "user_id": "7", "reason": "" } }))
+        Some(json!({ "data": { "user_id": "7" } }))
     );
 }
 
@@ -243,7 +281,6 @@ fn every_command_names_a_scope_the_login_asks_for() {
     for command in &commands {
         let scope = required_scope(command);
         assert!(MODERATION_SCOPES.contains(&scope), "{command:?}: {scope}");
-        assert!(SCOPES.contains(&scope));
         seen.insert(scope);
     }
     assert_eq!(
@@ -284,7 +321,7 @@ fn twitchs_answers_become_sentences() {
     );
     assert_eq!(
         error.to_string(),
-        "Log in again to grant moderator:manage:banned_users (account menu → Log in again)."
+        "Log in again to enable moderation (grants moderator:manage:banned_users): account menu → Enable moderation tools."
     );
     assert!(
         interpret(&response(401, "Invalid OAuth token"))
@@ -328,7 +365,12 @@ fn stored(scopes: &[&str]) -> StoredToken {
     }
 }
 
-/// A logged-in client whose token was granted `granted` (the app asks for [`SCOPES`]).
+/// Every scope: the login of a user who enabled moderation.
+fn everything() -> Vec<&'static str> {
+    SCOPES.iter().chain(MODERATION_SCOPES).copied().collect()
+}
+
+/// A logged-in client whose token was granted `granted`.
 async fn client(server: &MockServer, granted: &[&str]) -> HelixClient {
     Mock::given(method("GET"))
         .and(path("/oauth2/validate"))
@@ -350,7 +392,7 @@ async fn client(server: &MockServer, granted: &[&str]) -> HelixClient {
 #[tokio::test]
 async fn a_ban_by_login_looks_the_user_up_then_bans_as_the_moderator() {
     let server = MockServer::start().await;
-    let helix = client(&server, SCOPES).await;
+    let helix = client(&server, &everything()).await;
     Mock::given(method("GET"))
         .and(path("/helix/users"))
         .and(query_param("login", "bob"))
@@ -368,7 +410,7 @@ async fn a_ban_by_login_looks_the_user_up_then_bans_as_the_moderator() {
         .and(query_param("moderator_id", "42"))
         .and(header("Authorization", "Bearer access"))
         .and(body_json(
-            json!({ "data": { "user_id": "7", "duration": 600, "reason": "" } }),
+            json!({ "data": { "user_id": "7", "duration": 600 } }),
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{}] })))
         .expect(1)
@@ -385,7 +427,7 @@ async fn a_ban_by_login_looks_the_user_up_then_bans_as_the_moderator() {
 #[tokio::test]
 async fn a_known_user_id_skips_the_lookup() {
     let server = MockServer::start().await;
-    let helix = client(&server, SCOPES).await;
+    let helix = client(&server, &everything()).await;
     Mock::given(method("GET"))
         .and(path("/helix/users"))
         .respond_with(ResponseTemplate::new(500))
@@ -406,7 +448,7 @@ async fn a_known_user_id_skips_the_lookup() {
 #[tokio::test]
 async fn an_unknown_login_is_reported_without_sending_anything() {
     let server = MockServer::start().await;
-    let helix = client(&server, SCOPES).await;
+    let helix = client(&server, &everything()).await;
     Mock::given(method("GET"))
         .and(path("/helix/users"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
@@ -429,12 +471,8 @@ async fn an_unknown_login_is_reported_without_sending_anything() {
 #[tokio::test]
 async fn a_login_without_the_scope_is_told_to_log_in_again_and_nothing_is_sent() {
     let server = MockServer::start().await;
-    // A login from before the moderation scopes existed.
-    let old: Vec<&str> = SCOPES
-        .iter()
-        .copied()
-        .filter(|scope| !MODERATION_SCOPES.contains(scope))
-        .collect();
+    // A normal login: moderation was never enabled.
+    let old: Vec<&str> = SCOPES.to_vec();
     let helix = client(&server, &old).await;
     Mock::given(method("DELETE"))
         .respond_with(ResponseTemplate::new(500))
@@ -452,16 +490,16 @@ async fn a_login_without_the_scope_is_told_to_log_in_again_and_nothing_is_sent()
         }
     );
     assert!(
-        error
-            .to_string()
-            .starts_with("Log in again to grant moderator:manage:chat_messages")
+        error.to_string().starts_with(
+            "Log in again to enable moderation (grants moderator:manage:chat_messages)"
+        )
     );
 }
 
 #[tokio::test]
 async fn a_scope_the_login_has_but_twitch_does_not_accept_is_still_a_clear_message() {
     let server = MockServer::start().await;
-    let helix = client(&server, SCOPES).await;
+    let helix = client(&server, &everything()).await;
     Mock::given(method("PATCH"))
         .and(path("/helix/chat/settings"))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({
@@ -481,7 +519,7 @@ async fn a_scope_the_login_has_but_twitch_does_not_accept_is_still_a_clear_messa
 #[tokio::test]
 async fn a_room_mode_is_patched_with_its_body_and_a_refusal_carries_twitchs_text() {
     let server = MockServer::start().await;
-    let helix = client(&server, SCOPES).await;
+    let helix = client(&server, &everything()).await;
     Mock::given(method("PATCH"))
         .and(path("/helix/chat/settings"))
         .and(query_param("broadcaster_id", "1000"))

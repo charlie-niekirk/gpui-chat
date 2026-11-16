@@ -897,7 +897,7 @@ fn missing_scopes_lists_what_the_constant_adds() {
 }
 
 #[test]
-fn the_login_asks_for_every_moderation_scope() {
+fn moderation_scopes_are_not_part_of_the_normal_login() {
     assert_eq!(MODERATION_SCOPES.len(), 8);
     for scope in [
         "moderator:manage:banned_users",
@@ -910,11 +910,98 @@ fn the_login_asks_for_every_moderation_scope() {
         "moderator:manage:shoutouts",
     ] {
         assert!(MODERATION_SCOPES.contains(&scope), "{scope}");
-        assert!(SCOPES.contains(&scope), "{scope} is not requested at login");
+        assert!(
+            !SCOPES.contains(&scope),
+            "{scope} is asked for only when the user enables moderation"
+        );
     }
-    // An older login lacks exactly those, and is told so.
-    let old = vec!["chat:read".to_owned(), "chat:edit".to_owned()];
-    assert!(missing_scopes(&old, SCOPES).contains(&"channel:manage:raids"));
+}
+
+/// A device-code request that asks for a moderation scope (or not), `device_code` / `token` answers.
+async fn mount_device_login(server: &MockServer, with_moderation: bool, granted: &[&str]) {
+    let wants_moderation = move |request: &Request| {
+        String::from_utf8_lossy(&request.body).contains("moderator%3Amanage%3Abanned_users")
+            == with_moderation
+    };
+    Mock::given(method("POST"))
+        .and(path("/oauth2/device"))
+        .and(public_client)
+        .and(wants_moderation)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "secret-device-code",
+            "expires_in": 1800,
+            "interval": 1,
+            "user_code": "ABCDEFGH",
+            "verification_uri": "https://www.twitch.tv/activate",
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .and(body_string_contains("device_code=secret-device-code"))
+        .and(public_client)
+        .and(wants_moderation)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access", "refresh_token": "refresh", "expires_in": 14_000,
+            "scope": granted, "token_type": "bearer",
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth2/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(validation("viewer", granted)))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_normal_login_does_not_ask_for_moderation_and_is_not_told_to_log_in_again() {
+    let server = MockServer::start().await;
+    mount_device_login(&server, false, WANTED).await;
+    let auth = Auth::with_scopes(
+        OAuthClient::with_base(CLIENT, server.uri()).unwrap(),
+        Arc::new(MemoryTokenStore::new()),
+        WANTED,
+    );
+    auth.restore().await;
+    let code = auth.request_device_code().await.unwrap();
+    let account = auth.complete_device_login(&code, polling()).await.unwrap();
+    assert!(
+        !account.needs_relogin(),
+        "moderation is not a reason to log in again"
+    );
+    assert!(!account.moderation_enabled());
+    assert_eq!(
+        account.missing_moderation_scopes.len(),
+        MODERATION_SCOPES.len()
+    );
+    assert!(!account.has_moderation_scope("channel:manage:raids"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_moderation_asks_for_the_extra_scopes_and_the_login_has_them() {
+    let server = MockServer::start().await;
+    let granted: Vec<&str> = WANTED.iter().chain(MODERATION_SCOPES).copied().collect();
+    mount_device_login(&server, true, &granted).await;
+    let auth = Auth::with_scopes(
+        OAuthClient::with_base(CLIENT, server.uri()).unwrap(),
+        Arc::new(MemoryTokenStore::new()),
+        WANTED,
+    );
+    auth.restore().await;
+    let code = auth
+        .request_device_code_with(MODERATION_SCOPES)
+        .await
+        .unwrap();
+    let account = auth
+        .complete_device_login_with(&code, polling(), MODERATION_SCOPES)
+        .await
+        .unwrap();
+    assert!(account.moderation_enabled());
+    assert!(account.has_moderation_scope("moderator:manage:banned_users"));
+    assert!(!account.needs_relogin());
 }
 
 #[test]

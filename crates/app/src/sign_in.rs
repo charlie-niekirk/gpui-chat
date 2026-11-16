@@ -140,7 +140,10 @@ impl SignInSheet {
                         .primary()
                         .label("Try again")
                         .on_click(move |_, _, cx| {
-                            hub.update(cx, |hub, cx| hub.begin_sign_in(cx));
+                            hub.update(cx, |hub, cx| {
+                                let moderation = hub.sign_in_moderation();
+                                hub.begin_sign_in(moderation, cx);
+                            });
                         }),
                 ),
             )
@@ -169,14 +172,27 @@ impl Render for SignInSheet {
 
 /// Opens the login sheet and starts a sign-in. Does nothing while another dialog is open.
 pub fn open(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
+    open_with(hub, false, window, cx);
+}
+
+/// [`open`] asking for the moderation scopes too (PR 5.2): *Enable moderation tools*.
+pub fn open_for_moderation(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
+    open_with(hub, true, window, cx);
+}
+
+fn open_with(hub: Entity<AccountHub>, moderation: bool, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
-    hub.update(cx, |hub, cx| hub.begin_sign_in(cx));
+    hub.update(cx, |hub, cx| hub.begin_sign_in(moderation, cx));
     let sheet = cx.new(|cx| SignInSheet::new(hub, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
-            .title("Log in to Twitch")
+            .title(if moderation {
+                "Enable moderation tools"
+            } else {
+                "Log in to Twitch"
+            })
             .w(px(420.))
             .child(sheet.clone())
             .footer(

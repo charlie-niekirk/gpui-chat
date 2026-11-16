@@ -242,19 +242,33 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `USERSTATE` (`ChannelRole`: viewer / moderator / broadcaster; reset by any non-connected channel state, a rejoin asks the
   server again), and the controls need that *and* a pane with a `Moderator`. Viewers (and every anonymous run) get none of
   it: no hover tracking, no menu items, static room chips, completion offers only `/me`. `ChatView` draws them
-  (`chat/row.rs`: hover buttons beside Reply: Delete, a 10 m timeout, Ban, and Unban on a removed message; the right-click
-  menu's Delete message / Timeout… (a submenu of lengths) / Ban… / Unban) and emits `ChatViewEvent::Moderate`; `ChannelPane`
-  takes it up on its next render (a Ban opens the confirmation dialog first), runs it and shows a failure in a dismissible strip
-  under the header. A moderator's room chips are Kit buttons with a caret (the caret is what makes `Button::dropdown_menu`
-  open) listing every mode, with checks and lengths (`pane::room_menu`, `core::RoomMode::toggled`); with no mode on, a
-  "Chat modes" button. The composer's `plan_submit` checks the role (*"You need to be a moderator of #chan to use /ban"*),
-  shows the command's usage under the box once its name is typed (`core::command_hint`) and the completion list only offers
-  what the role may use. Account banner: the eight moderation scopes (`auth::MODERATION_SCOPES`) are requested at login like
-  the rest but are *not* in the "log in again" banner (every existing login lacks them); using a tool without its scope says
-  which one to log in again for.
+  (`chat/row.rs`: hover buttons beside Reply: four fixed slots on every row, Delete / 10m timeout / Ban / Unban, the ones that do
+  not apply disabled so a click always lands on what was aimed at; while the pointer is on the strip the list stands still
+  (`ChatView::hold_for_strip`, `Surface::keep_frozen`: held again every frame like a selection, resumed on leaving); ids are
+  namespaced with the row's prefix because the list and the thread popover share sequence numbers; the right-click menu's
+  Delete message / Timeout… (a submenu of lengths) / Ban… / Unban) and emits `ChatViewEvent::Moderate`; `ChannelPane` subscribes with
+  window access (`subscribe_in`, first render), asks first for a Ban (confirmation dialog), runs it and shows a failure in a
+  dismissible strip under the header. A 403 means Twitch does not think you moderate here: the role is dropped
+  (`ChannelStore::drop_role`) and the controls go until the next join. A moderator's room chips are Kit buttons with a caret (the
+  caret is what makes `Button::dropdown_menu` open) listing every mode, with checks and lengths (`pane::room_menu`,
+  `core::RoomMode::toggled`); with no mode on, a "Chat modes" button. The composer's `plan_submit` checks the role (*"You need
+  to be a moderator of #chan to use /ban"*), shows the command's usage under the box once its name is typed
+  (`core::command_hint`) and the completion list only offers what the role may use. **Moderation scopes are opt-in:** a normal
+  login asks only for `auth::SCOPES`; the eight `auth::MODERATION_SCOPES` are requested by *Enable moderation tools…* (account
+  menu, Settings → Account, or the button on the failure strip) through the same device-code flow with them as extra scopes
+  (`Auth::request_device_code_with`, `AccountHub::begin_sign_in(moderation)`); a later normal login keeps them if they were
+  enabled. `Account::missing_moderation_scopes` says what a login lacks and is **not** part of `needs_relogin()`, so neither the
+  account banner, the title-bar warning icon nor Settings → Account nags anyone who never moderates; using a tool without them says
+  "Log in again to enable moderation (grants …)". Own messages (`account::own_login`), the broadcaster's, other moderators' and
+  event cards (a `USERNOTICE`) get no controls.
 - **Removed messages** (PR 5.2). `CLEARCHAT` / `CLEARMSG` strike messages out as before (`flags.deleted`; the chat view
   draws them dimmed and struck through, or, with `chat.deleted_messages = "collapse"`, as `name: <message deleted>` that a
-  click reveals; collapsing is another row height, so `ChannelStore::deletions` and the setting make the list measure again).
+  click reveals. The collapsed line is the same `MessageElement` with another display text (`display::build_collapsed`, key
+  `LayoutKey::collapsed`), so selecting, copying and the right-click menu work on it. Collapsing is another row height:
+  `ChannelStore::struck_since` (a bounded log of the sequence numbers a delete / timeout / ban / clear changed) makes the view
+  measure just those rows again, and `revealed` is pruned to messages the store still holds). `MessageFlags::removal` says why
+  a message was removed (`Deleted`, `Cleared`, `TimedOut`, `Banned`; a stronger one replaces a weaker): Unban is offered only for
+  the last two, a timeout stays available after a delete. Event cards (`USERNOTICE`) are not chat lines: no collapse, no strike.
   `core::clear_line` makes the system line ("alice was timed out for 10m.", "alice was banned.", "Chat was cleared by a
   moderator.") from an event that has its `tmi-sent-ts`; its id is built from what happened and when, so the live copy and
   recent-messages history (`ChannelStore::with_clear_lines`, lines older than anything shown are left out) are one line, and
@@ -722,13 +736,15 @@ Twitch removed the IRC chat commands, so every moderation action is a Helix requ
   moderation/bans` (timeout with `duration`, ban without), `DELETE moderation/bans` (unban), `DELETE moderation/chat` (one
   message with `message_id`, else the whole chat), `PATCH chat/settings` (only the changed mode), `POST chat/announcements`,
   `POST chat/shoutouts`, `POST` / `DELETE moderation/moderators`, `channels/vips`, `raids`. `required_scope` names the OAuth scope
-  each needs; `auth::MODERATION_SCOPES` are those eight, all in `auth::SCOPES`.
-- **`HelixClient::moderate(broadcaster_id, command, target_id)`** — checks the login's missing scopes first (a login from before
-  the scopes got `ModError::MissingScope`: *"Log in again to grant moderator:manage:banned_users"*, nothing is sent), resolves
+  each needs; `auth::MODERATION_SCOPES` are those eight, deliberately **not** in `auth::SCOPES` (see the app section: opt-in).
+- **`HelixClient::moderate(broadcaster_id, command, target_id)`** — checks the login's moderation scopes first (a login that did
+  not enable them gets `ModError::MissingScope`: *"Log in again to enable moderation (grants moderator:manage:banned_users)"*,
+  nothing is sent; `ModError::is_forbidden` is a 403), resolves
   the target's login with `GET users?login=` unless the caller knows the id (a message's author), sends through
   `request_json` (any method; same refresh-on-401 and rate-limit handling as `post_json`) and maps Twitch's answer: 2xx is
   done, a 401 naming a scope is `MissingScope`, other refusals carry Twitch's own message, 429 is `RateLimited`.
-- **`USERSTATE`** is parsed (`ChatEvent::UserState { channel, role }`; the broadcaster has `broadcaster/1` and no `mod=1`).
+- **`USERSTATE`** is parsed (`ChatEvent::UserState { channel, role }`; the broadcaster has `broadcaster/1` and no `mod=1`; staff / admin / global-mod badges are not moderator status in the channel).
+- A ban or timeout without a reason omits `reason` from the body.
 
 ### User emotes (`crates/twitch`, PR 3.3)
 

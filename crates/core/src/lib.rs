@@ -32,7 +32,9 @@ pub use event::{
     RoomStateUpdate,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
-pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
+pub use message::{
+    Author, Fragment, Message, MessageFlags, MessageKind, Removal, ReplyRef, Rgb, Timestamp,
+};
 pub use moderation::{
     COMMANDS, CommandError, CommandInfo, CommandRole, DEFAULT_TIMEOUT_SECS, FOLLOWER_PRESETS,
     ModCommand, RoomChange, RoomMode, RowActions, SLOW_PRESETS, TIMEOUT_PRESETS, clear_line,

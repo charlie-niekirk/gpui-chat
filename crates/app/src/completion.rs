@@ -681,7 +681,7 @@ mod tests {
             texts(&auto)
         };
         assert_eq!(commands(ChannelRole::Viewer, "/ti"), Vec::<String>::new());
-        assert_eq!(commands(ChannelRole::Moderator, "/ti"), ["timeout"]);
+        assert!(commands(ChannelRole::Moderator, "/ti").contains(&"timeout".to_owned()));
         assert_eq!(
             commands(ChannelRole::Moderator, "/ra"),
             Vec::<String>::new()

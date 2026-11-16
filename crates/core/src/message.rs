@@ -94,7 +94,42 @@ pub enum MessageKind {
     System,
 }
 
-/// Per-message flags. Mutations after creation go through [`Message::with_deleted`]
+/// Why a message was removed (PR 5.2): what the UI may offer for it (a timeout or ban can be
+/// lifted with Unban, a deleted message cannot) and how much it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Removal {
+    #[default]
+    None,
+    /// Deleted on its own (`CLEARMSG`).
+    Deleted,
+    /// The whole chat was cleared.
+    Cleared,
+    /// Its author was timed out.
+    TimedOut,
+    /// Its author was banned.
+    Banned,
+}
+
+impl Removal {
+    /// How much a removal says: a later one replaces an earlier one only when it says more (a
+    /// message that was deleted and then its author banned is a ban removal; a clear after a
+    /// ban changes nothing).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Deleted | Self::Cleared => 1,
+            Self::TimedOut => 2,
+            Self::Banned => 3,
+        }
+    }
+
+    /// Whether the author is (or was) punished: Unban makes sense.
+    pub fn is_punishment(self) -> bool {
+        matches!(self, Self::TimedOut | Self::Banned)
+    }
+}
+
+/// Per-message flags. Mutations after creation go through [`Message::with_removal`]
 /// (messages themselves are immutable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MessageFlags {
@@ -106,6 +141,8 @@ pub struct MessageFlags {
     pub highlighted: bool,
     /// Removed by a moderator / timeout / ban; kept so the UI can strike it through.
     pub deleted: bool,
+    /// Why (`deleted` is `removal != Removal::None`).
+    pub removal: Removal,
     /// Came from recent-messages history rather than live chat.
     pub history: bool,
     /// The app's own stand-in for a message the user just sent, shown until Twitch's copy of it
@@ -304,12 +341,19 @@ impl Message {
         }
     }
 
-    /// A copy with `flags.deleted` set. Used by the store, since stored messages
-    /// are shared and never mutated in place.
+    /// A copy with `flags.deleted` set (a single deletion). Used by the store, since stored
+    /// messages are shared and never mutated in place.
     #[must_use]
     pub fn with_deleted(&self) -> Self {
+        self.with_removal(Removal::Deleted)
+    }
+
+    /// A copy removed for `removal`.
+    #[must_use]
+    pub fn with_removal(&self, removal: Removal) -> Self {
         let mut copy = self.clone();
-        copy.flags.deleted = true;
+        copy.flags.deleted = removal != Removal::None;
+        copy.flags.removal = removal;
         copy
     }
 

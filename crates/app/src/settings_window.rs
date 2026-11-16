@@ -792,6 +792,13 @@ fn account_page() -> SettingPage {
 fn account_row(cx: &App) -> impl IntoElement + use<> {
     let tokens = *cx.global::<Tokens>();
     let state = account::current(cx).map(|hub| hub_state(&hub, cx));
+    let moderation_off = matches!(
+        &state,
+        Some(AccountStatus::LoggedIn {
+            moderation: false,
+            ..
+        })
+    );
     let (status, detail, logged_in) = match state {
         None => (
             "Not available".to_owned(),
@@ -800,11 +807,23 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
         ),
         Some(AccountStatus::Restoring) => ("Checking the saved login…".to_owned(), None, None),
         Some(AccountStatus::LoggedOut(notice)) => ("Not logged in".to_owned(), notice, Some(false)),
-        Some(AccountStatus::LoggedIn { login, relogin }) => (
+        Some(AccountStatus::LoggedIn {
+            login,
+            relogin,
+            moderation,
+        }) => (
             format!("Logged in as {login}"),
-            relogin.then(|| {
-                "This login lacks permissions the app now asks for. Log in again.".to_owned()
-            }),
+            if relogin {
+                Some("This login lacks permissions the app now asks for. Log in again.".to_owned())
+            } else if !moderation {
+                Some(
+                    "Moderation tools (timeouts, bans, room modes, slash commands) need extra \
+                     Twitch permissions, asked for only if you enable them."
+                        .to_owned(),
+                )
+            } else {
+                None
+            },
             Some(true),
         ),
     };
@@ -841,6 +860,16 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
                             .label("Log in again…")
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(LogIn), cx)),
                     )
+                    .children(moderation_off.then(|| {
+                        Button::new("settings-enable-moderation")
+                            .small()
+                            .label("Enable moderation tools…")
+                            .on_click(|_, window, cx| {
+                                if let Some(hub) = account::current(cx) {
+                                    sign_in::open_for_moderation(hub, window, cx);
+                                }
+                            })
+                    }))
                     .child(
                         Button::new("settings-log-out")
                             .small()
@@ -862,7 +891,11 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
 enum AccountStatus {
     Restoring,
     LoggedOut(Option<String>),
-    LoggedIn { login: String, relogin: bool },
+    LoggedIn {
+        login: String,
+        relogin: bool,
+        moderation: bool,
+    },
 }
 
 fn hub_state(hub: &gpui_kit::Entity<AccountHub>, cx: &App) -> AccountStatus {
@@ -873,6 +906,7 @@ fn hub_state(hub: &gpui_kit::Entity<AccountHub>, cx: &App) -> AccountStatus {
         AuthState::LoggedIn(account) => AccountStatus::LoggedIn {
             login: account.login.clone(),
             relogin: account.needs_relogin(),
+            moderation: account.moderation_enabled(),
         },
     }
 }

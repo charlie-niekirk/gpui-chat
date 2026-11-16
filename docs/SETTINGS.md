@@ -194,8 +194,9 @@ moderator."), for live chat and for recent-messages history alike. A value this 
 `"strikethrough"`.
 
 Moderation tools (buttons, menu items, the room-mode menu, `/timeout` and the other commands) appear only for a moderator or the
-broadcaster of the channel and need a login with the moderation scopes: after updating, log in again from the account menu (the
-tools say which scope is missing when you use one).
+broadcaster of the channel. They need Twitch permissions a normal login does not ask for (least privilege, and nobody who only
+watches chat is asked to log in again): choose **Enable moderation tools…** (account menu, *Settings → Account*, or the button on
+the strip that appears when you first use a tool) and approve the extra permissions. Logging in again later keeps them.
 
 ## Twitch account (PR 3.1)
 

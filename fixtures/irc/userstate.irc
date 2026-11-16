@@ -9,3 +9,5 @@
 @badge-info=;badges=;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=1;subscriber=0;user-type=mod :tmi.twitch.tv USERSTATE #tagchan
 # broadcaster: no mod tag, only the badge
 @badge-info=;badges=broadcaster/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #ownchan
+# staff / admin / global mod: not a moderator of this channel
+@badge-info=;badges=staff/1,global_mod/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type=staff :tmi.twitch.tv USERSTATE #staffchan

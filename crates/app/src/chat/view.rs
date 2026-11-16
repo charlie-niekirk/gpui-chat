@@ -144,10 +144,15 @@ pub struct ChatView {
     /// Whether moderation controls can act (the pane has someone to run commands); they are
     /// shown when the logged-in user is also a moderator here (PR 5.2).
     moderation: bool,
-    /// Removed messages the user clicked open (`chat.deleted_messages = "collapse"`).
-    revealed: HashSet<MessageId>,
-    /// How far into the store's count of struck-out messages this view has applied.
-    deletions_seen: u64,
+    /// Removed messages the user clicked open (`chat.deleted_messages = "collapse"`); only ones the
+    /// store still holds are kept.
+    revealed: Rc<RefCell<HashSet<MessageId>>>,
+    /// How far into the store's log of struck-out messages this view has applied
+    /// ([`ChannelStore::struck_since`]).
+    struck_seen: u64,
+    /// The pointer is on a row's moderation strip: the list stands still (`Some(true)`: it was
+    /// following the newest messages and goes back to that afterwards).
+    strip_hold: Option<bool>,
     /// The thread popover, while one is open.
     thread: Option<ThreadPanel>,
     /// Text selection and links in the list.
@@ -202,8 +207,9 @@ impl ChatView {
             can_reply: false,
             hovered: Rc::default(),
             moderation: false,
-            revealed: HashSet::new(),
-            deletions_seen: 0,
+            revealed: Rc::default(),
+            struck_seen: 0,
+            strip_hold: None,
             thread: None,
             _subscriptions: subscriptions,
         }
@@ -238,12 +244,36 @@ impl ChatView {
 
     /// Shows the text of a collapsed removed message.
     pub fn reveal(&mut self, id: &MessageId, cx: &mut Context<Self>) {
-        if !self.revealed.insert(id.clone()) {
+        if !self.revealed.borrow_mut().insert(id.clone()) {
             return;
         }
         let seq = self.store.read(cx).messages().seq_of(id.as_str());
         if let Some(seq) = seq {
             self.remeasure_seqs(&[seq]);
+        }
+        cx.notify();
+    }
+
+    /// The pointer entered (`true`) or left a row's moderation strip. While it is on it the list
+    /// stands still, so no message can arrive and slide another row under the pointer between aiming
+    /// at a button and clicking it (a Delete or a 10-minute timeout asks no confirmation); the
+    /// new messages wait behind the "N new messages" pill and the list resumes following when the
+    /// pointer leaves.
+    pub fn hold_for_strip(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on == self.strip_hold.is_some() {
+            return;
+        }
+        if on {
+            // Stopped where it is, the way a selection stops it (a bare pause would re-engage at
+            // the bottom as soon as the next message is laid out).
+            self.strip_hold = Some(self.surface.freeze_list());
+            self.surface.keep_frozen(true);
+        } else {
+            self.surface.keep_frozen(false);
+            if self.strip_hold.take() == Some(true) {
+                self.list.set_follow_mode(FollowMode::Tail);
+                self.unseen_from = None;
+            }
         }
         cx.notify();
     }
@@ -351,13 +381,24 @@ impl ChatView {
                 None => self.list.remeasure(),
             }
         }
-        // Messages struck out: when removed ones are drawn collapsed that is another row height.
-        let deletions = self.store.read(cx).deletions();
-        if deletions != self.deletions_seen {
-            self.deletions_seen = deletions;
+        // Messages struck out: when removed ones are drawn collapsed that is another row height,
+        // for those rows only.
+        let (struck, serial) = self.store.read(cx).struck_since(self.struck_seen);
+        if serial != self.struck_seen {
+            self.struck_seen = serial;
             if config::current(cx).chat.deleted_messages == DeletedMessages::Collapse {
-                self.list.remeasure();
+                match struck {
+                    Some(seqs) => self.remeasure_seqs(&seqs),
+                    None => self.list.remeasure(),
+                }
             }
+        }
+        // Revealed messages that left the store are forgotten.
+        {
+            let store = self.store.read(cx);
+            self.revealed
+                .borrow_mut()
+                .retain(|id| store.messages().contains(id.as_str()));
         }
         // Also covers changes without new messages (deletions): rows re-render.
         cx.notify();
@@ -613,7 +654,11 @@ impl Render for ChatView {
             (store.channel().clone(), role)
         };
         let track_hover = self.can_reply || role.can_moderate();
-        let revealed = Rc::new(self.revealed.clone());
+        // The pointer left the rows while a strip held the list (the strip went away with it).
+        if self.strip_hold.is_some() && self.hovered.get().is_none() {
+            self.hold_for_strip(false, cx);
+        }
+        let own_login: Option<Arc<str>> = crate::account::own_login(cx).map(Arc::from);
         let style = Rc::new(MessageStyle {
             bold_font: regular.clone().bold(),
             font: regular,
@@ -656,7 +701,8 @@ impl Render for ChatView {
             role,
             channel: channel.clone(),
             deleted: config.deleted,
-            revealed: revealed.clone(),
+            revealed: self.revealed.clone(),
+            own_login: own_login.clone(),
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -1097,6 +1143,38 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_list_stands_still_while_the_pointer_is_on_a_moderation_strip(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(100, "hello", cx);
+        assert!(h.following(cx));
+        // The pointer is over a row (a moderator's rows track it), as it is when it is on the strip.
+        h.view.update(cx, |view, cx| view.set_can_reply(true, cx));
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(px(400.0), px(595.0)), None, Default::default());
+        cx.run_until_parked();
+        h.view.update(cx, |view, cx| view.hold_for_strip(true, cx));
+        assert!(!h.following(cx), "holding stops following");
+        h.push(5, "more", cx);
+        assert!(!h.following(cx), "new messages do not move the list");
+        assert!(
+            h.view.read_with(cx, |v, _| v.unseen()) >= 5,
+            "they wait behind the pill"
+        );
+        // Entering again changes nothing; leaving resumes following the newest.
+        h.view.update(cx, |view, cx| view.hold_for_strip(true, cx));
+        h.view.update(cx, |view, cx| view.hold_for_strip(false, cx));
+        cx.run_until_parked();
+        assert!(h.following(cx));
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
+        // A list that was not following (the user scrolled up) is left where it is.
+        h.scroll(200.0, cx);
+        assert!(!h.following(cx));
+        h.view.update(cx, |view, cx| view.hold_for_strip(true, cx));
+        h.view.update(cx, |view, cx| view.hold_for_strip(false, cx));
+        assert!(!h.following(cx));
+    }
+
+    #[gpui_kit::test]
     fn choosing_a_moderation_action_tells_the_owner_which_message_and_action(
         cx: &mut TestAppContext,
     ) {
@@ -1153,7 +1231,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        assert_eq!(h.store.read_with(cx, |s, _| s.deletions()), 1);
+        assert_eq!(h.store.read_with(cx, |s, _| s.struck_count()), 30);
         assert_eq!(overflow(&h, cx), intact);
 
         // Collapsing is a setting; every removed message is laid out again as one line.
@@ -1167,13 +1245,34 @@ mod tests {
         let collapsed = overflow(&h, cx);
         assert!(collapsed < intact / 2.0, "{collapsed:?} < {intact:?}");
 
+        let shown = |h: &Harness, cx: &mut VisualTestContext| {
+            h.view.read_with(cx, |view, _| {
+                view.cache
+                    .borrow()
+                    .shaped(29)
+                    .expect("laid out")
+                    .display
+                    .text
+                    .clone()
+            })
+        };
+        assert!(
+            shown(&h, cx).ends_with("Al: <message deleted>"),
+            "{}",
+            shown(&h, cx)
+        );
+
         // Revealing one brings its text back, and only that one's.
-        let id = MessageId::from("m0");
+        let id = MessageId::from("m29");
         h.view.update(cx, |view, cx| view.reveal(&id, cx));
         cx.run_until_parked();
         let revealed = overflow(&h, cx);
-        assert!(revealed > collapsed && revealed < intact, "{revealed:?}");
-        assert!(h.view.read_with(cx, |view, _| view.revealed.contains(&id)));
+        assert!(revealed > collapsed, "{revealed:?}");
+        assert!(shown(&h, cx).contains("Al: word word"), "{}", shown(&h, cx));
+        assert!(
+            h.view
+                .read_with(cx, |view, _| view.revealed.borrow().contains(&id))
+        );
     }
 
     /// Presses (with `clicks`), optionally drags to `to`, and releases there.
