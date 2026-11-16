@@ -648,40 +648,24 @@ impl Composer {
         )
     }
 
-    fn error_strip(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn error_strip(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let error = self.error.clone()?;
-        Some(
-            h_flex()
-                .id("composer-error")
-                .w_full()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .gap_2()
-                .items_center()
-                .bg(tokens.danger.opacity(0.14))
-                .border_t_1()
-                .border_color(tokens.danger)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(tokens.danger_text)
-                        .child(error),
-                )
-                .child(
-                    Button::new("composer-error-dismiss")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Close))
-                        .accessibility_label("Dismiss error")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.error = None;
-                            cx.notify();
-                        })),
-                ),
-        )
+        let this = cx.entity().downgrade();
+        Some(crate::problems::strip(
+            "composer-error",
+            &crate::problems::Problem::error(error.to_string()),
+            tokens,
+            crate::problems::StripActions {
+                on_fix: Box::new(|_, _, _| {}),
+                on_dismiss: Box::new(move |_, cx| {
+                    this.update(cx, |this, cx| {
+                        this.error = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+            },
+        ))
     }
 }
 

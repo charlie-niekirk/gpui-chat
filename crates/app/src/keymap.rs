@@ -239,6 +239,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<KeymapReport>> {
         }
         Err(error) => {
             tracing::warn!(%error, "keymap.toml changes will not be picked up live");
+            crate::problems::report_watch_failure("keymap.toml", &error.to_string());
             None
         }
     }

@@ -631,7 +631,6 @@ impl ChatView {
                 .ghost()
                 .label(label)
                 .selected(on)
-                .tab_stop(false)
                 .on_click(move |_, _, cx| {
                     view.update(cx, run).ok();
                 })
@@ -643,7 +642,7 @@ impl ChatView {
                 .ghost()
                 .icon(Icon::new(icon))
                 .tooltip(tip)
-                .tab_stop(false)
+                .accessibility_label(tip)
                 .disabled(status.matches == 0)
                 .on_click(move |_, _, cx| {
                     view.update(cx, |view, cx| view.find_step(forward, cx)).ok();
@@ -656,7 +655,7 @@ impl ChatView {
                 .ghost()
                 .icon(Icon::new(IconName::Close))
                 .tooltip("Close (Esc)")
-                .tab_stop(false)
+                .accessibility_label("Close find bar")
                 .on_click(move |_, _, cx| {
                     view.update(cx, |view, cx| {
                         view.close_find(cx);

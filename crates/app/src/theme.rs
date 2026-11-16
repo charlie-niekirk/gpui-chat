@@ -71,6 +71,8 @@ pub struct Tokens {
     pub danger_text: Hsla,
     /// `accent` drawn as text or a thin icon, same rule.
     pub accent_link: Hsla,
+    /// The keyboard focus ring (Kit's `ring`, the Mentions row): 3:1 on every surface.
+    pub focus_ring: Hsla,
     /// Connected.
     pub success: Hsla,
     /// Connecting / reconnecting.
@@ -117,6 +119,7 @@ impl Tokens {
             danger: hsla(palette.danger),
             danger_text: hsla(palette.danger_text),
             accent_link: hsla(palette.accent_link),
+            focus_ring: hsla(palette.focus_ring),
             success: hsla(palette.success),
             warning: hsla(palette.warning),
             history_opacity: history_opacity(
@@ -223,6 +226,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
         }
         Err(error) => {
             tracing::warn!(%error, "theme file changes will not be picked up live");
+            crate::problems::report_watch_failure("themes", &error.to_string());
             None
         }
     }
@@ -447,7 +451,7 @@ fn apply_kit_colors(colors: &mut gpui_kit::component::ThemeColor, p: &Palette, t
     colors.muted = h(p.surface);
     colors.border = h(p.border);
     colors.input = h(p.border);
-    colors.ring = h(p.accent);
+    colors.ring = h(p.focus_ring);
     colors.caret = h(p.text);
     colors.selection = h(p.accent).opacity(0.3);
     colors.overlay = gpui_kit::black().opacity(0.5);
@@ -460,9 +464,10 @@ fn apply_kit_colors(colors: &mut gpui_kit::component::ThemeColor, p: &Palette, t
     colors.primary_active = h(p.accent.mix(p.text, 0.22));
     colors.accent = hover;
     colors.accent_foreground = h(p.text);
-    colors.link = h(p.accent);
-    colors.link_hover = h(p.accent.mix(p.text, 0.15));
-    colors.link_active = h(p.accent.mix(p.text, 0.25));
+    // Links are text: the readable accent, not the raw one.
+    colors.link = h(p.accent_link);
+    colors.link_hover = h(p.accent_link.mix(p.text, 0.15));
+    colors.link_active = h(p.accent_link.mix(p.text, 0.25));
 
     colors.secondary = h(p.surface);
     colors.secondary_foreground = h(p.text);

@@ -71,15 +71,39 @@ impl TokenStore for KeychainTokenStore {
     }
 
     fn save(&self, token: &StoredToken) -> Result<(), StoreError> {
-        self.entry()?
-            .set_password(&encode_token(token))
-            .map_err(map_error)
+        let result = self
+            .entry()
+            .and_then(|entry| entry.set_password(&encode_token(token)).map_err(map_error));
+        report("save", &result);
+        result
     }
 
     fn clear(&self) -> Result<(), StoreError> {
-        match self.entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(map_error(error)),
-        }
+        let result = self
+            .entry()
+            .and_then(|entry| match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(error) => Err(map_error(error)),
+            });
+        report("remove", &result);
+        result
+    }
+}
+
+/// A login that could not be written to (or removed from) the keychain would otherwise be a log
+/// line: the user would be logged in for this run only, or logged out with the token still stored.
+/// One strip says so; a later write that works clears it.
+fn report(what: &str, result: &Result<(), StoreError>) {
+    match result {
+        Ok(()) => crate::problems::clear_from_anywhere("keychain"),
+        Err(error) => crate::problems::report_from_anywhere(
+            "keychain",
+            crate::problems::Problem::error("The system keychain is not available")
+                .line(
+                    "Your Twitch login could not be saved or removed there, so it may not survive a restart. \
+                     Unlock the keychain and log in again.",
+                )
+                .details(format!("could not {what} the login: {error}")),
+        ),
     }
 }

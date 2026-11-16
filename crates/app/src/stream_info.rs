@@ -45,8 +45,10 @@ impl StreamInfoHub {
                 while snapshots.changed().await.is_ok() {
                     let snapshot = snapshots.borrow_and_update().clone();
                     // Every poll notifies, even an unchanged one: uptime and viewers move.
+                    let error = snapshot.error.clone();
                     let alive = this.update(cx, |hub, cx| {
                         hub.snapshot = snapshot;
+                        report_poll_error(error, cx);
                         cx.notify();
                     });
                     if alive.is_err() {
@@ -189,6 +191,31 @@ pub fn format_uptime(uptime: Duration) -> String {
         .map(|(n, unit)| format!("{n}{unit}"))
         .collect();
     parts.join(" ")
+}
+
+/// Files the stream poll's failure, or clears it. Nothing answering is the shared offline strip
+/// (unless chat is up, which makes it Twitch's API being down); anything else is its own strip.
+fn report_poll_error(error: Option<String>, cx: &mut App) {
+    let Some(error) = error else {
+        crate::problems::network::recovered("streams");
+        crate::problems::clear("streams", cx);
+        return;
+    };
+    if crate::problems::network::is_transport_error(&error) {
+        if crate::problems::network::failure("streams", &error) {
+            crate::problems::clear("streams", cx);
+            return;
+        }
+    } else {
+        crate::problems::network::recovered("streams");
+    }
+    crate::problems::report(
+        "streams",
+        crate::problems::Problem::warning("Can't check which channels are live")
+            .line("The live markers may be out of date. It keeps trying by itself.")
+            .details(error),
+        cx,
+    );
 }
 
 #[cfg(test)]

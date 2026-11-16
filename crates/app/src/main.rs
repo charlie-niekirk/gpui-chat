@@ -23,6 +23,7 @@ mod emote_picker;
 mod emote_service;
 mod emote_sources;
 mod emote_thumb;
+mod empty;
 mod firehose;
 mod fonts;
 mod history_service;
@@ -39,6 +40,7 @@ mod notifications;
 mod palette;
 mod pane;
 mod platform;
+mod problems;
 mod replay;
 mod reply;
 mod runtime;
@@ -149,9 +151,13 @@ fn start_chat(
     .detach();
     // The account (login, Helix) exists only with the live source: offline runs never touch the
     // keychain.
+    // First run: no `[channels]` section was ever written (the first channel added writes it), so
+    // the main pane shows the welcome until then (PR 6.3).
+    let mut first_run = false;
     let (channels, live, account) = if offline {
         (ChannelList::default(), None, None)
     } else {
+        first_run = state::is_first_run();
         let saved = state::load().channels.unwrap_or_default();
         let account = AccountHub::create(cx);
         let live = LiveSource::start(sender.clone(), account.clone(), cx);
@@ -205,6 +211,7 @@ fn start_chat(
         loopback,
         diagnostics,
         hud_visible: cli.hud,
+        first_run,
     }
 }
 
@@ -234,6 +241,10 @@ fn main() {
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            // Before anything that can fail at startup reports.
+            problems::init(cx);
+            // The system "Reduce motion" is read by `init`; the env override is for testing.
+            config::apply_reduce_motion_override(cx);
             // The backend runtime exists before any window and stops when the app quits.
             runtime::init(cx)
                 .unwrap_or_else(|error| panic!("failed to start the backend runtime: {error}"));

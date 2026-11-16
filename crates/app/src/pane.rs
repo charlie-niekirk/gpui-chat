@@ -14,7 +14,7 @@ use gpui_chat_core::{
     ChannelId, ConnectionState, FOLLOWER_PRESETS, FollowersOnly, Message, ModCommand, RoomChange,
     RoomMode, RoomState, SLOW_PRESETS, format_seconds,
 };
-use gpui_chat_streamlink::QUALITIES;
+use gpui_chat_streamlink::{QUALITIES, StreamError};
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
@@ -36,6 +36,7 @@ use crate::chat::selection_layer::CopySelection;
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
 use crate::moderation::{FailureKind, ModRequest, Moderator, RowAction, confirmation};
+use crate::problems::{self, Fix, Problem};
 use crate::splits::view::{DragChip, DraggedPane};
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
@@ -723,63 +724,69 @@ impl ChannelPane {
         &self,
         tokens: &Tokens,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let (notice, kind) = self.mod_notice.clone()?;
-        Some(
-            h_flex()
-                .id("mod-notice")
-                .w_full()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .gap_2()
-                .items_center()
-                .bg(tokens.danger.opacity(0.14))
-                .border_b_1()
-                .border_color(tokens.danger)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(tokens.danger_text)
-                        .child(notice),
-                )
-                // Moderation needs permissions a normal login does not ask for: enable them.
-                .children((kind == FailureKind::MissingScope).then(|| {
-                    Button::new("mod-notice-enable")
-                        .small()
-                        .primary()
-                        .label("Enable moderation tools")
-                        .on_click(|_, window, cx| {
-                            if let Some(hub) = crate::account::current(cx) {
+        let mut problem = Problem::error(notice.to_string());
+        // Moderation needs permissions a normal login does not ask for: enable them.
+        match kind {
+            FailureKind::MissingScope => {
+                problem = problem.fix("Enable moderation tools", Fix::EnableModeration);
+            }
+            FailureKind::BlockListScope => {
+                problem = problem.fix("Enable block list sync", Fix::EnableBlockList);
+            }
+            _ => {}
+        }
+        let pane = cx.entity().downgrade();
+        Some(problems::strip(
+            "mod-notice",
+            &problem,
+            tokens,
+            problems::StripActions {
+                on_fix: Box::new(|fix, window, cx| {
+                    if let Some(hub) = crate::account::current(cx) {
+                        match fix {
+                            Fix::EnableModeration => {
                                 crate::sign_in::open_for_moderation(hub, window, cx);
                             }
-                        })
-                }))
-                .children((kind == FailureKind::BlockListScope).then(|| {
-                    Button::new("mod-notice-enable-blocks")
-                        .small()
-                        .primary()
-                        .label("Enable block list sync")
-                        .on_click(|_, window, cx| {
-                            if let Some(hub) = crate::account::current(cx) {
+                            Fix::EnableBlockList => {
                                 crate::sign_in::open_for_block_list(hub, window, cx);
                             }
-                        })
-                }))
-                .child(
-                    Button::new("mod-notice-dismiss")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Close))
-                        .accessibility_label("Dismiss")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.mod_notice = None;
-                            cx.notify();
-                        })),
-                ),
-        )
+                            _ => {}
+                        }
+                    }
+                }),
+                on_dismiss: Box::new(move |_, cx| {
+                    pane.update(cx, |this, cx| {
+                        this.mod_notice = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+            },
+        ))
+    }
+
+    /// The streamlink failure of this channel, if any, as a strip under the header.
+    fn stream_error_strip(&self, tokens: &Tokens, cx: &App) -> Option<gpui_kit::AnyElement> {
+        if !self.live {
+            return None;
+        }
+        let channel = self.store.read(cx).channel().clone();
+        let error = self.streams.read(cx).state(&channel)?.error.clone()?;
+        let problem = stream_problem(&error);
+        let (streams, target) = (self.streams.clone(), channel);
+        Some(problems::strip(
+            "stream-error",
+            &problem,
+            tokens,
+            problems::StripActions {
+                on_fix: Box::new(|_, _, cx| crate::settings_window::open(cx)),
+                on_dismiss: Box::new(move |_, cx| {
+                    streams.update(cx, |hub, cx| hub.dismiss(&target, cx));
+                }),
+            },
+        ))
     }
 
     /// Split right / split down / close: they act on the focused pane, which a press in this
@@ -973,7 +980,7 @@ impl ChannelPane {
             .flex_none()
             .gap_3()
             .items_center()
-            .child(self.stream_actions(tokens, compact, cx))
+            .child(self.stream_actions(compact, cx))
             .child(self.pane_actions(tokens));
         let main_row = h_flex()
             .id("pane-header-main")
@@ -1000,7 +1007,7 @@ impl ChannelPane {
 
     /// Streamlink error (when there is one) and the play / stop button with its quality menu.
     /// Offline sources have no real channels, so they get nothing.
-    fn stream_actions(&self, tokens: &Tokens, compact: bool, cx: &App) -> impl IntoElement {
+    fn stream_actions(&self, compact: bool, cx: &App) -> impl IntoElement {
         let actions = h_flex()
             .id("pane-actions")
             .flex_none()
@@ -1015,36 +1022,6 @@ impl ChannelPane {
         let quality = hub.quality(&channel, cx);
         let active = state.is_some_and(StreamState::is_active);
         let stopping = state.is_some_and(|s| s.phase == Phase::Stopping);
-
-        let notice = state.and_then(|s| s.error.as_ref()).map(|error| {
-            let message = error.to_string();
-            let streams = self.streams.clone();
-            let target = channel.clone();
-            h_flex()
-                .id("stream-error")
-                .gap_1()
-                .items_center()
-                .min_w_0()
-                .max_w(px(if compact { 120.0 } else { 420.0 }))
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(tokens.danger_text)
-                        .child(message),
-                )
-                .child(
-                    Button::new("stream-error-dismiss")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Close))
-                        .accessibility_label("Dismiss streamlink error")
-                        .on_click(move |_, _, cx| {
-                            streams.update(cx, |hub, cx| hub.dismiss(&target, cx));
-                        }),
-                )
-        });
 
         let toggle = {
             let streams = self.streams.clone();
@@ -1094,7 +1071,7 @@ impl ChannelPane {
                 menu
             }
         };
-        actions.children(notice).child(
+        actions.child(
             DropdownButton::new("stream-play")
                 .button(toggle)
                 .dropdown_menu(menu)
@@ -1186,6 +1163,7 @@ impl Render for ChannelPane {
                 cx.entity().downgrade(),
                 cx,
             ))
+            .children(self.stream_error_strip(&tokens, cx))
             .children(self.mod_notice_strip(&tokens, cx))
             .child(div().flex_1().min_h_0().w_full().child(self.chat.clone()))
             .children(self.composer.clone())
@@ -1198,6 +1176,33 @@ impl Focusable for ChannelPane {
     }
 }
 
+/// What a failed streamlink run says: one actionable sentence, the raw error behind
+/// "Copy details".
+fn stream_problem(error: &StreamError) -> Problem {
+    match error {
+        StreamError::NotFound { configured } => Problem::error("streamlink was not found")
+            .line(match configured {
+                Some(path) => format!(
+                    "Nothing runnable at {path}. Fix the path in Settings, or clear it to search for streamlink."
+                ),
+                None => "Install it (brew install streamlink), or set its path in Settings."
+                    .to_owned(),
+            })
+            .fix("Open settings", Fix::OpenSettings),
+        StreamError::ChannelOffline => Problem::info("This channel is offline")
+            .line("streamlink only plays live streams."),
+        StreamError::NoPlayer(detail) => Problem::error("No video player was found")
+            .line("streamlink needs a player such as VLC or mpv. Install one, or set the player under Streamlink in Settings.")
+            .fix("Open settings", Fix::OpenSettings)
+            .details(detail.clone()),
+        StreamError::Spawn(detail) | StreamError::Other(detail) => {
+            Problem::error("streamlink could not play this stream")
+                .line("Copy the details if you want to report it.")
+                .details(detail.clone())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,6 +1211,23 @@ mod tests {
         let mut room = RoomState::default();
         f(&mut room);
         room
+    }
+
+    #[test]
+    fn a_missing_streamlink_says_what_to_do_and_offers_settings() {
+        let missing = stream_problem(&StreamError::NotFound { configured: None });
+        assert_eq!(missing.fix.map(|(_, fix)| fix), Some(Fix::OpenSettings));
+        assert!(missing.lines[0].contains("brew install streamlink"));
+        let at = stream_problem(&StreamError::NotFound {
+            configured: Some("/nope/streamlink".into()),
+        });
+        assert!(at.lines[0].contains("/nope/streamlink"));
+        let other = stream_problem(&StreamError::Other("error: boom".into()));
+        assert_eq!(other.details.as_deref(), Some("error: boom"));
+        assert!(
+            !other.title.contains("boom"),
+            "the raw error stays behind Copy details"
+        );
     }
 
     #[test]

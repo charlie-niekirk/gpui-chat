@@ -26,15 +26,16 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::{Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, FocusHandle, Focusable, FontWeight, Global,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
-    WeakEntity, Window, WindowBounds, WindowOptions, div, px, size,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, FocusHandle, Focusable, FontWeight,
+    Global, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
+    Subscription, WeakEntity, Window, WindowBounds, WindowOptions, div, px, size,
 };
 
 use self::fields::{Commit, NumberSpec, Reset};
 use crate::account::{self, AccountHub};
 use crate::actions::{CloseWindow, LogIn, LogOut, MinimizeWindow, OpenSettings};
 use crate::fonts::FontConfig;
+use crate::problems::{self, Problem};
 use crate::theme::{self, Tokens};
 use crate::{config, sign_in};
 
@@ -106,6 +107,9 @@ pub struct SettingsView {
     /// Why the last change from a toggle or menu was not saved. Cleared when the settings
     /// change (the file loaded, or a write worked).
     edit_error: Option<SharedString>,
+    /// The banner text the user dismissed; it stays hidden while it reads the same, and comes
+    /// back when the problem changes or the file has loaded cleanly in between.
+    dismissed_banner: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -123,8 +127,11 @@ impl SettingsView {
             true
         });
         let mut subscriptions = vec![
-            cx.observe(&config::store(cx), |this, _, cx| {
+            cx.observe(&config::store(cx), |this, store, cx| {
                 this.edit_error = None;
+                if store.read(cx).error().is_none() {
+                    this.dismissed_banner = None;
+                }
                 cx.notify();
             }),
             // The theme and font follow the settings: redraw in the new colours. A theme file
@@ -142,6 +149,7 @@ impl SettingsView {
         Self {
             focus_handle,
             edit_error: None,
+            dismissed_banner: None,
             _subscriptions: subscriptions,
         }
     }
@@ -159,12 +167,11 @@ impl SettingsView {
         .ok();
     }
 
-    fn banner(&self, tokens: &Tokens, cx: &App) -> Option<impl IntoElement + use<>> {
+    fn banner(&self, tokens: &Tokens, view: WeakEntity<Self>, cx: &App) -> Option<AnyElement> {
         let load_error = config::store(cx).read(cx).error().map(ToString::to_string);
         if load_error.is_none() && self.edit_error.is_none() {
             return None;
         }
-        let danger = tokens.danger;
         let (headline, detail) = match (&load_error, &self.edit_error) {
             (Some(error), edit_error) => (
                 "settings.toml has a problem. It has not been changed.",
@@ -181,26 +188,30 @@ impl SettingsView {
             (None, Some(error)) => ("The change was not saved.", error.to_string()),
             (None, None) => unreachable!("checked above"),
         };
-        Some(
-            v_flex()
-                .id("settings-banner")
-                .w_full()
-                .flex_none()
-                .px_3()
-                .py_2()
-                .gap_1()
-                .bg(danger.opacity(0.14))
-                .border_b_1()
-                .border_color(danger)
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(tokens.danger_text)
-                        .child(headline),
-                )
-                .child(div().text_sm().child(detail)),
-        )
+        let fingerprint = format!("{headline}\n{detail}");
+        if self.dismissed_banner.as_deref() == Some(fingerprint.as_str()) {
+            return None;
+        }
+        let problem = Problem::error(headline).lines(detail.lines().map(str::to_owned));
+        let problem = match &load_error {
+            Some(error) => problem.details(error.clone()),
+            None => problem,
+        };
+        Some(problems::strip(
+            "settings-banner",
+            &problem,
+            tokens,
+            problems::StripActions {
+                on_fix: Box::new(|_, _, _| {}),
+                on_dismiss: Box::new(move |_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.dismissed_banner = Some(fingerprint.clone());
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+            },
+        ))
     }
 
     fn pages(&self, cx: &mut Context<Self>) -> Vec<SettingPage> {
@@ -228,7 +239,7 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let font = cx.global::<FontConfig>().clone();
-        let banner = self.banner(&tokens, cx);
+        let banner = self.banner(&tokens, cx.entity().downgrade(), cx);
         let location = config::file(cx).map(|path| path.display().to_string());
         let pages = self.pages(cx);
         v_flex()
@@ -256,13 +267,14 @@ impl Render for SettingsView {
             .bg(tokens.window_bg)
             .text_color(tokens.text)
             .font_family(font.family)
-            .text_size(px(14.0))
+            // The chat font size, like the main window: text_sm and the controls scale with it.
+            .text_size(font.size)
             .child(TitleBar::new().child(div().text_sm().child("Settings")))
             .children(banner)
             .child(
                 div().flex_1().min_h_0().w_full().child(
                     SettingsPanes::new("settings")
-                        .sidebar_width(px(210.0))
+                        .sidebar_width(px(210.0 * (font.size.as_f32() / 14.0).max(1.0)))
                         .pages(pages),
                 ),
             )
@@ -286,7 +298,7 @@ impl Render for SettingsView {
 
 /// What a refused write says next to the control: the setting and the reason, without the path
 /// (the footer and the banner already name the file).
-fn friendly(error: &SettingsError) -> String {
+pub(crate) fn friendly(error: &SettingsError) -> String {
     match error {
         SettingsError::Invalid { field, reason, .. } => format!("`{field}`: {reason}"),
         SettingsError::Parse {
@@ -739,6 +751,7 @@ fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                         "Supporter, contributor and developer badges.",
                         "badges.chatterino",
                     ),
+                    SettingItem::render(|_, _, cx: &mut App| badge_status_rows(cx)),
                 ]),
             SettingGroup::new().title("Name paints").items([switch(
                 "7TV paints",
@@ -747,6 +760,20 @@ fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                 "badges.paints",
             )]),
         ])
+}
+
+/// Which optional badge sources could not be loaded (a quiet status line each, not a strip over
+/// the chat), or nothing.
+fn badge_status_rows(cx: &App) -> impl IntoElement + use<> {
+    let tokens = *cx.global::<Tokens>();
+    v_flex()
+        .gap_1()
+        .children(problems::statuses().into_iter().map(|(name, status)| {
+            div()
+                .text_sm()
+                .text_color(tokens.text_muted)
+                .child(format!("{name}: {status}"))
+        }))
 }
 
 fn streamlink_page() -> SettingPage {

@@ -223,6 +223,15 @@ pub struct ChatView {
     flash_task: Option<Task<()>>,
     /// Focused by a press in the chat, so ⌘C and Esc reach the selection.
     focus_handle: FocusHandle,
+    /// The user card's own focus (PR 6.3): it takes focus when it opens so Tab walks its buttons
+    /// (it sits inside this view, so Esc and ⌘C still reach the view's handlers) and gives it
+    /// back to the chat when it closes.
+    card_focus: FocusHandle,
+    /// Move focus into the card after the next frame (its element exists only then).
+    card_focus_pending: bool,
+    /// The card had keyboard focus at the last frame, so closing it hands focus back (to the
+    /// pane's input box) instead of leaving it on a button that is gone.
+    card_has_focus: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -294,6 +303,9 @@ impl ChatView {
             store,
             surface,
             focus_handle: cx.focus_handle(),
+            card_focus: cx.focus_handle().tab_stop(true),
+            card_focus_pending: false,
+            card_has_focus: false,
             list,
             rows,
             engine,
@@ -510,6 +522,7 @@ impl ChatView {
         }
         self.user_card = Some(UserCard::new(&login, origin_id, anchor));
         window.focus(&self.focus_handle, cx);
+        self.card_focus_pending = true;
         cx.notify();
     }
 
@@ -566,9 +579,22 @@ impl ChatView {
         }
     }
 
-    /// Closes the user card; whether one was open.
+    /// Closes the user card; whether one was open. When the card had keyboard focus (Esc, or one
+    /// of its own buttons) the pane is told to give the input box focus back; a press elsewhere
+    /// uses [`Self::close_user_card_for_press`], where the press has chosen the focus already.
     pub fn close_user_card(&mut self, cx: &mut Context<Self>) -> bool {
+        let had_focus = std::mem::take(&mut self.card_has_focus);
+        let open = self.close_user_card_for_press(cx);
+        if open && had_focus {
+            cx.emit(ChatViewEvent::SelectionDismissed);
+        }
+        open
+    }
+
+    /// Closes the card because of a press outside it: focus is wherever the press put it.
+    pub fn close_user_card_for_press(&mut self, cx: &mut Context<Self>) -> bool {
         let open = self.user_card.take().is_some();
+        self.card_has_focus = false;
         if open {
             cx.notify();
         }
@@ -1014,6 +1040,15 @@ pub fn pill_label(unseen: usize) -> String {
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
+        if std::mem::take(&mut self.card_focus_pending) {
+            cx.on_next_frame(window, |this, window, cx| {
+                if this.user_card.is_some() {
+                    window.focus(&this.card_focus, cx);
+                }
+            });
+        }
+        self.card_has_focus =
+            self.user_card.is_some() && self.card_focus.contains_focused(window, cx);
         let config = self.update_text_config(cx);
         self.apply_image_changes(cx);
         self.apply_badge_changes(cx);
@@ -1021,7 +1056,7 @@ impl Render for ChatView {
         // release the textures of evicted images nothing shows any more.
         self.images.borrow_mut().begin_frame();
         Images::sweep(window, cx);
-        let animate = config::current(cx).emotes.animate;
+        let animate = config::animate_emotes(cx);
         let clock = cx
             .try_global::<Images>()
             .filter(|_| animate)
@@ -1193,6 +1228,29 @@ impl Render for ChatView {
             .size_0()
         };
 
+        // Nothing to show: say why (PR 6.3). Quiet and offline channels look the same from here.
+        let (shown, total) = self.row_counts(cx);
+        let placeholder = (shown == 0).then(|| {
+            let joined = matches!(
+                self.store.read(cx).connection(),
+                Some(gpui_chat_core::ConnectionState::Connected)
+            );
+            let filtered = self.filters.is_active() || self.find.is_some();
+            let (title, hint) = empty_copy(total, joined, filtered);
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::empty::empty_state(
+                    "chat-empty",
+                    title,
+                    Some(hint.into()),
+                    &tokens,
+                ))
+        });
+
         let pill = self.pill_shown.then(|| {
             div()
                 .absolute()
@@ -1204,6 +1262,8 @@ impl Render for ChatView {
                 .child(
                     div()
                         .id("chat-jump-to-latest")
+                        .role(gpui_kit::Role::Button)
+                        .aria_label("Jump to the latest messages")
                         .px_3()
                         .py_1()
                         .rounded_full()
@@ -1262,6 +1322,7 @@ impl Render for ChatView {
                     // First, so the rows and what is drawn over them see a press before it does.
                     .child(self.surface.layer())
                     .child(messages)
+                    .children(placeholder)
                     .child(probe)
                     .children(pill)
                     .children(thread_panel)
@@ -1348,6 +1409,8 @@ impl ChatView {
         }
         Some(user_card::render(
             user_card::Env {
+                focus: self.card_focus.clone(),
+                scale: crate::fonts::chrome_scale(cx),
                 tokens: *tokens,
                 view: cx.entity().downgrade(),
                 owner: cx.entity_id(),
@@ -1362,6 +1425,30 @@ impl ChatView {
             window,
             cx,
         ))
+    }
+}
+
+/// What the empty message list says: nothing has arrived (`total == 0`: joined or not), or
+/// messages exist and none is shown (`filtered`: the find bar's filters; otherwise everything here
+/// is from users who are ignored or blocked).
+fn empty_copy(total: usize, joined: bool, filtered: bool) -> (&'static str, &'static str) {
+    match (total, joined) {
+        (0, true) => (
+            "Waiting for chat…",
+            "Messages appear here as they arrive. A quiet or offline channel stays empty.",
+        ),
+        (0, false) => (
+            "Joining the channel…",
+            "Chat appears here once it is joined.",
+        ),
+        _ if filtered => (
+            "No messages match the filters",
+            "Clear the filters in the find bar to see them again.",
+        ),
+        _ => (
+            "All messages here are from ignored users",
+            "Their messages are hidden. Change who is ignored in Settings → Ignores.",
+        ),
     }
 }
 
@@ -2980,6 +3067,50 @@ mod tests {
         let outside = point(px(2.0), px(300.0));
         press(outside, outside, 1, cx);
         assert_eq!(card_login(&h, cx), None);
+    }
+
+    #[test]
+    fn the_empty_list_says_why() {
+        assert_eq!(empty_copy(0, true, false).0, "Waiting for chat…");
+        assert_eq!(empty_copy(0, false, false).0, "Joining the channel…");
+        assert_eq!(empty_copy(5, true, true).0, "No messages match the filters");
+        assert_eq!(
+            empty_copy(5, true, false).0,
+            "All messages here are from ignored users"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_card_from_its_own_focus_hands_focus_back_but_a_press_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        push_events(&mut h, vec![said(0, "al", "hello there")], cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                sink.borrow_mut().push(format!("{event:?}"));
+            })
+        });
+        let name = at_text(&h, 0, "al", cx);
+        press(name, name, 1, cx);
+        assert_eq!(card_login(&h, cx).as_deref(), Some("al"));
+        // The card's focus was seen at the last frame: its own button closing it asks the pane to
+        // give the input box focus back (the button is gone, so focus would be lost).
+        h.view.update(cx, |v, cx| {
+            v.card_has_focus = true;
+            assert!(v.close_user_card(cx));
+        });
+        assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+        // A press elsewhere closes it too, without touching focus: the press chose it.
+        press(name, name, 1, cx);
+        events.borrow_mut().clear();
+        h.view.update(cx, |v, cx| {
+            v.card_has_focus = true;
+            assert!(v.close_user_card_for_press(cx));
+        });
+        assert!(events.borrow().is_empty());
     }
 
     #[gpui_kit::test]

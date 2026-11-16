@@ -169,9 +169,59 @@ struct Inner {
     changed: Arc<Notify>,
     handle: Handle,
     state: Mutex<State>,
+    /// The scopes (`"global"`, a channel's login) whose last badge load failed: while any is, one
+    /// strip says so.
+    failed: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl Inner {
+    /// Records whether `scope`'s Twitch badge load worked (`"global"` or a channel's login) and
+    /// files or clears the strips: failures where nothing answered go to the shared offline strip
+    /// (unless chat is up, which makes it the service being down), the rest to one "Twitch badges"
+    /// strip.
+    fn note(&self, scope: &str, error: Option<String>) {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        match error {
+            Some(error) => {
+                failed.insert(scope.to_owned(), error);
+            }
+            None => {
+                failed.remove(scope);
+            }
+        }
+        let (offline, other): (Vec<_>, Vec<_>) = failed
+            .iter()
+            .partition(|(_, error)| crate::problems::network::is_transport_error(error));
+        let mut shown: Vec<(&String, &String)> = other;
+        if offline.is_empty() {
+            crate::problems::network::recovered("badges");
+        } else {
+            let details = offline
+                .iter()
+                .map(|(scope, error)| format!("Twitch badges ({scope}): {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !crate::problems::network::failure("badges", &details) {
+                shown.extend(offline);
+            }
+        }
+        if shown.is_empty() {
+            crate::problems::clear_from_anywhere("badges");
+            return;
+        }
+        let details = shown
+            .iter()
+            .map(|(scope, error)| format!("Twitch badges ({scope}): {error}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::problems::report_from_anywhere(
+            "badges",
+            crate::problems::Problem::warning("Twitch badges could not be loaded")
+                .line("Chat shows the built-in badges, and a channel's own badges are missing until it works again.")
+                .details(details),
+        );
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -199,6 +249,7 @@ impl BadgeService {
                 changed,
                 handle,
                 state: Mutex::default(),
+                failed: Mutex::default(),
             }),
         }
     }
@@ -283,9 +334,11 @@ impl BadgeService {
                 Ok(set) => {
                     inner.registry.store_global(set);
                     inner.changed.notify_one();
+                    inner.note("global", None);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "global badges unavailable; keeping the bundled ones");
+                    inner.note("global", Some(error.to_string()));
                 }
             }
         }));
@@ -314,7 +367,8 @@ impl BadgeService {
                 tracing::warn!(channel = %channel, %error, "channel badges unavailable");
             }
             let ok = result.is_ok();
-            // The channel may have been closed (or its room id changed) while this loaded.
+            // The channel may have been closed (or its room id changed) while this loaded: then
+            // the result says nothing about what is open now and is not reported.
             let mut state = inner.state();
             let Some(room) = state.rooms.get_mut(&channel) else {
                 return;
@@ -322,6 +376,10 @@ impl BadgeService {
             if room.room_id != room_id {
                 return;
             }
+            inner.note(
+                channel.login(),
+                result.as_ref().err().map(ToString::to_string),
+            );
             if let Ok(set) = result {
                 inner.registry.store_channel(&channel, set);
                 inner.changed.notify_one();
@@ -336,6 +394,7 @@ impl BadgeService {
     pub fn forget(&self, channel: &ChannelId) {
         self.inner.state().rooms.remove(channel);
         self.inner.registry.forget_channel(channel);
+        self.inner.note(channel.login(), None);
     }
 
     /// Looks at an event on its way to the UI: a `ROOMSTATE` with a new room id (or repeating

@@ -36,6 +36,11 @@ const REFRESH_MARGIN_SECS: u64 = 5 * 60;
 /// The notice when Twitch ended the login (the refresh was rejected).
 pub const SESSION_EXPIRED_NOTICE: &str = "Your Twitch login expired or was revoked. Log in again.";
 
+/// How the notice for a token store that could not be *read* (the keychain is locked, missing or
+/// refused access) begins; the platform's own wording follows. The UI matches this constant, not
+/// the words, to tell it from other notices.
+pub const STORE_UNAVAILABLE_NOTICE: &str = "Could not read the saved Twitch login";
+
 /// The logged-in account as the UI shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -278,7 +283,7 @@ impl Auth {
                 drop(slot);
                 tracing::warn!(%error, "cannot read the stored Twitch login");
                 self.publish(AuthState::LoggedOut {
-                    notice: Some(format!("Could not read the saved Twitch login: {error}")),
+                    notice: Some(format!("{STORE_UNAVAILABLE_NOTICE}: {error}")),
                 });
             }
         }

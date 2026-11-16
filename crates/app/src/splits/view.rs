@@ -358,18 +358,12 @@ fn empty_pane(
         .justify_center()
         .gap_2()
         .bg(tokens.main_bg)
-        .child(
-            div()
-                .text_sm()
-                .text_color(tokens.text_muted)
-                .child("No channel in this pane"),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(tokens.text_muted)
-                .child("Pick one in the sidebar, or drag one here."),
-        )
+        .child(crate::empty::empty_state(
+            "pane-empty",
+            "No channel in this pane",
+            Some("Pick one in the sidebar, or drag one here.".into()),
+            tokens,
+        ))
         .children(closable.then(|| {
             Button::new(("close-empty-pane", id.get()))
                 .small()

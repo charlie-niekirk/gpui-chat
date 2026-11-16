@@ -106,6 +106,29 @@ pub fn current(cx: &App) -> &Settings {
     cx.global::<SettingsHandle>().0.read(cx).settings()
 }
 
+/// Whether animated emotes play: `emotes.animate` is on **and** the system is not asked for reduced
+/// motion (macOS: Accessibility → Display → Reduce motion, read by `gpui_kit::init` and kept in
+/// [`App::reduce_motion`]; `GPUI_CHAT_REDUCE_MOTION=1` forces it for a run). Reduced motion wins:
+/// emotes then show their first frame, exactly as with `emotes.animate = false`.
+pub fn animate_emotes(cx: &App) -> bool {
+    animation_allowed(current(cx).emotes.animate, cx.reduce_motion())
+}
+
+fn animation_allowed(setting: bool, reduce_motion: bool) -> bool {
+    setting && !reduce_motion
+}
+
+/// Environment variable that turns reduced motion on for a run, for looking at (and testing) it
+/// without touching the system setting.
+pub const REDUCE_MOTION_ENV: &str = "GPUI_CHAT_REDUCE_MOTION";
+
+/// Applies [`REDUCE_MOTION_ENV`] after `gpui_kit::init` has read the system setting.
+pub fn apply_reduce_motion_override(cx: &mut App) {
+    if std::env::var_os(REDUCE_MOTION_ENV).is_some_and(|value| value != "0" && !value.is_empty()) {
+        cx.set_reduce_motion(true);
+    }
+}
+
 /// Changes single keys of `settings.toml` in place (comments, unknown keys and everything else
 /// stay; see [`Settings::update_file`]) and puts the result in effect at once. The watcher then
 /// reports the same file, which changes nothing.
@@ -186,6 +209,12 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<SettingsEvent>> {
         Ok(paths) => paths,
         Err(error) => {
             tracing::warn!(%error, "no settings location; using default settings");
+            crate::problems::report_from_anywhere(
+                "location",
+                crate::problems::Problem::warning("No settings folder was found")
+                    .line("The default settings are in use, and nothing you change is kept.")
+                    .details(error.to_string()),
+            );
             let defaults = LoadOutcome {
                 settings: Settings::default(),
                 error: None,
@@ -217,6 +246,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<SettingsEvent>> {
         }
         Err(error) => {
             tracing::warn!(%error, "settings changes will not be picked up live");
+            crate::problems::report_watch_failure("settings.toml", &error.to_string());
             None
         }
     }
@@ -224,6 +254,15 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<SettingsEvent>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reduced_motion_overrides_the_animate_setting() {
+        use super::animation_allowed;
+        assert!(animation_allowed(true, false));
+        assert!(!animation_allowed(true, true), "reduced motion wins");
+        assert!(!animation_allowed(false, false));
+        assert!(!animation_allowed(false, true));
+    }
+
     use std::time::Duration;
 
     use gpui_chat_settings::ThemeMode;

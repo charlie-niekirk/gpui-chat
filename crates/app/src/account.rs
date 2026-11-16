@@ -165,6 +165,12 @@ impl AccountHub {
             Ok(built) => Some(built),
             Err(error) => {
                 tracing::warn!(%error, "Twitch login unavailable");
+                crate::problems::report_from_anywhere(
+                    "login-unavailable",
+                    crate::problems::Problem::error("Twitch login is unavailable")
+                        .line("Chat can still be read, but logging in, sending and the followed list are off. Restart the app to try again.")
+                        .details(error.to_string()),
+                );
                 None
             }
         }

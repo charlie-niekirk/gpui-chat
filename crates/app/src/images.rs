@@ -420,6 +420,12 @@ impl Images {
             Ok(cache) => Some(cache),
             Err(error) => {
                 tracing::warn!(%error, "image cache unavailable; emotes are drawn as text");
+                crate::problems::report_from_anywhere(
+                    "images",
+                    crate::problems::Problem::warning("Images can't be cached")
+                        .line("Emotes and avatars may draw as text or load slowly.")
+                        .details(error.to_string()),
+                );
                 None
             }
         };
@@ -757,6 +763,12 @@ pub fn init(cx: &mut App) {
         Ok(paths) => Some(paths.cache_dir().join("images")),
         Err(error) => {
             tracing::warn!(%error, "no cache directory; images are not cached on disk");
+            crate::problems::report_from_anywhere(
+                "images",
+                crate::problems::Problem::warning("Images can't be cached")
+                    .line("Emotes and avatars are downloaded again on every launch.")
+                    .details(error.to_string()),
+            );
             None
         }
     };

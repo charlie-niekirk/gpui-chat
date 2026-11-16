@@ -122,9 +122,122 @@ struct Inner {
     state: Mutex<State>,
     extras: Extras,
     bulk: Mutex<BulkState>,
+    /// Which providers failed in each scope (`"global"` or a channel's login), for the one strip
+    /// the user sees (see [`Inner::note`]).
+    failures: Mutex<HashMap<String, Vec<Failure>>>,
+}
+
+/// One provider's failed request.
+struct Failure {
+    provider: &'static str,
+    error: String,
+    /// Nothing answered (timeout, refused, DNS), as against a bad answer.
+    transport: bool,
+}
+
+/// Whether `error` means nothing answered at all.
+fn is_transport(error: &gpui_chat_emotes::EmoteError) -> bool {
+    use gpui_chat_emotes::{EmoteError, HttpError};
+    match error {
+        EmoteError::Http(HttpError::Timeout | HttpError::Network(_)) => true,
+        // A provider with a fallback source (FFZ) failed on both: nothing answered if neither did.
+        EmoteError::BothSourcesFailed { primary, fallback } => {
+            is_transport(primary) && is_transport(fallback)
+        }
+        _ => false,
+    }
 }
 
 impl Inner {
+    /// Records how `results` went for `scope` and files (or clears) the "emotes did not load"
+    /// strip for all scopes together, so a provider that is down is one strip, not one per
+    /// channel. Providers that did not answer at all (timeout, refused, DNS) while chat is not
+    /// connected are the network being down: they go to the shared offline strip instead.
+    fn note(&self, scope: &str, results: &gpui_chat_emotes::ProviderResults) {
+        let failed: Vec<Failure> = results
+            .errors()
+            .map(|(provider, error)| Failure {
+                provider: provider.name(),
+                error: error.to_string(),
+                transport: is_transport(error),
+            })
+            .collect();
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        if failed.is_empty() {
+            failures.remove(scope);
+        } else {
+            failures.insert(scope.to_owned(), failed);
+        }
+        self.publish(&failures);
+    }
+
+    /// The holder list of a third-party badge provider (`"FFZ"`, `"Chatterino"`) loaded, or not.
+    /// These are optional cosmetics: a failure is a status line in Settings → Badges, never a
+    /// strip over the chat.
+    fn note_badges(&self, name: &'static str, error: Option<String>) {
+        crate::problems::set_status(
+            &format!("{name} badges"),
+            error.map(|_| {
+                "unavailable; asked again when chat reconnects or on Reload Emotes".to_owned()
+            }),
+        );
+    }
+
+    /// Files or clears the strips for what `failures` holds.
+    fn publish(&self, failures: &HashMap<String, Vec<Failure>>) {
+        let mut shown: Vec<(&String, &Failure)> = Vec::new();
+        let mut offline: Vec<String> = Vec::new();
+        for (scope, list) in failures {
+            for failure in list {
+                if failure.transport {
+                    offline.push(format!("{} ({scope}): {}", failure.provider, failure.error));
+                } else {
+                    shown.push((scope, failure));
+                }
+            }
+        }
+        offline.sort();
+        if offline.is_empty() {
+            crate::problems::network::recovered("emotes");
+        } else if !crate::problems::network::failure("emotes", &offline.join("; ")) {
+            // Chat is up: this is the provider being down, not the network.
+            for (scope, list) in failures {
+                shown.extend(list.iter().filter(|f| f.transport).map(|f| (scope, f)));
+            }
+        }
+        if shown.is_empty() {
+            crate::problems::clear_from_anywhere("emotes");
+            return;
+        }
+        let mut names: Vec<&'static str> = shown.iter().map(|(_, f)| f.provider).collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut details: Vec<String> = shown
+            .iter()
+            .map(|(scope, f)| format!("{} ({scope}): {}", f.provider, f.error))
+            .collect();
+        details.sort();
+        details.dedup();
+        crate::problems::report_from_anywhere(
+            "emotes",
+            crate::problems::Problem::warning(format!(
+                "Some emotes could not be loaded ({})",
+                names.join(", ")
+            ))
+            .line("Those emotes show as plain text until the provider answers again.")
+            .fix("Retry", crate::problems::Fix::ReloadEmotes)
+            .details(details.join("\n")),
+        );
+    }
+
+    /// A channel was closed: its failures no longer count.
+    fn forget_failures(&self, scope: &str) {
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        if failures.remove(scope).is_some() {
+            self.publish(&failures);
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -164,6 +277,7 @@ impl EmoteService {
                 handle,
                 extras,
                 bulk: Mutex::default(),
+                failures: Mutex::default(),
                 state: Mutex::new(State {
                     next_token: 0,
                     global: Attempt {
@@ -184,6 +298,12 @@ impl EmoteService {
             Ok(http) => Arc::new(http),
             Err(error) => {
                 tracing::warn!(%error, "third-party emotes unavailable");
+                crate::problems::report_from_anywhere(
+                    "emotes",
+                    crate::problems::Problem::warning("Third-party emotes are unavailable")
+                        .line("They show as plain text. Restart the app to try again.")
+                        .details(error.to_string()),
+                );
                 return None;
             }
         };
@@ -275,9 +395,11 @@ impl EmoteService {
                             cosmetics.store_chatterino(list.badges, list.holders);
                         }
                         changed.notify_one();
+                        inner.note_badges(name, None);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "{name} badges unavailable");
+                        inner.note_badges(name, Some(error.to_string()));
                         let mut bulk = inner.bulk.lock().unwrap_or_else(PoisonError::into_inner);
                         if name == "FFZ" {
                             bulk.ffz = false;
@@ -297,6 +419,13 @@ impl EmoteService {
             return;
         };
         cosmetics.set_options(options);
+        // A source that is switched off has nothing to report.
+        if !options.ffz_badges {
+            crate::problems::set_status("FFZ badges", None);
+        }
+        if !options.chatterino_badges {
+            crate::problems::set_status("Chatterino badges", None);
+        }
         if let Some(live) = &self.inner.extras.live {
             live.configure(self.inner.registry.enabled(), options);
         }
@@ -321,6 +450,7 @@ impl EmoteService {
                 .load_global_with(inner.registry.enabled())
                 .await;
             inner.registry.store_global(&results);
+            inner.note("global", &results);
             let mut state = inner.state();
             if state.global.token == token {
                 state.global.load = if results.all_ok() {
@@ -364,6 +494,7 @@ impl EmoteService {
                 return;
             }
             inner.registry.store_channel(&channel, &results);
+            inner.note(channel.login(), &results);
             if room.attempt.token == token {
                 room.attempt.load = if results.all_ok() {
                     Load::Complete
@@ -398,6 +529,8 @@ impl EmoteService {
         for (channel, room_id) in rooms {
             self.load_channel(channel, room_id);
         }
+        // Retry (and Reload Emotes) also asks again for the badge lists that failed.
+        self.load_bulk_badges();
     }
 
     /// Applies the provider switches; turning a provider on reloads.
@@ -426,6 +559,7 @@ impl EmoteService {
     /// The channel was closed: forget its room and sets.
     pub fn forget(&self, channel: &ChannelId) {
         self.inner.state().rooms.remove(channel);
+        self.inner.forget_failures(channel.login());
         self.inner.registry.forget_channel(channel);
         if let Some(live) = &self.inner.extras.live {
             live.close_channel(channel);
@@ -1057,6 +1191,29 @@ mod tests {
                 .iter()
                 .all(|u| !u.contains("gql"))
         );
+    }
+
+    #[test]
+    fn only_requests_nothing_answered_are_transport_failures() {
+        use gpui_chat_emotes::{EmoteError, HttpError};
+        assert!(is_transport(&EmoteError::Http(HttpError::Timeout)));
+        assert!(is_transport(&EmoteError::Http(HttpError::Network(
+            "refused".into()
+        ))));
+        assert!(!is_transport(&EmoteError::Status(503)));
+        let both = |primary, fallback| EmoteError::BothSourcesFailed {
+            primary: Box::new(primary),
+            fallback: Box::new(fallback),
+        };
+        assert!(is_transport(&both(
+            EmoteError::Http(HttpError::Timeout),
+            EmoteError::Http(HttpError::Network("dns".into()))
+        )));
+        assert!(!is_transport(&both(
+            EmoteError::Http(HttpError::Timeout),
+            EmoteError::Status(502)
+        )));
+        assert!(!is_transport(&EmoteError::Parse("x".into())));
     }
 
     #[test]

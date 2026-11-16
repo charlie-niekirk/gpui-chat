@@ -337,7 +337,7 @@ fn paint_preview(
     let Some(images) = cx.try_global::<Images>() else {
         return;
     };
-    let animate = crate::config::current(cx).emotes.animate;
+    let animate = crate::config::animate_emotes(cx);
     let clock = animate.then(|| images.clock(std::time::Instant::now()));
     let mut frame = frame.borrow_mut();
     match cx.global_mut::<Images>().lookup(url, &mut frame, entity) {

@@ -28,7 +28,7 @@ theme_name_light = "rose-pine"  # optional: use this theme whenever the light va
 * **Problems are shown in the window** (a "Theme problem" strip above the content): a theme file
   that does not parse or lacks a required colour, two files with the same name once normalised
   (`Tokyo Night.toml` and `tokyo_night.toml`; the later file wins), a theme whose text is below
-  3:1 contrast on its background, and a `theme_name` that matches nothing. The strip goes when
+  4.5:1 contrast on a surface or on the error / warning / info strip tint over it (the strip names where it reads worst), and a `theme_name` that matches nothing. The strip goes when
   the problem is fixed.
 
 The settings window (⌘, → Appearance → Theme) lists the bundled pack and the files in `themes/`
@@ -49,8 +49,8 @@ sidebar     = "#13141c"     # (default: background nudged towards text)
 title_bar   = "#24283b"
 border      = "#292e42"
 surface     = "#24283b"     # menus, popovers, dialogs, inputs, emote picker, autocomplete
-text_muted  = "#787c99"     # (default: text faded towards background, keeping 4.5:1)
-accent_text = "#ffffff"     # text on an accent fill (default: black or white by contrast)
+text_muted  = "#787c99"     # (default: text faded towards background, keeping 4.5:1; a value under 4.5:1 on any surface is moved towards `text` until it reaches it)
+accent_text = "#ffffff"     # text on an accent fill (default: black or white by contrast; moved to 4.5:1 when it falls short)
 danger  = "#f7768e"         # errors, the live dot
 success = "#9ece6a"         # connected
 warning = "#e0af68"         # connecting / reconnecting
@@ -60,7 +60,8 @@ Colours are `#rgb` or `#rrggbb`. Unknown keys are ignored. A user file with the 
 theme replaces it, but keeps the variant it does not define: a `catppuccin.toml` with only
 `[dark]` still follows the OS to the bundled Latte. `danger_text` and `accent_link` (danger / accent drawn as *text*) are derived, never written:
 each is nudged towards `text` until it has 4.5:1 on every surface it is drawn on, plain and under
-a tint. Chat usernames keep their Twitch colours (adjusted for readability against the
+a tint. The keyboard focus ring is derived too: `accent`, nudged towards `text` until it has 3:1 on every
+surface. Chat usernames keep their Twitch colours (adjusted for readability against the
 theme's `background`).
 
 ## Bundled pack
