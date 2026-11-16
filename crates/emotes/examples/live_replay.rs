@@ -83,10 +83,11 @@ async fn serve(
                         };
                         println!("[{name}] <- {text}");
                         let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) else { continue };
-                        if name == "7tv" && frame["d"]["type"] == "user.update" {
-                            if let Some(id) = frame["d"]["condition"]["object_id"].as_str() {
-                                *user.lock().unwrap() = id.to_owned();
-                            }
+                        if name == "7tv"
+                            && frame["d"]["type"] == "user.update"
+                            && let Some(id) = frame["d"]["condition"]["object_id"].as_str()
+                        {
+                            *user.lock().unwrap() = id.to_owned();
                         }
                         // The first subscription starts the script.
                         let id = if name == "7tv" {
