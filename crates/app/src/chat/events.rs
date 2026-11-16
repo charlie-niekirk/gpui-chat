@@ -108,6 +108,18 @@ impl Look {
     }
 }
 
+impl Look {
+    /// `base` with this row's tint over it, as [`Look::paint`] draws it: what the row's text is
+    /// actually read against (a name paint is judged on it).
+    pub fn tint_over(&self, base: Hsla, colors: &Colors, tint: bool) -> Hsla {
+        if self.quiet || !tint {
+            base
+        } else {
+            base.blend(colors.of(self.accent).opacity(TINT))
+        }
+    }
+}
+
 /// How `message` is dressed, if it is an event row.
 pub fn look(message: &Message) -> Option<Look> {
     if let Some(event) = message
@@ -395,6 +407,26 @@ mod tests {
     use gpui_chat_core::{Author, Fragment, MessageId, Recipient, SharedChat, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn the_tint_a_row_text_is_read_against_is_the_cards_own() {
+        let tokens = crate::theme::Tokens::dark();
+        let colors = Colors::from_tokens(&tokens);
+        let look = Look {
+            accent: Accent::Raid,
+            quiet: false,
+        };
+        let base = tokens.main_bg;
+        let tinted = look.tint_over(base, &colors, true);
+        assert_ne!(tinted, base);
+        // No tint drawn (a mention or a rule has its own), or a quiet row: the base itself.
+        assert_eq!(look.tint_over(base, &colors, false), base);
+        let quiet = Look {
+            quiet: true,
+            ..look
+        };
+        assert_eq!(quiet.tint_over(base, &colors, true), base);
+    }
 
     fn notice(event: EventKind, system: Option<&str>) -> Message {
         let mut message = Message::chat(

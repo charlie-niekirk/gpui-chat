@@ -4,3 +4,4 @@
 {"name":"lookup_user","data":{"name":"twitch:1","subscribed":true}}
 {"name":"emote_create","data":{"channel":"youtube:abc","emote":{"id":"x","code":"NotTwitch","imageType":"png"}}}
 {"name":"emote_create","data":{"channel":"twitch:1","emote":{"code":"NoId"}}}
+{"name":"emote_update","data":{"channel":"twitch:22484632","emote":{"id":"5f1b0f4e0c6dbd6d1f8b1234","code":"JustCode"}}}

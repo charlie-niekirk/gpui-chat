@@ -1013,7 +1013,20 @@ impl Element for MessageElement {
             let name_paint = if flags.deleted || self.collapsed || self.ignored {
                 None
             } else {
-                name_paint(message, shaped.name_extent, palette.background, cx)
+                // What the name is read against: the background with the row's tints over it.
+                let mut row_bg = palette.background;
+                if let Some(color) = rule {
+                    row_bg = row_bg.blend(color.opacity(RULE_TINT));
+                } else if flags.mention {
+                    row_bg = row_bg.blend(palette.mention_bg);
+                } else if look.is_none() && flags.highlighted {
+                    row_bg = row_bg.blend(palette.highlight_bg);
+                }
+                if let Some(look) = &look {
+                    row_bg =
+                        look.tint_over(row_bg, &palette.events, !(flags.mention || rule.is_some()));
+                }
+                name_paint(message, shaped.name_extent, row_bg, cx)
             };
             if let (Some(line), Some(prepared)) = (&shaped.reply, &prepainted.reply) {
                 self.paint_reply(line, prepared, window);

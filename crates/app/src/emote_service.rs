@@ -371,9 +371,10 @@ impl EmoteService {
                     Load::Incomplete
                 };
             }
-            drop(state);
             // Listen for changes: a channel whose providers failed to load still gets its
-            // cosmetics, and BTTV (keyed by the room id alone).
+            // cosmetics, and BTTV (keyed by the room id alone). Done while the room is still
+            // known to be open (`state` is held), so a `forget` cannot slip in between and have
+            // its channel re-opened afterwards.
             if let Some(live) = &inner.extras.live {
                 let origin = inner
                     .registry
@@ -562,10 +563,15 @@ impl LiveSink for AppSink {
     }
 }
 
-/// The system line for a live emote change. The id carries the text so two lines of one
+/// The system line for a live emote change. The id carries a counter so two lines of one
 /// millisecond (7TV and BTTV) are not taken for one message.
 pub fn emote_notice(channel: &ChannelId, text: String, at: Timestamp) -> ChatEvent {
-    let id = format!("emote-live:{}:{}", at.unix_millis(), text.len());
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "emote-live:{}:{}",
+        at.unix_millis(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     ChatEvent::Message {
         channel: channel.clone(),
         message: Arc::new(Message::plain(id, at, MessageKind::System, text)),
@@ -1126,7 +1132,7 @@ mod tests {
             .channel_set(&channel, gpui_chat_core::EmoteProvider::SevenTv)
             .and_then(|set| set.origin().cloned())
             .expect("the 7TV set's ids");
-        assert_eq!(&*origin.set_id, "01F7GF1ZV8000EFV6JZ29CKEDB");
+        assert_eq!(origin.set_id.as_deref(), Some("01F7GF1ZV8000EFV6JZ29CKEDB"));
 
         service.forget(&channel);
         assert!(!is_open(&service));

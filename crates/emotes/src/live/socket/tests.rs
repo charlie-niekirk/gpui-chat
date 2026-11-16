@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::live::testserver::server;
+use crate::live::testserver::{server, server_greeting};
 
 #[test]
 fn the_wait_doubles_up_to_the_cap_and_jitter_spreads_it() {
@@ -23,6 +23,9 @@ struct Probe {
     subs: Vec<String>,
     seen: Arc<Mutex<Vec<String>>>,
     opened: Arc<Mutex<Vec<Vec<String>>>>,
+    /// When `on_tick` should run next, and how often it did.
+    tick: Arc<Mutex<Option<Instant>>>,
+    ticks: Arc<Mutex<usize>>,
 }
 
 impl Session for Probe {
@@ -42,7 +45,12 @@ impl Session for Probe {
         self.seen.lock().unwrap().push(text.to_owned());
         Reaction {
             send: Vec::new(),
-            reconnect: text == "bye",
+            reconnect: text == "bye" || text == "refused",
+            hold_off: if text == "refused" {
+                Duration::from_millis(400)
+            } else {
+                Duration::ZERO
+            },
         }
     }
 
@@ -72,10 +80,13 @@ impl Session for Probe {
     }
 
     fn next_tick(&self) -> Option<Instant> {
-        None
+        *self.tick.lock().unwrap()
     }
 
-    fn on_tick(&mut self, _: Instant) {}
+    fn on_tick(&mut self, _: Instant) {
+        *self.tick.lock().unwrap() = None;
+        *self.ticks.lock().unwrap() += 1;
+    }
 }
 
 fn fast() -> Backoff {
@@ -105,6 +116,8 @@ async fn no_subscriptions_means_no_connection_until_there_is_one() {
         subs: Vec::new(),
         seen: Arc::default(),
         opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
     };
     tokio::spawn(run("probe", server.url.clone(), probe, rx, fast()));
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -127,6 +140,8 @@ async fn events_arrive_and_the_last_unsubscribe_closes_the_connection() {
         subs: vec!["a".into()],
         seen: seen.clone(),
         opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
     };
     tokio::spawn(run("probe", server.url.clone(), probe, rx, fast()));
     eventually(|| *server.accepted.lock().unwrap() == 1).await;
@@ -159,6 +174,8 @@ async fn a_dropped_connection_is_remade_and_everything_resubscribed() {
         subs: vec!["a".into()],
         seen: Arc::default(),
         opened: opened.clone(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
     };
     tokio::spawn(run("probe", server.url.clone(), probe, rx, fast()));
     eventually(|| *server.accepted.lock().unwrap() == 1).await;
@@ -183,6 +200,8 @@ async fn a_session_that_asks_to_reconnect_gets_a_new_connection() {
         subs: vec!["a".into()],
         seen: Arc::default(),
         opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
     };
     tokio::spawn(run("probe", server.url.clone(), probe, rx, fast()));
     eventually(|| *server.accepted.lock().unwrap() == 1).await;
@@ -202,6 +221,8 @@ async fn an_unreachable_server_is_retried_without_giving_up() {
         subs: vec!["a".into()],
         seen: Arc::default(),
         opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
     };
     let task = tokio::spawn(run("probe", url, probe, rx, fast()));
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -211,4 +232,88 @@ async fn an_unreachable_server_is_retried_without_giving_up() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_server_that_greets_and_ends_the_stream_does_not_reset_the_backoff() {
+    // Every connection is told "bye" by the session (like 7TV's Hello followed by an end of
+    // stream): a frame arriving must not count as a healthy connection.
+    let server = server_greeting(Some("bye".to_owned())).await;
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let probe = Probe {
+        subs: vec!["a".into()],
+        seen: Arc::default(),
+        opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
+    };
+    let backoff = Backoff {
+        initial: Duration::from_millis(100),
+        max: Duration::from_secs(10),
+        healthy_after: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(2),
+    };
+    tokio::spawn(run("probe", server.url.clone(), probe, rx, backoff));
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // Waits of ~100, 200, 400, 800 ms: at most five connections in 1.3 s (a reset after every
+    // greeting would make it a dozen).
+    let connections = *server.accepted.lock().unwrap();
+    assert!((3..=5).contains(&connections), "{connections} connections");
+}
+
+#[tokio::test]
+async fn a_refusal_holds_the_client_off_for_as_long_as_the_server_asked() {
+    let server = server_greeting(Some("refused".to_owned())).await;
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let probe = Probe {
+        subs: vec!["a".into()],
+        seen: Arc::default(),
+        opened: Arc::default(),
+        tick: Arc::default(),
+        ticks: Arc::default(),
+    };
+    tokio::spawn(run("probe", server.url.clone(), probe, rx, fast()));
+    eventually(|| *server.accepted.lock().unwrap() == 1).await;
+    // The usual wait is 20 ms; the refusal asks for 400.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(*server.accepted.lock().unwrap(), 1);
+    eventually(|| *server.accepted.lock().unwrap() == 2).await;
+}
+
+#[tokio::test]
+async fn due_ticks_run_with_no_connection_and_while_waiting_to_reconnect() {
+    // Idle (no subscriptions): a pending notice is still written out.
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let probe = Probe {
+        subs: Vec::new(),
+        seen: Arc::default(),
+        opened: Arc::default(),
+        tick: Arc::new(Mutex::new(Some(Instant::now() + Duration::from_millis(30)))),
+        ticks: Arc::default(),
+    };
+    let ticks = probe.ticks.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(run("probe", url.clone(), probe, rx, fast()));
+    eventually(|| *ticks.lock().unwrap() == 1).await;
+
+    // Waiting out a long backoff after a failed connect: the same.
+    drop(listener);
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let probe = Probe {
+        subs: vec!["a".into()],
+        seen: Arc::default(),
+        opened: Arc::default(),
+        tick: Arc::new(Mutex::new(Some(
+            Instant::now() + Duration::from_millis(100),
+        ))),
+        ticks: Arc::default(),
+    };
+    let ticks = probe.ticks.clone();
+    let slow = Backoff {
+        initial: Duration::from_secs(30),
+        ..fast()
+    };
+    tokio::spawn(run("probe", url, probe, rx, slow));
+    eventually(|| *ticks.lock().unwrap() == 1).await;
 }

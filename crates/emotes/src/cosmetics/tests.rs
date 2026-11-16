@@ -51,9 +51,9 @@ fn a_badge_is_a_7tv_badge_with_the_provider_in_its_title() {
         Some("https://cdn.7tv.app/badge/B1/4x.webp")
     );
     // No tooltip: the name stands in. No usable image: no badge.
-    let named = json!({"id": "B2", "name": "Plain", "host": {"url": "//c/b", "files": [{"name": "1x.webp", "format": "WEBP"}]}});
+    let named = json!({"id": "B2", "name": "Plain", "host": {"url": "//cdn.7tv.app/badge/b", "files": [{"name": "1x.webp", "format": "WEBP"}]}});
     assert_eq!(parse_seventv_badge(&named).unwrap().title, "7TV: Plain");
-    let none = json!({"id": "B3", "host": {"url": "//c/b", "files": [{"name": "1x.avif", "format": "AVIF"}]}});
+    let none = json!({"id": "B3", "host": {"url": "//cdn.7tv.app/badge/b", "files": [{"name": "1x.avif", "format": "AVIF"}]}});
     assert!(parse_seventv_badge(&none).is_none());
 }
 
@@ -162,7 +162,7 @@ fn an_image_paint_with_no_base_colour_is_not_drawable() {
     let (_, cosmetics) = cosmetics();
     cosmetics.store_paint(
         parse_paint(
-            &json!({"id": "I", "function": "URL", "image_url": "https://x/y.webp", "stops": []}),
+            &json!({"id": "I", "function": "URL", "image_url": "https://cdn.7tv.app/paint/x/1x.webp", "stops": []}),
         )
         .unwrap(),
     );
@@ -178,4 +178,56 @@ fn lookups_are_remembered_for_a_while() {
     cosmetics.set_style("5", UserStyle::default(), now);
     assert!(!cosmetics.needs_lookup("5", now));
     assert!(cosmetics.needs_lookup("5", now + STYLE_TTL + Duration::from_secs(1)));
+}
+
+#[test]
+fn badges_and_paint_images_on_other_hosts_are_refused() {
+    let badge = |url: &str| json!({"id": "B", "tooltip": "t", "host": {"url": url, "files": [{"name": "1x.webp", "format": "WEBP"}]}});
+    assert!(parse_seventv_badge(&badge("//cdn.7tv.app/badge/B")).is_some());
+    assert!(parse_seventv_badge(&badge("//evil.example/badge/B")).is_none());
+    assert!(parse_seventv_badge(&badge("http://cdn.7tv.app/badge/B")).is_none());
+    // An image paint from elsewhere is no image paint: its base colour (or nothing) is left.
+    let paint = parse_paint(&json!({"id": "P", "function": "URL", "image_url": "https://evil.example/p.webp", "color": -1, "stops": []})).unwrap();
+    assert_eq!(paint.fill, PaintFill::Solid(PaintColor::WHITE));
+}
+
+#[test]
+fn the_style_cache_is_bounded_and_forgets_the_oldest() {
+    let (_, cosmetics) = cosmetics();
+    let start = Instant::now();
+    // Fill it past the cap with styles looked up one second apart.
+    for i in 0..(STYLE_CAP + 50) {
+        cosmetics.set_style(
+            &i.to_string(),
+            UserStyle::default(),
+            start + Duration::from_millis(i as u64),
+        );
+    }
+    let kept = cosmetics.style_count();
+    assert!(kept <= STYLE_CAP, "{kept}");
+    // The oldest went, the newest stayed.
+    assert!(cosmetics.needs_lookup("0", start + Duration::from_secs(1)));
+    assert!(!cosmetics.needs_lookup(
+        &(STYLE_CAP + 49).to_string(),
+        start + Duration::from_secs(1)
+    ));
+}
+
+#[test]
+fn entries_past_their_time_go_first_and_a_delete_for_a_stranger_makes_nothing() {
+    let (_, cosmetics) = cosmetics();
+    let start = Instant::now();
+    cosmetics.set_style("old", UserStyle::default(), start);
+    // Well past the TTL, a style for someone else is stored: the prune drops "old" even though the
+    // cache is nowhere near its cap.
+    cosmetics.prune(start + STYLE_TTL + Duration::from_secs(1));
+    assert_eq!(cosmetics.style_count(), 0);
+    cosmetics.entitle("stranger", true, "P1", false, start);
+    assert_eq!(
+        cosmetics.style_count(),
+        0,
+        "losing something nobody was known to wear"
+    );
+    cosmetics.entitle("stranger", true, "P1", true, start);
+    assert_eq!(cosmetics.style_count(), 1);
 }

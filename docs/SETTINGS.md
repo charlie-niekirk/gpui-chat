@@ -201,7 +201,7 @@ provider that is off hides its badges at once (on messages already on screen as 
 draws every name in its plain colour. BetterTTV's badges are not offered: they are SVG images and
 the image pipeline draws bitmaps only. A paint that would be hard to read on the current theme is
 drawn in the plain colour as well. With `emotes.seventv` (live emote updates) and the 7TV
-cosmetics both off, no connection to 7TV's EventAPI is made (and with `badges.seventv` and `badges.paints` both off no chatter id is sent to 7tv.io; with either on, the Twitch ids of the chatters you see are looked up there in batches); likewise none to BTTV's socket with
+cosmetics both off, no connection to 7TV's EventAPI is made (and with `badges.seventv` and `badges.paints` both off no chatter id is sent to 7tv.io; with either on, the Twitch ids of the chatters you see are looked up there in batches). The sockets also tell the providers which channels you have open: 7TV's EventAPI and BTTV's socket receive the Twitch room id of every open channel (and, for 7TV, the ids of its emote set and owner), along with your IP address, for as long as the provider is on; likewise none to BTTV's socket with
 `emotes.bttv` off.
 
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its

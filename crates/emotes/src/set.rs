@@ -61,7 +61,8 @@ pub struct EmoteSet {
 /// (7TV: the emote set id and the owning 7TV user's id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetOrigin {
-    pub set_id: Arc<str>,
+    /// `None`: the owner has an account but no active set.
+    pub set_id: Option<Arc<str>>,
     pub owner_id: Option<Arc<str>>,
     /// 7TV: the index of the owner's Twitch connection in their connection list (a
     /// `user.update` names the connection that changed by index).
@@ -182,6 +183,11 @@ impl EmoteSet {
         self.emotes.iter().map(|e| &e.emote)
     }
 
+    /// Whether an emote with this id is in the set.
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.emotes.iter().any(|e| e.emote.id.as_str() == id)
+    }
+
     /// The first emote typed as `name` (case-sensitive), in O(1).
     pub fn get(&self, name: &str) -> Option<&SetEmote> {
         self.index.get(name).map(|&i| &self.emotes[i])
@@ -235,7 +241,7 @@ mod tests {
             vec![entry("1", "A"), entry("2", "B")],
         )
         .with_origin(SetOrigin {
-            set_id: "S".into(),
+            set_id: Some("S".into()),
             owner_id: None,
             connection: None,
         })

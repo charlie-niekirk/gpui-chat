@@ -15,6 +15,8 @@ use crate::set::EmoteChange;
 pub const WINDOW: Duration = Duration::from_millis(1500);
 /// Names listed per kind before "and N more".
 const MAX_NAMES: usize = 5;
+/// Characters of an emote name shown.
+const MAX_NAME_CHARS: usize = 32;
 
 #[derive(Default)]
 struct Pending {
@@ -90,8 +92,23 @@ impl Notices {
     }
 }
 
+/// An emote name as shown in a line: provider data, so cut to a sane length.
+fn short(name: &str) -> String {
+    let mut chars = name.chars();
+    let head: String = chars.by_ref().take(MAX_NAME_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn list(names: &[String]) -> String {
-    let shown = names.iter().take(MAX_NAMES).cloned().collect::<Vec<_>>();
+    let shown = names
+        .iter()
+        .take(MAX_NAMES)
+        .map(|name| short(name))
+        .collect::<Vec<_>>();
     let mut text = shown.join(", ");
     if names.len() > MAX_NAMES {
         text.push_str(&format!(" and {} more", names.len() - MAX_NAMES));
@@ -111,7 +128,7 @@ fn line(provider: EmoteProvider, pending: &Pending) -> String {
         let pairs: Vec<String> = pending
             .renamed
             .iter()
-            .map(|(from, to)| format!("{from} → {to}"))
+            .map(|(from, to)| format!("{} → {}", short(from), short(to)))
             .collect();
         parts.push(format!("renamed {}", list(&pairs)));
     }
@@ -221,6 +238,16 @@ mod tests {
             line,
             "7TV: added E0, E1, E2, E3, E4 and 3 more · renamed Old → New"
         );
+    }
+
+    #[test]
+    fn a_huge_emote_name_is_cut() {
+        let mut notices = Notices::default();
+        let c = ChannelId::new("c");
+        let t = Instant::now();
+        notices.push(&c, EmoteProvider::SevenTv, &[added(&"x".repeat(5000))], t);
+        let (_, line) = notices.take_due(t + WINDOW).remove(0);
+        assert_eq!(line, format!("7TV: added {}…", "x".repeat(32)));
     }
 
     #[test]

@@ -32,10 +32,19 @@ pub fn part_frame(room_id: &str) -> String {
 /// A channel's emote event. `room_id` is the Twitch room id.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// A new emote (`emote_create`) or a changed one (`emote_update`: same id, maybe a new code).
-    Emote {
+    /// A new emote (`emote_create`).
+    Created {
         room_id: String,
         emote: SetEmote,
+    },
+    /// A changed emote (`emote_update`). The payload is often just `{id, code}`, so only the new
+    /// code is certain; `full` is the emote as described when the payload carried its image type
+    /// (enough to add it if it is unknown here).
+    Updated {
+        room_id: String,
+        id: String,
+        code: String,
+        full: Option<SetEmote>,
     },
     Deleted {
         room_id: String,
@@ -54,10 +63,20 @@ pub fn parse_frame(text: &str) -> Option<Event> {
         .strip_prefix("twitch:")?
         .to_owned();
     match name {
-        "emote_create" | "emote_update" => Some(Event::Emote {
+        "emote_create" => Some(Event::Created {
             room_id,
             emote: parse_live_emote(data.get("emote")?)?,
         }),
+        "emote_update" => {
+            let emote = data.get("emote")?;
+            let has_image = emote.get("imageType").is_some() || emote.get("animated").is_some();
+            Some(Event::Updated {
+                room_id,
+                id: emote.get("id")?.as_str()?.to_owned(),
+                code: emote.get("code")?.as_str()?.to_owned(),
+                full: has_image.then(|| parse_live_emote(emote)).flatten(),
+            })
+        }
         "emote_delete" => Some(Event::Deleted {
             room_id,
             emote_id: data.get("emoteId")?.as_str()?.to_owned(),
@@ -85,7 +104,7 @@ mod tests {
     #[test]
     fn create_and_update_carry_an_emote_with_cdn_images() {
         let lines = lines();
-        let Some(Event::Emote { room_id, emote }) = parse_frame(&lines[0]) else {
+        let Some(Event::Created { room_id, emote }) = parse_frame(&lines[0]) else {
             panic!("{:?}", parse_frame(&lines[0]));
         };
         assert_eq!(room_id, "22484632");
@@ -96,12 +115,22 @@ mod tests {
             Some("https://cdn.betterttv.net/emote/5e0fa9d40550d42106b8a489/2x.webp")
         );
         assert!(!emote.emote.animated);
-        // A gif is animated even without the flag.
-        let Some(Event::Emote { emote, .. }) = parse_frame(&lines[1]) else {
+        // An update names the emote by id and carries its new code; a gif is animated even
+        // without the flag.
+        let Some(Event::Updated { id, code, full, .. }) = parse_frame(&lines[1]) else {
+            panic!("{:?}", parse_frame(&lines[1]))
+        };
+        assert_eq!(
+            (id.as_str(), code.as_str()),
+            ("5f1b0f4e0c6dbd6d1f8b1234", "RenamedGif")
+        );
+        assert!(full.expect("it says what image it has").emote.animated);
+        // A bare `{id, code}` update is just a rename.
+        let Some(Event::Updated { code, full, .. }) = parse_frame(&lines[6]) else {
             panic!()
         };
-        assert!(emote.emote.animated);
-        assert_eq!(&*emote.emote.name, "RenamedGif");
+        assert_eq!(code, "JustCode");
+        assert!(full.is_none());
     }
 
     #[test]
@@ -118,7 +147,7 @@ mod tests {
     #[test]
     fn other_messages_and_other_platforms_are_ignored() {
         let lines = lines();
-        for line in &lines[3..] {
+        for line in &lines[3..6] {
             assert_eq!(parse_frame(line), None, "{line}");
         }
         assert_eq!(parse_frame("garbage"), None);

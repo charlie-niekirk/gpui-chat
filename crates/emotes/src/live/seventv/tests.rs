@@ -29,6 +29,34 @@ fn synthetic() -> Vec<Frame> {
 }
 
 #[test]
+fn the_hello_heartbeat_is_clamped_and_end_codes_are_told_apart() {
+    let hello = |ms: u64| parse_frame(&format!(r#"{{"op":1,"d":{{"heartbeat_interval":{ms}}}}}"#));
+    assert_eq!(
+        hello(1),
+        Frame::Hello {
+            heartbeat: MIN_HEARTBEAT
+        }
+    );
+    assert_eq!(
+        hello(10_000_000_000),
+        Frame::Hello {
+            heartbeat: MAX_HEARTBEAT
+        }
+    );
+    assert_eq!(
+        hello(30_000),
+        Frame::Hello {
+            heartbeat: Duration::from_secs(30)
+        }
+    );
+    // A restart comes back at once, a refusal stays away.
+    assert_eq!(end_of_stream_hold_off(Some(4006)), Duration::ZERO);
+    assert_eq!(end_of_stream_hold_off(None), Duration::ZERO);
+    assert!(end_of_stream_hold_off(Some(4005)) >= Duration::from_secs(60));
+    assert!(end_of_stream_hold_off(Some(4002)) >= Duration::from_secs(60));
+}
+
+#[test]
 fn the_session_frames_are_recognised() {
     let frames = real();
     assert_eq!(
@@ -122,6 +150,24 @@ fn a_connection_switching_its_set_is_a_set_switch() {
     );
     // Any other user change is not interesting.
     assert_eq!(s[4], Frame::Ignored);
+    // The shape Chatterino reads (`key: "emote_set"`, objects carrying the set's id); lines 9 and
+    // 10 of the fixture. Cleared: `value` is null.
+    assert_eq!(
+        s[9],
+        Frame::Dispatch(Dispatch::SetSwitch {
+            user_id: "USER1".into(),
+            set_id: Some("SET2".into()),
+            connection: Some(1),
+        })
+    );
+    assert_eq!(
+        s[10],
+        Frame::Dispatch(Dispatch::SetSwitch {
+            user_id: "USER1".into(),
+            set_id: None,
+            connection: Some(0)
+        })
+    );
 }
 
 #[test]

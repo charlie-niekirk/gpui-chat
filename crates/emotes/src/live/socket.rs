@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, timeout};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 /// A change to what the session listens to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,9 @@ pub struct Reaction {
     pub send: Vec<String>,
     /// Drop the connection and reconnect (the server asked, or said it is going away).
     pub reconnect: bool,
+    /// With `reconnect`: do not reconnect before this has passed (the server refused us; asking
+    /// again at once would only be refused again).
+    pub hold_off: Duration,
 }
 
 /// One provider's protocol and state, driven by [`run`].
@@ -94,12 +98,54 @@ fn jitter() -> f64 {
 }
 
 enum Served {
-    /// The connection dropped (or was dropped on purpose): connect again.
-    Lost { healthy: bool },
+    /// The connection dropped (or was dropped on purpose): connect again, but not before
+    /// `hold_off` (the server told us to go away).
+    Lost { hold_off: Duration },
     /// No subscriptions left: wait for one.
     Idle,
     /// The command channel closed: the owner is gone.
     Shutdown,
+}
+
+const LOST: Served = Served::Lost {
+    hold_off: Duration::ZERO,
+};
+
+/// The largest websocket message accepted (provider frames are a few KB; this is a guard against
+/// a hostile or broken server).
+pub const MAX_MESSAGE: usize = 1024 * 1024;
+
+fn config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE))
+}
+
+/// Waits until `until` (or forever when `None`) while applying subscription changes and flushing
+/// the session's due notices. `false`: the command channel closed.
+async fn wait<S: Session>(
+    session: &mut S,
+    commands: &mut mpsc::UnboundedReceiver<Change<S::Sub>>,
+    until: Option<tokio::time::Instant>,
+    stop_when_wanted: bool,
+) -> bool {
+    let never = tokio::time::Instant::now() + Duration::from_secs(86_400);
+    loop {
+        if stop_when_wanted && session.wants_connection() {
+            return true;
+        }
+        let tick_at = session.next_tick().map(tokio::time::Instant::from_std);
+        tokio::select! {
+            () = sleep_until(until.unwrap_or(never)), if until.is_some() => return true,
+            () = sleep_until(tick_at.unwrap_or(never)), if tick_at.is_some() => {
+                session.on_tick(Instant::now());
+            }
+            change = commands.recv() => match change {
+                Some(change) => { session.apply(change); }
+                None => return false,
+            },
+        }
+    }
 }
 
 /// Runs `session` against `url` until the command channel closes.
@@ -112,50 +158,41 @@ pub async fn run<S: Session>(
 ) {
     let mut failures = 0u32;
     loop {
-        // Nothing to listen to: no connection.
-        while !session.wants_connection() {
-            match commands.recv().await {
-                Some(change) => {
-                    session.apply(change);
-                }
-                None => return,
-            }
+        // Nothing to listen to: no connection (notices still flush).
+        if !session.wants_connection() && !wait(&mut session, &mut commands, None, true).await {
+            return;
         }
         let started = Instant::now();
-        let served = match timeout(backoff.connect_timeout, connect_async(url.as_str())).await {
+        let connecting = connect_async_with_config(url.as_str(), Some(config()), false);
+        let served = match timeout(backoff.connect_timeout, connecting).await {
             Ok(Ok((socket, _))) => {
                 tracing::debug!(name, "live emote socket connected");
                 serve(name, socket, &mut session, &mut commands).await
             }
             Ok(Err(error)) => {
                 tracing::debug!(name, %error, "live emote socket: connect failed");
-                Served::Lost { healthy: false }
+                LOST
             }
             Err(_) => {
                 tracing::debug!(name, "live emote socket: connect timed out");
-                Served::Lost { healthy: false }
+                LOST
             }
         };
         match served {
             Served::Shutdown => return,
             Served::Idle => failures = 0,
-            Served::Lost { healthy } => {
-                if healthy || started.elapsed() >= backoff.healthy_after {
+            Served::Lost { hold_off } => {
+                // A connection is healthy only once it has stayed up for a while: the server
+                // greeting us and then ending the stream does not make it so.
+                if started.elapsed() >= backoff.healthy_after {
                     failures = 0;
                 }
                 failures = failures.saturating_add(1);
-                let wait = backoff.delay(failures, jitter());
-                tracing::debug!(name, ?wait, failures, "live emote socket: reconnecting");
-                // Subscription changes keep being applied while waiting.
-                let deadline = tokio::time::Instant::now() + wait;
-                loop {
-                    tokio::select! {
-                        () = sleep_until(deadline) => break,
-                        change = commands.recv() => match change {
-                            Some(change) => { session.apply(change); }
-                            None => return,
-                        },
-                    }
+                let wait_for = backoff.delay(failures, jitter()).max(hold_off);
+                tracing::debug!(name, ?wait_for, failures, "live emote socket: reconnecting");
+                let until = tokio::time::Instant::now() + wait_for;
+                if !wait(&mut session, &mut commands, Some(until), false).await {
+                    return;
                 }
             }
         }
@@ -176,13 +213,12 @@ async fn serve<S: Session>(
         ($frames:expr) => {
             for frame in $frames {
                 if write.send(Message::text(frame)).await.is_err() {
-                    return Served::Lost { healthy: false };
+                    return LOST;
                 }
             }
         };
     }
     send_all!(session.on_open());
-    let mut healthy = false;
     let mut last_frame = tokio::time::Instant::now();
     let mut next_ping = session
         .ping_interval()
@@ -198,22 +234,21 @@ async fn serve<S: Session>(
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         let reaction = session.on_text(text.as_str(), Instant::now());
-                        healthy = true;
                         send_all!(reaction.send);
                         if reaction.reconnect {
-                            return Served::Lost { healthy };
+                            return Served::Lost { hold_off: reaction.hold_off };
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if write.send(Message::Pong(payload)).await.is_err() {
-                            return Served::Lost { healthy };
+                            return LOST;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Served::Lost { healthy },
+                    Some(Ok(Message::Close(_))) | None => return LOST,
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         tracing::debug!(name, %error, "live emote socket: read failed");
-                        return Served::Lost { healthy };
+                        return LOST;
                     }
                 }
             }
@@ -234,12 +269,12 @@ async fn serve<S: Session>(
             }
             () = sleep_until(idle_at.unwrap_or(never)), if idle_at.is_some() => {
                 tracing::debug!(name, "live emote socket: silent for too long");
-                return Served::Lost { healthy };
+                return LOST;
             }
             () = sleep_until(next_ping.unwrap_or(never)), if next_ping.is_some() => {
                 next_ping = session.ping_interval().map(|every| tokio::time::Instant::now() + every);
                 if write.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    return Served::Lost { healthy };
+                    return LOST;
                 }
             }
         }

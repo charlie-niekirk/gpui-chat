@@ -67,7 +67,11 @@ pub(crate) fn parse_ffz(body: &[u8]) -> Result<BadgeHolders, EmoteError> {
             ("2", ImageScale::X2),
             ("4", ImageScale::X4),
         ] {
-            if let Some(url) = raw.urls.get(key) {
+            if let Some(url) = raw
+                .urls
+                .get(key)
+                .filter(|url| crate::trusted_image_url(url))
+            {
                 urls = urls.with(scale, crate::absolute_url(url));
             }
         }
@@ -138,7 +142,7 @@ pub(crate) fn parse_chatterino(body: &[u8]) -> Result<BadgeHolders, EmoteError> 
             (&raw.image2, ImageScale::X2),
             (&raw.image3, ImageScale::X4),
         ] {
-            if let Some(url) = url {
+            if let Some(url) = url.as_ref().filter(|url| crate::trusted_image_url(url)) {
                 urls = urls.with(scale, url.clone());
             }
         }
@@ -198,7 +202,8 @@ mod tests {
 
     #[test]
     fn ffz_holders_of_a_badge_without_a_definition_are_dropped() {
-        let body = br#"{"badges":[{"id":2,"title":"Bot","urls":{"1":"//c/2/1"}}],
+        let body =
+            br#"{"badges":[{"id":2,"title":"Bot","urls":{"1":"//cdn.frankerfacez.com/badge/2/1"}}],
             "users":{"2":[11, "12"],"9":[13]}}"#;
         let parsed = parse_ffz(body).unwrap();
         assert_eq!(parsed.badges.len(), 1);
@@ -206,7 +211,7 @@ mod tests {
         assert!(!parsed.holders.contains_key("13"));
         assert_eq!(
             parsed.badges[0].urls.get(ImageScale::X1),
-            Some("https://c/2/1")
+            Some("https://cdn.frankerfacez.com/badge/2/1")
         );
     }
 
@@ -232,7 +237,7 @@ mod tests {
             .find(|v| v.iter().any(|v| **v == *index.to_string()));
         assert!(holder.is_some());
         // A tooltip that does not say who it is from gets the provider prefix.
-        let body = br#"{"badges":[{"tooltip":"Pepe","image1":"https://a/1.png","users":["1"]}]}"#;
+        let body = br#"{"badges":[{"tooltip":"Pepe","image1":"https://fourtf.com/a/1.png","users":["1"]}]}"#;
         assert_eq!(
             parse_chatterino(body).unwrap().badges[0].title,
             "Chatterino: Pepe"

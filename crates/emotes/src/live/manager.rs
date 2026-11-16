@@ -45,6 +45,9 @@ impl Default for Endpoints {
 pub(crate) struct Route {
     pub room_id: String,
     pub set_id: Option<String>,
+    /// A set this channel switched to whose answer is awaited. Only the answer for the *latest*
+    /// switch is applied: A → B → C with B's fetch finishing last must leave C.
+    pub pending: Option<String>,
     pub owner_id: Option<String>,
     pub connection: Option<usize>,
 }
@@ -132,57 +135,71 @@ impl Shared {
     }
 
     /// A 7TV user changed the set of one of their connections: every open channel they own
-    /// follows (the set is fetched; the channel keeps its old one until it arrives).
+    /// follows (the set is fetched; the channel keeps its old one until it arrives). A switch
+    /// while an earlier one is still being fetched supersedes it.
     pub(crate) fn seven_set_switched(
         self: &Arc<Self>,
         user_id: &str,
         set_id: Option<String>,
         connection: Option<usize>,
     ) {
-        let targets: Vec<ChannelId> = self
-            .state()
-            .routes
-            .iter()
-            .filter(|(_, route)| {
-                route.owner_id.as_deref() == Some(user_id)
-                    && route.set_id != set_id
-                    && match (route.connection, connection) {
-                        (Some(ours), Some(changed)) => ours == changed,
-                        _ => true,
-                    }
-            })
-            .map(|(channel, _)| channel.clone())
-            .collect();
-        for channel in targets {
-            let Some(new_id) = set_id.clone() else {
-                // The channel has no active set any more.
-                self.registry.replace_channel_set(
-                    &channel,
-                    EmoteSet::empty(EmoteProvider::SevenTv, crate::EmoteScope::Channel),
-                );
-                if let Some(route) = self.state().routes.get_mut(&channel) {
-                    route.set_id = None;
+        let mut fetch: Vec<(ChannelId, String, Option<usize>)> = Vec::new();
+        let mut cleared: Vec<ChannelId> = Vec::new();
+        {
+            let mut state = self.state();
+            for (channel, route) in &mut state.routes {
+                if route.owner_id.as_deref() != Some(user_id) {
+                    continue;
                 }
-                self.reconcile();
-                self.sink
-                    .notice(&channel, "7TV: emote set removed".to_owned());
-                continue;
-            };
+                if let (Some(ours), Some(changed)) = (route.connection, connection)
+                    && ours != changed
+                {
+                    continue;
+                }
+                match &set_id {
+                    // Back to what the channel shows: whatever was in flight is stale.
+                    Some(new) if route.set_id.as_deref() == Some(new.as_str()) => {
+                        route.pending = None;
+                    }
+                    Some(new) => {
+                        route.pending = Some(new.clone());
+                        fetch.push((channel.clone(), new.clone(), route.connection));
+                    }
+                    None => {
+                        route.pending = None;
+                        if route.set_id.take().is_some() {
+                            cleared.push(channel.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for channel in cleared {
+            // The channel has no active set any more.
+            self.registry.replace_channel_set(
+                &channel,
+                EmoteSet::empty(EmoteProvider::SevenTv, crate::EmoteScope::Channel),
+            );
+            self.reconcile();
+            self.sink
+                .notice(&channel, "7TV: emote set removed".to_owned());
+        }
+        for (channel, new_id, connection) in fetch {
             let this = self.clone();
             let owner = user_id.to_owned();
             drop(self.handle.spawn(async move {
-                let connection = this.state().routes.get(&channel).and_then(|r| r.connection);
                 match this.seven_client.set(&new_id, Some(&owner), connection).await {
                     Ok((set, name)) => {
                         {
                             let mut state = this.state();
-                            // Closed or moved on meanwhile.
+                            // Closed, or superseded by a later switch, meanwhile.
                             let Some(route) = state.routes.get_mut(&channel) else {
                                 return;
                             };
-                            if route.owner_id.as_deref() != Some(owner.as_str()) {
+                            if route.pending.as_deref() != Some(new_id.as_str()) {
                                 return;
                             }
+                            route.pending = None;
                             route.set_id = Some(new_id.clone());
                         }
                         let count = set.len();
@@ -195,6 +212,12 @@ impl Shared {
                     }
                     Err(error) => {
                         tracing::warn!(%error, set = %new_id, "7TV: could not load the emote set the channel switched to");
+                        let mut state = this.state();
+                        if let Some(route) = state.routes.get_mut(&channel)
+                            && route.pending.as_deref() == Some(new_id.as_str())
+                        {
+                            route.pending = None;
+                        }
                     }
                 }
             }));
@@ -259,7 +282,8 @@ impl LiveEmotes {
     pub fn open_channel(&self, channel: &ChannelId, room_id: &str, origin: Option<&SetOrigin>) {
         let route = Route {
             room_id: room_id.to_owned(),
-            set_id: origin.map(|o| o.set_id.to_string()),
+            set_id: origin.and_then(|o| o.set_id.as_ref().map(ToString::to_string)),
+            pending: None,
             owner_id: origin.and_then(|o| o.owner_id.as_ref().map(ToString::to_string)),
             connection: origin.and_then(|o| o.connection),
         };

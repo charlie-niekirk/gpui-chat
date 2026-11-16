@@ -188,7 +188,7 @@ pub(crate) fn parse_set(
     let set = convert_set(raw, EmoteScope::Channel);
     let set = match set_id.filter(|id| !id.is_empty()) {
         Some(set_id) => set.with_origin(SetOrigin {
-            set_id: set_id.into(),
+            set_id: Some(set_id.into()),
             owner_id: owner_id.map(Into::into),
             connection,
         }),
@@ -214,14 +214,26 @@ pub(crate) fn parse_channel(body: &[u8]) -> Result<EmoteSet, EmoteError> {
             let converted = convert_set(set, EmoteScope::Channel);
             match set_id {
                 Some(set_id) => converted.with_origin(SetOrigin {
-                    set_id: set_id.into(),
+                    set_id: Some(set_id.into()),
                     owner_id: owner_id.map(Into::into),
                     connection,
                 }),
                 None => converted,
             }
         }
-        None => EmoteSet::empty(EmoteProvider::SevenTv, EmoteScope::Channel),
+        // An account without an active set: the owner is still listened to, so a set activated
+        // later is picked up.
+        None => {
+            let empty = EmoteSet::empty(EmoteProvider::SevenTv, EmoteScope::Channel);
+            match owner_id {
+                Some(owner_id) => empty.with_origin(SetOrigin {
+                    set_id: None,
+                    owner_id: Some(owner_id.into()),
+                    connection,
+                }),
+                None => empty,
+            }
+        }
     })
 }
 
@@ -249,6 +261,10 @@ fn convert(raw: RawActive) -> Option<SetEmote> {
     let data = raw.data?;
     let host = data.host?;
     let base = absolute_url(&host.url);
+    if !crate::trusted_image_url(&base) {
+        tracing::warn!(url = %base, "skipping a 7TV emote whose images are not on a trusted host");
+        return None;
+    }
 
     // Best file per scale: webp > gif > png.
     let mut best: [Option<(u8, &RawFile)>; 4] = [None; 4];
@@ -435,7 +451,7 @@ mod tests {
         let emote = |name: &str, entry_flags: &str, data_flags: u32| {
             format!(
                 r#"{{"id":"{name}","name":"{name}"{entry_flags},"data":{{"name":"{name}","flags":{data_flags},
-                "host":{{"url":"//c/{name}","files":[{{"name":"1x.webp","format":"WEBP"}}]}}}}}}"#
+                "host":{{"url":"//cdn.7tv.app/emote/{name}","files":[{{"name":"1x.webp","format":"WEBP"}}]}}}}}}"#
             )
         };
         let body = format!(
@@ -460,7 +476,7 @@ mod tests {
 
     #[test]
     fn one_bad_entry_is_skipped_and_the_rest_load() {
-        let host = r#""host":{"url":"//c/x","files":[{"name":"1x.webp","width":null,"height":null,"format":"WEBP"}]}"#;
+        let host = r#""host":{"url":"//cdn.7tv.app/emote/x","files":[{"name":"1x.webp","width":null,"height":null,"format":"WEBP"}]}"#;
         let body = format!(
             r#"{{"emotes":[
               {{"id":"1","name":"Good","flags":null,"data":{{"name":"Good","flags":null,"animated":null,"owner":null,{host}}}}},
@@ -527,5 +543,23 @@ mod tests {
             c.channel("x").await,
             Err(EmoteError::InvalidUserId(_))
         ));
+    }
+
+    #[test]
+    fn an_emote_whose_images_are_on_an_untrusted_host_is_skipped() {
+        let entry = |name: &str, url: &str| {
+            format!(
+                r#"{{"id":"{name}","name":"{name}","flags":0,"data":{{"name":"{name}","host":{{"url":"{url}","files":[{{"name":"1x.webp","format":"WEBP"}}]}}}}}}"#
+            )
+        };
+        let body = format!(
+            r#"{{"emotes":[{},{},{}]}}"#,
+            entry("Good", "//cdn.7tv.app/emote/G"),
+            entry("Http", "http://cdn.7tv.app/emote/H"),
+            entry("Evil", "https://evil.example/emote/E"),
+        );
+        let set = parse_global(body.as_bytes()).unwrap();
+        let names: Vec<_> = set.iter().map(|e| &*e.name).collect();
+        assert_eq!(names, ["Good"]);
     }
 }

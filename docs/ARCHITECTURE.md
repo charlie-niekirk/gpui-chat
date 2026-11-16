@@ -748,7 +748,14 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   applied to the channel's set in the `EmoteRegistry` (`EmoteSet::with_changes`: add, rename, remove by emote id; the
   next message resolves against the new set, messages already shown keep what they had) and reported as one
   coalesced quiet system line per channel and provider (`live::notices`: "7TV: added PogU, KEKW · removed Old",
-  written out 1.5 s after the first change). A provider switched off in the settings holds no connection; a channel
+  written out 1.5 s after the first change, also while the socket is idle or waiting to reconnect; names are cut to 32
+  characters). Reconnecting: a connection counts as healthy only after it stayed up 30 s (a server that says
+  `Hello` and ends the stream does not reset the backoff); the EventAPI's end-of-stream codes ask for a pause (a
+  restart comes back at once, a refusal waits 2–5 minutes); subscriptions are sent once, after `Hello`. Frames are
+  limited to 1 MiB and the heartbeat interval the server asks for is clamped to 5–120 s. An overlapping set switch is
+  superseded by the later one (each route keeps the set it is waiting for; late answers are dropped), and a channel
+  whose owner has an account but no active set still listens for `user.update`. A BTTV `emote_update` is a rename of
+  the emote the channel has (it often carries just `{id, code}`), never a replacement. A provider switched off in the settings holds no connection; a channel
   that closes unsubscribes. `EmoteService` opens a channel once its sets loaded (the load records the 7TV ids in
   `EmoteSet::origin`), `GPUI_CHAT_7TV_EVENTS_URL` / `GPUI_CHAT_BTTV_SOCKET_URL` point the connections elsewhere and
   `cargo run -p gpui-chat-emotes --example live_replay -- fixtures/emotes/live-demo.jsonl` is a local server that
@@ -767,7 +774,11 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   badge") and copy are the ones every badge has. A chatter's *first* message may precede the answer of the lookup
   and then has none (BACKLOG). *Paints* (`cosmetics::paint`): `Paint` is gradient / flat colour / image data plus
   `color_at(x, y, w, h)` (CSS linear and radial gradient maths, `repeat`) and the luminance of every stop and
-  midpoint for readability; paints are looked up by Twitch user id at paint time.
+  midpoint for readability (a translucent colour is judged as it looks over the background); paints are looked up by
+  Twitch user id at paint time. Everything from the network is limited: at most 32 stops, 3 shadows offset by at most
+  8 px, 20 000 styles (30-minute TTL, oldest dropped first), 4 096 paint and badge definitions, and image URLs are
+  accepted only as `https` on the providers' hosts (`emotes::TRUSTED_IMAGE_HOSTS`: 7tv.app, 7tv.io, betterttv.net,
+  frankerfacez.com, chatterino.com, fourtf.com (where Chatterino's badge list really serves from), jtvnw.net).
 - Async I/O runs on a `tokio` runtime on background threads. GPUI has its own
   executor; backends talk to the UI over channels.
 
@@ -796,7 +807,10 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   no offset, and image paints are not drawn: the plain colour is used). `colors::paint_readable` falls back to the
   plain colour whenever any colour of the paint (stops and their midpoints) has under 3:1 contrast against the
   theme's background, so a paint is judged per theme. Removed, collapsed and ignored lines, event headers, reply
-  lines and the user card keep plain colours; selection, copy, search and highlights work on the display text,
+  lines and the user card keep plain colours; the readability check is against the row's real background (the
+  event card's or highlight's tint included); a gradient is sampled once per glyph at the middle of the line, so a
+  vertical one (angle 0° / 180°) shows as a single colour, and a radial one follows the paint's `shape` (circle or
+  ellipse); selection, copy, search and highlights work on the display text,
   which paints do not touch.
 - **Selection and links** (PR 5.6, `chat/selection.rs` pure, `chat/selection_layer.rs` GPUI). A
   selection is two units (anchor, head) of `(store seq, byte offset in the display text)`, so it

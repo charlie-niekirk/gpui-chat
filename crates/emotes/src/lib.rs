@@ -65,6 +65,39 @@ pub(crate) fn validate_user_id(id: &str) -> Result<&str, EmoteError> {
     }
 }
 
+/// The hosts image URLs from the providers may point to (and their subdomains): the providers'
+/// own CDNs, Chatterino's badge host and Twitch's CDN. Images come from provider APIs and live
+/// sockets, which are untrusted: an `http` URL, a bare IP or any other host is refused rather
+/// than fetched.
+pub const TRUSTED_IMAGE_HOSTS: [&str; 7] = [
+    "7tv.app",
+    "7tv.io",
+    "betterttv.net",
+    "frankerfacez.com",
+    "chatterino.com",
+    // Where Chatterino's badge list actually serves its images from.
+    "fourtf.com",
+    "jtvnw.net",
+];
+
+/// Whether `url` is an `https` URL on one of [`TRUSTED_IMAGE_HOSTS`] (protocol-relative `//host`
+/// URLs are made `https` first, as [`absolute_url`] does).
+pub fn trusted_image_url(url: &str) -> bool {
+    let absolute = absolute_url(url);
+    let Ok(parsed) = reqwest::Url::parse(&absolute) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    TRUSTED_IMAGE_HOSTS
+        .iter()
+        .any(|trusted| host == *trusted || host.ends_with(&format!(".{trusted}")))
+}
+
 /// Makes a provider URL absolute: protocol-relative (`//cdn...`) gets `https:`.
 pub(crate) fn absolute_url(url: &str) -> String {
     match url.strip_prefix("//") {
@@ -82,6 +115,33 @@ mod tests {
         assert!(validate_user_id("11148817").is_ok());
         for bad in ["", "abc", "12/34", "1 2", "-1", "１２"] {
             assert!(validate_user_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_https_on_the_providers_hosts_is_trusted() {
+        for good in [
+            "https://cdn.7tv.app/emote/A/1x.webp",
+            "//cdn.7tv.app/emote/A",
+            "https://cdn.betterttv.net/emote/x/1x.webp",
+            "https://cdn.frankerfacez.com/badge/2/1",
+            "https://fourtf.com/chatterino/badges/topd.png",
+            "https://static-cdn.jtvnw.net/emoticons/v2/1/default/dark/1.0",
+        ] {
+            assert!(trusted_image_url(good), "{good}");
+        }
+        for bad in [
+            "",
+            "http://cdn.7tv.app/emote/A",
+            "https://evil.example/7tv.app",
+            "https://7tv.app.evil.example/x",
+            "https://not7tv.app/x",
+            "https://user@cdn.7tv.app/x",
+            "https://127.0.0.1/x",
+            "ftp://cdn.7tv.app/x",
+            "javascript:alert(1)",
+        ] {
+            assert!(!trusted_image_url(bad), "{bad}");
         }
     }
 

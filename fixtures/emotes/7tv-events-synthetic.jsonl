@@ -7,3 +7,5 @@
 {"op":4,"d":{"reason":"restart"}}
 {"op":7,"d":{"code":4000,"message":"Server Error"}}
 {"op":6,"d":{"message":"bad subscription"}}
+{"op":0,"d":{"type":"user.update","body":{"id":"USER1","kind":1,"actor":{"display_name":"someone"},"updated":[{"key":"connections","index":1,"type":"array","value":[{"key":"emote_set","type":"object","old_value":{"id":"SET1"},"value":{"id":"SET2"}}]}]}}}
+{"op":0,"d":{"type":"user.update","body":{"id":"USER1","kind":1,"updated":[{"key":"connections","index":0,"type":"array","value":[{"key":"emote_set","type":"object","old_value":{"id":"SET2"},"value":null}]}]}}}

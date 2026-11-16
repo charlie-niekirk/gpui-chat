@@ -3,7 +3,7 @@
 //! * 7TV: a user's *style* (`badge_id`, `paint_id`) comes from the GraphQL API ([`lookup`], one
 //!   batched request for many chatters) and, live, from EventAPI `entitlement.*` events; the
 //!   definitions come from the same API and `cosmetic.create`.
-//! * FFZ (`api.frankerfacez.com/v1/badges/ids`, users by *login*) and Chatterino
+//! * FFZ (`api.frankerfacez.com/v1/badges/ids`, users by Twitch id) and Chatterino
 //!   (`api.chatterino.com/badges`, users by Twitch id) publish one list of badge holders each,
 //!   loaded once ([`bulk`]).
 //! * BTTV's badges are SVG only and the image pipeline cannot draw SVG, so there are none.
@@ -44,6 +44,11 @@ pub mod sets {
 
 /// How long a chatter's 7TV style is trusted before it is looked up again.
 pub const STYLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// The most styles kept. A busy channel shows tens of thousands of distinct chatters an hour, and
+/// the EventAPI adds users who are in no chat of ours; past this the oldest go.
+pub const STYLE_CAP: usize = 20_000;
+/// The most paint definitions kept (7TV has a few hundred).
+pub const PAINT_CAP: usize = 4_096;
 
 /// Which cosmetics are shown (the `[badges]` settings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,26 @@ struct Inner {
     ffz: HashMap<Arc<str>, Vec<Arc<str>>>,
     /// Chatterino badge versions by Twitch user id.
     chatterino: HashMap<Arc<str>, Vec<Arc<str>>>,
+}
+
+impl Inner {
+    fn prune(&mut self, now: Instant) {
+        self.styles
+            .retain(|_, entry| now.saturating_duration_since(entry.at) <= STYLE_TTL);
+        if self.styles.len() > STYLE_CAP {
+            let keep = STYLE_CAP - STYLE_CAP / 4;
+            let mut by_age: Vec<(Arc<str>, Instant)> = self
+                .styles
+                .iter()
+                .map(|(id, e)| (id.clone(), e.at))
+                .collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            let drop_count = by_age.len() - keep;
+            for (id, _) in by_age.into_iter().take(drop_count) {
+                self.styles.remove(&id);
+            }
+        }
+    }
 }
 
 /// The cosmetics of every user seen so far.
@@ -177,11 +202,15 @@ impl Cosmetics {
     /// Records a paint definition.
     pub fn store_paint(&self, paint: Paint) {
         let paint = Arc::new(paint);
-        let changed = self
-            .write()
+        let mut inner = self.write();
+        if inner.paints.len() >= PAINT_CAP && !inner.paints.contains_key(&paint.id) {
+            return;
+        }
+        let changed = inner
             .paints
             .insert(paint.id.clone(), paint.clone())
             .is_none_or(|old| *old != *paint);
+        drop(inner);
         if changed {
             self.bump();
         }
@@ -199,16 +228,36 @@ impl Cosmetics {
             at: now,
             complete: true,
         };
-        let old = self.write().styles.insert(Arc::from(twitch_id), entry);
+        let mut inner = self.write();
+        let old = inner.styles.insert(Arc::from(twitch_id), entry);
+        if inner.styles.len() > STYLE_CAP {
+            inner.prune(now);
+        }
+        drop(inner);
         if old.is_none_or(|old| old.style.paint_id != style.paint_id) {
             self.bump();
         }
+    }
+
+    /// Drops styles past [`STYLE_TTL`] and, if the cache is still over [`STYLE_CAP`], the oldest
+    /// ones until a quarter of the room is free again (so the work is not done at every insert).
+    pub fn prune(&self, now: Instant) {
+        self.write().prune(now);
+    }
+
+    /// How many styles are kept.
+    pub fn style_count(&self) -> usize {
+        self.read().styles.len()
     }
 
     /// An EventAPI entitlement: `twitch_id` got (`granted`) or lost the paint or badge `ref_id`.
     /// Losing one that is not the one worn changes nothing.
     pub fn entitle(&self, twitch_id: &str, paint: bool, ref_id: &str, granted: bool, now: Instant) {
         let mut inner = self.write();
+        // Losing something nobody is known to wear is no news (and makes no entry).
+        if !granted && !inner.styles.contains_key(twitch_id) {
+            return;
+        }
         let entry = inner
             .styles
             .entry(Arc::from(twitch_id))
@@ -228,6 +277,9 @@ impl Cosmetics {
             *slot = None;
         } else {
             return;
+        }
+        if inner.styles.len() > STYLE_CAP {
+            inner.prune(now);
         }
         drop(inner);
         self.bump();
@@ -336,6 +388,9 @@ pub fn parse_seventv_badge(value: &Value) -> Option<Badge> {
     };
     let host = raw.host?;
     let base = absolute_url(&host.url);
+    if !crate::trusted_image_url(&base) {
+        return None;
+    }
     let mut best: [Option<(u8, String)>; 4] = [None, None, None, None];
     for file in parse_entries::<RawFile>("7TV badge file", host.files) {
         let (Some(scale), Some(rank)) = (

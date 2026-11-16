@@ -130,6 +130,9 @@ fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// The most third-party badge definitions kept (7TV has a few hundred).
+const EXTRA_CAP: usize = 4_096;
+
 /// A set and the registry version at which it was stored.
 struct Stored {
     set: Arc<BadgeSet>,
@@ -208,6 +211,16 @@ impl BadgeRegistry {
                 .set
                 .get(&badge.id.set, &badge.id.version)
                 .is_some_and(|old| **old == badge)
+            {
+                continue;
+            }
+            // Definitions come from the network; a sane number is plenty.
+            if sets.extra.set.len() >= EXTRA_CAP
+                && sets
+                    .extra
+                    .set
+                    .get(&badge.id.set, &badge.id.version)
+                    .is_none()
             {
                 continue;
             }

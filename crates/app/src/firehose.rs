@@ -103,6 +103,7 @@ pub fn seed_cosmetics(cosmetics: &Cosmetics) {
             "demo-neon".into(),
             "Neon".into(),
             PaintFill::Radial {
+                ellipse: false,
                 repeat: false,
                 stops: stops(&[c(255, 255, 255), c(255, 0, 255)]),
             },

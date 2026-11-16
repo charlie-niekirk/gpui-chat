@@ -73,6 +73,8 @@ pub enum PaintFill {
         stops: Vec<Stop>,
     },
     Radial {
+        /// `shape: "ellipse"`: the gradient is stretched to the box; else a circle.
+        ellipse: bool,
         repeat: bool,
         stops: Vec<Stop>,
     },
@@ -100,9 +102,9 @@ pub struct Paint {
     pub name: Arc<str>,
     pub fill: PaintFill,
     pub shadows: Vec<Shadow>,
-    /// WCAG relative luminance of every stop and of the middle of every pair of neighbouring
-    /// stops: the colours a name can show, for [`Paint::min_contrast`].
-    luminances: Vec<f32>,
+    /// WCAG relative luminance and opacity of every stop and of the middle of every pair of
+    /// neighbouring stops: the colours a name can show, for [`Paint::min_contrast`].
+    luminances: Vec<(f32, f32)>,
 }
 
 /// WCAG 2 relative luminance of an sRGB colour.
@@ -140,23 +142,26 @@ impl Paint {
             }
             _ => paint.colors().collect(),
         };
-        let mut luminances: Vec<f32> = colors.iter().map(|&c| luminance(c)).collect();
+        let weigh = |c: PaintColor| (luminance(c), f32::from(c.a) / 255.0);
+        let mut luminances: Vec<(f32, f32)> = colors.iter().map(|&c| weigh(c)).collect();
         luminances.extend(
             colors
                 .windows(2)
-                .map(|pair| luminance(pair[0].lerp(pair[1], 0.5))),
+                .map(|pair| weigh(pair[0].lerp(pair[1], 0.5))),
         );
         paint.luminances = luminances;
         paint
     }
 
     /// The lowest contrast ratio any colour of the paint has against a background of
-    /// luminance `background` (a gradient is judged at its stops and halfway between them).
+    /// luminance `background` (a gradient is judged at its stops and halfway between them). A
+    /// translucent colour is judged as what shows: laid over the background, whose luminance is
+    /// the mix `alpha * colour + (1 - alpha) * background` (luminance is linear in linear light).
     /// `f32::INFINITY` for a paint with no colour.
     pub fn min_contrast(&self, background: f32) -> f32 {
         self.luminances
             .iter()
-            .map(|&l| contrast(l, background))
+            .map(|&(l, alpha)| contrast(alpha * l + (1.0 - alpha) * background, background))
             .fold(f32::INFINITY, f32::min)
     }
 
@@ -180,13 +185,27 @@ impl Paint {
                 };
                 sample(stops, t, *repeat)
             }
-            PaintFill::Radial { repeat, stops } => {
+            PaintFill::Radial {
+                ellipse,
+                repeat,
+                stops,
+            } => {
                 let (dx, dy) = (x - w / 2.0, y - h / 2.0);
-                let reach = (w * w + h * h).sqrt() / 2.0;
-                let t = if reach <= f32::EPSILON {
-                    0.0
+                let t = if *ellipse {
+                    // Farthest-corner ellipse: the corner is at distance 1.
+                    if w <= f32::EPSILON || h <= f32::EPSILON {
+                        0.0
+                    } else {
+                        let (nx, ny) = (dx / (w / 2.0), dy / (h / 2.0));
+                        (nx * nx + ny * ny).sqrt() / std::f32::consts::SQRT_2
+                    }
                 } else {
-                    (dx * dx + dy * dy).sqrt() / reach
+                    let reach = (w * w + h * h).sqrt() / 2.0;
+                    if reach <= f32::EPSILON {
+                        0.0
+                    } else {
+                        (dx * dx + dy * dy).sqrt() / reach
+                    }
                 };
                 sample(stops, t, *repeat)
             }
@@ -238,6 +257,20 @@ fn sample(stops: &[Stop], t: f32, repeat: bool) -> Option<PaintColor> {
     })
 }
 
+/// Limits on what a paint may ask for (it comes from the network).
+pub const MAX_STOPS: usize = 32;
+pub const MAX_SHADOWS: usize = 3;
+/// The farthest a shadow may be drawn from its glyph, in logical pixels.
+pub const MAX_SHADOW_OFFSET: f32 = 8.0;
+
+fn clamp_offset(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-MAX_SHADOW_OFFSET, MAX_SHADOW_OFFSET)
+    } else {
+        0.0
+    }
+}
+
 #[derive(Deserialize)]
 struct RawStop {
     at: f32,
@@ -269,6 +302,8 @@ struct RawPaint {
     #[serde(default, deserialize_with = "null_default")]
     repeat: bool,
     #[serde(default, deserialize_with = "null_default")]
+    shape: String,
+    #[serde(default, deserialize_with = "null_default")]
     image_url: String,
     #[serde(default, deserialize_with = "null_default")]
     stops: Vec<Value>,
@@ -286,21 +321,27 @@ pub fn parse_paint(value: &Value) -> Option<Paint> {
             return None;
         }
     };
-    let mut stops: Vec<Stop> = parse_entries::<RawStop>("7TV paint stop", raw.stops)
-        .into_iter()
-        .map(|stop| Stop {
-            at: stop.at,
-            color: PaintColor::from_i32(stop.color),
-        })
-        .collect();
+    // Untrusted data: a paint has a handful of stops and shadows.
+    let mut stops: Vec<Stop> = parse_entries::<RawStop>(
+        "7TV paint stop",
+        raw.stops.into_iter().take(MAX_STOPS).collect(),
+    )
+    .into_iter()
+    .map(|stop| Stop {
+        at: stop.at,
+        color: PaintColor::from_i32(stop.color),
+    })
+    .collect();
     stops.sort_by(|a, b| a.at.total_cmp(&b.at));
     let base = raw.color.map(PaintColor::from_i32);
     let fill = match raw.function.as_str() {
-        "URL" if !raw.image_url.is_empty() => PaintFill::Image {
+        // An image from anywhere but 7TV's own hosts is not trusted (and could not be drawn anyway).
+        "URL" if crate::trusted_image_url(&raw.image_url) => PaintFill::Image {
             url: raw.image_url,
             fallback: base,
         },
         "RADIAL_GRADIENT" if !stops.is_empty() => PaintFill::Radial {
+            ellipse: raw.shape == "ellipse",
             repeat: raw.repeat,
             stops,
         },
@@ -311,15 +352,18 @@ pub fn parse_paint(value: &Value) -> Option<Paint> {
         },
         _ => PaintFill::Solid(base?),
     };
-    let shadows = parse_entries::<RawShadow>("7TV paint shadow", raw.shadows)
-        .into_iter()
-        .map(|shadow| Shadow {
-            x: shadow.x_offset,
-            y: shadow.y_offset,
-            radius: shadow.radius,
-            color: PaintColor::from_i32(shadow.color),
-        })
-        .collect();
+    let shadows = parse_entries::<RawShadow>(
+        "7TV paint shadow",
+        raw.shadows.into_iter().take(MAX_SHADOWS).collect(),
+    )
+    .into_iter()
+    .map(|shadow| Shadow {
+        x: clamp_offset(shadow.x_offset),
+        y: clamp_offset(shadow.y_offset),
+        radius: shadow.radius.clamp(0.0, MAX_SHADOW_OFFSET),
+        color: PaintColor::from_i32(shadow.color),
+    })
+    .collect();
     Some(Paint::new(raw.id.into(), raw.name.into(), fill, shadows))
 }
 
@@ -386,7 +430,7 @@ mod tests {
             PaintFill::Solid(PaintColor::new(255, 0, 208, 255))
         );
         let image = paint(
-            json!({"id":"I","function":"URL","image_url":"https://x/y.webp","color":null,"stops":[]}),
+            json!({"id":"I","function":"URL","image_url":"https://cdn.7tv.app/paint/x/1x.webp","color":null,"stops":[]}),
         );
         assert!(matches!(
             image.fill,
@@ -475,6 +519,81 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(image.min_contrast(black), f32::INFINITY);
+    }
+
+    #[test]
+    fn an_ellipse_follows_the_box_and_a_circle_does_not() {
+        let stops = r#"[{"at":0,"color":255},{"at":1,"color":-1}]"#;
+        let make = |shape: &str| {
+            paint(json!({"id":"R","function":"RADIAL_GRADIENT","shape":shape,
+                "stops": serde_json::from_str::<Value>(stops).unwrap()}))
+        };
+        // On the middle of the top edge of a wide, flat box: the circle is still near its centre,
+        // the ellipse has already reached 1/sqrt(2) of the way (the edge is at its radius).
+        let (circle, ellipse) = (make("circle"), make("ellipse"));
+        let at = |p: &Paint| p.color_at(50.0, 0.0, 100.0, 10.0).unwrap().r;
+        assert!(
+            at(&ellipse) > at(&circle) + 20,
+            "{} vs {}",
+            at(&ellipse),
+            at(&circle)
+        );
+        assert!(matches!(
+            ellipse.fill,
+            PaintFill::Radial { ellipse: true, .. }
+        ));
+        assert!(matches!(
+            circle.fill,
+            PaintFill::Radial { ellipse: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_paint_cannot_ask_for_more_than_it_is_allowed() {
+        let many: Vec<Value> = (0..100)
+            .map(|i| json!({"at": i as f32 / 100.0, "color": -1}))
+            .collect();
+        let shadows: Vec<Value> = (0..9)
+            .map(|_| json!({"x_offset": 500, "y_offset": -500, "radius": 1000, "color": 255}))
+            .collect();
+        let p =
+            paint(json!({"id":"P","function":"LINEAR_GRADIENT","stops": many,"shadows": shadows}));
+        let PaintFill::Linear { stops, .. } = &p.fill else {
+            panic!()
+        };
+        assert_eq!(stops.len(), MAX_STOPS);
+        assert_eq!(p.shadows.len(), MAX_SHADOWS);
+        for shadow in &p.shadows {
+            assert_eq!(
+                (shadow.x, shadow.y),
+                (MAX_SHADOW_OFFSET, -MAX_SHADOW_OFFSET)
+            );
+            assert!(shadow.radius <= MAX_SHADOW_OFFSET);
+        }
+    }
+
+    #[test]
+    fn a_translucent_colour_is_judged_as_it_looks_over_the_background() {
+        let faint = Paint::new(
+            "F".into(),
+            "F".into(),
+            PaintFill::Solid(PaintColor::new(255, 255, 255, 25)),
+            Vec::new(),
+        );
+        let solid = Paint::new(
+            "S".into(),
+            "S".into(),
+            PaintFill::Solid(PaintColor::WHITE),
+            Vec::new(),
+        );
+        let black = 0.0;
+        // Opaque white on black is the best there is; 10 % white barely shows.
+        assert!(solid.min_contrast(black) > 20.0);
+        assert!(
+            faint.min_contrast(black) < 3.0,
+            "{}",
+            faint.min_contrast(black)
+        );
     }
 
     #[test]

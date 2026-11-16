@@ -11,8 +11,13 @@
 //! * `emote_set.update` for a set id (`object_id`): `pushed` (added), `pulled` (removed) and
 //!   `updated` (renamed: `value` is the new entry, `old_value` the old) lists of fields with
 //!   `key: "emotes"`.
-//! * `user.update` for a 7TV user id: an `updated` field `connections` with a nested
-//!   `emote_set_id` change is the channel switching its active set.
+//! * `user.update` for a 7TV user id: an `updated` field `connections` (with the connection's
+//!   `index`) holding nested changes; one whose `key` is `emote_set` (`value` / `old_value` are
+//!   objects with the set's `id`) is the channel switching its active set. That is the shape
+//!   Chatterino reads, see `Client::onUserUpdate` in
+//!   <https://github.com/Chatterino/chatterino2/blob/master/src/providers/seventv/eventapi/Client.cpp>
+//!   and `UserConnectionUpdateDispatch` in `eventapi/Dispatch.cpp`; a nested `emote_set_id` change
+//!   (the connection's field name in the REST API, `value` a plain id) is accepted as well.
 //! * `cosmetic.create`, `entitlement.create` and `entitlement.delete` with the condition
 //!   `{platform: TWITCH, ctx: channel, id: <room id>}`: paint and badge definitions, and who
 //!   gets or loses one (the user's Twitch id is in their `connections`).
@@ -27,6 +32,11 @@ use crate::seventv::parse_active_emote;
 use gpui_chat_core::Badge;
 
 pub const DEFAULT_URL: &str = "wss://events.7tv.io/v3";
+
+/// The heartbeat interval the server may ask for is clamped to this range (it is untrusted data
+/// and decides when a silent connection is given up on).
+pub const MIN_HEARTBEAT: Duration = Duration::from_secs(5);
+pub const MAX_HEARTBEAT: Duration = Duration::from_secs(120);
 
 const OP_DISPATCH: u64 = 0;
 const OP_HELLO: u64 = 1;
@@ -144,6 +154,18 @@ pub enum Frame {
     Ignored,
 }
 
+/// How long to stay away after the server ended the stream with `code`. 4006 (restart) and a
+/// missing code come back at once (the usual backoff applies); a client error (4000–4004, 4009–
+/// 4011: bad payload, unknown operation, already subscribed, ...) would only be repeated, so it
+/// waits five minutes; 4005 (rate limited) and the rest wait two.
+pub fn end_of_stream_hold_off(code: Option<u64>) -> Duration {
+    match code {
+        None | Some(4006) => Duration::ZERO,
+        Some(4005 | 4007 | 4008) => Duration::from_secs(120),
+        Some(_) => Duration::from_secs(300),
+    }
+}
+
 /// Parses one text frame. Garbage is [`Frame::Ignored`] (logged at debug level).
 pub fn parse_frame(text: &str) -> Frame {
     let Ok(frame) = serde_json::from_str::<Value>(text) else {
@@ -158,7 +180,7 @@ pub fn parse_frame(text: &str) -> Frame {
                 .and_then(Value::as_u64)
                 .unwrap_or(45_000);
             Frame::Hello {
-                heartbeat: Duration::from_millis(ms),
+                heartbeat: Duration::from_millis(ms).clamp(MIN_HEARTBEAT, MAX_HEARTBEAT),
             }
         }
         Some(OP_HEARTBEAT) => Frame::Heartbeat,
@@ -270,7 +292,8 @@ fn emote_changes(body: &Value) -> Vec<EmoteChange> {
     changes
 }
 
-/// `user.update` → [`Dispatch::SetSwitch`] when a connection's `emote_set_id` changed.
+/// `user.update` → [`Dispatch::SetSwitch`] when a connection's emote set changed (see the module
+/// docs for the two shapes).
 fn set_switch(body: &Value) -> Option<Dispatch> {
     let user_id = body.get("id")?.as_str()?.to_owned();
     for field in body.get("updated")?.as_array()? {
@@ -282,18 +305,20 @@ fn set_switch(body: &Value) -> Option<Dispatch> {
             .and_then(Value::as_u64)
             .and_then(|i| usize::try_from(i).ok());
         for change in field.get("value").and_then(Value::as_array)? {
-            if change.get("key").and_then(Value::as_str) == Some("emote_set_id") {
-                let set_id = change
-                    .get("value")
+            let set_id = match change.get("key").and_then(Value::as_str) {
+                // Objects with an `id` (null: no set any more).
+                Some("emote_set") => change.get("value").and_then(|v| v.get("id")),
+                Some("emote_set_id") => change.get("value"),
+                _ => continue,
+            };
+            return Some(Dispatch::SetSwitch {
+                user_id,
+                set_id: set_id
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                    .map(str::to_owned);
-                return Some(Dispatch::SetSwitch {
-                    user_id,
-                    set_id,
-                    connection,
-                });
-            }
+                    .map(str::to_owned),
+                connection,
+            });
         }
     }
     None

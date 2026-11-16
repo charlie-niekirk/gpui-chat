@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::badges::BadgeRegistry;
+use crate::http::{HttpClient, HttpFuture, HttpResponse};
 use crate::live::testserver::{Harness, server_greeting};
 use crate::loader::ProviderResults;
 use crate::set::EmoteScope;
@@ -63,7 +64,7 @@ fn bttv_set(names: &[(&str, &str)]) -> EmoteSet {
     .unwrap()
 }
 
-async fn world(emotes: Providers, http: FakeHttp) -> World {
+async fn world(emotes: Providers, http: impl HttpClient) -> World {
     let seven = server_greeting(Some(HELLO.to_owned())).await;
     let bttv = server_greeting(None).await;
     let registry = Arc::new(EmoteRegistry::new(emotes));
@@ -478,4 +479,213 @@ async fn cosmetics_are_subscribed_only_when_wanted_and_feed_the_store() {
     // Paints are on now (options were switched), so the paint is there.
     world.cosmetics.set_options(CosmeticOptions::default());
     assert!(world.cosmetics.paint("98712408").is_some());
+}
+
+/// Answers set requests from a map, each only once its gate is opened.
+struct Gated {
+    replies: std::collections::HashMap<String, (Vec<u8>, Arc<tokio::sync::Notify>)>,
+}
+
+impl HttpClient for Gated {
+    fn get<'a>(&'a self, url: &'a str) -> HttpFuture<'a> {
+        let reply = self.replies.get(url).cloned();
+        Box::pin(async move {
+            let Some((body, gate)) = reply else {
+                return Ok(HttpResponse {
+                    status: 404,
+                    body: Vec::new(),
+                });
+            };
+            gate.notified().await;
+            Ok(HttpResponse { status: 200, body })
+        })
+    }
+}
+
+fn set_doc(id: &str, name: &str, emote: (&str, &str)) -> Vec<u8> {
+    serde_json::to_vec(&json!({"id": id, "name": name, "emotes": [emote_json(emote.0, emote.1)]}))
+        .unwrap()
+}
+
+fn user_switch(index: u64, new: &str) -> String {
+    json!({"op": 0, "d": {"type": "user.update", "body": {"id": "USER1", "kind": 1,
+        "updated": [{"key": "connections", "index": index, "type": "array",
+            "value": [{"key": "emote_set", "old_value": {"id": "x"}, "value": {"id": new}}]}]}}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_slow_answer_for_an_earlier_switch_does_not_undo_a_later_one() {
+    let (gate_b, gate_c) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let http = Gated {
+        replies: [
+            (
+                "https://7tv.test/v3/emote-sets/SETB".to_owned(),
+                (set_doc("SETB", "Bee", ("N1", "FromB")), gate_b.clone()),
+            ),
+            (
+                "https://7tv.test/v3/emote-sets/SETC".to_owned(),
+                (set_doc("SETC", "Sea", ("N2", "FromC")), gate_c.clone()),
+            ),
+        ]
+        .into(),
+    };
+    let world = world(Providers::ALL, http).await;
+    let channel = ChannelId::new("forsen");
+    store(
+        &world.registry,
+        &channel,
+        seven_set(&[("E1", "Old")]),
+        bttv_set(&[]),
+    );
+    let origin = world
+        .registry
+        .channel_set(&channel, EmoteProvider::SevenTv)
+        .unwrap()
+        .origin()
+        .cloned();
+    world
+        .live
+        .open_channel(&channel, "22484632", origin.as_ref());
+    eventually(|| frames(&world.seven, 0).len() >= 2).await;
+
+    // A → B (slow) → C (fast): C lands first, then B's answer arrives.
+    world.seven.push.send(user_switch(0, "SETB")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    world.seven.push.send(user_switch(0, "SETC")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate_c.notify_one();
+    eventually(|| resolves(&world.registry, &channel, "FromC")).await;
+    gate_b.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(resolves(&world.registry, &channel, "FromC"), "still on C");
+    assert!(
+        !resolves(&world.registry, &channel, "FromB"),
+        "B's late answer was dropped"
+    );
+    let lines = world.sink.notices.lock().unwrap().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    // Listening to C's set, not B's.
+    eventually(|| {
+        frames(&world.seven, 0)
+            .iter()
+            .any(|f| f["op"] == 35 && f["d"]["condition"]["object_id"] == "SETC")
+    })
+    .await;
+    assert!(
+        !frames(&world.seven, 0)
+            .iter()
+            .any(|f| f["op"] == 35 && f["d"]["condition"]["object_id"] == "SETB")
+    );
+}
+
+#[tokio::test]
+async fn switching_back_to_the_current_set_cancels_the_one_in_flight() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let http = Gated {
+        replies: [(
+            "https://7tv.test/v3/emote-sets/SETB".to_owned(),
+            (set_doc("SETB", "Bee", ("N1", "FromB")), gate.clone()),
+        )]
+        .into(),
+    };
+    let world = world(Providers::ALL, http).await;
+    let channel = ChannelId::new("forsen");
+    store(
+        &world.registry,
+        &channel,
+        seven_set(&[("E1", "Old")]),
+        bttv_set(&[]),
+    );
+    let origin = world
+        .registry
+        .channel_set(&channel, EmoteProvider::SevenTv)
+        .unwrap()
+        .origin()
+        .cloned();
+    world
+        .live
+        .open_channel(&channel, "22484632", origin.as_ref());
+    eventually(|| frames(&world.seven, 0).len() >= 2).await;
+    world.seven.push.send(user_switch(0, "SETB")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    world.seven.push.send(user_switch(0, "SET1")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(resolves(&world.registry, &channel, "Old"));
+    assert!(!resolves(&world.registry, &channel, "FromB"));
+}
+
+#[tokio::test]
+async fn an_account_without_an_active_set_still_listens_for_one_being_activated() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    gate.notify_one();
+    let http = Gated {
+        replies: [(
+            "https://7tv.test/v3/emote-sets/SETB".to_owned(),
+            (set_doc("SETB", "Bee", ("N1", "FromB")), gate),
+        )]
+        .into(),
+    };
+    let world = world(Providers::ALL, http).await;
+    let channel = ChannelId::new("forsen");
+    // The REST answer for a user whose `emote_set` is null: an empty set that still names the owner.
+    let body = json!({"id": "22484632", "emote_set": null, "user": {"id": "USER1", "connections": [{"platform": "TWITCH", "id": "22484632"}]}});
+    let set = crate::seventv::parse_channel(&serde_json::to_vec(&body).unwrap()).unwrap();
+    let origin = set.origin().cloned().expect("the owner is kept");
+    assert_eq!(
+        (origin.set_id.as_deref(), origin.owner_id.as_deref()),
+        (None, Some("USER1"))
+    );
+    store(&world.registry, &channel, set, bttv_set(&[]));
+    world.live.open_channel(&channel, "22484632", Some(&origin));
+    eventually(|| !frames(&world.seven, 0).is_empty()).await;
+    let types: Vec<String> = frames(&world.seven, 0)
+        .iter()
+        .map(|f| f["d"]["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        types,
+        ["user.update"],
+        "only the owner, there is no set yet"
+    );
+
+    world.seven.push.send(user_switch(0, "SETB")).unwrap();
+    eventually(|| resolves(&world.registry, &channel, "FromB")).await;
+    eventually(|| {
+        frames(&world.seven, 0)
+            .iter()
+            .any(|f| f["d"]["type"] == "emote_set.update")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_bttv_rename_keeps_what_the_emote_was() {
+    let world = world(Providers::ALL, FakeHttp::new()).await;
+    let channel = ChannelId::new("forsen");
+    let animated = json!([{"id": "B1", "code": "Dance", "imageType": "gif", "animated": true, "width": 40, "height": 30}]);
+    let set = crate::bttv::parse_channel(
+        &serde_json::to_vec(&json!({"channelEmotes": animated, "sharedEmotes": []})).unwrap(),
+    )
+    .unwrap();
+    store(&world.registry, &channel, seven_set(&[]), set);
+    world.live.open_channel(&channel, "22484632", None);
+    eventually(|| !frames(&world.bttv, 0).is_empty()).await;
+    // The update says nothing but the id and the new code.
+    world.bttv.push.send(json!({"name": "emote_update", "data": {"channel": "twitch:22484632", "emote": {"id": "B1", "code": "Dancing"}}}).to_string()).unwrap();
+    eventually(|| resolves(&world.registry, &channel, "Dancing")).await;
+    let emote = world
+        .registry
+        .resolver(&channel)
+        .resolve("Dancing")
+        .unwrap();
+    assert!(emote.animated, "an animated emote stays animated");
+    assert_eq!((emote.width, emote.height), (Some(40), Some(30)));
+    assert_eq!(emote.id.as_str(), "B1");
+    assert!(!resolves(&world.registry, &channel, "Dance"));
 }
