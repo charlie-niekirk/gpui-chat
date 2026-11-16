@@ -101,6 +101,35 @@ fn non_chat_lines_are_none() {
 }
 
 #[test]
+fn userstate_is_the_local_users_role_in_the_channel() {
+    let roles: Vec<(String, ChannelRole)> = fixture_lines("userstate.irc")
+        .iter()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| match parse_line(line) {
+            Ok(Some(ChatEvent::UserState { channel, role })) => (channel.login().to_owned(), role),
+            other => panic!("{line:?} parsed as {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            ("testchan".to_owned(), ChannelRole::Viewer),
+            ("subchan".to_owned(), ChannelRole::Viewer),
+            ("modchan".to_owned(), ChannelRole::Moderator),
+            ("tagchan".to_owned(), ChannelRole::Moderator),
+            ("ownchan".to_owned(), ChannelRole::Broadcaster),
+            ("staffchan".to_owned(), ChannelRole::Viewer),
+        ]
+    );
+    // Without a channel there is nothing to say; GLOBALUSERSTATE is not about a channel.
+    assert!(parse_line("@mod=1 :tmi.twitch.tv USERSTATE").is_err());
+    assert_eq!(
+        parse_line("@mod=1 :tmi.twitch.tv GLOBALUSERSTATE"),
+        Ok(None)
+    );
+}
+
+#[test]
 fn blank_lines_comments_and_crlf() {
     assert_eq!(parse_line(""), Ok(None));
     assert_eq!(parse_line("   "), Ok(None));

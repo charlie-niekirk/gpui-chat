@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui_chat_core::{APP_ID, APP_NAME, ChannelId};
+use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent};
 use gpui_chat_settings::SettingsError;
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::streams::StreamInfo;
@@ -42,6 +42,7 @@ use crate::actions::{
     SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::add_channel;
+use crate::bridge::BridgeSender;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
 use crate::composer::Composer;
@@ -52,8 +53,9 @@ use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
 use crate::keymap::{self, KeymapState};
 use crate::live::LiveSource;
+use crate::moderation::Moderator;
 use crate::palette;
-use crate::pane::ChannelPane;
+use crate::pane::{ChannelPane, PaneTools};
 use crate::sign_in;
 use crate::splits::view::{ChannelRows, Splits};
 use crate::splits::{Direction, DropZone, Layout, PaneId};
@@ -148,6 +150,9 @@ pub struct ShellParts {
     pub live: Option<LiveSource>,
     /// The Twitch account; `None` with the offline sources (they never touch the keychain).
     pub account: Option<Entity<AccountHub>>,
+    /// With `--replay`: where moderation commands go instead of Helix, so a recorded log that
+    /// says the user is a moderator can show (and try) the moderation controls offline.
+    pub loopback: Option<BridgeSender<ChatEvent>>,
     pub diagnostics: Diagnostics,
     pub hud_visible: bool,
 }
@@ -161,6 +166,7 @@ pub struct AppShell {
     list: ChannelList,
     live: Option<LiveSource>,
     account: Option<Entity<AccountHub>>,
+    loopback: Option<BridgeSender<ChatEvent>>,
     /// Live state of the open and the followed channels (PR 3.5); live source only, polls while
     /// logged in.
     stream_info: Option<Entity<StreamInfoHub>>,
@@ -190,6 +196,7 @@ impl AppShell {
             channels,
             live,
             account,
+            loopback,
             diagnostics,
             hud_visible,
         } = parts;
@@ -257,6 +264,7 @@ impl AppShell {
             list: channels,
             live,
             account,
+            loopback,
             stream_info,
             streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
@@ -346,8 +354,19 @@ impl AppShell {
                 cx.new(|cx| Composer::new(store, live, account, cx))
             });
         let stream_info = self.stream_info.clone();
-        let pane =
-            cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, composer, cx));
+        // Moderation commands: Helix for the live source (with a login owner), the loopback for
+        // `--replay`.
+        let moderator = self
+            .live
+            .clone()
+            .filter(LiveSource::can_send)
+            .map(Moderator::Live)
+            .or_else(|| self.loopback.clone().map(Moderator::Loopback));
+        let tools = PaneTools {
+            composer,
+            moderator,
+        };
+        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, tools, cx));
         self.panes.insert(channel, pane);
     }
 
@@ -702,6 +721,13 @@ impl AppShell {
         }
     }
 
+    /// *Enable moderation tools…*: a login that also asks for the moderation scopes.
+    fn enable_moderation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(account) = self.account.clone() {
+            sign_in::open_for_moderation(account, window, cx);
+        }
+    }
+
     fn log_out(&mut self, cx: &mut Context<Self>) {
         if let Some(account) = &self.account {
             account.update(cx, |account, cx| account.log_out(cx));
@@ -725,6 +751,7 @@ impl AppShell {
             AuthState::LoggedIn(user) => {
                 let login = user.login.clone();
                 let needs_relogin = user.needs_relogin();
+                let can_enable_moderation = !user.moderation_enabled();
                 Button::new("account-menu")
                     .ghost()
                     .small()
@@ -737,17 +764,31 @@ impl AppShell {
                     .dropdown_caret(true)
                     .accessibility_label("Account")
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, _, _| {
-                        let (again, out) = (shell.clone(), shell.clone());
-                        menu.label(format!("Logged in to Twitch as {login}"))
+                        let (again, moderation, out) =
+                            (shell.clone(), shell.clone(), shell.clone());
+                        let menu = menu
+                            .label(format!("Logged in to Twitch as {login}"))
                             .separator()
                             .item(PopupMenuItem::new("Log In Again…").on_click(
                                 move |_, window, cx| {
                                     again.update(cx, |shell, cx| shell.log_in(window, cx)).ok();
                                 },
+                            ));
+                        // Moderation needs extra permissions, asked for only when wanted.
+                        let menu = if can_enable_moderation {
+                            menu.item(PopupMenuItem::new("Enable Moderation Tools…").on_click(
+                                move |_, window, cx| {
+                                    moderation
+                                        .update(cx, |shell, cx| shell.enable_moderation(window, cx))
+                                        .ok();
+                                },
                             ))
-                            .item(PopupMenuItem::new("Log Out").on_click(move |_, _, cx| {
-                                out.update(cx, |shell, cx| shell.log_out(cx)).ok();
-                            }))
+                        } else {
+                            menu
+                        };
+                        menu.item(PopupMenuItem::new("Log Out").on_click(move |_, _, cx| {
+                            out.update(cx, |shell, cx| shell.log_out(cx)).ok();
+                        }))
                     })
                     .into_any_element()
             }

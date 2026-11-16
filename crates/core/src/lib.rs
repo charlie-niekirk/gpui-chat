@@ -15,14 +15,15 @@ pub mod emote;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod moderation;
 pub mod special;
 pub mod store;
 pub mod tokenizer;
 
 pub use cheer::{CheerTier, Cheermote, CheermoteSet};
 pub use complete::{
-    COMMANDS, Chatter, CommandInfo, Edit, MIN_COLON_QUERY, RECENT_EMOTES, Recents, Tier, Trigger,
-    TriggerKind, apply, find_trigger, match_tier, rank, recent_chatters, word_insertion,
+    Chatter, Edit, MIN_COLON_QUERY, RECENT_EMOTES, Recents, Tier, Trigger, TriggerKind, apply,
+    find_trigger, match_tier, rank, recent_chatters, word_insertion,
 };
 pub use compose::{
     HISTORY_CAPACITY, Input, InputError, InputHistory, MAX_MESSAGE_CHARS, Outgoing, parse_input,
@@ -30,10 +31,18 @@ pub use compose::{
 };
 pub use emote::{Badge, BadgeId, Emote, EmoteProvider, ImageScale, ImageUrls};
 pub use event::{
-    ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState, RoomStateUpdate,
+    ChannelRole, ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState,
+    RoomStateUpdate,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
-pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
+pub use message::{
+    Author, Fragment, Message, MessageFlags, MessageKind, Removal, ReplyRef, Rgb, Timestamp,
+};
+pub use moderation::{
+    COMMANDS, CommandError, CommandInfo, CommandRole, DEFAULT_TIMEOUT_SECS, FOLLOWER_PRESETS,
+    ModCommand, RoomChange, RoomMode, RowActions, SLOW_PRESETS, TIMEOUT_PRESETS, clear_line,
+    command_hint, command_info, format_seconds, row_actions,
+};
 pub use special::{AnnouncementColor, EventKind, Recipient, SharedChat, SubPlan};
 pub use store::{DEFAULT_CAPACITY, MessageStore, Rebuild, Thread};
 pub use tokenizer::{

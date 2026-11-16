@@ -269,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn deleted_messages_default_to_strikethrough_and_unknown_values_fall_back() {
+        use crate::DeletedMessages::{Collapse, Strikethrough};
+        let load = |text: &str| {
+            Settings::parse(text, Path::new("x"))
+                .unwrap()
+                .chat
+                .deleted_messages
+        };
+        assert_eq!(load("[chat]\nscrollback = 500\n"), Strikethrough);
+        assert_eq!(load("[chat]\ndeleted_messages = \"collapse\"\n"), Collapse);
+        assert_eq!(
+            load("[chat]\ndeleted_messages = \"strikethrough\"\n"),
+            Strikethrough
+        );
+        // A value a newer build added still loads.
+        assert_eq!(load("[chat]\ndeleted_messages = \"hide\"\n"), Strikethrough);
+        let bad = Settings::parse("[chat]\ndeleted_messages = 3\n", Path::new("x"));
+        assert!(bad.is_err(), "a non-string is refused, not guessed");
+    }
+
+    #[test]
     fn a_file_from_before_the_streamlink_section_still_loads() {
         let old = "schema_version = 1\n\n[appearance]\nfont_size = 15.0\n\n[chat]\nscrollback = 500\n\n[emotes]\nscale = 2.0\n";
         let s = Settings::parse(old, Path::new("x")).unwrap();

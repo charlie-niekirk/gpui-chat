@@ -29,6 +29,7 @@ mod images;
 mod keymap;
 mod live;
 mod login;
+mod moderation;
 mod palette;
 mod pane;
 mod platform;
@@ -166,8 +167,10 @@ fn start_chat(
             firehose::run(sender.clone(), config, diagnostics.counters()),
         ));
     }
+    let mut loopback = None;
     if let Some(log) = replay_log {
         let speed = replay::Speed::from_factor(cli.replay_speed);
+        loopback = Some(sender.clone());
         drop(runtime::spawn_backend(
             cx,
             replay::run(sender, log, speed, diagnostics.counters()),
@@ -178,6 +181,7 @@ fn start_chat(
         channels,
         live,
         account,
+        loopback,
         diagnostics,
         hud_visible: cli.hud,
     }

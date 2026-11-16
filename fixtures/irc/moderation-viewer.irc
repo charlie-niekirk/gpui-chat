@@ -1,0 +1,13 @@
+# The same chat as moderation.irc for someone who is not a moderator (PR 5.2): the cleared messages
+# are struck through and the "was timed out" lines show, but there are no moderation controls.
+#
+#   cargo run -p gpui-chat --release -- --replay fixtures/irc/moderation-viewer.irc --replay-speed 0
+@badge-info=;badges=;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #testchan
+@emote-only=0;followers-only=10;r9k=0;room-id=1000;slow=0;subs-only=0 :tmi.twitch.tv ROOMSTATE #testchan
+@badge-info=subscriber/3;badges=subscriber/3;color=#1E90FF;display-name=Alice;id=40000000-0000-4000-8000-000000000003;room-id=1000;tmi-sent-ts=1700000012000;user-id=3001 :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchan :that last round was great, what is the game called again?
+@badge-info=;badges=;color=#FF69B4;display-name=Spammer;id=40000000-0000-4000-8000-000000000004;room-id=1000;tmi-sent-ts=1700000013000;user-id=3002 :spammer!spammer@spammer.tmi.twitch.tv PRIVMSG #testchan :BUY FOLLOWERS at cheap-followers.example now now now
+@badge-info=;badges=;color=#9ACD32;display-name=Bob;id=40000000-0000-4000-8000-000000000006;room-id=1000;tmi-sent-ts=1700000014000;user-id=3003 :bob!bob@bob.tmi.twitch.tv PRIVMSG #testchan :first time here, hi all
+@ban-duration=600;room-id=1000;target-user-id=3002;tmi-sent-ts=1700000017000 :tmi.twitch.tv CLEARCHAT #testchan :spammer
+@login=bob;room-id=1000;target-msg-id=40000000-0000-4000-8000-000000000006;tmi-sent-ts=1700000018000 :tmi.twitch.tv CLEARMSG #testchan :first time here, hi all
+@room-id=1000;tmi-sent-ts=1700000019000 :tmi.twitch.tv CLEARCHAT #testchan
+@badge-info=;badges=;color=#1E90FF;display-name=Dave;id=40000000-0000-4000-8000-000000000010;room-id=1000;tmi-sent-ts=1700000020000;user-id=3006 :dave!dave@dave.tmi.twitch.tv PRIVMSG #testchan :what did I miss?

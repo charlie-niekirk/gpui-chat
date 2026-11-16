@@ -46,9 +46,9 @@ pub use paths::{
     THEMES_DIR_NAME,
 };
 pub use schema::{
-    AppearanceSettings, ChatSettings, EMOTE_SCALE_RANGE, EmoteSettings, FONT_SIZE_RANGE,
-    LINE_HEIGHT_RANGE, SCHEMA_VERSION, SCROLLBACK_RANGE, Settings, StreamlinkSettings, ThemeMode,
-    UNVERSIONED_SCHEMA_VERSION,
+    AppearanceSettings, ChatSettings, DeletedMessages, EMOTE_SCALE_RANGE, EmoteSettings,
+    FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, SCHEMA_VERSION, SCROLLBACK_RANGE, Settings,
+    StreamlinkSettings, ThemeMode, UNVERSIONED_SCHEMA_VERSION,
 };
 pub use store::LoadOutcome;
 pub use theme::{

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_chat_twitch::auth::{
-    AuthError, AuthState, DeviceCode, DevicePolling, OAuthClient, client_id,
+    AuthError, AuthState, DeviceCode, DevicePolling, MODERATION_SCOPES, OAuthClient, client_id,
 };
 use gpui_chat_twitch::{Auth, HelixClient};
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
@@ -64,6 +64,15 @@ struct AccountHandle(Entity<AccountHub>);
 
 impl Global for AccountHandle {}
 
+/// The logged-in user's login, if any (`None` anonymous, while restoring, and in offline runs).
+pub fn own_login(cx: &App) -> Option<String> {
+    let hub = current(cx)?;
+    hub.read(cx)
+        .state()
+        .account()
+        .map(|account| account.login.clone())
+}
+
 /// The account hub, or `None` when there is none (offline runs, or no HTTP client).
 pub fn current(cx: &App) -> Option<Entity<AccountHub>> {
     cx.try_global::<AccountHandle>()
@@ -78,6 +87,8 @@ pub struct AccountHub {
     /// The notice of the current logged-out state was dismissed.
     notice_dismissed: bool,
     sign_in: Option<SignIn>,
+    /// The sign-in in progress (or just finished) also asks for the moderation scopes.
+    sign_in_moderation: bool,
     /// Numbers sign-in attempts so a stale one cannot overwrite a newer one's progress.
     attempt: u64,
     sign_in_abort: Option<AbortHandle>,
@@ -135,6 +146,7 @@ impl AccountHub {
                 helix,
                 notice_dismissed: false,
                 sign_in: None,
+                sign_in_moderation: false,
                 attempt: 0,
                 sign_in_abort: None,
                 _sign_in_task: None,
@@ -181,18 +193,34 @@ impl AccountHub {
         self.sign_in.as_ref()
     }
 
-    /// Starts a device-code sign-in (cancelling one still running).
-    pub fn begin_sign_in(&mut self, cx: &mut Context<Self>) {
+    /// Whether the sign-in in progress asks for the moderation scopes (the sheet's wording, and
+    /// what "Try again" repeats).
+    pub fn sign_in_moderation(&self) -> bool {
+        self.sign_in_moderation
+    }
+
+    /// Starts a device-code sign-in (cancelling one still running). `moderation` asks for the
+    /// moderation scopes too (**Enable moderation tools**: the extra permission is requested only
+    /// when the user wants it); a normal login keeps them if the user already enabled them, so
+    /// logging in again does not take the tools away.
+    pub fn begin_sign_in(&mut self, moderation: bool, cx: &mut Context<Self>) {
         self.cancel_sign_in(cx);
+        let moderation = moderation
+            || self
+                .state
+                .account()
+                .is_some_and(gpui_chat_twitch::auth::Account::moderation_enabled);
+        self.sign_in_moderation = moderation;
+        let extra: &'static [&'static str] = if moderation { MODERATION_SCOPES } else { &[] };
         self.attempt += 1;
         let attempt = self.attempt;
         let (progress, mut updates) = watch::channel(SignIn::Requesting);
         let auth = self.auth.clone();
         let flow = runtime::spawn_backend(cx, async move {
             let result = async {
-                let code = auth.request_device_code().await?;
+                let code = auth.request_device_code_with(extra).await?;
                 progress.send_replace(SignIn::Waiting(code.clone()));
-                auth.complete_device_login(&code, DevicePolling::default())
+                auth.complete_device_login_with(&code, DevicePolling::default(), extra)
                     .await
             }
             .await;

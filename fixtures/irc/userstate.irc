@@ -1,0 +1,13 @@
+# USERSTATE fixtures (PR 5.2): the logged-in user's role in a channel.
+# viewer: no badges, mod=0
+@badge-info=;badges=;color=#FF0000;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #testchan
+# subscriber, still a viewer
+@badge-info=subscriber/3;badges=subscriber/3;color=#FF0000;display-name=Viewer;emote-sets=0;mod=0;subscriber=1;user-type= :tmi.twitch.tv USERSTATE #subchan
+# moderator (mod=1 and the badge)
+@badge-info=;badges=moderator/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=1;subscriber=0;user-type=mod :tmi.twitch.tv USERSTATE #modchan
+# moderator by the tag alone
+@badge-info=;badges=;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=1;subscriber=0;user-type=mod :tmi.twitch.tv USERSTATE #tagchan
+# broadcaster: no mod tag, only the badge
+@badge-info=;badges=broadcaster/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #ownchan
+# staff / admin / global mod: not a moderator of this channel
+@badge-info=;badges=staff/1,global_mod/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type=staff :tmi.twitch.tv USERSTATE #staffchan

@@ -25,8 +25,8 @@
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    ChannelId, Input as Parsed, InputHistory, Message, Outgoing, ReplyRef, parse_input,
-    sanitize_line,
+    ChannelId, ChannelRole, CommandInfo, Input as Parsed, InputHistory, Message, ModCommand,
+    Outgoing, ReplyRef, command_hint, parse_input, sanitize_line,
 };
 use gpui_chat_twitch::SendError;
 use gpui_chat_twitch::auth::AuthState;
@@ -54,6 +54,7 @@ use crate::completion::{
 use crate::emote_picker::EmotePicker;
 use crate::emote_sources::EmoteSources;
 use crate::live::{LiveSource, SendRequest};
+use crate::moderation::{ModRequest, Moderator};
 use crate::reply::{ReplyTarget, restored};
 use crate::sign_in;
 use crate::theme::Tokens;
@@ -126,31 +127,84 @@ pub enum Plan {
         outgoing: Outgoing,
         reply: Option<ReplyRef>,
     },
+    /// Run a moderation command in the room (PR 5.2).
+    Moderate {
+        room_id: String,
+        command: ModCommand,
+    },
+}
+
+/// The command name as typed (`ban` for `/Ban bob`), for the sentence refusing it.
+fn typed_name(text: &str) -> String {
+    text.trim_start()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
 }
 
 /// Decides what to do with `text` typed in `channel`, whose Twitch room id is `room_id` once its
-/// `ROOMSTATE` has arrived.
+/// `ROOMSTATE` has arrived, by a user who is `role` there.
 pub fn plan_submit(
     text: &str,
     channel: &ChannelId,
     room_id: Option<&str>,
+    role: ChannelRole,
     reply: Option<&ReplyTarget>,
 ) -> Plan {
+    let not_connected = || {
+        Plan::Refuse(format!(
+            "Not connected to #{} yet. Try again in a moment.",
+            channel.login()
+        ))
+    };
     match parse_input(text) {
         Parsed::Empty => Plan::Nothing,
         Parsed::Invalid(error) => Plan::Refuse(error.to_string()),
+        Parsed::Command(command) => {
+            let allowed = if command.needs_broadcaster() {
+                role.is_broadcaster()
+            } else {
+                role.can_moderate()
+            };
+            let name = typed_name(text);
+            if !allowed {
+                return Plan::Refuse(if command.needs_broadcaster() {
+                    format!(
+                        "Only the broadcaster can use /{name} in #{}.",
+                        channel.login()
+                    )
+                } else {
+                    format!(
+                        "You need to be a moderator of #{} to use /{name}.",
+                        channel.login()
+                    )
+                });
+            }
+            match room_id {
+                Some(room_id) => Plan::Moderate {
+                    room_id: room_id.to_owned(),
+                    command,
+                },
+                None => not_connected(),
+            }
+        }
         Parsed::Send(outgoing) => match room_id {
             Some(room_id) => Plan::Send {
                 room_id: room_id.to_owned(),
                 outgoing,
                 reply: reply.map(|target| target.reference.clone()),
             },
-            None => Plan::Refuse(format!(
-                "Not connected to #{} yet. Try again in a moment.",
-                channel.login()
-            )),
+            None => not_connected(),
         },
     }
+}
+
+/// The command whose usage to show under the box for `text`: the one it starts with, when the
+/// user may use it.
+pub fn hint_for(text: &str, role: ChannelRole) -> Option<&'static CommandInfo> {
+    command_hint(text).filter(|command| command.role.allows(role))
 }
 
 /// What Esc does in the box, in this order: close the completion list if one is open, else leave
@@ -295,12 +349,39 @@ impl Composer {
             return;
         }
         let typed = input.read(cx).value();
-        let (channel, room_id) = {
+        let (channel, room_id, role) = {
             let store = self.store.read(cx);
-            (store.channel().clone(), store.room().room_id.clone())
+            (
+                store.channel().clone(),
+                store.room().room_id.clone(),
+                store.role(),
+            )
         };
-        match plan_submit(&typed, &channel, room_id.as_deref(), self.reply.as_ref()) {
+        match plan_submit(
+            &typed,
+            &channel,
+            room_id.as_deref(),
+            role,
+            self.reply.as_ref(),
+        ) {
             Plan::Nothing => {}
+            Plan::Moderate { room_id, command } => {
+                let request = ModRequest {
+                    channel,
+                    room_id,
+                    command,
+                    target_id: None,
+                };
+                let Some(result) = Moderator::Live(self.live.clone()).run(request, cx) else {
+                    return;
+                };
+                self.history.push(&typed);
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+                self.completion.close();
+                self.error = None;
+                cx.notify();
+                self.await_command(typed.to_string(), result, window, cx);
+            }
             Plan::Refuse(reason) => {
                 self.error = Some(reason.into());
                 cx.notify();
@@ -348,6 +429,43 @@ impl Composer {
             };
             this.update_in(cx, |this, window, cx| {
                 this.send_failed(&typed, reply, &error, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Waits for the outcome of a moderation command; a refusal shows under the box and the text
+    /// comes back for editing, as for a message that was not sent.
+    fn await_command(
+        &mut self,
+        typed: String,
+        result: oneshot::Receiver<crate::moderation::ModOutcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Err(failure)) = result.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                // Twitch says this user may not moderate here: the commands go away.
+                if failure.kind == crate::moderation::FailureKind::Forbidden {
+                    this.store.update(cx, |store, cx| {
+                        if store.drop_role() {
+                            cx.notify();
+                        }
+                    });
+                }
+                this.error = Some(failure.message.into());
+                if let Some(input) = &this.input {
+                    input.update(cx, |input, cx| {
+                        if input.value().is_empty() {
+                            input.set_value(typed, window, cx);
+                        }
+                    });
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -496,6 +614,40 @@ impl Composer {
         }
     }
 
+    /// The usage of the command being typed (`/timeout <user> [duration] [reason]`) under the box,
+    /// once its name is complete and the user may run it (PR 5.2).
+    fn hint_strip(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let typed = self.input.as_ref()?.read(cx).value();
+        let command = hint_for(&typed, self.store.read(cx).role())?;
+        Some(
+            h_flex()
+                .id("composer-hint")
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_t_1()
+                .border_color(tokens.border)
+                .text_sm()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(tokens.text)
+                        .child(command.usage),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(tokens.text_muted)
+                        .child(command.summary),
+                ),
+        )
+    }
+
     fn error_strip(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let error = self.error.clone()?;
         Some(
@@ -627,6 +779,7 @@ impl Render for Composer {
             .border_t_1()
             .border_color(tokens.border)
             .children(self.error_strip(&tokens, cx))
+            .children(self.hint_strip(&tokens, cx))
             // The completion list / emote picker hang off this zero-height line, above the reply
             // strip and the box.
             .child(div().w_full().h(px(0.0)).children(overlays))
@@ -657,6 +810,7 @@ mod tests {
             login: "viewer".into(),
             user_id: "42".into(),
             missing_scopes: missing.iter().map(|s| (*s).to_owned()).collect(),
+            missing_moderation_scopes: Vec::new(),
         })
     }
 
@@ -690,7 +844,13 @@ mod tests {
     fn enter_sends_to_the_room_once_it_is_known() {
         let channel = ChannelId::new("forsen");
         assert_eq!(
-            plan_submit("hello", &channel, Some("22484632"), None),
+            plan_submit(
+                "hello",
+                &channel,
+                Some("22484632"),
+                ChannelRole::Viewer,
+                None
+            ),
             Plan::Send {
                 room_id: "22484632".into(),
                 outgoing: Outgoing {
@@ -700,7 +860,8 @@ mod tests {
                 reply: None,
             }
         );
-        let Plan::Send { outgoing, .. } = plan_submit("/me waves", &channel, Some("1"), None)
+        let Plan::Send { outgoing, .. } =
+            plan_submit("/me waves", &channel, Some("1"), ChannelRole::Viewer, None)
         else {
             panic!("an action is sent")
         };
@@ -721,7 +882,13 @@ mod tests {
         let target = ReplyTarget::new(&parent).unwrap();
         let Plan::Send {
             outgoing, reply, ..
-        } = plan_submit("chess", &channel, Some("1"), Some(&target))
+        } = plan_submit(
+            "chess",
+            &channel,
+            Some("1"),
+            ChannelRole::Viewer,
+            Some(&target),
+        )
         else {
             panic!("a reply is sent")
         };
@@ -730,12 +897,20 @@ mod tests {
         assert_eq!(reply.parent_id.as_str(), "parent-1");
         assert_eq!(reply.parent_body, "what is the game");
         // Without reply mode there is none, and a refused message carries nothing.
-        let Plan::Send { reply, .. } = plan_submit("chess", &channel, Some("1"), None) else {
+        let Plan::Send { reply, .. } =
+            plan_submit("chess", &channel, Some("1"), ChannelRole::Viewer, None)
+        else {
             panic!()
         };
         assert_eq!(reply, None);
         assert!(matches!(
-            plan_submit("/ban x", &channel, Some("1"), Some(&target)),
+            plan_submit(
+                "/ban x",
+                &channel,
+                Some("1"),
+                ChannelRole::Viewer,
+                Some(&target)
+            ),
             Plan::Refuse(_)
         ));
     }
@@ -743,14 +918,21 @@ mod tests {
     #[test]
     fn enter_on_a_blank_box_does_nothing() {
         let channel = ChannelId::new("forsen");
-        assert_eq!(plan_submit("   ", &channel, Some("1"), None), Plan::Nothing);
-        assert_eq!(plan_submit("", &channel, None, None), Plan::Nothing);
+        assert_eq!(
+            plan_submit("   ", &channel, Some("1"), ChannelRole::Viewer, None),
+            Plan::Nothing
+        );
+        assert_eq!(
+            plan_submit("", &channel, None, ChannelRole::Viewer, None),
+            Plan::Nothing
+        );
     }
 
     #[test]
     fn a_channel_that_is_not_joined_yet_is_not_sent_to() {
         let channel = ChannelId::new("forsen");
-        let Plan::Refuse(reason) = plan_submit("hello", &channel, None, None) else {
+        let Plan::Refuse(reason) = plan_submit("hello", &channel, None, ChannelRole::Viewer, None)
+        else {
             panic!("no room id, no send")
         };
         assert!(reason.contains("#forsen"), "{reason}");
@@ -759,15 +941,81 @@ mod tests {
     #[test]
     fn bad_input_is_refused_with_the_reason() {
         let channel = ChannelId::new("forsen");
-        let Plan::Refuse(reason) = plan_submit("/ban x", &channel, Some("1"), None) else {
+        let Plan::Refuse(reason) =
+            plan_submit("/w x", &channel, Some("1"), ChannelRole::Viewer, None)
+        else {
             panic!("unknown command")
         };
-        assert!(reason.contains("Unknown command /ban"), "{reason}");
+        assert!(reason.contains("Unknown command /w"), "{reason}");
         let long = "a".repeat(501);
-        let Plan::Refuse(reason) = plan_submit(&long, &channel, Some("1"), None) else {
+        let Plan::Refuse(reason) =
+            plan_submit(&long, &channel, Some("1"), ChannelRole::Viewer, None)
+        else {
             panic!("too long")
         };
         assert!(reason.contains("501/500"), "{reason}");
+    }
+
+    #[test]
+    fn moderation_commands_run_only_for_those_who_may_use_them() {
+        let channel = ChannelId::new("forsen");
+        let ban = || ModCommand::Ban {
+            user: "bob".into(),
+            reason: None,
+        };
+        let run = |text, role| plan_submit(text, &channel, Some("22"), role, None);
+        // A viewer is told why, in terms of the channel and the command they typed.
+        let Plan::Refuse(reason) = run("/Ban bob", ChannelRole::Viewer) else {
+            panic!("a viewer cannot ban")
+        };
+        assert_eq!(reason, "You need to be a moderator of #forsen to use /ban.");
+        assert_eq!(
+            run("/ban bob", ChannelRole::Moderator),
+            Plan::Moderate {
+                room_id: "22".into(),
+                command: ban()
+            }
+        );
+        assert!(matches!(
+            run("/ban bob", ChannelRole::Broadcaster),
+            Plan::Moderate { .. }
+        ));
+        // Mods and raids are the broadcaster's.
+        let Plan::Refuse(reason) = run("/mod bob", ChannelRole::Moderator) else {
+            panic!("a moderator cannot make moderators")
+        };
+        assert_eq!(reason, "Only the broadcaster can use /mod in #forsen.");
+        assert!(matches!(
+            run("/mod bob", ChannelRole::Broadcaster),
+            Plan::Moderate { .. }
+        ));
+        // Bad arguments are the parser's sentence, whoever types them.
+        let Plan::Refuse(reason) = run("/timeout", ChannelRole::Moderator) else {
+            panic!("a timeout needs a user")
+        };
+        assert!(reason.starts_with("Usage: /timeout"), "{reason}");
+        // Not joined yet: no room to act in.
+        let Plan::Refuse(reason) =
+            plan_submit("/ban bob", &channel, None, ChannelRole::Moderator, None)
+        else {
+            panic!("no room id")
+        };
+        assert!(reason.contains("#forsen"), "{reason}");
+    }
+
+    #[test]
+    fn the_usage_shows_once_the_command_is_named_and_allowed() {
+        assert_eq!(
+            hint_for("/timeout ", ChannelRole::Moderator).map(|c| c.name),
+            Some("timeout")
+        );
+        assert!(hint_for("/timeout ", ChannelRole::Viewer).is_none());
+        assert!(hint_for("/timeout", ChannelRole::Moderator).is_none());
+        assert_eq!(
+            hint_for("/me ", ChannelRole::Viewer).map(|c| c.name),
+            Some("me")
+        );
+        assert!(hint_for("hello /ban x", ChannelRole::Moderator).is_none());
     }
 
     #[test]
@@ -780,7 +1028,9 @@ mod tests {
         // Flattened, it is one message for the user to confirm.
         let channel = ChannelId::new("forsen");
         let flat = flatten_paste("a\nb\nc").unwrap();
-        let Plan::Send { outgoing, .. } = plan_submit(&flat, &channel, Some("1"), None) else {
+        let Plan::Send { outgoing, .. } =
+            plan_submit(&flat, &channel, Some("1"), ChannelRole::Viewer, None)
+        else {
             panic!("one message")
         };
         assert_eq!(outgoing.text, "a b c");

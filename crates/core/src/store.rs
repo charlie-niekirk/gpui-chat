@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::event::{ClearTarget, Moderation};
 use crate::ids::MessageId;
-use crate::message::Message;
+use crate::message::{Message, MessageKind, Removal};
 
 /// Default number of messages kept per channel.
 pub const DEFAULT_CAPACITY: usize = 1_000;
@@ -22,6 +23,12 @@ pub struct Thread<'a> {
     pub root: Option<&'a Arc<Message>>,
     /// The replies still retained, oldest first.
     pub replies: Vec<&'a Arc<Message>>,
+}
+
+/// Whether `message` is something a moderator can remove: what a person wrote. A `USERNOTICE` (a
+/// sub, a raid, an announcement) is an event, not a chat line: a timeout or a clear leaves it.
+fn is_chat_line(message: &Message) -> bool {
+    matches!(message.kind, MessageKind::Chat | MessageKind::Action)
 }
 
 /// A bounded, ordered buffer of the most recent messages of one channel.
@@ -289,24 +296,29 @@ impl MessageStore {
         (Some(list), self.rebuild_serial)
     }
 
-    /// Applies one moderation action from recent-messages history; returns how many retained
-    /// messages it marked as deleted. A `Clear` reaches only messages sent at or before its time,
-    /// so what a timed-out user said after it survives.
-    pub fn apply_moderation(&mut self, moderation: &Moderation) -> usize {
+    /// Applies one moderation action from recent-messages history; returns the sequence numbers of
+    /// the retained messages it changed. A `Clear` reaches only messages sent at or before its
+    /// time, so what a timed-out user said after it survives.
+    pub fn apply_moderation(&mut self, moderation: &Moderation) -> Vec<u64> {
         match moderation {
             Moderation::Delete { message_id } => {
-                usize::from(self.mark_deleted(message_id.as_str()))
+                self.mark_deleted(message_id.as_str()).into_iter().collect()
             }
             Moderation::Clear { target, at } => {
                 let at = *at;
                 match target {
-                    ClearTarget::Channel => self.mark_where(|m| m.timestamp <= at),
-                    ClearTarget::User { login, .. } => self.mark_where(|m| {
-                        m.timestamp <= at
-                            && m.author
-                                .as_ref()
-                                .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
-                    }),
+                    ClearTarget::Channel => {
+                        self.mark_where(Removal::Cleared, |m| is_chat_line(m) && m.timestamp <= at)
+                    }
+                    ClearTarget::User { login, duration } => {
+                        self.mark_where(user_removal(*duration), |m| {
+                            is_chat_line(m)
+                                && m.timestamp <= at
+                                && m.author
+                                    .as_ref()
+                                    .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
+                        })
+                    }
                 }
             }
         }
@@ -441,53 +453,60 @@ impl MessageStore {
     }
 
     /// Marks the message with this id as deleted (replacing it with a copy that has
-    /// `flags.deleted` set). Returns `false` if the id is unknown or already deleted.
-    pub fn mark_deleted(&mut self, id: &str) -> bool {
-        match self.by_id.get(id).copied() {
-            Some(seq) => self.mark_deleted_seq(seq),
-            None => false,
+    /// `flags.deleted` set). Returns its sequence number, `None` if the id is unknown or the message
+    /// was already removed.
+    pub fn mark_deleted(&mut self, id: &str) -> Option<u64> {
+        let seq = *self.by_id.get(id)?;
+        let index = self.index_of_seq(seq)?;
+        let entry = &mut self.entries[index];
+        if entry.message.flags.deleted {
+            return None;
         }
+        entry.message = Arc::new(entry.message.with_deleted());
+        self.generation += 1;
+        Some(seq)
     }
 
-    /// Marks every retained message by `login` as deleted; returns how many changed.
-    pub fn mark_user_deleted(&mut self, login: &str) -> usize {
-        self.mark_where(|m| {
-            m.author
-                .as_ref()
-                .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
+    /// Marks every retained chat line by `login` as removed by a timeout of `duration` (`None`: a
+    /// ban); returns the sequence numbers that changed. A message already removed changes only
+    /// when this says more (a timeout or ban after a single delete).
+    pub fn mark_user_deleted(&mut self, login: &str, duration: Option<Duration>) -> Vec<u64> {
+        self.mark_where(user_removal(duration), |m| {
+            is_chat_line(m)
+                && m.author
+                    .as_ref()
+                    .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
         })
     }
 
-    /// Marks every retained message as deleted; returns how many changed.
-    pub fn mark_all_deleted(&mut self) -> usize {
-        self.mark_where(|_| true)
+    /// Marks every retained chat line as removed by a chat clear; returns the sequence numbers that
+    /// changed. System lines and notices stay as they are (a "chat was cleared" line must not be
+    /// struck through by the clear it reports).
+    pub fn mark_all_deleted(&mut self) -> Vec<u64> {
+        self.mark_where(Removal::Cleared, is_chat_line)
     }
 
-    fn mark_where(&mut self, mut pred: impl FnMut(&Message) -> bool) -> usize {
-        let mut changed = 0;
+    fn mark_where(&mut self, removal: Removal, mut pred: impl FnMut(&Message) -> bool) -> Vec<u64> {
+        let mut changed = Vec::new();
         for entry in &mut self.entries {
-            if !entry.message.flags.deleted && pred(&entry.message) {
-                entry.message = Arc::new(entry.message.with_deleted());
-                changed += 1;
+            if removal.rank() > entry.message.flags.removal.rank() && pred(&entry.message) {
+                entry.message = Arc::new(entry.message.with_removal(removal));
+                changed.push(entry.seq);
             }
         }
-        if changed > 0 {
+        if !changed.is_empty() {
             self.generation += 1;
         }
         changed
     }
+}
 
-    fn mark_deleted_seq(&mut self, seq: u64) -> bool {
-        let Some(index) = self.index_of_seq(seq) else {
-            return false;
-        };
-        let entry = &mut self.entries[index];
-        if entry.message.flags.deleted {
-            return false;
-        }
-        entry.message = Arc::new(entry.message.with_deleted());
-        self.generation += 1;
-        true
+/// What removing a user's messages by a timeout (`Some`) or a ban (`None`) is.
+fn user_removal(duration: Option<Duration>) -> Removal {
+    if duration.is_some() {
+        Removal::TimedOut
+    } else {
+        Removal::Banned
     }
 }
 
@@ -608,12 +627,12 @@ mod tests {
         };
         store.push(msg("a"));
         assert!(bumped(&store));
-        assert!(store.mark_deleted("a"));
+        assert!(store.mark_deleted("a").is_some());
         assert!(bumped(&store));
         // No-ops do not bump.
-        assert!(!store.mark_deleted("a"));
-        assert!(!store.mark_deleted("missing"));
-        assert_eq!(store.mark_user_deleted("nobody"), 0);
+        assert!(store.mark_deleted("a").is_none());
+        assert!(store.mark_deleted("missing").is_none());
+        assert!(store.mark_user_deleted("nobody", None).is_empty());
         assert!(!bumped(&store));
         store.set_capacity(5);
         assert!(bumped(&store));
@@ -683,7 +702,7 @@ mod tests {
         store.push(msg("a"));
         store.push(original.clone());
         store.push(msg("c"));
-        assert!(store.mark_deleted("b"));
+        assert!(store.mark_deleted("b").is_some());
         assert!(store.get("b").unwrap().flags.deleted);
         assert!(!original.flags.deleted, "shared Arc is never mutated");
         assert_eq!(ids(&store), ["a", "b", "c"]);
@@ -702,11 +721,20 @@ mod tests {
             MessageKind::System,
             "x",
         )));
-        assert_eq!(store.mark_user_deleted("Alice"), 2);
+        assert_eq!(store.mark_user_deleted("Alice", None).len(), 2);
         assert!(store.get("1").unwrap().flags.deleted);
         assert!(!store.get("2").unwrap().flags.deleted);
-        assert_eq!(store.mark_all_deleted(), 2, "already-deleted are skipped");
-        assert!(store.iter().all(|m| m.flags.deleted));
+        assert_eq!(
+            store.mark_all_deleted().len(),
+            1,
+            "already-deleted are skipped"
+        );
+        assert!(
+            store
+                .iter()
+                .all(|m| m.flags.deleted == (m.kind == MessageKind::Chat)),
+            "chat lines are deleted, the system line is not"
+        );
     }
 
     #[test]
@@ -721,7 +749,7 @@ mod tests {
             "index must not be dropped by eviction"
         );
         assert_eq!(store.seq_of("dup"), Some(2));
-        assert!(store.mark_deleted("dup"));
+        assert!(store.mark_deleted("dup").is_some());
         assert!(store.get_by_seq(2).unwrap().flags.deleted);
     }
 
@@ -1070,22 +1098,28 @@ mod tests {
             },
             at: Timestamp(40),
         };
-        assert_eq!(store.apply_moderation(&timeout), 2);
+        assert_eq!(store.apply_moderation(&timeout).len(), 2);
         let deleted: Vec<bool> = store.iter().map(|m| m.flags.deleted).collect();
         assert_eq!(
             deleted,
             [true, false, true, false],
             "the later message survives"
         );
-        assert_eq!(store.apply_moderation(&timeout), 0, "again: nothing new");
+        assert_eq!(
+            store.apply_moderation(&timeout).len(),
+            0,
+            "again: nothing new"
+        );
         let delete = Moderation::Delete {
             message_id: "2".into(),
         };
-        assert_eq!(store.apply_moderation(&delete), 1);
+        assert_eq!(store.apply_moderation(&delete).len(), 1);
         assert_eq!(
-            store.apply_moderation(&Moderation::Delete {
-                message_id: "nope".into()
-            }),
+            store
+                .apply_moderation(&Moderation::Delete {
+                    message_id: "nope".into()
+                })
+                .len(),
             0
         );
         let clear = Moderation::Clear {
@@ -1093,7 +1127,7 @@ mod tests {
             at: Timestamp(45),
         };
         assert_eq!(
-            store.apply_moderation(&clear),
+            store.apply_moderation(&clear).len(),
             0,
             "all those were already deleted"
         );
@@ -1101,7 +1135,84 @@ mod tests {
             target: ClearTarget::Channel,
             at: Timestamp(60),
         };
-        assert_eq!(store.apply_moderation(&clear), 1);
+        assert_eq!(store.apply_moderation(&clear).len(), 1);
         assert!(store.iter().all(|m| m.flags.deleted));
+    }
+
+    #[test]
+    fn a_removal_remembers_why_and_a_stronger_one_replaces_a_weaker() {
+        use crate::message::Removal;
+        let mut store = MessageStore::with_capacity(10);
+        store.push(msg_by("1", "alice"));
+        store.push(msg_by("2", "alice"));
+        store.push(msg_by("3", "bob"));
+        let why = |store: &MessageStore, id: &str| store.get(id).unwrap().flags.removal;
+        assert_eq!(why(&store, "1"), Removal::None);
+        // A single delete, then the author is timed out: the message now says timeout.
+        assert!(store.mark_deleted("1").is_some());
+        assert_eq!(why(&store, "1"), Removal::Deleted);
+        let timeout = Some(Duration::from_secs(600));
+        assert_eq!(store.mark_user_deleted("alice", timeout), [0, 1]);
+        assert_eq!(why(&store, "1"), Removal::TimedOut);
+        assert_eq!(why(&store, "2"), Removal::TimedOut);
+        // Repeating it changes nothing; a ban says more; a clear says less.
+        assert!(store.mark_user_deleted("alice", timeout).is_empty());
+        assert_eq!(store.mark_user_deleted("alice", None), [0, 1]);
+        assert_eq!(why(&store, "2"), Removal::Banned);
+        assert_eq!(store.mark_all_deleted(), [2]);
+        assert_eq!(why(&store, "3"), Removal::Cleared);
+        assert_eq!(
+            why(&store, "1"),
+            Removal::Banned,
+            "a clear does not hide a ban"
+        );
+        // History applies the same ranks, whatever the order.
+        let mut again = MessageStore::with_capacity(10);
+        again.push(msg_by("1", "alice"));
+        let ban = Moderation::Clear {
+            target: ClearTarget::User {
+                login: "alice".into(),
+                duration: None,
+            },
+            at: Timestamp(100),
+        };
+        let delete = Moderation::Delete {
+            message_id: "1".into(),
+        };
+        assert_eq!(again.apply_moderation(&ban), [0]);
+        assert!(again.apply_moderation(&delete).is_empty());
+        assert_eq!(why(&again, "1"), Removal::Banned);
+    }
+
+    #[test]
+    fn a_user_notice_is_an_event_not_struck_by_a_timeout_or_a_clear() {
+        let mut store = MessageStore::with_capacity(10);
+        let mut notice = (*msg_by("n", "alice")).clone();
+        notice.kind = MessageKind::UserNotice;
+        store.push(Arc::new(notice));
+        assert!(store.mark_user_deleted("alice", None).is_empty());
+        assert!(store.mark_all_deleted().is_empty());
+        assert!(!store.get("n").unwrap().flags.deleted);
+        // The same through history's moderation, and for a card that carries system text.
+        let mut card = (*msg_by("c", "alice")).clone();
+        card.kind = MessageKind::UserNotice;
+        card.system_text = Some("alice subscribed".into());
+        store.push(Arc::new(card));
+        for action in [
+            Moderation::Clear {
+                target: ClearTarget::Channel,
+                at: Timestamp(i64::MAX),
+            },
+            Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "alice".into(),
+                    duration: None,
+                },
+                at: Timestamp(i64::MAX),
+            },
+        ] {
+            assert!(store.apply_moderation(&action).is_empty());
+        }
+        assert!(store.iter().all(|m| !m.flags.deleted));
     }
 }

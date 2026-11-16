@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, watch};
 use super::oauth::{AuthError, DeviceCode, OAuthClient, PollOutcome, TokenResponse, Validation};
 use super::store::{StoreError, TokenStore};
 use super::token::{StoredToken, missing_scopes};
-use super::{SCOPES, Secret, unix_now};
+use super::{MODERATION_SCOPES, SCOPES, Secret, unix_now};
 
 /// Refresh this long before the access token expires.
 const REFRESH_MARGIN_SECS: u64 = 5 * 60;
@@ -41,14 +41,30 @@ pub const SESSION_EXPIRED_NOTICE: &str = "Your Twitch login expired or was revok
 pub struct Account {
     pub login: String,
     pub user_id: String,
-    /// Scopes the app asks for that this login was not granted (the scope list grew since).
+    /// Scopes the app asks for at login that this login was not granted (the scope list grew since).
     pub missing_scopes: Vec<String>,
+    /// The moderation scopes ([`MODERATION_SCOPES`], PR 5.2) this login was not granted. They are
+    /// not asked for at a normal login (least privilege): the user enables them the first time they
+    /// use a moderation tool ([`Auth::request_device_code_with`]), so this never counts as a reason
+    /// to log in again ([`Account::needs_relogin`]).
+    pub missing_moderation_scopes: Vec<String>,
 }
 
 impl Account {
     /// The login works but predates scopes the app now needs: ask the user to log in again.
+    /// Moderation scopes are not among them; see [`Account::missing_moderation_scopes`].
     pub fn needs_relogin(&self) -> bool {
         !self.missing_scopes.is_empty()
+    }
+
+    /// Whether this login was granted `scope` of [`MODERATION_SCOPES`].
+    pub fn has_moderation_scope(&self, scope: &str) -> bool {
+        !self.missing_moderation_scopes.iter().any(|m| m == scope)
+    }
+
+    /// Whether every moderation scope was granted (the tools are enabled).
+    pub fn moderation_enabled(&self) -> bool {
+        self.missing_moderation_scopes.is_empty()
     }
 }
 
@@ -438,10 +454,30 @@ impl Auth {
     /// Starts a device login: show the result's code and link to the user, then call
     /// [`Auth::complete_device_login`].
     pub async fn request_device_code(&self) -> Result<DeviceCode, AuthError> {
+        self.request_device_code_with(&[]).await
+    }
+
+    /// [`Auth::request_device_code`] asking for `extra` scopes on top of the normal ones: how the
+    /// moderation scopes are requested ([`MODERATION_SCOPES`]). Pass the same `extra` to
+    /// [`Auth::complete_device_login_with`].
+    pub async fn request_device_code_with(
+        &self,
+        extra: &[&'static str],
+    ) -> Result<DeviceCode, AuthError> {
         self.inner
             .oauth
-            .request_device_code(&self.inner.scopes)
+            .request_device_code(&self.scopes_with(extra))
             .await
+    }
+
+    fn scopes_with(&self, extra: &[&'static str]) -> Vec<&'static str> {
+        let mut scopes = self.inner.scopes.clone();
+        for scope in extra {
+            if !scopes.contains(scope) {
+                scopes.push(scope);
+            }
+        }
+        scopes
     }
 
     /// Polls until the user approves `code` (honouring `interval` and `slow_down`), then stores the
@@ -457,7 +493,19 @@ impl Auth {
         code: &DeviceCode,
         polling: DevicePolling,
     ) -> Result<Account, AuthError> {
+        self.complete_device_login_with(code, polling, &[]).await
+    }
+
+    /// [`Auth::complete_device_login`] for a code requested with
+    /// [`Auth::request_device_code_with`]`(extra)`.
+    pub async fn complete_device_login_with(
+        &self,
+        code: &DeviceCode,
+        polling: DevicePolling,
+        extra: &[&'static str],
+    ) -> Result<Account, AuthError> {
         let oauth = &self.inner.oauth;
+        let scopes = self.scopes_with(extra);
         let deadline = tokio::time::Instant::now() + polling.unit * saturate(code.expires_in);
         let mut interval = code.interval.max(1);
         let response = loop {
@@ -465,7 +513,7 @@ impl Auth {
             if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
-            match oauth.poll_device_code(code, &self.inner.scopes).await {
+            match oauth.poll_device_code(code, &scopes).await {
                 Ok(PollOutcome::Token(response)) => break response,
                 Ok(PollOutcome::Pending) => {}
                 Ok(PollOutcome::SlowDown) => interval += polling.slow_down_step,
@@ -559,6 +607,10 @@ impl Auth {
             login: token.login.clone(),
             user_id: token.user_id.clone(),
             missing_scopes: missing_scopes(&token.scopes, &self.inner.scopes)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            missing_moderation_scopes: missing_scopes(&token.scopes, MODERATION_SCOPES)
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),

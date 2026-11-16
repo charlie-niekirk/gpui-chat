@@ -67,6 +67,30 @@ impl RoomState {
     }
 }
 
+/// What the local user is in a channel, from the `USERSTATE` the server sends after a join and
+/// after each message (PR 5.2): decides whether moderation controls are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelRole {
+    /// Anyone else, and everyone while chat is anonymous.
+    #[default]
+    Viewer,
+    /// A moderator (or staff / admin) of the channel.
+    Moderator,
+    /// The broadcaster: moderator rights plus mods, VIPs and raids.
+    Broadcaster,
+}
+
+impl ChannelRole {
+    /// Whether the user may delete messages, time out and ban here.
+    pub fn can_moderate(self) -> bool {
+        self != Self::Viewer
+    }
+
+    pub fn is_broadcaster(self) -> bool {
+        self == Self::Broadcaster
+    }
+}
+
 /// What a `CLEARCHAT` removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClearTarget {
@@ -142,6 +166,12 @@ pub enum ChatEvent {
         channel: ChannelId,
         update: RoomStateUpdate,
     },
+    /// `USERSTATE`: what the logged-in user is in the channel (PR 5.2). Anonymous connections
+    /// get none.
+    UserState {
+        channel: ChannelId,
+        role: ChannelRole,
+    },
     /// `NOTICE`. `channel` is `None` for notices not tied to a channel (e.g. login
     /// failures). `msg_id` is Twitch's notice id (`msg_banned`, `slow_on`, ...).
     Notice {
@@ -165,7 +195,8 @@ impl ChatEvent {
             | Self::History { channel, .. }
             | Self::ClearChat { channel, .. }
             | Self::DeleteMessage { channel, .. }
-            | Self::RoomState { channel, .. } => Some(channel),
+            | Self::RoomState { channel, .. }
+            | Self::UserState { channel, .. } => Some(channel),
             Self::Notice { channel, .. } | Self::Connection { channel, .. } => channel.as_ref(),
         }
     }

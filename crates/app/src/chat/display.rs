@@ -329,6 +329,23 @@ pub fn body_fragments(message: &Message) -> Cow<'_, [Fragment]> {
     Cow::Owned(out)
 }
 
+/// The text a removed message collapses to under `chat.deleted_messages = "collapse"` (PR 5.2):
+/// `[time] name: <message deleted>`, muted. Built like any display text, so it is shaped, laid out,
+/// selected and copied by the same machinery as a message.
+pub fn build_collapsed(message: &Message, options: DisplayOptions) -> DisplayText {
+    let mut out = DisplayText::default();
+    if options.timestamps {
+        out.push(&clock(message.timestamp.unix_millis()), Role::Timestamp);
+        out.push(" ", Role::Separator);
+    }
+    if let Some(author) = &message.author {
+        out.push(author_name(author), Role::System);
+        out.push(": ", Role::System);
+    }
+    out.push("<message deleted>", Role::System);
+    out
+}
+
 /// The display text of `message`; `badges` are drawn before the author's name.
 ///
 /// An event row (PR 5.1, [`super::events`]) has its header first and the message on the line
@@ -444,6 +461,20 @@ mod tests {
             parent_body: body.into(),
             thread_parent_id: None,
         }
+    }
+
+    #[test]
+    fn a_collapsed_message_is_its_author_and_a_placeholder() {
+        let message = chat(vec![Fragment::Text("secret".into())]);
+        let shown = |timestamps| build_collapsed(&message, DisplayOptions { timestamps }).text;
+        assert_eq!(shown(false), "Alice: <message deleted>");
+        assert_eq!(shown(true), "01:01 Alice: <message deleted>");
+        let anonymous = Message::plain("1", Timestamp(0), MessageKind::Notice, "x");
+        assert_eq!(
+            build_collapsed(&anonymous, DisplayOptions::default()).text,
+            "<message deleted>"
+        );
+        assert!(!shown(true).contains("secret"));
     }
 
     #[test]

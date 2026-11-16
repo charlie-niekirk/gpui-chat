@@ -34,6 +34,7 @@ theme_name = "default"                     # colour theme: bundled id or themes/
 scrollback = 1000                          # 10 to 100000
 timestamps = true
 history = true                             # load recent messages on join / reconnect (sends the channel name to a third party)
+deleted_messages = "strikethrough"         # how removed messages show: strikethrough (dimmed, in place) | collapse ("<message deleted>", click to show)
 
 [emotes]
 scale = 1.0                                # 0.5 to 4.0; a Twitch emote is 28 px at 1.0
@@ -179,6 +180,23 @@ starts empty at the moment you join, as on twitch.tv. The setting is read when a
 re-joined, so changing it affects the next join or reconnect, not channels already open. If the service
 is slow, down or refuses (it is a volunteer-run service), joining is not delayed and the channel shows a
 single quiet line saying history could not be loaded.
+
+### Removed messages (`chat.deleted_messages`, PR 5.2)
+
+What a moderator removing a message (deleting it, timing out or banning its author, clearing the chat) looks like:
+
+- `"strikethrough"` (the default): the message stays where it is, dimmed and struck through.
+- `"collapse"`: it becomes one muted line, `name: <message deleted>`, until you click it. A moderator's own view uses the same
+  setting. *Chat → Moderation → Removed messages* in the settings window.
+
+Either way a system line says what happened ("alice was timed out for 10m.", "alice was banned.", "Chat was cleared by a
+moderator."), for live chat and for recent-messages history alike. A value this build does not know falls back to
+`"strikethrough"`.
+
+Moderation tools (buttons, menu items, the room-mode menu, `/timeout` and the other commands) appear only for a moderator or the
+broadcaster of the channel. They need Twitch permissions a normal login does not ask for (least privilege, and nobody who only
+watches chat is asked to log in again): choose **Enable moderation tools…** (account menu, *Settings → Account*, or the button on
+the strip that appears when you first use a tool) and approve the extra permissions. Logging in again later keeps them.
 
 ## Twitch account (PR 3.1)
 

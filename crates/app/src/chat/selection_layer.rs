@@ -176,6 +176,9 @@ pub struct Surface {
     first_seq: Cell<u64>,
     /// The selection stopped the list following new messages: clearing it resumes.
     resume: Cell<bool>,
+    /// Someone else (the moderation strip, PR 5.2) asked the list to stand still: it is held again
+    /// every frame, as for a selection.
+    keep_frozen: Cell<bool>,
     /// The display text of the anchor's and the head's message when the pointer was on them.
     ends: RefCell<[Option<End>; 2]>,
     pending: RefCell<Option<PendingClick>>,
@@ -207,6 +210,7 @@ impl Surface {
             list,
             first_seq: Cell::new(0),
             resume: Cell::new(false),
+            keep_frozen: Cell::new(false),
             ends: RefCell::default(),
             pending: RefCell::default(),
             clicks: Cell::new(0),
@@ -562,12 +566,23 @@ impl Surface {
 
     /// Stops a following list where it is (see the module docs).
     fn hold(&self) {
+        if self.freeze_list() {
+            self.resume.set(true);
+        }
+    }
+
+    /// Stops a following list where it is, without the selection's "resume when cleared": for
+    /// whoever else needs the list to stand still (the moderation strip, PR 5.2), which resumes it
+    /// itself. Whether it was following and has been stopped.
+    pub fn freeze_list(&self) -> bool {
         if let Some(list) = &self.list
             && list.is_following_tail()
             && let Some(top) = self.scroll_top()
         {
             list.scroll_to(top);
-            self.resume.set(true);
+            true
+        } else {
+            false
         }
     }
 
@@ -708,6 +723,12 @@ impl Surface {
         }
     }
 
+    /// Holds the list where it is every frame from now on (`true`) until told otherwise (`false`;
+    /// following is not resumed here: the caller knows whether the list was following).
+    pub fn keep_frozen(&self, on: bool) {
+        self.keep_frozen.set(on);
+    }
+
     /// Each frame: keep the list held while it should be (GPUI re-engages following whenever the
     /// list is at its end), and scroll it while a drag is past its top or bottom.
     fn tick(&self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
@@ -719,6 +740,9 @@ impl Surface {
             None => (false, false),
         };
         let waiting = self.pending.borrow().is_some();
+        if self.keep_frozen.get() {
+            self.freeze_list();
+        }
         if !(pressed || waiting || self.has_selection()) {
             // Following again by other means (scrolled to the end, the pill): nothing to resume.
             if list.is_following_tail() {

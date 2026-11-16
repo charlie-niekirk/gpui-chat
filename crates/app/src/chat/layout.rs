@@ -508,6 +508,8 @@ pub struct LayoutKey {
     pub generation: u64,
     /// `f32::to_bits` of the window scale factor.
     pub scale_bits: u32,
+    /// The message is shown collapsed (`<message deleted>`, PR 5.2): another display text.
+    pub collapsed: bool,
 }
 
 impl LayoutKey {
@@ -515,7 +517,13 @@ impl LayoutKey {
         Self {
             generation,
             scale_bits: scale_factor.to_bits(),
+            collapsed: false,
         }
+    }
+
+    #[must_use]
+    pub fn collapsed(self, collapsed: bool) -> Self {
+        Self { collapsed, ..self }
     }
 }
 

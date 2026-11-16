@@ -55,6 +55,23 @@ pub const SCOPES: &[&str] = &[
     "user:read:follows",
 ];
 
+/// The scopes only the moderation tools use (PR 5.2), **not** part of [`SCOPES`]: a normal login does
+/// not ask for them (least privilege, and no existing login is told to log in again for them).
+/// The user enables them the first time they use a moderation tool (or from the account menu),
+/// through the same device-code flow with these as extra scopes
+/// ([`Auth::request_device_code_with`]); until then a tool says "Log in again to enable moderation
+/// (grants …)". [`Account::missing_moderation_scopes`] says what a login lacks.
+pub const MODERATION_SCOPES: &[&str] = &[
+    "moderator:manage:banned_users",
+    "moderator:manage:chat_messages",
+    "moderator:manage:chat_settings",
+    "moderator:manage:announcements",
+    "moderator:manage:shoutouts",
+    "channel:manage:moderators",
+    "channel:manage:vips",
+    "channel:manage:raids",
+];
+
 /// The client id to use: `$GPUI_CHAT_TWITCH_CLIENT_ID` when set and not blank, else
 /// [`DEFAULT_CLIENT_ID`].
 pub fn client_id() -> String {

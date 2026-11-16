@@ -9,6 +9,5 @@ PING :tmi.twitch.tv
 :tmi.twitch.tv PONG tmi.twitch.tv :tmi.twitch.tv
 :tmi.twitch.tv RECONNECT
 :viewer!viewer@viewer.tmi.twitch.tv PART #testchan
-@badge-info=;badges=;color=#FF0000;display-name=Viewer;emote-sets=0;mod=0;subscriber=0;user-type= :tmi.twitch.tv USERSTATE #testchan
 @badge-info=;badges=;color=#FF0000;display-name=Viewer;emote-sets=0,300374282;user-id=4001;user-type= :tmi.twitch.tv GLOBALUSERSTATE
 

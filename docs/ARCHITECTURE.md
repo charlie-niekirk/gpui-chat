@@ -232,6 +232,49 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   others. History rows are drawn at `Tokens::history_opacity` (`chat/row.rs`), derived per theme from how far its muted text
   sits between background and text, and `flags.history` stays on the message for notifications (PR 5.3) to skip. The
   setting is read when a channel is joined, so a change applies to the next join or reconnect.
+- `moderation.rs` (PR 5.2) — moderation in the app, plain data and functions (tested without a window). `Moderator` runs a
+  `ModRequest` (channel, room id, `core::ModCommand`, the target's user id when a message supplies it): `Live` goes through
+  `LiveSource::moderate` (Helix as the logged-in user, a failure is the sentence shown, and the few commands chat does not
+  echo, like `/mod`, add a system line), `Loopback` (`--replay` only, `ShellParts::loopback`) turns the command into the events
+  the server would send (`loopback_events`: `CLEARCHAT` / `CLEARMSG` / `ROOMSTATE` / a confirmation line) so the controls can
+  be tried and screenshotted offline, nothing leaves the machine. `RowAction` (Delete, Timeout(secs), Ban, Unban) is a button
+  or menu item on a message and builds the same `ModCommand` typing would; `confirmation` says which ask first (only Ban);
+  `is_collapsed` decides the `chat.deleted_messages = "collapse"` row. **Who sees what:** `ChannelStore::role` comes from
+  `USERSTATE` (`ChannelRole`: viewer / moderator / broadcaster; reset by any non-connected channel state, a rejoin asks the
+  server again), and the controls need that *and* a pane with a `Moderator`. Viewers (and every anonymous run) get none of
+  it: no hover tracking, no menu items, static room chips, completion offers only `/me`. `ChatView` draws them
+  (`chat/row.rs`: hover buttons beside Reply: four fixed slots on every row, Delete / 10m timeout / Ban / Unban, the ones that do
+  not apply disabled so a click always lands on what was aimed at; while the pointer is on the strip the list stands still
+  (`ChatView::hold_for_strip`, `Surface::keep_frozen`: held again every frame like a selection, resumed on leaving); ids are
+  namespaced with the row's prefix because the list and the thread popover share sequence numbers; the right-click menu's
+  Delete message / Timeout… (a submenu of lengths) / Ban… / Unban) and emits `ChatViewEvent::Moderate`; `ChannelPane` subscribes with
+  window access (`subscribe_in`, first render), asks first for a Ban (confirmation dialog), runs it and shows a failure in a
+  dismissible strip under the header. A 403 means Twitch does not think you moderate here: the role is dropped
+  (`ChannelStore::drop_role`) and the controls go until the next join. A moderator's room chips are Kit buttons with a caret (the
+  caret is what makes `Button::dropdown_menu` open) listing every mode, with checks and lengths (`pane::room_menu`,
+  `core::RoomMode::toggled`); with no mode on, a "Chat modes" button. The composer's `plan_submit` checks the role (*"You need
+  to be a moderator of #chan to use /ban"*), shows the command's usage under the box once its name is typed
+  (`core::command_hint`) and the completion list only offers what the role may use. **Moderation scopes are opt-in:** a normal
+  login asks only for `auth::SCOPES`; the eight `auth::MODERATION_SCOPES` are requested by *Enable moderation tools…* (account
+  menu, Settings → Account, or the button on the failure strip) through the same device-code flow with them as extra scopes
+  (`Auth::request_device_code_with`, `AccountHub::begin_sign_in(moderation)`); a later normal login keeps them if they were
+  enabled. `Account::missing_moderation_scopes` says what a login lacks and is **not** part of `needs_relogin()`, so neither the
+  account banner, the title-bar warning icon nor Settings → Account nags anyone who never moderates; using a tool without them says
+  "Log in again to enable moderation (grants …)". Own messages (`account::own_login`), the broadcaster's, other moderators' and
+  event cards (a `USERNOTICE`) get no controls.
+- **Removed messages** (PR 5.2). `CLEARCHAT` / `CLEARMSG` strike messages out as before (`flags.deleted`; the chat view
+  draws them dimmed and struck through, or, with `chat.deleted_messages = "collapse"`, as `name: <message deleted>` that a
+  click reveals. The collapsed line is the same `MessageElement` with another display text (`display::build_collapsed`, key
+  `LayoutKey::collapsed`), so selecting, copying and the right-click menu work on it. Collapsing is another row height:
+  `ChannelStore::struck_since` (a bounded log of the sequence numbers a delete / timeout / ban / clear changed) makes the view
+  measure just those rows again, and `revealed` is pruned to messages the store still holds). `MessageFlags::removal` says why
+  a message was removed (`Deleted`, `Cleared`, `TimedOut`, `Banned`; a stronger one replaces a weaker): Unban is offered only for
+  the last two, a timeout stays available after a delete. Event cards (`USERNOTICE`) are not chat lines: no collapse, no strike.
+  `core::clear_line` makes the system line ("alice was timed out for 10m.", "alice was banned.", "Chat was cleared by a
+  moderator.") from an event that has its `tmi-sent-ts`; its id is built from what happened and when, so the live copy and
+  recent-messages history (`ChannelStore::with_clear_lines`, lines older than anything shown are left out) are one line, and
+  it is flagged `history` like the messages around it. `mark_all_deleted` and a history channel clear only touch chat lines,
+  never system lines (the line a clear made must not be struck by it).
 - `account.rs` / `sign_in.rs` / `platform/keychain.rs` (PR 3.1) — the Twitch account. `AccountHub` (GPUI
   entity, live source only: offline runs never touch the keychain) mirrors `gpui_chat_twitch::Auth`'s
   `AuthState` (a `watch` channel) into the UI: on start the backend restores the stored login and then
@@ -250,7 +293,7 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (`core::InputHistory`, 100 lines per pane; actions `ComposerHistoryPrevious/Next`, bound in
   `platform::default_bindings` to `ChatComposer > Input` so they beat the input's own cursor keys). `plan_submit`
   (pure) turns the text into *nothing / refuse with a reason / send to room id* using `core::parse_input`
-  (`/me text` = action, `//text` = a literal leading slash, any other `/command` refused, 500-character limit) and
+  (`/me text` = action, `//text` = a literal leading slash, the moderation commands of PR 5.2 are `Plan::Moderate`, any other `/command` refused, 500-character limit) and
   the channel's `ROOMSTATE` room id. The box clears at once; if the send fails the reason shows in a strip above
   the box and the text comes back (unless the user typed something new; ↑ finds it anyway). `Mode` (from the
   `AuthState`) disables the box with its placeholder and a *Log in* button when logged out, still restoring, or
@@ -740,6 +783,33 @@ GPUI-free, tested on Linux against a local mock server (`wiremock`, dev-only).
   shows the message itself (flagged `echo`), as the account whose token made the request (`SentMessage` carries
   its login and user id), under the id Twitch returned; Twitch's own copy, if it comes, replaces it, and any other
   second chat line with that id is ignored.
+
+### Moderation (`crates/twitch` and `crates/core`, PR 5.2)
+
+Twitch removed the IRC chat commands, so every moderation action is a Helix request as the logged-in user
+(`crates/twitch/src/moderation.rs`, tested against wiremock and as pure request building).
+
+- **`core::moderation`** — pure: `parse_mod_command` (`/timeout user [duration] [reason]`, `/ban`, `/unban`, `/delete id`,
+  `/clear`, `/slow [s]`, `/slowoff`, `/followers [duration]`, `/followersoff`, `/subscribers[off]`, `/emoteonly[off]`,
+  `/uniquechat[off]`, `/mod`, `/unmod`, `/vip`, `/unvip`, `/announce`, `/raid`, `/unraid`, `/shoutout`; durations are `90`, `10m`,
+  `1h30m`, `1w`, `3mo`; ranges are Twitch's: timeout 1 s to 14 d, slow 3 to 120 s, followers up to 3 months in whole minutes) into
+  `ModCommand`; `COMMANDS` (usage, summary, who may use it) for completion and the hint under the box; `RoomMode` toggling;
+  `row_actions(role, channel, message)` (none for viewers, for lines nobody wrote, for the broadcaster's own messages and for
+  another moderator unless the user is the broadcaster); `clear_line`. `parse_input` returns `Input::Command` for these; anything
+  else starting with `/` is still "Unknown command".
+- **`build_request(command, Ids)`** — the method, path (query values percent-encoded) and JSON body of each endpoint: `POST
+  moderation/bans` (timeout with `duration`, ban without), `DELETE moderation/bans` (unban), `DELETE moderation/chat` (one
+  message with `message_id`, else the whole chat), `PATCH chat/settings` (only the changed mode), `POST chat/announcements`,
+  `POST chat/shoutouts`, `POST` / `DELETE moderation/moderators`, `channels/vips`, `raids`. `required_scope` names the OAuth scope
+  each needs; `auth::MODERATION_SCOPES` are those eight, deliberately **not** in `auth::SCOPES` (see the app section: opt-in).
+- **`HelixClient::moderate(broadcaster_id, command, target_id)`** — checks the login's moderation scopes first (a login that did
+  not enable them gets `ModError::MissingScope`: *"Log in again to enable moderation (grants moderator:manage:banned_users)"*,
+  nothing is sent; `ModError::is_forbidden` is a 403), resolves
+  the target's login with `GET users?login=` unless the caller knows the id (a message's author), sends through
+  `request_json` (any method; same refresh-on-401 and rate-limit handling as `post_json`) and maps Twitch's answer: 2xx is
+  done, a 401 naming a scope is `MissingScope`, other refusals carry Twitch's own message, 429 is `RateLimited`.
+- **`USERSTATE`** is parsed (`ChatEvent::UserState { channel, role }`; the broadcaster has `broadcaster/1` and no `mod=1`; staff / admin / global-mod badges are not moderator status in the channel).
+- A ban or timeout without a reason omits `reason` from the body.
 
 ### User emotes (`crates/twitch`, PR 3.3)
 
