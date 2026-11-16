@@ -16,8 +16,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent, MessageId};
-use gpui_chat_settings::SettingsError;
+use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent, ConnectionState, MessageId};
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -55,6 +54,7 @@ use crate::composer::Composer;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
 use crate::emote_service;
+use crate::empty;
 use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
 use crate::keymap::{self, KeymapState};
@@ -64,6 +64,8 @@ use crate::moderation::Moderator;
 use crate::notifications::Target;
 use crate::palette;
 use crate::pane::{ChannelPane, PaneTools};
+use crate::problems::{self, Fix, Problem};
+use crate::settings_window;
 use crate::sign_in;
 use crate::splits::view::{ChannelRows, Splits};
 use crate::splits::{Direction, DropZone, Layout, PaneId};
@@ -168,6 +170,9 @@ pub struct ShellParts {
     pub loopback: Option<BridgeSender<ChatEvent>>,
     pub diagnostics: Diagnostics,
     pub hud_visible: bool,
+    /// No channel was ever added (no `[channels]` in `state.toml`): the main pane shows the
+    /// welcome until the first one is (PR 6.3). Always `false` for the offline sources.
+    pub first_run: bool,
 }
 
 pub struct AppShell {
@@ -176,6 +181,11 @@ pub struct AppShell {
     diagnostics: Diagnostics,
     hub: Entity<ChannelHub>,
     attention: Entity<Attention>,
+    /// The welcome view is up (see [`ShellParts::first_run`]); cleared by the first channel added,
+    /// and never set again.
+    first_run: bool,
+    /// The welcome's first button, which has keyboard focus while the welcome is shown.
+    welcome_focus: FocusHandle,
     /// The Mentions panel is open beside the panes.
     mentions_open: bool,
     /// A line shown for a few seconds above the panes (a jump to a message that is gone).
@@ -186,6 +196,11 @@ pub struct AppShell {
     /// The pointer is on the Mentions panel.
     mentions_hover: Rc<Cell<bool>>,
     mentions_scroll: UniformListScrollHandle,
+    /// Keyboard focus and the highlighted row of the Mentions panel (PR 6.3).
+    mentions_focus: FocusHandle,
+    mentions_selected: Rc<Cell<usize>>,
+    /// The panel just opened: focus it after the next frame.
+    mentions_focus_pending: bool,
     /// Whether this window is the active one (a channel is only being watched while it is).
     window_active: bool,
     hud: Entity<DebugHud>,
@@ -226,6 +241,7 @@ impl AppShell {
             loopback,
             diagnostics,
             hud_visible,
+            first_run,
         } = parts;
         let hud = cx.new(|cx| DebugHud::new(diagnostics.clone(), hub.clone(), hud_visible, cx));
         let mut subscriptions = vec![
@@ -257,6 +273,8 @@ impl AppShell {
             // A keymap reload (or a problem with the file appearing or clearing) re-renders the
             // strip and every shortcut hint.
             cx.observe_global::<KeymapState>(|_, cx| cx.notify()),
+            // A problem filed by any source (or dismissed) redraws the strips.
+            cx.observe_global::<problems::Problems>(|_, cx| cx.notify()),
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.placement_changed(window, cx);
             }),
@@ -303,12 +321,17 @@ impl AppShell {
             diagnostics,
             hub,
             attention,
+            first_run,
+            welcome_focus: cx.focus_handle(),
             mentions_open: false,
             notice: None,
             notice_task: None,
             mentions_feed: RefCell::default(),
             mentions_hover: Rc::default(),
             mentions_scroll: UniformListScrollHandle::new(),
+            mentions_focus: cx.focus_handle(),
+            mentions_selected: Rc::default(),
+            mentions_focus_pending: false,
             window_active: window.is_window_active(),
             hud,
             list: channels,
@@ -529,6 +552,7 @@ impl AppShell {
             Target::Message(channel, id) => self.show_message(channel, Some(id), window, cx),
             Target::Mentions => {
                 self.mentions_open = true;
+                self.mentions_focus_pending = true;
                 window.activate_window();
                 cx.notify();
             }
@@ -539,6 +563,11 @@ impl AppShell {
     fn toggle_mentions(&mut self, cx: &mut Context<Self>) {
         self.mentions_open = !self.mentions_open;
         self.mentions_hover.set(false);
+        // Opened: the panel takes keyboard focus (Up / Down / Enter / Esc); closed: it goes back
+        // to the pane.
+        self.mentions_selected.set(0);
+        self.mentions_focus_pending = self.mentions_open;
+        self.focus_pending |= !self.mentions_open;
         cx.notify();
     }
 
@@ -594,6 +623,8 @@ impl AppShell {
     }
 
     fn add_channel(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        // The welcome is for the time before the first channel, and is not shown again.
+        self.first_run = false;
         self.open_channel(&channel, cx);
         self.show_channel(&channel);
         self.list_changed(cx);
@@ -759,6 +790,8 @@ impl AppShell {
             .cloned();
         match pane {
             Some(pane) => pane.update(cx, |pane, cx| pane.focus(window, cx)),
+            // The welcome's first button, so Enter adds a channel and Tab reaches the others.
+            None if self.welcome_shown() => window.focus(&self.welcome_focus, cx),
             None => window.focus(&self.focus_handle, cx),
         }
     }
@@ -977,61 +1010,6 @@ impl AppShell {
         Some(div().pr_2().child(control).into_any_element())
     }
 
-    /// A strip above the content when the user was logged out without asking (with why), or the
-    /// login lacks scopes the app now asks for.
-    fn account_banner(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let account = self.account.as_ref()?.read(cx);
-        let (message, action, colour) = if let Some(notice) = account.notice() {
-            (notice.to_owned(), "Log in", tokens.danger)
-        } else if let AuthState::LoggedIn(user) = account.state()
-            && user.needs_relogin()
-        {
-            (
-                format!(
-                    "Log in again to grant the new Twitch permissions ({}).",
-                    user.missing_scopes.join(", ")
-                ),
-                "Log in again",
-                tokens.accent,
-            )
-        } else {
-            return None;
-        };
-        let dismissable = account.notice().is_some();
-        Some(
-            h_flex()
-                .id("account-banner")
-                .w_full()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .gap_2()
-                .items_center()
-                .bg(colour.opacity(0.14))
-                .border_b_1()
-                .border_color(colour)
-                .child(div().flex_1().min_w_0().text_sm().child(message))
-                .child(
-                    Button::new("account-banner-log-in")
-                        .small()
-                        .label(action)
-                        .on_click(cx.listener(|this, _, window, cx| this.log_in(window, cx))),
-                )
-                .children(dismissable.then(|| {
-                    Button::new("account-banner-dismiss")
-                        .small()
-                        .ghost()
-                        .label("Dismiss")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(account) = &this.account {
-                                account.update(cx, |account, cx| account.dismiss_notice(cx));
-                            }
-                        }))
-                }))
-                .into_any_element(),
-        )
-    }
-
     fn placement_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let display = window
             .display(cx)
@@ -1115,7 +1093,7 @@ impl AppShell {
         let items: Vec<(SidebarMenuItem, Option<ChannelId>)> = if self.list.is_empty() {
             vec![(
                 SidebarMenuItem::new(match keymap::shortcut_of(AddChannel, cx) {
-                    Some(keys) => format!("No channels yet: {keys}"),
+                    Some(keys) => format!("No channels yet ({keys})"),
                     None => "No channels yet".to_owned(),
                 })
                 .disable(true),
@@ -1193,75 +1171,167 @@ impl AppShell {
             .children(groups)
     }
 
-    /// A non-blocking strip above the content while `settings.toml` fails to load. The
-    /// previous settings stay in effect; it disappears when the file loads again.
-    fn settings_error_banner(error: &SettingsError, tokens: &Tokens) -> impl IntoElement {
-        let danger = tokens.danger;
-        v_flex()
-            .id("settings-error-banner")
-            .w_full()
-            .flex_none()
-            .px_3()
-            .py_2()
-            .gap_1()
-            .bg(danger.opacity(0.14))
-            .border_b_1()
-            .border_color(danger)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(tokens.danger_text)
-                    .child("Settings not applied: keeping the previous settings"),
-            )
-            .child(div().text_sm().child(error.to_string()))
+    /// Files the problems the shell itself can see (a bad settings, keymap or theme file, the
+    /// login, the chat connection) in [`problems`], or clears them when the cause is gone. Sources
+    /// elsewhere (the providers, the keychain, …) report on their own. Cheap and idempotent: a
+    /// problem that did not change notifies nobody.
+    fn sync_problems(&self, cx: &mut Context<Self>) {
+        // settings.toml: the last good settings stay in effect.
+        match config::store(cx).read(cx).error() {
+            Some(error) => {
+                let full = error.to_string();
+                problems::report(
+                    "settings",
+                    Problem::error(
+                        "settings.toml could not be loaded: the last good settings (or the defaults) are in use",
+                    )
+                    .line(settings_window::friendly(error))
+                    .details(full),
+                    cx,
+                );
+            }
+            None => problems::clear("settings", cx),
+        }
+        let theme_notices = theme::notices(cx);
+        if theme_notices.is_empty() {
+            problems::clear("theme", cx);
+        } else {
+            problems::report(
+                "theme",
+                Problem::warning("Theme problem: the theme in effect keeps working")
+                    .lines(theme_notices.iter().map(|line| problems::plain(line)))
+                    .details(theme_notices.join("\n")),
+                cx,
+            );
+        }
+        let keymap_notices = keymap::notices(cx);
+        if keymap_notices.is_empty() {
+            problems::clear("keymap", cx);
+        } else {
+            problems::report(
+                "keymap",
+                Problem::warning(
+                    "Keymap problem (keymap.toml): the previous bindings stay in effect",
+                )
+                .lines(keymap_notices.iter().map(|line| problems::plain(line)))
+                .details(keymap_notices.join("\n")),
+                cx,
+            );
+        }
+        // The login: logged out without asking, or the login lacks permissions the app now asks for.
+        let account = self.account.as_ref().map(|account| account.read(cx));
+        let login = match account {
+            Some(account) if account.notice().is_some() => {
+                account.notice().map(login_notice_problem)
+            }
+            Some(account) => match account.state() {
+                AuthState::LoggedIn(user) if user.needs_relogin() => Some(
+                    Problem::info("Log in again to grant the new Twitch permissions")
+                        .line(user.missing_scopes.join(", "))
+                        .fix("Log in again", Fix::LogIn),
+                ),
+                _ => None,
+            },
+            None => None,
+        };
+        match login {
+            Some(problem) => problems::report("account", problem, cx),
+            None => problems::clear("account", cx),
+        }
+        // The chat connection (live source only): a short blip is the header's business, a
+        // connection that keeps failing is a strip.
+        if self.live.is_some() {
+            match connection_problem(self.hub.read(cx).connection()) {
+                Some(problem) => problems::report("connection", problem, cx),
+                None => problems::clear("connection", cx),
+            }
+        }
     }
 
-    /// A strip listing problems with the user's themes: a theme file that does not parse, a
-    /// duplicate name, unreadable colours, or a `theme_name` that matches no theme. The theme
-    /// in effect keeps working; the strip goes when the problem is fixed.
-    fn theme_notice_banner(notices: &[String], tokens: &Tokens) -> impl IntoElement {
-        Self::notice_banner("theme-notice-banner", "Theme problem", notices, tokens)
-    }
-
-    /// The same strip for `keymap.toml` (PR 4.3): an entry naming no action, a keystroke that
-    /// does not parse, two actions on one key, or a file that is not TOML (the previous bindings
-    /// stay in effect). It goes when the file is fixed.
-    fn keymap_notice_banner(notices: &[String], tokens: &Tokens) -> impl IntoElement {
-        Self::notice_banner(
-            "keymap-notice-banner",
-            "Keymap problem (keymap.toml)",
-            notices,
+    /// The strip for one problem: its button runs the fix, Dismiss hides it.
+    fn problem_strip(
+        &self,
+        key: &'static str,
+        problem: &Problem,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (fix_shell, dismiss_shell) = (cx.entity().downgrade(), cx.entity().downgrade());
+        problems::strip(
+            key,
+            problem,
             tokens,
+            problems::StripActions {
+                on_fix: Box::new(move |fix, window, cx| {
+                    fix_shell
+                        .update(cx, |shell, cx| shell.run_fix(fix, window, cx))
+                        .ok();
+                }),
+                on_dismiss: Box::new(move |_, cx| {
+                    dismiss_shell
+                        .update(cx, |shell, cx| {
+                            // The login notice has its own "seen" flag.
+                            if key == "account"
+                                && let Some(account) = &shell.account
+                            {
+                                account.update(cx, |account, cx| account.dismiss_notice(cx));
+                            }
+                            problems::dismiss(key, cx);
+                        })
+                        .ok();
+                }),
+            },
         )
     }
 
-    fn notice_banner(
-        id: &'static str,
-        title: &'static str,
-        notices: &[String],
+    /// The one-line, self-clearing notice (a jump to a message that is gone) as an info strip.
+    fn notice_strip(
+        &self,
+        text: &'static str,
         tokens: &Tokens,
-    ) -> impl IntoElement {
-        v_flex()
-            .id(id)
-            .w_full()
-            .flex_none()
-            .px_3()
-            .py_2()
-            .gap_1()
-            .bg(tokens.warning.opacity(0.14))
-            .border_b_1()
-            .border_color(tokens.warning)
-            .child(div().text_sm().font_weight(FontWeight::BOLD).child(title))
-            .children(
-                notices
-                    .iter()
-                    .map(|line| div().text_sm().child(line.clone())),
-            )
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let shell = cx.entity().downgrade();
+        problems::strip(
+            "jump-notice",
+            &Problem::info(text),
+            tokens,
+            problems::StripActions {
+                on_fix: Box::new(|_, _, _| {}),
+                on_dismiss: Box::new(move |_, cx| {
+                    shell
+                        .update(cx, |shell, cx| {
+                            shell.notice = None;
+                            shell.notice_task = None;
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+            },
+        )
+    }
+
+    fn run_fix(&mut self, fix: Fix, window: &mut Window, cx: &mut Context<Self>) {
+        match fix {
+            Fix::LogIn => self.log_in(window, cx),
+            Fix::OpenSettings => settings_window::open(cx),
+            Fix::ReloadEmotes => {
+                if let Some(live) = &self.live {
+                    live.reload_emotes();
+                }
+            }
+            Fix::EnableModeration => self.enable_moderation(window, cx),
+            Fix::EnableBlockList => self.enable_block_list(window, cx),
+        }
     }
 
     /// The Mentions panel (PR 5.3), when it is open.
-    fn mentions_panel(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn mentions_panel(
+        &self,
+        tokens: &Tokens,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.mentions_open {
             return None;
         }
@@ -1291,6 +1361,11 @@ impl AppShell {
             rows,
             waiting,
             &self.mentions_scroll,
+            mentions::Keys {
+                focus: self.mentions_focus.clone(),
+                selected: self.mentions_selected.clone(),
+                focused: self.mentions_focus.contains_focused(window, cx),
+            },
             tokens,
             mentions::PanelActions {
                 on_pick,
@@ -1299,6 +1374,7 @@ impl AppShell {
                         .update(cx, |shell, cx| {
                             shell.mentions_open = false;
                             shell.mentions_hover.set(false);
+                            shell.focus_pending = true;
                             cx.notify();
                         })
                         .ok();
@@ -1320,11 +1396,16 @@ impl AppShell {
         ))
     }
 
-    fn main_area(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn main_area(
+        &self,
+        tokens: &Tokens,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let area = div().flex().flex_1().min_h_0().w_full().bg(tokens.main_bg);
-        // Nothing open and nothing split: the welcome text instead of an empty pane.
-        let welcome = self.list.is_empty() && !self.layout.is_split();
-        if !welcome {
+        // Nothing open and nothing split: the welcome (first run) or the empty state.
+        let nothing_open = self.list.is_empty() && !self.layout.is_split();
+        if !nothing_open {
             let splits = Splits {
                 layout: &self.layout,
                 panes: &self.panes,
@@ -1333,20 +1414,104 @@ impl AppShell {
             };
             return area
                 .child(splits.render(cx))
-                .children(self.mentions_panel(tokens, cx));
+                .children(self.mentions_panel(tokens, window, cx));
         }
+        let shell = cx.entity().downgrade();
+        let on = |f: fn(&mut AppShell, &mut Window, &mut Context<AppShell>)| {
+            let shell = shell.clone();
+            move |window: &mut Window, cx: &mut App| {
+                shell.update(cx, |shell, cx| f(shell, window, cx)).ok();
+            }
+        };
+        if self.welcome_shown() {
+            let logged_out = self.account.as_ref().is_some_and(|account| {
+                matches!(account.read(cx).state(), AuthState::LoggedOut { .. })
+            });
+            return area.child(empty::welcome(
+                APP_NAME,
+                welcome_hint(cx),
+                keymap::shortcut_of(AddChannel, cx).map(|keys| keys.to_string()),
+                &self.welcome_focus,
+                empty::WelcomeActions {
+                    add_channel: Box::new(on(|shell, window, cx| {
+                        shell.open_add_dialog(window, cx)
+                    })),
+                    log_in: logged_out
+                        .then(|| Box::new(on(|shell, window, cx| shell.log_in(window, cx))) as _),
+                    choose_theme: Box::new(|_, cx| settings_window::open(cx)),
+                },
+                tokens,
+            ));
+        }
+        // Everything was closed (or an offline run has not produced a channel yet).
         area.items_center().justify_center().child(
             v_flex()
                 .items_center()
-                .gap_2()
-                .child(div().text_xl().child(APP_NAME))
+                .gap_3()
+                .child(empty::empty_state(
+                    "no-channels",
+                    "No channels open",
+                    Some(
+                        match keymap::shortcut_of(AddChannel, cx) {
+                            Some(keys) => {
+                                format!("Add one with {keys}, or use the + in the sidebar.")
+                            }
+                            None => "Add one with the + in the sidebar.".to_owned(),
+                        }
+                        .into(),
+                    ),
+                    tokens,
+                ))
                 .child(
-                    div()
-                        .text_sm()
-                        .text_color(tokens.text_muted)
-                        .child(welcome_hint(cx)),
+                    Button::new("no-channels-add")
+                        .primary()
+                        .label("Add a channel")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_add_dialog(window, cx);
+                        })),
                 ),
         )
+    }
+
+    /// The first-run welcome is up: live source, no channel ever added, none open now.
+    fn welcome_shown(&self) -> bool {
+        welcome_visible(self.first_run, self.live.is_some(), self.list.is_empty())
+    }
+}
+
+/// The strip for a logout notice. A keychain failure carries the platform's wording
+/// ("token store unavailable: keychain error: …"), which goes behind Copy details; the strip says
+/// what it means and what still works.
+fn login_notice_problem(notice: &str) -> Problem {
+    if notice.starts_with("Could not read the saved Twitch login") {
+        Problem::error("The system keychain is not available")
+            .line("Your saved Twitch login could not be read. Chat still works; log in again to send messages.")
+            .fix("Log in", Fix::LogIn)
+            .details(notice)
+    } else {
+        Problem::error(notice).fix("Log in", Fix::LogIn)
+    }
+}
+
+/// The strip for the chat connection, if it needs one: from the second failed attempt on (a single
+/// reconnect is a blip the pane header already shows), or when it gave up.
+fn connection_problem(state: Option<&ConnectionState>) -> Option<Problem> {
+    match state? {
+        ConnectionState::Reconnecting { attempt } if *attempt >= 2 => Some(
+            // The wording is the same from attempt to attempt, so a dismissed strip stays hidden
+            // while the outage lasts.
+            Problem::warning("Can't reach Twitch chat: trying again")
+                .line("Check your internet connection. It keeps trying by itself."),
+        ),
+        ConnectionState::Disconnected { reason } => {
+            let mut problem = Problem::error("Disconnected from Twitch chat")
+                .line("Check your internet connection.");
+            if let Some(reason) = reason {
+                problem = problem.details(reason.clone());
+            }
+            Some(problem)
+        }
+        _ => None,
     }
 }
 
@@ -1614,14 +1779,24 @@ impl Render for AppShell {
             self.focus_pending = false;
             cx.on_next_frame(window, |this, window, cx| this.apply_focus(window, cx));
         }
+        if self.mentions_focus_pending {
+            self.mentions_focus_pending = false;
+            cx.on_next_frame(window, |this, window, cx| {
+                if this.mentions_open {
+                    window.focus(&this.mentions_focus, cx);
+                }
+            });
+        }
         // A drag that ended outside every pane leaves no drop target behind.
         if !cx.has_active_drag() {
             self.drop_target = None;
         }
         let font = cx.global::<FontConfig>().clone();
-        let settings_error = config::store(cx).read(cx).error().cloned();
-        let theme_notices = theme::notices(cx);
-        let keymap_notices = keymap::notices(cx);
+        self.sync_problems(cx);
+        let strips: Vec<AnyElement> = problems::visible(cx)
+            .iter()
+            .map(|(key, problem)| self.problem_strip(key, problem, &tokens, cx))
+            .collect();
 
         let root = v_flex()
             .key_context(SHELL_CONTEXT)
@@ -1783,30 +1958,52 @@ impl Render for AppShell {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .children(
-                                settings_error
-                                    .as_ref()
-                                    .map(|error| Self::settings_error_banner(error, &tokens)),
-                            )
-                            .children(
-                                (!theme_notices.is_empty())
-                                    .then(|| Self::theme_notice_banner(&theme_notices, &tokens)),
-                            )
-                            .children(
-                                (!keymap_notices.is_empty())
-                                    .then(|| Self::keymap_notice_banner(&keymap_notices, &tokens)),
-                            )
-                            .children(self.account_banner(&tokens, cx))
-                            .children(
-                                self.notice.map(|text| {
-                                    Self::notice_banner("jump-notice", text, &[], &tokens)
-                                }),
-                            )
-                            .child(self.main_area(&tokens, cx))
+                            .children(strips)
+                            .children(self.notice.map(|text| self.notice_strip(text, &tokens, cx)))
+                            .child(self.main_area(&tokens, window, cx))
                             .child(self.hud.clone()),
                     ),
             );
         // Times the draw of everything above for the HUD.
         frame_probe(self.diagnostics.clone(), root)
+    }
+}
+
+/// The welcome is for the live source's first run, until a channel is open.
+fn welcome_visible(first_run: bool, live: bool, no_channels: bool) -> bool {
+    first_run && live && no_channels
+}
+
+#[cfg(test)]
+mod problem_tests {
+    use super::*;
+
+    #[test]
+    fn the_welcome_shows_on_a_first_live_run_with_no_channel_and_never_otherwise() {
+        assert!(welcome_visible(true, true, true));
+        assert!(!welcome_visible(false, true, true), "not a first run");
+        assert!(
+            !welcome_visible(true, false, true),
+            "offline sources have none"
+        );
+        assert!(!welcome_visible(true, true, false), "a channel is open");
+    }
+
+    #[test]
+    fn a_connection_blip_is_no_strip_and_an_outage_is_one_with_stable_words() {
+        assert!(connection_problem(None).is_none());
+        assert!(connection_problem(Some(&ConnectionState::Connected)).is_none());
+        assert!(connection_problem(Some(&ConnectionState::Reconnecting { attempt: 1 })).is_none());
+        let two = connection_problem(Some(&ConnectionState::Reconnecting { attempt: 2 })).unwrap();
+        let nine = connection_problem(Some(&ConnectionState::Reconnecting { attempt: 9 })).unwrap();
+        assert_eq!(
+            two, nine,
+            "dismissing it keeps it dismissed through the outage"
+        );
+        let gone = connection_problem(Some(&ConnectionState::Disconnected {
+            reason: Some("refused".into()),
+        }))
+        .unwrap();
+        assert_eq!(gone.details.as_deref(), Some("refused"));
     }
 }

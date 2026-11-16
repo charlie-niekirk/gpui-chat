@@ -5,19 +5,23 @@
 //! click does. The list is virtualised (`uniform_list`, fixed row height), so only the rows on
 //! screen are built each frame however many hits are logged.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_chat_core::{ChannelId, HighlightColor, MessageId};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    Window, div, px, uniform_list,
 };
 
 use crate::activity::MentionEntry;
 use crate::chat::display::{author_name, clock};
 use crate::chat::element::Palette;
+use crate::empty::empty_state;
 use crate::theme::Tokens;
 
 /// Width of the panel.
@@ -129,11 +133,38 @@ pub struct PanelActions {
     pub on_reveal: Callback,
 }
 
+/// Keyboard state of the panel (PR 6.3): it takes focus when it opens; Up / Down move the
+/// highlighted row, Enter shows its message, Esc closes the panel (focus goes back to the chat).
+#[derive(Clone)]
+pub struct Keys {
+    pub focus: FocusHandle,
+    /// The highlighted row (an index into the rows shown).
+    pub selected: Rc<Cell<usize>>,
+    /// The panel has keyboard focus, so the highlighted row is drawn with a ring.
+    pub focused: bool,
+}
+
+/// How a key moves the highlighted row of `count` rows from `selected`: `None` when the key is not
+/// one of ours.
+pub fn step(key: &str, selected: usize, count: usize) -> Option<usize> {
+    let last = count.saturating_sub(1);
+    match key {
+        "down" => Some((selected + 1).min(last)),
+        "up" => Some(selected.saturating_sub(1)),
+        "home" => Some(0),
+        "end" => Some(last),
+        "pagedown" => Some((selected + 5).min(last)),
+        "pageup" => Some(selected.saturating_sub(5)),
+        _ => None,
+    }
+}
+
 /// The panel. `waiting` hits are held back behind the rows (see [`Feed`]).
 pub fn panel(
     rows: Rc<Vec<Row>>,
     waiting: usize,
     scroll: &UniformListScrollHandle,
+    keys: Keys,
     tokens: &Tokens,
     actions: PanelActions,
 ) -> AnyElement {
@@ -143,6 +174,7 @@ pub fn panel(
         on_hover,
         on_reveal,
     } = actions;
+    let (key_pick, key_close, key_rows) = (on_pick.clone(), on_close.clone(), rows.clone());
     let palette = Palette::from_tokens(tokens);
     let unseen = rows.iter().filter(|row| row.unseen).count();
     let header = h_flex()
@@ -183,6 +215,8 @@ pub fn panel(
     let waiting_bar = (waiting > 0).then(|| {
         div()
             .id("mentions-waiting")
+            .role(Role::Button)
+            .aria_label(SharedString::from(format!("Show {waiting} new mentions")))
             .flex_none()
             .w_full()
             .px_3()
@@ -198,14 +232,19 @@ pub fn panel(
     });
     let (muted, surface, border) = (tokens.text_muted, tokens.surface, tokens.border);
     let body = if rows.is_empty() {
-        div()
-            .p_3()
-            .text_sm()
-            .text_color(tokens.text_muted)
-            .child("No highlights yet. Messages that mention you, match a phrase or come from a highlighted user show up here.")
-            .into_any_element()
+        empty_state(
+            "mentions-empty",
+            "No mentions yet",
+            Some(
+                "Messages that mention you, match a phrase or come from a highlighted user show up here."
+                    .into(),
+            ),
+            tokens,
+        )
     } else {
         let count = rows.len();
+        let (selected, ring) = (keys.selected.get().min(count - 1), keys.focused);
+        let accent = tokens.accent;
         uniform_list("mentions-list", count, move |range, _, _| {
             range
                 .filter_map(|index| rows.get(index).map(|row| (index, row.clone())))
@@ -213,8 +252,16 @@ pub fn panel(
                     let color = palette.rule_color(row.color);
                     let (channel, id) = (row.channel.clone(), row.id.clone());
                     let on_pick = on_pick.clone();
+                    let label = format!(
+                        "{}, {}, {}: {}",
+                        row.channel, row.author, row.time, row.text
+                    );
+                    let current = ring && index == selected;
                     h_flex()
                         .id(SharedString::from(format!("mention-{index}")))
+                        .role(Role::ListItem)
+                        .aria_label(SharedString::from(label))
+                        .aria_selected(index == selected)
                         .w_full()
                         .h(px(ROW_HEIGHT))
                         .overflow_hidden()
@@ -222,6 +269,10 @@ pub fn panel(
                         .hover(|style| style.bg(surface))
                         .border_b_1()
                         .border_color(border.opacity(0.5))
+                        // The keyboard's row: a ring inside the row (the list clips outside it).
+                        .when(current, |row| {
+                            row.border_2().border_color(accent).bg(surface)
+                        })
                         .on_click(move |_, window, cx| on_pick(&channel, &id, window, cx))
                         .child(
                             div()
@@ -271,8 +322,32 @@ pub fn panel(
         .size_full()
         .into_any_element()
     };
+    let (key_scroll, key_selected) = (scroll.clone(), keys.selected.clone());
     v_flex()
         .id("mentions-panel")
+        .role(Role::Complementary)
+        .aria_label("Mentions")
+        .track_focus(&keys.focus)
+        .on_key_down(move |event, window, cx| {
+            let key = event.keystroke.key.as_str();
+            let count = key_rows.len();
+            if key == "escape" {
+                key_close(window, cx);
+            } else if key == "enter" {
+                if let Some(row) = key_rows.get(key_selected.get().min(count.saturating_sub(1))) {
+                    key_pick(&row.channel, &row.id, window, cx);
+                }
+            } else if count > 0
+                && let Some(next) = step(key, key_selected.get().min(count - 1), count)
+            {
+                key_selected.set(next);
+                key_scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+                window.refresh();
+            } else {
+                return;
+            }
+            cx.stop_propagation();
+        })
         .flex_none()
         .w(px(WIDTH))
         .h_full()
@@ -309,6 +384,24 @@ mod tests {
             color: HighlightColor::Red,
             unseen,
         }
+    }
+
+    #[test]
+    fn arrow_keys_move_the_highlight_and_stop_at_the_ends() {
+        assert_eq!(step("down", 0, 3), Some(1));
+        assert_eq!(step("down", 2, 3), Some(2));
+        assert_eq!(step("up", 0, 3), Some(0));
+        assert_eq!(step("up", 2, 3), Some(1));
+        assert_eq!(step("end", 0, 10), Some(9));
+        assert_eq!(step("home", 7, 10), Some(0));
+        assert_eq!(step("pagedown", 7, 10), Some(9));
+        assert_eq!(step("pageup", 2, 10), Some(0));
+        assert_eq!(step("a", 0, 3), None);
+        assert_eq!(
+            step("down", 0, 0),
+            Some(0),
+            "an empty list has no row to move to"
+        );
     }
 
     #[test]

@@ -223,6 +223,7 @@ pub fn init(cx: &mut App) -> Option<BridgeReceiver<LoadReport>> {
         }
         Err(error) => {
             tracing::warn!(%error, "theme file changes will not be picked up live");
+            crate::problems::report_watch_failure("themes", &error.to_string());
             None
         }
     }

@@ -309,11 +309,20 @@ impl RawPalette {
             border,
             surface,
             text,
+            // Both are pulled to 4.5:1 when a theme's own value (or the derivation, which only
+            // looks at the main background) falls short on some surface it is drawn on.
             text_muted: color("text_muted", &self.text_muted)?
-                .unwrap_or_else(|| muted_text(text, background)),
+                .unwrap_or_else(|| muted_text(text, background))
+                .with_contrast(text, &surfaces, TEXT_CONTRAST),
             accent,
-            accent_text: color("accent_text", &self.accent_text)?
-                .unwrap_or_else(|| text_on(accent)),
+            accent_text: {
+                let given = color("accent_text", &self.accent_text)?;
+                given.unwrap_or_else(|| text_on(accent)).with_contrast(
+                    text_on(accent),
+                    &[accent],
+                    TEXT_CONTRAST,
+                )
+            },
             danger,
             danger_text: readable_on(danger),
             accent_link: readable_on(accent),

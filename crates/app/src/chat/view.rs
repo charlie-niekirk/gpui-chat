@@ -223,6 +223,12 @@ pub struct ChatView {
     flash_task: Option<Task<()>>,
     /// Focused by a press in the chat, so ⌘C and Esc reach the selection.
     focus_handle: FocusHandle,
+    /// The user card's own focus (PR 6.3): it takes focus when it opens so Tab walks its buttons
+    /// (it sits inside this view, so Esc and ⌘C still reach the view's handlers) and gives it
+    /// back to the chat when it closes.
+    card_focus: FocusHandle,
+    /// Move focus after the next frame (the card's element exists only then).
+    card_focus_to: Option<CardFocus>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -294,6 +300,8 @@ impl ChatView {
             store,
             surface,
             focus_handle: cx.focus_handle(),
+            card_focus: cx.focus_handle().tab_stop(true),
+            card_focus_to: None,
             list,
             rows,
             engine,
@@ -510,6 +518,7 @@ impl ChatView {
         }
         self.user_card = Some(UserCard::new(&login, origin_id, anchor));
         window.focus(&self.focus_handle, cx);
+        self.card_focus_to = Some(CardFocus::Card);
         cx.notify();
     }
 
@@ -570,6 +579,8 @@ impl ChatView {
     pub fn close_user_card(&mut self, cx: &mut Context<Self>) -> bool {
         let open = self.user_card.take().is_some();
         if open {
+            // Focus inside the card goes back to the chat (a press elsewhere has moved it already).
+            self.card_focus_to = Some(CardFocus::Chat);
             cx.notify();
         }
         open
@@ -1014,6 +1025,17 @@ pub fn pill_label(unseen: usize) -> String {
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
+        if let Some(to) = self.card_focus_to.take() {
+            cx.on_next_frame(window, move |this, window, cx| match to {
+                CardFocus::Card if this.user_card.is_some() => {
+                    window.focus(&this.card_focus, cx);
+                }
+                CardFocus::Chat if this.card_focus.is_focused(window) => {
+                    window.focus(&this.focus_handle, cx);
+                }
+                _ => {}
+            });
+        }
         let config = self.update_text_config(cx);
         self.apply_image_changes(cx);
         self.apply_badge_changes(cx);
@@ -1021,7 +1043,7 @@ impl Render for ChatView {
         // release the textures of evicted images nothing shows any more.
         self.images.borrow_mut().begin_frame();
         Images::sweep(window, cx);
-        let animate = config::current(cx).emotes.animate;
+        let animate = config::animate_emotes(cx);
         let clock = cx
             .try_global::<Images>()
             .filter(|_| animate)
@@ -1193,6 +1215,41 @@ impl Render for ChatView {
             .size_0()
         };
 
+        // Nothing to show: say why (PR 6.3). Quiet and offline channels look the same from here.
+        let (shown, total) = self.row_counts(cx);
+        let placeholder = (shown == 0).then(|| {
+            let joined = matches!(
+                self.store.read(cx).connection(),
+                Some(gpui_chat_core::ConnectionState::Connected)
+            );
+            let (title, hint) = match (total, joined) {
+                (0, true) => (
+                    "Waiting for chat…",
+                    "Messages appear here as they arrive. A quiet or offline channel stays empty.",
+                ),
+                (0, false) => (
+                    "Joining the channel…",
+                    "Chat appears here once it is joined.",
+                ),
+                _ => (
+                    "No messages match the filters",
+                    "Clear the filters in the find bar to see them again.",
+                ),
+            };
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::empty::empty_state(
+                    "chat-empty",
+                    title,
+                    Some(hint.into()),
+                    &tokens,
+                ))
+        });
+
         let pill = self.pill_shown.then(|| {
             div()
                 .absolute()
@@ -1204,6 +1261,8 @@ impl Render for ChatView {
                 .child(
                     div()
                         .id("chat-jump-to-latest")
+                        .role(gpui_kit::Role::Button)
+                        .aria_label("Jump to the latest messages")
                         .px_3()
                         .py_1()
                         .rounded_full()
@@ -1262,6 +1321,7 @@ impl Render for ChatView {
                     // First, so the rows and what is drawn over them see a press before it does.
                     .child(self.surface.layer())
                     .child(messages)
+                    .children(placeholder)
                     .child(probe)
                     .children(pill)
                     .children(thread_panel)
@@ -1348,6 +1408,7 @@ impl ChatView {
         }
         Some(user_card::render(
             user_card::Env {
+                focus: self.card_focus.clone(),
                 tokens: *tokens,
                 view: cx.entity().downgrade(),
                 owner: cx.entity_id(),
@@ -1363,6 +1424,13 @@ impl ChatView {
             cx,
         ))
     }
+}
+
+/// Where focus goes after the next frame when the user card opens or closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardFocus {
+    Card,
+    Chat,
 }
 
 impl Focusable for ChatView {

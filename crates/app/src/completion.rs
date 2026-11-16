@@ -22,7 +22,8 @@ use gpui_chat_emotes::EmoteCatalog;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, EntityId, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Styled as _, Window, div, px,
+    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px,
 };
 use gpui_kit::{App, KeyBinding, actions};
 
@@ -445,6 +446,9 @@ impl Autocomplete {
                 };
                 div()
                     .id(("completion-row", index))
+                    .role(Role::ListItem)
+                    .aria_label(SharedString::from(name.clone()))
+                    .aria_selected(selected)
                     .flex()
                     .flex_row()
                     .items_center()

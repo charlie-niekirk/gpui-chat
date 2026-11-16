@@ -30,8 +30,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex};
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement as _,
-    MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    WeakEntity, Window, div, px,
+    MouseButton, ParentElement as _, Role, SharedString, StatefulInteractiveElement as _,
+    Styled as _, WeakEntity, Window, div, px,
 };
 
 use super::element::{MessageElement, MessageStyle};
@@ -104,6 +104,8 @@ pub fn message_row(
         let (view, id) = (row.view.clone(), message.id.clone());
         div()
             .id(row_id(row, "collapsed", seq))
+            .role(Role::Button)
+            .aria_label("Show the hidden message")
             .w_full()
             .cursor_pointer()
             .tooltip(|window, cx| Tooltip::new("Click to show the message").build(window, cx))

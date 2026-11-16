@@ -169,9 +169,34 @@ struct Inner {
     changed: Arc<Notify>,
     handle: Handle,
     state: Mutex<State>,
+    /// The scopes (`"global"`, a channel's login) whose last badge load failed: while any is, one
+    /// strip says so.
+    failed: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Inner {
+    /// Records whether `scope`'s load worked and files or clears the one badges strip.
+    fn note(&self, scope: &str, error: Option<String>) {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        match error {
+            Some(error) => {
+                failed.insert(scope.to_owned());
+                crate::problems::report_from_anywhere(
+                    "badges",
+                    crate::problems::Problem::warning("Some badges could not be loaded")
+                        .line("Chat shows the built-in badges, and a channel's own badges are missing until it works again.")
+                        .details(format!("{scope}: {error}")),
+                );
+            }
+            None => {
+                failed.remove(scope);
+                if failed.is_empty() {
+                    crate::problems::clear_from_anywhere("badges");
+                }
+            }
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -199,6 +224,7 @@ impl BadgeService {
                 changed,
                 handle,
                 state: Mutex::default(),
+                failed: Mutex::default(),
             }),
         }
     }
@@ -283,9 +309,11 @@ impl BadgeService {
                 Ok(set) => {
                     inner.registry.store_global(set);
                     inner.changed.notify_one();
+                    inner.note("global", None);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "global badges unavailable; keeping the bundled ones");
+                    inner.note("global", Some(error.to_string()));
                 }
             }
         }));
@@ -314,6 +342,10 @@ impl BadgeService {
                 tracing::warn!(channel = %channel, %error, "channel badges unavailable");
             }
             let ok = result.is_ok();
+            inner.note(
+                channel.login(),
+                result.as_ref().err().map(ToString::to_string),
+            );
             // The channel may have been closed (or its room id changed) while this loaded.
             let mut state = inner.state();
             let Some(room) = state.rooms.get_mut(&channel) else {
@@ -336,6 +368,7 @@ impl BadgeService {
     pub fn forget(&self, channel: &ChannelId) {
         self.inner.state().rooms.remove(channel);
         self.inner.registry.forget_channel(channel);
+        self.inner.note(channel.login(), None);
     }
 
     /// Looks at an event on its way to the UI: a `ROOMSTATE` with a new room id (or repeating

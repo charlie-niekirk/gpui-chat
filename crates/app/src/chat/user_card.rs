@@ -32,8 +32,8 @@ use gpui_chat_twitch::UserProfile;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, ClipboardItem, Context, EntityId, InteractiveElement as _,
-    IntoElement as _, MouseButton, ParentElement as _, Pixels, Point, SharedString,
+    Anchor, AnyElement, ClipboardItem, Context, EntityId, FocusHandle, InteractiveElement as _,
+    IntoElement as _, MouseButton, ParentElement as _, Pixels, Point, Role, SharedString,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored, canvas, deferred,
     div, point, px, uniform_list,
 };
@@ -295,6 +295,8 @@ pub fn row_text(message: &Message, deleted: DeletedMessages) -> String {
 
 /// What [`render`] needs from the chat view.
 pub struct Env<'a> {
+    /// The card's focus handle (a tab stop): it has focus while the card is open.
+    pub focus: FocusHandle,
     pub tokens: Tokens,
     pub view: WeakEntity<ChatView>,
     pub owner: EntityId,
@@ -312,6 +314,7 @@ pub struct Env<'a> {
 /// The card, positioned at its anchor (and kept inside the window).
 pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> AnyElement {
     let Env {
+        focus,
         tokens,
         view,
         owner,
@@ -490,6 +493,9 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     let upward = anchor.y > window.viewport_size().height / 2.0;
     let card = v_flex()
         .id("user-card")
+        .role(Role::Dialog)
+        .aria_label(SharedString::from(format!("User card: {}", model.title)))
+        .track_focus(&focus)
         .relative()
         .occlude()
         .w(px(WIDTH))
@@ -906,6 +912,7 @@ fn message_row(
     let body = body.child(text);
     let mut row = h_flex()
         .id(SharedString::from(format!("user-card-row-{seq}")))
+        .role(Role::ListItem)
         .w_full()
         .h(px(ROW_HEIGHT))
         .gap_2()

@@ -350,17 +350,30 @@ mod tests {
                 .filter_map(|(v, p)| p.map(|p| (v, p)))
             {
                 let at = format!("{} {variant}", theme.id);
+                // Every colour the app draws text in must reach 4.5:1 (WCAG AA) on every surface
+                // it can sit on (PR 6.3): body and muted text on all five surfaces, the text on an
+                // accent fill (buttons, selected rows) on that fill.
+                for (surface_name, surface) in [
+                    ("background", palette.background),
+                    ("window", palette.window),
+                    ("title_bar", palette.title_bar),
+                    ("sidebar", palette.sidebar),
+                    ("surface", palette.surface),
+                ] {
+                    for (what, colour) in
+                        [("text", palette.text), ("text_muted", palette.text_muted)]
+                    {
+                        let ratio = colour.contrast(surface);
+                        assert!(
+                            ratio >= TEXT_CONTRAST,
+                            "{at}: {what} on {surface_name} is {ratio:.2}:1"
+                        );
+                    }
+                }
+                let ratio = palette.accent_text.contrast(palette.accent);
                 assert!(
-                    palette.text.contrast(palette.background) >= 4.5,
-                    "{at}: text on background"
-                );
-                assert!(
-                    palette.text_muted.contrast(palette.background) >= 3.0,
-                    "{at}: muted text on background"
-                );
-                assert!(
-                    palette.accent_text.contrast(palette.accent) >= 3.0,
-                    "{at}: text on accent"
+                    ratio >= TEXT_CONTRAST,
+                    "{at}: text on accent is {ratio:.2}:1"
                 );
                 assert!(
                     palette.accent.contrast(palette.background) >= 1.8,
@@ -650,6 +663,22 @@ mod tests {
         };
         assert!(source_name.ends_with("murky.toml"));
         assert_eq!((*variant, ratio.as_str()), ("dark", "1.3"));
+    }
+
+    #[test]
+    fn a_themes_own_muted_and_accent_text_are_pulled_to_4_5_to_1() {
+        let theme = Theme::parse(
+            "faint",
+            "faint.toml",
+            "[dark]\nbackground=\"#202020\"\ntitle_bar=\"#383838\"\ntext=\"#f0f0f0\"\naccent=\"#808080\"\ntext_muted=\"#454545\"\naccent_text=\"#7a7a7a\"\n",
+            ThemeOrigin::Bundled,
+        )
+        .unwrap();
+        let p = theme.dark.unwrap();
+        for surface in [p.background, p.window, p.title_bar, p.sidebar, p.surface] {
+            assert!(p.text_muted.contrast(surface) >= TEXT_CONTRAST);
+        }
+        assert!(p.accent_text.contrast(p.accent) >= TEXT_CONTRAST);
     }
 
     #[test]

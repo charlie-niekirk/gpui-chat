@@ -26,15 +26,16 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::{Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, FocusHandle, Focusable, FontWeight, Global,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
-    WeakEntity, Window, WindowBounds, WindowOptions, div, px, size,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, FocusHandle, Focusable, FontWeight,
+    Global, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
+    Subscription, WeakEntity, Window, WindowBounds, WindowOptions, div, px, size,
 };
 
 use self::fields::{Commit, NumberSpec, Reset};
 use crate::account::{self, AccountHub};
 use crate::actions::{CloseWindow, LogIn, LogOut, MinimizeWindow, OpenSettings};
 use crate::fonts::FontConfig;
+use crate::problems::{self, Problem};
 use crate::theme::{self, Tokens};
 use crate::{config, sign_in};
 
@@ -159,12 +160,11 @@ impl SettingsView {
         .ok();
     }
 
-    fn banner(&self, tokens: &Tokens, cx: &App) -> Option<impl IntoElement + use<>> {
+    fn banner(&self, tokens: &Tokens, cx: &App) -> Option<AnyElement> {
         let load_error = config::store(cx).read(cx).error().map(ToString::to_string);
         if load_error.is_none() && self.edit_error.is_none() {
             return None;
         }
-        let danger = tokens.danger;
         let (headline, detail) = match (&load_error, &self.edit_error) {
             (Some(error), edit_error) => (
                 "settings.toml has a problem. It has not been changed.",
@@ -181,26 +181,14 @@ impl SettingsView {
             (None, Some(error)) => ("The change was not saved.", error.to_string()),
             (None, None) => unreachable!("checked above"),
         };
-        Some(
-            v_flex()
-                .id("settings-banner")
-                .w_full()
-                .flex_none()
-                .px_3()
-                .py_2()
-                .gap_1()
-                .bg(danger.opacity(0.14))
-                .border_b_1()
-                .border_color(danger)
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(tokens.danger_text)
-                        .child(headline),
-                )
-                .child(div().text_sm().child(detail)),
-        )
+        let problem = Problem::error(headline)
+            .pinned()
+            .lines(detail.lines().map(str::to_owned));
+        let problem = match &load_error {
+            Some(error) => problem.details(error.clone()),
+            None => problem,
+        };
+        Some(problems::static_strip("settings-banner", &problem, tokens))
     }
 
     fn pages(&self, cx: &mut Context<Self>) -> Vec<SettingPage> {
@@ -256,13 +244,14 @@ impl Render for SettingsView {
             .bg(tokens.window_bg)
             .text_color(tokens.text)
             .font_family(font.family)
-            .text_size(px(14.0))
+            // The chat font size, like the main window: text_sm and the controls scale with it.
+            .text_size(font.size)
             .child(TitleBar::new().child(div().text_sm().child("Settings")))
             .children(banner)
             .child(
                 div().flex_1().min_h_0().w_full().child(
                     SettingsPanes::new("settings")
-                        .sidebar_width(px(210.0))
+                        .sidebar_width(px(210.0 * (font.size.as_f32() / 14.0).max(1.0)))
                         .pages(pages),
                 ),
             )
@@ -286,7 +275,7 @@ impl Render for SettingsView {
 
 /// What a refused write says next to the control: the setting and the reason, without the path
 /// (the footer and the banner already name the file).
-fn friendly(error: &SettingsError) -> String {
+pub(crate) fn friendly(error: &SettingsError) -> String {
     match error {
         SettingsError::Invalid { field, reason, .. } => format!("`{field}`: {reason}"),
         SettingsError::Parse {

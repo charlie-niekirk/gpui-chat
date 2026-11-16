@@ -206,6 +206,12 @@ pub fn load_from(path: &Path) -> AppState {
         },
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "ignoring corrupt state file");
+            crate::problems::report_from_anywhere(
+                "state",
+                crate::problems::Problem::warning("Saved window and channel state could not be read")
+                    .line("Starting fresh. The unreadable file is kept as state.toml.bad when a new one is written.")
+                    .details(format!("{}: {error}", path.display())),
+            );
             AppState::default()
         }
     }

@@ -21,8 +21,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, Context, Entity, EventEmitter, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Styled as _, Subscription,
-    UniformListScrollHandle, Window, actions, div, px, uniform_list,
+    ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, UniformListScrollHandle, Window,
+    actions, div, px, uniform_list,
 };
 
 use crate::emote_thumb;
@@ -338,6 +339,8 @@ impl EmotePicker {
                         let emote = &self.results[index];
                         div()
                             .id(("emote-cell", index))
+                            .role(Role::Button)
+                            .aria_label(SharedString::from(emote.name.to_string()))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -393,6 +396,9 @@ impl EmotePicker {
                 let active = !searching && tab == self.tab;
                 div()
                     .id(("emote-tab", i))
+                    .role(Role::Tab)
+                    .aria_label(SharedString::from(tab.label().to_string()))
+                    .aria_selected(active)
                     .px_2()
                     .py_0p5()
                     .rounded_md()

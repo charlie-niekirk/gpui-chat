@@ -45,8 +45,23 @@ impl StreamInfoHub {
                 while snapshots.changed().await.is_ok() {
                     let snapshot = snapshots.borrow_and_update().clone();
                     // Every poll notifies, even an unchanged one: uptime and viewers move.
+                    let error = snapshot.error.clone();
                     let alive = this.update(cx, |hub, cx| {
                         hub.snapshot = snapshot;
+                        match error {
+                            Some(error) => crate::problems::report(
+                                "streams",
+                                crate::problems::Problem::warning(
+                                    "Can't check which channels are live",
+                                )
+                                .line(
+                                    "The live markers may be out of date. It keeps trying by itself.",
+                                )
+                                .details(error),
+                                cx,
+                            ),
+                            None => crate::problems::clear("streams", cx),
+                        }
                         cx.notify();
                     });
                     if alive.is_err() {
