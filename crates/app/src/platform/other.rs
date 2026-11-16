@@ -7,11 +7,12 @@ use super::{
     about_item, account_items, channel_menu, quit_item, settings_item, view_menu, window_menu,
 };
 use crate::actions::{
-    AddChannel, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft,
-    FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    AddChannel, CHAT_CONTEXT, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown,
+    FocusPaneLeft, FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp,
     OpenChannelSwitcher, OpenPalette, OpenSettings, Quit, RemoveChannel, SHELL_CONTEXT,
     SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
+use crate::chat::selection_layer::CopySelection;
 use crate::completion::ComposerToggleEmotePicker;
 
 pub fn bindings() -> Vec<KeyBinding> {
@@ -40,6 +41,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-shift-up", FocusPaneUp, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-alt-shift-down", FocusPaneDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-e", ComposerToggleEmotePicker, Some(COMPOSER_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopySelection, Some(CHAT_CONTEXT)),
     ]
 }
 

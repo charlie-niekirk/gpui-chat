@@ -17,9 +17,10 @@
 //!   in their line by the painter.
 //!
 //! [`AtomKind::Inline`] atoms (emote images with a known logical size, PR 2.2) wrap like glyph
-//! clusters; the painter draws an image instead of glyphs. **Seam for later PRs:** PR 5.6 (selection across messages) hit-tests with
-//! [`Flow::index_at`] / [`Flow::position_of`], which map between a point in the message and a
-//! byte offset in its display text.
+//! clusters; the painter draws an image instead of glyphs. Selection (PR 5.6) hit-tests with
+//! [`Flow::line_at`] and [`Flow::index_at`] (a caret between atoms) or [`Flow::atom_at`] (the
+//! atom under a point, for links), which map a point in the message to a byte offset in its
+//! display text.
 
 use std::ops::Range;
 
@@ -94,9 +95,24 @@ impl Flow {
         self.lines.iter().map(|line| line.width).fold(0.0, f32::max)
     }
 
+    /// The line at height `y` (relative to the content origin), clamped to the first and last.
+    pub fn line_at(&self, y: f32) -> usize {
+        self.lines
+            .partition_point(|line| line.top + line.height <= y)
+            .min(self.lines.len() - 1)
+    }
+
+    /// The atom drawn under `x` on `line`, if any (a hanging space past the content is not drawn).
+    pub fn atom_at(&self, atoms: &[Atom], line: usize, x: f32) -> Option<usize> {
+        let line = self.lines.get(line)?;
+        line.atoms.clone().find(|&i| {
+            let left = self.placements[i].x;
+            left < line.width && x >= left && x < left + atoms[i].width
+        })
+    }
+
     /// The byte offset in the display text closest to `x` on `line` (a caret position: the
     /// start or end of the atom under `x`, whichever is nearer). Clamps to the line's ends.
-    #[cfg_attr(not(test), allow(dead_code))] // First used by selection (PR 5.6).
     pub fn index_at(&self, atoms: &[Atom], line: usize, x: f32) -> usize {
         let line = &self.lines[line.min(self.lines.len() - 1)];
         let mut caret = atoms.get(line.atoms.start).map_or(0, |a| a.range.start);
@@ -503,5 +519,25 @@ mod tests {
             assert_eq!(f.index_at(&a, line, x), index, "index {index}");
         }
         assert_eq!(f.position_of(&a, text.len()), (1, 6.0));
+    }
+
+    #[test]
+    fn lines_and_atoms_under_a_point() {
+        let text = "hello world foo";
+        let a = atoms(text, 2.0);
+        let f = flow(&a, 22.0, 10.0); // "hello world" | "foo", 10 high each
+        assert_eq!(f.line_at(-5.0), 0, "above the first line clamps to it");
+        assert_eq!(f.line_at(0.0), 0);
+        assert_eq!(f.line_at(9.9), 0);
+        assert_eq!(f.line_at(10.0), 1);
+        assert_eq!(f.line_at(500.0), 1, "below the last line clamps to it");
+        // The atom under x: 'h' is 0..2, 'e' 2..4; the hanging space after "world" is not drawn.
+        assert_eq!(f.atom_at(&a, 0, 0.0), Some(0));
+        assert_eq!(f.atom_at(&a, 0, 3.0), Some(1));
+        assert_eq!(f.atom_at(&a, 0, 21.9), Some(10));
+        assert_eq!(f.atom_at(&a, 0, 22.5), None, "past the content");
+        assert_eq!(f.atom_at(&a, 1, 1.0), Some(12));
+        assert_eq!(f.atom_at(&a, 1, 6.0), None);
+        assert_eq!(f.atom_at(&a, 7, 1.0), None, "no such line");
     }
 }

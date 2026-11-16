@@ -668,6 +668,11 @@ impl LayoutCache {
         })
     }
 
+    /// The shaped message `seq` as last laid out, if it still is cached (whatever its key).
+    pub fn shaped(&self, seq: u64) -> Option<Rc<ShapedMessage>> {
+        self.entries.get(&seq).map(|entry| entry.shaped.clone())
+    }
+
     /// The cached flow of message `seq`, if any.
     #[cfg(test)]
     pub fn flow_of(&self, seq: u64) -> Option<Rc<Flow>> {
@@ -1009,6 +1014,7 @@ mod tests {
             }],
             emotes: Vec::new(),
             badges: Vec::new(),
+            links: Vec::new(),
         };
         assert_eq!(visual.len(), text.chars().count());
         let glyphs = visual
@@ -1130,6 +1136,7 @@ mod tests {
             }],
             emotes: Vec::new(),
             badges: Vec::new(),
+            links: Vec::new(),
         };
         let xs = [0.0, 8.7, 16.1, 25.3, 33.9];
         let glyphs = xs

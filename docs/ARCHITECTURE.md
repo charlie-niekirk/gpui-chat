@@ -169,7 +169,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   grapheme atoms, per-message layout cache), `colors` (fallback and readability-adjusted username
   colours), `element` (`MessageElement`), `list_sync` (incremental list splices), `view`
   (`ChatView`: list, follow-bottom, "new messages" pill, live settings), `row` (reply button and
-  context menu around a message, PR 3.4), `thread` (the thread popover, PR 3.4).
+  context menu around a message, PR 3.4; Copy message / username, Open / Copy link, PR 5.6),
+  `thread` (the thread popover, PR 3.4), `selection` (selecting text across messages and what
+  copying gives, pure, PR 5.6), `selection_layer` (the window side of selection and links: one
+  `Surface` per list / popover, PR 5.6).
 - `streams.rs` (PR 1.6) — `StreamHub`, a GPUI entity created by the shell: owns the `Streams` tracker from
   `crates/streamlink`, turns its events (from worker threads, through a bridge channel) into a per-channel
   `StreamStates` (`Starting` → `Running` → `Stopping`, or `Ended` with the error until dismissed; events
@@ -478,8 +481,32 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   the theme, so a theme switch re-lays out nothing.
   *Seams:* PR 2.2 adds `AtomKind::Inline` atoms (emote images with a known width) to the same
   stream — flow already treats them as unbreakable boxes and the painter skips their glyphs;
-  PR 5.6 hit-tests with `Flow::index_at` / `position_of` (point ↔ byte offset in the display
-  text).
+  PR 5.6 hit-tests with `Flow::line_at` / `index_at` / `atom_at` (point ↔ byte offset in the
+  display text).
+- **Selection and links** (PR 5.6, `chat/selection.rs` pure, `chat/selection_layer.rs` GPUI). A
+  selection is two units (anchor, head) of `(store seq, byte offset in the display text)`, so it
+  spans messages; a click picks a caret, a double-click a word (a run of non-spaces inside one
+  span: a name, a mention, a whole link), a triple-click the message, and dragging extends by the
+  same unit. Each surface (the list, the thread popover) has one `Surface`: an empty canvas put
+  before the rows registers the mouse handling once per frame, and each `MessageElement` only
+  reports its bounds and layout in prepaint and paints its own part of the highlight (theme
+  accent at 30 %, behind the text) — so a mouse move that changes the selection re-renders the
+  view once from the layout cache; nothing is shaped or flowed again. Dragging past the top or
+  bottom autoscrolls (until the first / last message is in view). From a left press until the
+  selection is gone the list stops following (held where it is, the "new messages" pill shows), so
+  a double / triple click lands on the text first clicked; a click that selects nothing lets it
+  follow again after the double-click interval (500 ms), Esc or a press outside the chat at once,
+  and only if the selection is what stopped it. Only a change of display text (timestamps, badge
+  definitions) drops the selection; a font, line-height or theme change keeps it. Copy (⌘C in the
+  `ChatView` key context, or the palette) writes one line per message: a whole message as
+  `HH:MM name: text` from the stored message (original text, emote codes), a partly selected one
+  as the selected text without badge titles, from the display text of the two end messages as it
+  was when the pointer was on them (snapshotted, since their layouts may be dropped or rebuilt).
+  The menu's *Copy message* is different on purpose: just the message's text, no time or name.
+  Links (`DisplayText::links`, from the tokenizer's `Fragment::Link`) get a pointing-hand hit area
+  per line; a click that starts and ends on the same link opens it with `cx.open_url` (http/https
+  only) once the double-click interval has passed, so a double-click selects it instead. Kit's own `TextSelection` layer (gpui-base) is
+  not used: it works on GPUI `TextLayout` runs, and these rows lay out their own atoms.
 - **Usernames** use the author's colour, or a Twitch default colour picked by a hash of the
   login, then **readability-adjusted** against the current background: hue and saturation are
   kept and HSL lightness moves away from the background just enough to reach a WCAG contrast of

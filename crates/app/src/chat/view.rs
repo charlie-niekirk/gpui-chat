@@ -25,6 +25,11 @@
 //!   wake-up for the soonest animation frame change, only if an animated emote was painted,
 //!   animation is on and the window is active (GPUI refreshes on (de)activation, so animation
 //!   stops and resumes with focus). Nothing animated on screen means no timers at all.
+//! * **Selection and links** (PR 5.6): the list and the thread popover are each a selection
+//!   [`Surface`] (see [`super::selection_layer`]). A press in the chat gives the view keyboard
+//!   focus (key context [`CHAT_CONTEXT`]), where ⌘C / Ctrl-C copies the selection and Esc clears
+//!   it (and asks the owner to focus the input box again); with nothing selected both go on. The
+//!   pane also handles Copy, so the command palette reaches it from the input box.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,9 +39,10 @@ use std::time::Instant;
 use gpui_chat_core::{Message, MessageId, Rebuild};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
-    App, Context, Entity, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
-    ListState, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, canvas, div, font, list, point, px,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div,
+    font, list, point, px,
 };
 
 use super::display::DisplayOptions;
@@ -44,8 +50,10 @@ use super::element::{BadgeStyle, EmoteStyle, HoveredRow, MessageStyle, OpenThrea
 use super::layout::LayoutCache;
 use super::list_sync::ListMirror;
 use super::row::{RowContext, message_row, row_menu};
+use super::selection_layer::{ClearSelection, CopySelection, Surface};
 use super::thread::{self, ThreadPanel};
 use super::tooltip::EmoteHover;
+use crate::actions::CHAT_CONTEXT;
 use crate::badges::Badges;
 use crate::channels::ChannelStore;
 use crate::config;
@@ -81,6 +89,8 @@ fn badge_size(font_size: Pixels) -> f32 {
 pub enum ChatViewEvent {
     /// The user chose Reply on this message: put the composer in reply mode.
     ReplyRequested(Arc<Message>),
+    /// Esc cleared the selection: hand focus back to the input box.
+    SelectionDismissed,
 }
 
 impl EventEmitter<ChatViewEvent> for ChatView {}
@@ -92,6 +102,9 @@ pub struct ChatView {
     cache: Rc<RefCell<LayoutCache>>,
     text_config: Option<TextConfig>,
     generation: u64,
+    /// Bumped when display texts may change (timestamps, badge definitions): selection offsets
+    /// are into display texts, so the selection is dropped then — not on a font or theme change.
+    text_generation: u64,
     /// How far into the image store's layout change log this view has applied
     /// ([`Images::layout_version`]); `None` before the first render.
     image_version: Option<u64>,
@@ -122,6 +135,10 @@ pub struct ChatView {
     hovered: HoveredRow,
     /// The thread popover, while one is open.
     thread: Option<ThreadPanel>,
+    /// Text selection and links in the list.
+    surface: Rc<Surface>,
+    /// Focused by a press in the chat, so ⌘C and Esc reach the selection.
+    focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -147,13 +164,17 @@ impl ChatView {
             // Loaders store badge sets off the UI thread; this is how a view hears about it.
             cx.observe_global::<Badges>(|_, cx| cx.notify()),
         ];
+        let cache = Rc::new(RefCell::new(LayoutCache::default()));
         Self {
             store,
+            surface: Surface::new(Some(list.clone()), cache.clone()),
+            focus_handle: cx.focus_handle(),
             list,
             mirror,
-            cache: Rc::new(RefCell::new(LayoutCache::default())),
+            cache,
             text_config: None,
             generation: 0,
+            text_generation: 0,
             image_version: None,
             badge_version: None,
             unseen_from: None,
@@ -196,6 +217,37 @@ impl ChatView {
         if self.thread.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// What ⌘C would copy: the popover's selection, else the list's.
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        let messages = self.store.read(cx).messages();
+        self.thread
+            .as_ref()
+            .and_then(|panel| panel.surface.selected_text(messages))
+            .or_else(|| self.surface.selected_text(messages))
+    }
+
+    /// Puts the selection on the clipboard; whether there was one.
+    pub fn copy_selection(&self, cx: &mut App) -> bool {
+        let Some(text) = self.selected_text(cx) else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    /// Drops the selection (list and popover); whether there was one.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let list = self.surface.clear();
+        let popover = self
+            .thread
+            .as_ref()
+            .is_some_and(|panel| panel.surface.clear());
+        if list || popover {
+            cx.notify();
+        }
+        list || popover
     }
 
     /// The root of the open thread popover, if any.
@@ -336,7 +388,10 @@ impl ChatView {
             light: cx.global::<Tokens>().light,
         };
         if self.text_config.as_ref() != Some(&current) {
-            if self.text_config.is_some() {
+            if let Some(previous) = &self.text_config {
+                if previous.options != current.options {
+                    self.text_generation += 1;
+                }
                 self.generation += 1;
                 self.list.remeasure();
                 self.retain_generation();
@@ -393,6 +448,7 @@ impl ChatView {
         };
         if seen != version {
             self.generation += 1;
+            self.text_generation += 1;
             self.list.remeasure();
             self.retain_generation();
         }
@@ -465,6 +521,14 @@ impl Render for ChatView {
 
         let regular = font(config.family.clone());
         self.line_height = px((config.size.as_f32() * config.line_height).round());
+        let selection_color = tokens.accent.opacity(0.3);
+        self.surface.begin_frame(
+            self.text_generation,
+            self.mirror.first_seq(),
+            config.options,
+            selection_color,
+            None,
+        );
         let style = Rc::new(MessageStyle {
             bold_font: regular.clone().bold(),
             font: regular,
@@ -495,6 +559,7 @@ impl Render for ChatView {
                 }) as OpenThread
             }),
             hovered_row: self.can_reply.then(|| self.hovered.clone()),
+            selection: Some(self.surface.clone()),
         });
         let handle = cx.entity().downgrade();
         let rows = |id, hovered: &HoveredRow| RowContext {
@@ -502,6 +567,7 @@ impl Render for ChatView {
             view: handle.clone(),
             tokens,
             hovered: self.can_reply.then(|| hovered.get()).flatten(),
+            can_reply: self.can_reply,
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -510,9 +576,17 @@ impl Render for ChatView {
                 on_open_thread: None,
                 hover: panel.hover.clone(),
                 hovered_row: self.can_reply.then(|| panel.hovered.clone()),
+                selection: Some(panel.surface.clone()),
                 ..(*style).clone()
             });
             let view = thread::thread_view(self.store.read(cx).messages(), panel.root.as_str());
+            panel.surface.begin_frame(
+                self.text_generation,
+                self.mirror.first_seq(),
+                config.options,
+                selection_color,
+                Some(view.seqs()),
+            );
             let rows = rows("thread-row", &panel.hovered);
             thread::render(panel, &view, &style, &rows, self.store.clone(), cx)
         });
@@ -573,6 +647,8 @@ impl Render for ChatView {
                         .text_sm()
                         .shadow_md()
                         .cursor_pointer()
+                        // Not a press in the chat: it must not start (or hold for) a selection.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, _, cx| this.jump_to_latest(cx)))
                         .child(format!("↓ {}", pill_label(self.unseen()))),
                 )
@@ -583,19 +659,49 @@ impl Render for ChatView {
         let menu = row_menu(
             cx.entity().downgrade(),
             self.store.clone(),
-            self.hovered.clone(),
+            self.surface.clone(),
+            self.can_reply,
         );
-        div().size_full().flex().flex_col().child(
-            div()
-                .relative()
-                .flex_1()
-                .min_h_0()
-                .child(messages)
-                .child(probe)
-                .children(pill)
-                .children(thread_panel)
-                .context_menu(menu),
-        )
+        div()
+            .id("chat-view")
+            .key_context(CHAT_CONTEXT)
+            .track_focus(&self.focus_handle)
+            // ⌘C and Esc with the chat focused. With nothing selected they go on (the pane, the
+            // window), so other handlers of the key still run.
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                if !this.copy_selection(cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.clear_selection(cx) {
+                    cx.emit(ChatViewEvent::SelectionDismissed);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    // First, so the rows and what is drawn over them see a press before it does.
+                    .child(self.surface.layer())
+                    .child(messages)
+                    .child(probe)
+                    .children(pill)
+                    .children(thread_panel)
+                    .context_menu(menu),
+            )
+    }
+}
+
+impl Focusable for ChatView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -606,10 +712,15 @@ mod tests {
     use gpui_chat_core::{Author, ChannelId, ChatEvent, Fragment, Message, Timestamp};
     use gpui_chat_settings::{AppearanceSettings, Settings, SettingsEvent};
     use gpui_kit::{
-        AppContext as _, Entity, ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, size,
+        AppContext as _, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Point,
+        ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, size,
     };
 
+    use std::cell::Cell;
+
     use super::*;
+    use crate::chat::selection;
+    use crate::chat::selection_layer::DOUBLE_CLICK;
     use crate::{fonts, theme};
 
     #[test]
@@ -850,7 +961,9 @@ mod tests {
         let sink = heard.clone();
         let _subscription = cx.update(|_, cx| {
             cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
-                let ChatViewEvent::ReplyRequested(message) = event;
+                let ChatViewEvent::ReplyRequested(message) = event else {
+                    return;
+                };
                 sink.borrow_mut().push(message.id.to_string());
             })
         });
@@ -860,6 +973,489 @@ mod tests {
         h.view
             .update(cx, |view, cx| view.request_reply(message, cx));
         assert_eq!(*heard.borrow(), ["m0"]);
+    }
+
+    /// Presses (with `clicks`), optionally drags to `to`, and releases there.
+    fn press(from: Point<Pixels>, to: Point<Pixels>, clicks: usize, cx: &mut VisualTestContext) {
+        cx.simulate_event(MouseDownEvent {
+            position: from,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: clicks,
+            first_mouse: false,
+        });
+        if to != from {
+            cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+        }
+        cx.simulate_event(MouseUpEvent {
+            position: to,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: clicks,
+        });
+        cx.run_until_parked();
+    }
+
+    fn point_of(h: &Harness, seq: u64, offset: usize, cx: &mut VisualTestContext) -> Point<Pixels> {
+        h.view
+            .read_with(cx, |v, _| v.surface.point_of(seq, offset))
+            .expect("the row was drawn")
+    }
+
+    fn message(h: &Harness, seq: u64, cx: &mut VisualTestContext) -> Arc<Message> {
+        h.store
+            .read_with(cx, |s, _| s.messages().get_by_seq(seq).unwrap().clone())
+    }
+
+    fn selected(h: &Harness, cx: &mut VisualTestContext) -> Option<String> {
+        h.view.read_with(cx, |v, cx| v.selected_text(cx))
+    }
+
+    #[gpui_kit::test]
+    fn dragging_selects_across_messages_and_copies_one_line_each(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(4, "hello world", cx);
+        // From the far left of message 1 to past the end of message 3: three whole messages.
+        let from = point(px(1.0), point_of(&h, 1, 0, cx).y);
+        let to = point(px(799.0), point_of(&h, 3, 0, cx).y);
+        press(from, to, 1, cx);
+        let lines: Vec<String> = (1..=3)
+            .map(|seq| selection::message_line(&message(&h, seq, cx)))
+            .collect();
+        assert_eq!(selected(&h, cx), Some(lines.join("\n")));
+
+        // From the middle of "world" in message 2 up into message 1: the end of 1, the start of 2.
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(2).unwrap().display.text.clone()
+        });
+        let world = text.find("world").unwrap();
+        press(
+            point_of(&h, 2, world + 2, cx),
+            point_of(&h, 1, world, cx),
+            1,
+            cx,
+        );
+        assert_eq!(
+            selected(&h, cx),
+            Some("world\n".to_owned() + &text[..world + 2])
+        );
+
+        // ⌘C's action puts it on the clipboard.
+        assert!(h.view.update(cx, |v, cx| v.copy_selection(cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("world\n".to_owned() + &text[..world + 2])
+        );
+
+        // A click without a drag clears it, and there is nothing to copy.
+        let somewhere = point_of(&h, 0, 2, cx);
+        press(somewhere, somewhere, 1, cx);
+        assert_eq!(selected(&h, cx), None);
+        assert!(!h.view.update(cx, |v, cx| v.copy_selection(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn double_click_selects_a_word_and_triple_click_the_message(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(2, "hello world", cx);
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(1).unwrap().display.text.clone()
+        });
+        let at = point_of(&h, 1, text.find("world").unwrap() + 1, cx);
+        press(at, at, 2, cx);
+        assert_eq!(selected(&h, cx).as_deref(), Some("world"));
+        press(at, at, 3, cx);
+        assert_eq!(
+            selected(&h, cx),
+            Some(selection::message_line(&message(&h, 1, cx)))
+        );
+        // Esc's action drops it.
+        assert!(h.view.update(cx, |v, cx| v.clear_selection(cx)));
+        assert_eq!(selected(&h, cx), None);
+        assert!(!h.view.update(cx, |v, cx| v.clear_selection(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_link_opens_it_and_dragging_from_one_does_not(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        let fragments = gpui_chat_core::Tokenizer::new()
+            .tokenize("see https://example.com/x now", &[])
+            .fragments;
+        h.store.update(cx, |store, cx| {
+            store.apply_all([ChatEvent::Message {
+                channel: ChannelId::new("test"),
+                message: Arc::new(Message::chat(
+                    "link",
+                    Timestamp(0),
+                    Author::new("al", "Al"),
+                    fragments,
+                )),
+            }]);
+            cx.notify();
+        });
+        h.next += 1;
+        cx.run_until_parked();
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(0).unwrap().display.text.clone()
+        });
+        let link = text.find("https").unwrap();
+        let start = point_of(&h, 0, link + 3, cx);
+        // A drag that starts on the link selects instead.
+        press(start, point_of(&h, 0, link + 10, cx), 1, cx);
+        assert_eq!(cx.opened_url(), None);
+        assert!(selected(&h, cx).is_some());
+        // A click opens it once the double-click interval passed without another press.
+        press(start, start, 1, cx);
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "not before the double-click interval"
+        );
+        settle(cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
+        // A double-click selects the link instead of opening it.
+        press(start, start, 1, cx);
+        press(start, start, 2, cx);
+        settle(cx);
+        assert_eq!(selected(&h, cx).as_deref(), Some("https://example.com/x"));
+        // Plain text opens nothing.
+        h.push(1, "no links here", cx);
+        let plain = point_of(&h, 1, 4, cx);
+        press(plain, plain, 1, cx);
+        settle(cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
+    }
+
+    /// Lets the double-click interval pass (pending clicks settle).
+    fn settle(cx: &mut VisualTestContext) {
+        cx.executor().advance_clock(DOUBLE_CLICK);
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn a_drag_keeps_the_list_still_while_messages_arrive(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(100, "hello", cx);
+        assert!(h.following(cx));
+        let from = point_of(&h, 90, 1, cx);
+        cx.simulate_event(MouseDownEvent {
+            position: from,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        let to = point_of(&h, 95, 1, cx);
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+        cx.run_until_parked();
+        h.push(5, "hello", cx);
+        assert!(
+            !h.following(cx),
+            "the list stopped following during the drag"
+        );
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.surface.hit(from).map(|hit| hit.seq)),
+            Some(90),
+            "the message under the pointer did not move"
+        );
+        cx.simulate_mouse_up(from, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        assert!(selected(&h, cx).is_some());
+        // It stays still while the selection is there, even when nothing arrived for a while (the
+        // list would otherwise find itself at its end and follow again).
+        h.next_frame(cx);
+        h.push(5, "hello", cx);
+        assert!(!h.following(cx));
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.surface.hit(from).map(|hit| hit.seq)),
+            Some(90)
+        );
+        // A click in the chat drops the selection but keeps the list where it is for the
+        // double-click interval (a second click must find the same text), then follows again.
+        press(from, from, 1, cx);
+        assert_eq!(selected(&h, cx), None);
+        h.push(2, "hello", cx);
+        assert!(!h.following(cx));
+        settle(cx);
+        h.push(1, "hello", cx);
+        assert!(h.following(cx));
+        // Esc (or a press outside the chat) on a selection follows the chat again at once.
+        let at = point_of(&h, 100, 1, cx);
+        press(at, at, 3, cx);
+        h.push(2, "hello", cx);
+        assert!(!h.following(cx));
+        assert!(h.view.update(cx, |v, cx| v.clear_selection(cx)));
+        h.push(1, "hello", cx);
+        assert!(h.following(cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_double_click_in_a_moving_chat_selects_a_word_of_the_message_first_clicked(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(50, "hello world", cx);
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(45).unwrap().display.text.clone()
+        });
+        let at = point_of(&h, 45, text.find("world").unwrap() + 1, cx);
+        // First click; messages arrive before the second (a busy chat).
+        press(at, at, 1, cx);
+        h.push(3, "other text", cx);
+        press(at, at, 2, cx);
+        assert_eq!(selected(&h, cx).as_deref(), Some("world"));
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.surface.hit(at).map(|hit| hit.seq)),
+            Some(45),
+            "the list did not move between the clicks"
+        );
+        // A press whose release was lost (the pointer moves with no button) does not hold the
+        // list forever.
+        assert!(h.view.update(cx, |v, cx| v.clear_selection(cx)));
+        h.push(1, "x", cx);
+        assert!(h.following(cx));
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        h.push(2, "x", cx);
+        assert!(!h.following(cx), "held while pressed");
+        cx.simulate_mouse_move(at, None, Modifiers::default());
+        cx.run_until_parked();
+        h.push(1, "x", cx);
+        assert!(h.following(cx));
+    }
+
+    #[gpui_kit::test]
+    fn copying_uses_the_end_messages_as_they_were_selected(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(3, "héllo wörld", cx);
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(2).unwrap().display.text.clone()
+        });
+        let o = text.find('ö').unwrap();
+        press(point_of(&h, 1, o, cx), point_of(&h, 2, o, cx), 1, cx);
+        let before = selected(&h, cx).expect("a selection");
+        // Every layout dropped (as an emote image arriving does to the rows that draw it): the
+        // copy still uses the texts the offsets were measured on.
+        h.view
+            .read_with(cx, |v, _| v.cache.borrow_mut().retain_key(u64::MAX));
+        assert_eq!(selected(&h, cx), Some(before));
+    }
+
+    #[gpui_kit::test]
+    fn a_settings_change_that_keeps_the_text_keeps_the_selection(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(2, "hello world", cx);
+        let at = point_of(&h, 1, 1, cx);
+        press(at, at, 3, cx);
+        let mut settings = Settings::default();
+        settings.appearance.line_height = 2.0;
+        settings.emotes.scale = 2.0;
+        h.settings.update(cx, |store, cx| {
+            store.apply_events([SettingsEvent::Reloaded(settings)]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.generation),
+            1,
+            "laid out again"
+        );
+        assert!(
+            selected(&h, cx).is_some(),
+            "the same text: the selection stays"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn copying_in_the_thread_popover_takes_only_its_messages(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "root message", cx);
+        h.push(1, "not in the thread", cx);
+        h.store.update(cx, |store, cx| {
+            store.apply_all(vec![reply_event(2, "m0", "m0")]);
+            cx.notify();
+        });
+        h.next += 1;
+        cx.run_until_parked();
+        h.view.update_in(cx, |view, window, cx| {
+            view.open_thread("m0".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let in_popover = |seq, cx: &mut VisualTestContext| {
+            h.view
+                .read_with(cx, |v, _| {
+                    v.thread.as_ref().unwrap().surface.point_of(seq, 0)
+                })
+                .expect("drawn in the popover")
+        };
+        let (from, to) = (in_popover(0, cx), in_popover(2, cx));
+        press(
+            point(px(from.x.as_f32() - 6.0), from.y),
+            point(px(to.x.as_f32() + 300.0), to.y),
+            1,
+            cx,
+        );
+        let copied = selected(&h, cx).expect("a selection in the popover");
+        let lines: Vec<&str> = copied.lines().collect();
+        assert_eq!(lines.len(), 2, "{copied}");
+        assert!(lines[0].ends_with("root message"), "{copied}");
+        assert!(lines[1].ends_with("in reply"), "{copied}");
+        assert!(!copied.contains("not in the thread"));
+    }
+
+    #[gpui_kit::test]
+    fn a_selection_made_while_scrolled_up_does_not_jump_to_the_end(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        h.scroll(400.0, cx);
+        assert!(!h.following(cx));
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        let at = point(px(400.0), px(300.0));
+        press(at, at, 3, cx);
+        assert!(selected(&h, cx).is_some());
+        assert!(h.view.update(cx, |v, cx| v.clear_selection(cx)));
+        h.push(3, "hello", cx);
+        assert!(!h.following(cx), "it was not following before");
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.list_state().logical_scroll_top()),
+            top
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_right_click_aims_the_menu_at_the_message_and_link_under_it(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "plain", cx);
+        let fragments = gpui_chat_core::Tokenizer::new()
+            .tokenize("go to https://example.com/y", &[])
+            .fragments;
+        h.store.update(cx, |store, cx| {
+            store.apply_all([ChatEvent::Message {
+                channel: ChannelId::new("test"),
+                message: Arc::new(Message::chat(
+                    "l",
+                    Timestamp(0),
+                    Author::new("al", "Al"),
+                    fragments,
+                )),
+            }]);
+            cx.notify();
+        });
+        h.next += 1;
+        cx.run_until_parked();
+        let right_click = |at: Point<Pixels>, cx: &mut VisualTestContext| {
+            cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+            cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+            cx.run_until_parked();
+        };
+        let target = |h: &Harness, cx: &mut VisualTestContext| {
+            h.view.read_with(cx, |v, _| {
+                v.surface
+                    .last_aimed()
+                    .map(|t| (t.seq, t.link.map(|url| url.to_string())))
+            })
+        };
+        right_click(point_of(&h, 0, 2, cx), cx);
+        assert_eq!(target(&h, cx), Some((0, None)));
+        let text = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(1).unwrap().display.text.clone()
+        });
+        right_click(point_of(&h, 1, text.find("example").unwrap(), cx), cx);
+        assert_eq!(
+            target(&h, cx),
+            Some((1, Some("https://example.com/y".to_owned())))
+        );
+        // The empty space above the two messages is neither's.
+        right_click(point(px(400.0), px(20.0)), cx);
+        assert_eq!(target(&h, cx), None);
+        // The menu takes the target as it opens: nothing stale is left for another menu.
+        right_click(point_of(&h, 0, 2, cx), cx);
+        assert_eq!(target(&h, cx).map(|(seq, _)| seq), Some(0));
+        assert!(
+            h.view
+                .read_with(cx, |v, _| v.surface.menu_target())
+                .is_none()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn copy_and_esc_keys_act_on_a_selection_and_otherwise_go_on(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(2, "hello world", cx);
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        let (copies, escapes) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let dismissed = Rc::new(Cell::new(0));
+        cx.update(|window, cx| {
+            cx.bind_keys([
+                gpui_kit::KeyBinding::new(copy_key, CopySelection, Some(CHAT_CONTEXT)),
+                gpui_kit::KeyBinding::new("escape", ClearSelection, Some(CHAT_CONTEXT)),
+            ]);
+            // What runs when the chat lets a key go on.
+            let (c, e) = (copies.clone(), escapes.clone());
+            cx.on_action(move |_: &CopySelection, _| c.set(c.get() + 1));
+            cx.on_action(move |_: &ClearSelection, _| e.set(e.get() + 1));
+            let d = dismissed.clone();
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                if matches!(event, ChatViewEvent::SelectionDismissed) {
+                    d.set(d.get() + 1);
+                }
+            })
+            .detach();
+            let focus = h.view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        // Nothing selected: both keys go on.
+        cx.simulate_keystrokes(copy_key);
+        cx.simulate_keystrokes("escape");
+        assert_eq!((copies.get(), escapes.get()), (1, 1));
+        // A selection: ⌘C copies it, Esc clears it and asks for the input box; neither goes on.
+        let at = point_of(&h, 1, 1, cx);
+        press(at, at, 3, cx);
+        cx.update(|window, cx| {
+            let focus = h.view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("before".into()));
+        cx.simulate_keystrokes(copy_key);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(selection::message_line(&message(&h, 1, cx)))
+        );
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected(&h, cx), None);
+        assert_eq!((copies.get(), escapes.get(), dismissed.get()), (1, 1, 1));
+    }
+
+    #[gpui_kit::test]
+    fn a_layout_change_drops_the_selection(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(2, "hello world", cx);
+        let at = point_of(&h, 1, 1, cx);
+        press(at, at, 3, cx);
+        assert!(selected(&h, cx).is_some());
+        let mut settings = Settings::default();
+        settings.chat.timestamps = !settings.chat.timestamps;
+        h.settings.update(cx, |store, cx| {
+            store.apply_events([SettingsEvent::Reloaded(settings)]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(&h, cx), None, "its offsets were into the old text");
     }
 
     #[gpui_kit::test]

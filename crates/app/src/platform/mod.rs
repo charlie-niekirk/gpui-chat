@@ -12,6 +12,8 @@ use crate::actions::{
     ToggleDebugHud, ToggleSidebar,
 };
 
+use crate::chat::selection_layer::ClearSelection;
+
 pub mod keychain;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -35,6 +37,12 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     // Completion (Tab, Esc) and the emote picker: after the above, so the picker's ↑/↓ win in its
     // own search field.
     bindings.extend(crate::completion::bindings());
+    // Esc in the chat clears its selection (⌘C / Ctrl-C to copy it is per platform).
+    bindings.push(KeyBinding::new(
+        "escape",
+        ClearSelection,
+        Some(crate::actions::CHAT_CONTEXT),
+    ));
     bindings
 }
 
