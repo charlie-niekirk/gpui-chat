@@ -308,8 +308,11 @@ pub fn message_line(message: &Message) -> String {
 }
 
 /// The text of `range` of a display text as drawn, without badge titles (and the space after each
-/// badge): badges are pictures.
+/// badge): badges are pictures. An end that is not on a character boundary (offsets measured on
+/// another version of the text) is moved out to the nearest one, never panicking.
 pub fn selected_text(display: &DisplayText, range: Range<usize>) -> String {
+    let text = display.text.as_str();
+    let range = floor_boundary(text, range.start)..ceil_boundary(text, range.end);
     let mut out = String::new();
     let mut after_badge = false;
     for span in &display.spans {
@@ -326,6 +329,24 @@ pub fn selected_text(display: &DisplayText, range: Range<usize>) -> String {
         }
     }
     out
+}
+
+/// The nearest character boundary of `text` at or before `index` (clamped to its length).
+fn floor_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// The nearest character boundary of `text` at or after `index` (clamped to its length).
+fn ceil_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 /// What a selection covers of one message: the message, its display text and the selected bytes.
@@ -481,9 +502,9 @@ mod tests {
         assert_eq!(&display.text[word_at(&display, display.text.len())], "KEKW");
         assert_eq!(word_at(&DisplayText::default(), 0), 0..0);
         // Not on a character boundary: the character it is inside.
-        let emoji = shown(&chat("a é b"));
-        let inside = emoji.text.find('é').unwrap() + 1;
-        assert_eq!(&emoji.text[word_at(&emoji, inside)], "é");
+        let accented = shown(&chat("a é b"));
+        let inside = accented.text.find('é').unwrap() + 1;
+        assert_eq!(&accented.text[word_at(&accented, inside)], "é");
     }
 
     #[test]
@@ -686,6 +707,31 @@ mod tests {
             selected_text(&d3, 0..d3.text.len()),
             "02:00 Alice: third and last"
         );
+    }
+
+    #[test]
+    fn offsets_inside_a_character_snap_out_instead_of_panicking() {
+        // Offsets measured on a text with a badge title, applied to the same message shown
+        // without it: they land inside the multibyte characters.
+        let message = chat("héllo wörld ünïcode");
+        let display = shown(&message);
+        let body = display.text.find('h').unwrap();
+        let inside_e = body + 2; // the second byte of 'é'
+        let inside_o = display.text.find('ö').unwrap() + 1;
+        assert!(!display.text.is_char_boundary(inside_e));
+        assert_eq!(selected_text(&display, inside_e..inside_o), "éllo wö");
+        // Past the end clamps; a range inside one character still gives that character.
+        assert_eq!(
+            selected_text(&display, inside_o..usize::MAX),
+            "örld ünïcode"
+        );
+        assert_eq!(selected_text(&display, inside_e..inside_e + 1), "é");
+        let rows = [CopyRow {
+            message: &message,
+            display: &display,
+            range: inside_e..inside_o,
+        }];
+        assert_eq!(copy_text(rows), "éllo wö");
     }
 
     #[test]

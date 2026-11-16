@@ -463,13 +463,20 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   reports its bounds and layout in prepaint and paints its own part of the highlight (theme
   accent at 30 %, behind the text) — so a mouse move that changes the selection re-renders the
   view once from the layout cache; nothing is shaped or flowed again. Dragging past the top or
-  bottom autoscrolls; while there is a selection the list stops following (held where it is, the
-  "new messages" pill shows), and Esc or a press outside the chat resumes it. Copy (⌘C in the
+  bottom autoscrolls (until the first / last message is in view). From a left press until the
+  selection is gone the list stops following (held where it is, the "new messages" pill shows), so
+  a double / triple click lands on the text first clicked; a click that selects nothing lets it
+  follow again after the double-click interval (500 ms), Esc or a press outside the chat at once,
+  and only if the selection is what stopped it. Only a change of display text (timestamps, badge
+  definitions) drops the selection; a font, line-height or theme change keeps it. Copy (⌘C in the
   `ChatView` key context, or the palette) writes one line per message: a whole message as
   `HH:MM name: text` from the stored message (original text, emote codes), a partly selected one
-  as the selected text without badge titles. Links (`DisplayText::links`, from the tokenizer's
-  `Fragment::Link`) get a pointing-hand hit area per line; a click that starts and ends on the same
-  link opens it with `cx.open_url` (http/https only). Kit's own `TextSelection` layer (gpui-base) is
+  as the selected text without badge titles, from the display text of the two end messages as it
+  was when the pointer was on them (snapshotted, since their layouts may be dropped or rebuilt).
+  The menu's *Copy message* is different on purpose: just the message's text, no time or name.
+  Links (`DisplayText::links`, from the tokenizer's `Fragment::Link`) get a pointing-hand hit area
+  per line; a click that starts and ends on the same link opens it with `cx.open_url` (http/https
+  only) once the double-click interval has passed, so a double-click selects it instead. Kit's own `TextSelection` layer (gpui-base) is
   not used: it works on GPUI `TextLayout` runs, and these rows lay out their own atoms.
 - **Usernames** use the author's colour, or a Twitch default colour picked by a hash of the
   login, then **readability-adjusted** against the current background: hue and saturation are

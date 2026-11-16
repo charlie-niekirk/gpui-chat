@@ -93,7 +93,8 @@ pub fn message_row(
 /// The right-click menu for the row the right-click was over (resolved by `surface` at the click):
 /// Copy (when there is a selection), Copy message, Copy username, Open / Copy link (over a link),
 /// then Reply and View thread when `can_reply`. Empty (which Kit does not show) over no row.
-/// `store` is where the message is looked up.
+/// `store` is where the message is looked up. *Copy message* is the message's text alone; ⌘C on a
+/// selected whole message copies the chat line (`HH:MM name: text`).
 pub fn row_menu(
     view: WeakEntity<ChatView>,
     store: Entity<ChannelStore>,
@@ -101,7 +102,7 @@ pub fn row_menu(
     can_reply: bool,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, _, cx| {
-        let Some(target) = surface.menu_target() else {
+        let Some(target) = surface.take_menu_target() else {
             return menu;
         };
         let store = store.read(cx);

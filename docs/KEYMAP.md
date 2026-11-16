@@ -78,8 +78,9 @@ Bindable but not in the palette (the input box and the emote picker; contexts
 `ComposerCompletionDismiss` (Esc), `ComposerToggleEmotePicker` (⌘E), `EmotePickerLeft`
 `EmotePickerRight` `EmotePickerUp` `EmotePickerDown` `EmotePickerNextTab` `EmotePickerPreviousTab`
 `EmotePickerClose`; and in the chat (context `ChatView`, focused by a press in the messages)
-`ClearSelection` (Esc: clears the selection and goes back to the input box, otherwise does
-nothing so Esc goes on). They keep their defaults unless an entry names them.
+`ClearSelection` (Esc: clears the selection and goes back to the input box; with nothing
+selected Esc goes on). `CopySelection` likewise goes on when nothing is selected; in the input box
+⌘C is the box's own copy. They keep their defaults unless an entry names them.
 
 The list lives in `crates/app/src/keymap.rs` (`catalog`); a test fails if an action is defined and
 missing from it.

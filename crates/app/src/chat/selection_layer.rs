@@ -11,15 +11,22 @@
 //!   can keep it.
 //! * A press hit-tests the reported rows ([`super::selection::row_at`], then the row's
 //!   [`super::flow::Flow`]) and starts a selection of the unit its click count picks; dragging
-//!   extends it, also above or below the surface, where the list scrolls along. While there is a
-//!   selection the list stops following new messages (it is held where it is, like scrolling up),
-//!   so the text does not run away under the pointer.
-//! * A click without a drag clears it, as does a press anywhere outside the surface; Esc clears it
-//!   too (handled by the pane, see `crate::pane`). Esc and a press outside also let the list
-//!   follow new messages again; a click in the chat does not (see [`Surface::release`]).
+//!   extends it, also above or below the surface, where the list scrolls along (until it reaches
+//!   its first or last message).
+//! * **Holding the list.** From a press until the selection is gone, the list stops following new
+//!   messages (it is held where it is, like scrolling up), so the text does not run away under the
+//!   pointer and the second and third press of a double / triple click land on the same text. A
+//!   click that selects nothing lets it follow again once the double-click interval passes without
+//!   another press; Esc (`ClearSelection`, handled by the chat view) and a press outside the
+//!   surface clear the selection and let it follow again at once. It resumes only if the
+//!   selection is what stopped it (a list the user had scrolled up stays where it is).
 //! * Rows paint their part of the selection behind their text ([`Surface::paint_row`]) and give
-//!   their links a pointing-hand cursor. A click that starts and ends on the same link opens it
-//!   in the browser.
+//!   their links a pointing-hand cursor. A click that starts and ends on the same link opens it in
+//!   the browser once the double-click interval has passed without another press, so a
+//!   double-click on a link selects it instead.
+//! * **Copying** uses the display text of the selection's two end messages as it was when the
+//!   pointer was on them (the offsets were measured on it), even if their layouts were dropped or
+//!   rebuilt since; the messages in between are copied whole from the store.
 //!
 //! A mouse move that changes the selection re-renders the view once; the rows' layouts come from
 //! the layout cache, so nothing is shaped or flowed again.
@@ -30,12 +37,14 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_chat_core::MessageStore;
 use gpui_kit::{
-    App, Bounds, CursorStyle, DispatchPhase, FollowMode, Hitbox, HitboxBehavior, Hsla, IntoElement,
-    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Styled as _, Window, actions, canvas, fill, point, px, size,
+    App, Bounds, CursorStyle, DispatchPhase, EntityId, FollowMode, Hitbox, HitboxBehavior, Hsla,
+    IntoElement, ListOffset, ListState, LongPressEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Styled as _, TouchPhase, Window, actions, canvas,
+    fill, point, px, size,
 };
 
 use super::display::{self, DisplayOptions, DisplayText};
@@ -50,7 +59,7 @@ actions!(
     [
         /// Copies the selected chat text.
         CopySelection,
-        /// Clears the chat selection (Esc), handing focus back to the input box.
+        /// Clears the chat selection (Esc); with nothing selected it lets the key go on.
         ClearSelection
     ]
 );
@@ -63,6 +72,8 @@ const DRAG_THRESHOLD: f32 = 3.0;
 const AUTOSCROLL_MIN: f32 = 2.0;
 /// …and at most this.
 const AUTOSCROLL_MAX: f32 = 40.0;
+/// How long after a click a second press still makes it a double-click (macOS's default).
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 /// Where one row was laid out this frame.
 struct RowGeometry {
@@ -116,16 +127,28 @@ struct Drag {
     link: Option<(u64, Arc<str>)>,
 }
 
-/// A message's display text for copying: from its cached layout, or built for the occasion.
+/// An end of the selection: its message's sequence number and display text as the pointer saw it.
+type End = (u64, Rc<ShapedMessage>);
+
+/// A click that selected nothing, waiting out the double-click interval: a second press cancels
+/// it; otherwise the list may follow again and the link it was on opens.
+struct PendingClick {
+    /// Which click (a later one replaces it).
+    id: u64,
+    link: Option<Arc<str>>,
+}
+
+/// A message's display text for copying: the one its offsets were measured on, from its cached
+/// layout, or built for the occasion.
 enum Shown {
-    Cached(Rc<ShapedMessage>),
+    Shaped(Rc<ShapedMessage>),
     Built(DisplayText),
 }
 
 impl Shown {
     fn display(&self) -> &DisplayText {
         match self {
-            Self::Cached(shaped) => &shaped.display,
+            Self::Shaped(shaped) => &shaped.display,
             Self::Built(display) => display,
         }
     }
@@ -153,7 +176,13 @@ pub struct Surface {
     first_seq: Cell<u64>,
     /// The selection stopped the list following new messages: clearing it resumes.
     resume: Cell<bool>,
-    /// The layout generation the offsets of the selection belong to.
+    /// The display text of the anchor's and the head's message when the pointer was on them.
+    ends: RefCell<[Option<End>; 2]>,
+    pending: RefCell<Option<PendingClick>>,
+    clicks: Cell<u64>,
+    /// Whether the window was active at the last paint.
+    active: Cell<bool>,
+    /// The display-text generation the offsets of the selection belong to.
     generation: Cell<u64>,
     options: Cell<DisplayOptions>,
     /// Where the rows' layouts are cached (for copying rows no longer on screen).
@@ -161,6 +190,8 @@ pub struct Surface {
     /// The rows this surface shows, when it shows only some of the store (the thread popover).
     members: RefCell<Option<Vec<u64>>>,
     menu_target: RefCell<Option<MenuTarget>>,
+    #[cfg(test)]
+    last_aimed: RefCell<Option<MenuTarget>>,
     /// The selection background.
     color: Cell<Hsla>,
 }
@@ -176,17 +207,24 @@ impl Surface {
             list,
             first_seq: Cell::new(0),
             resume: Cell::new(false),
+            ends: RefCell::default(),
+            pending: RefCell::default(),
+            clicks: Cell::new(0),
+            active: Cell::new(false),
             generation: Cell::new(0),
             options: Cell::new(DisplayOptions::default()),
             cache,
             members: RefCell::default(),
             menu_target: RefCell::default(),
+            #[cfg(test)]
+            last_aimed: RefCell::default(),
             color: Cell::new(Hsla::default()),
         })
     }
 
-    /// Called by the view each render. A new layout generation (another font, timestamps on or
-    /// off, badge definitions) moves every offset, so it drops the selection.
+    /// Called by the view each render. `generation` changes when display texts may have changed
+    /// (timestamps on or off, badge definitions): that moves offsets, so it drops the selection.
+    /// Font, line height or theme changes only lay the same text out again and keep it.
     pub fn begin_frame(
         &self,
         generation: u64,
@@ -212,10 +250,10 @@ impl Surface {
             .is_some_and(|selection| !selection.is_empty())
     }
 
-    /// Drops the selection; whether there was one.
     /// Drops the selection; whether there was one, or the list starts following again.
     pub fn clear(&self) -> bool {
         self.drag.borrow_mut().take();
+        self.pending.borrow_mut().take();
         let had = self
             .selection
             .borrow_mut()
@@ -257,9 +295,17 @@ impl Surface {
             let Some(message) = store.get_by_seq(seq) else {
                 continue;
             };
-            // Rows that were drawn are in the cache; rebuild (without badges) any that are not.
-            let shown = match cache.shaped(seq) {
-                Some(shaped) => Shown::Cached(shaped),
+            // The two ends as the pointer saw them; the others are whole lines from the store, so
+            // their display text only gives their length (cached, else rebuilt without badges).
+            let end = self
+                .ends
+                .borrow()
+                .iter()
+                .flatten()
+                .find(|(end, _)| *end == seq)
+                .map(|(_, shaped)| shaped.clone());
+            let shown = match end.or_else(|| cache.shaped(seq)) {
+                Some(shaped) => Shown::Shaped(shaped),
                 None => Shown::Built(display::build(message, options, &[])),
             };
             let Some(range) = selection.range_in(seq, shown.display().text.len()) else {
@@ -275,9 +321,22 @@ impl Surface {
         (!text.is_empty()).then_some(text)
     }
 
-    /// What the last right-click was over.
+    /// What the right-click (or long press) that is opening a menu was over; taken, so a menu
+    /// opened some other way finds nothing stale.
+    pub fn take_menu_target(&self) -> Option<MenuTarget> {
+        self.menu_target.borrow_mut().take()
+    }
+
+    /// Peeks at the menu target without taking it.
+    #[cfg(test)]
     pub fn menu_target(&self) -> Option<MenuTarget> {
         self.menu_target.borrow().clone()
+    }
+
+    /// What the last right-click was aimed at (kept after the menu took it).
+    #[cfg(test)]
+    pub fn last_aimed(&self) -> Option<MenuTarget> {
+        self.last_aimed.borrow().clone()
     }
 
     /// Where (in the window) the caret before byte `offset` of row `seq` was drawn this frame,
@@ -427,11 +486,31 @@ impl Surface {
             })
     }
 
+    /// Records the display text of the message an end of the selection is on (`which`: 0 the
+    /// anchor, 1 the head).
+    fn remember_end(&self, which: usize, hit: &Hit) {
+        self.ends.borrow_mut()[which] = Some((hit.seq, hit.layout.shaped.clone()));
+    }
+
+    /// Stops a following list where it is (see the module docs).
+    fn hold(&self) {
+        if let Some(list) = &self.list
+            && list.is_following_tail()
+            && let Some(top) = self.scroll_top()
+        {
+            list.scroll_to(top);
+            self.resume.set(true);
+        }
+    }
+
     /// Starts a selection (or extends it, with Shift) at a left press.
     fn press(&self, event: &MouseDownEvent) -> bool {
         let Some(hit) = self.hit(event.position) else {
             return false;
         };
+        // A second press: the first was not a click on its own.
+        self.pending.borrow_mut().take();
+        self.hold();
         let mut selection = self.selection.borrow_mut();
         let link = (event.click_count <= 1)
             .then(|| hit.link().map(|url| (hit.seq, url)))
@@ -439,10 +518,13 @@ impl Surface {
         match selection.as_mut() {
             Some(current) if event.modifiers.shift => {
                 current.extend_to(hit.unit(current.granularity));
+                self.remember_end(1, &hit);
             }
             _ => {
                 let granularity = Granularity::from_clicks(event.click_count);
                 *selection = Some(Selection::new(hit.unit(granularity), granularity));
+                self.remember_end(0, &hit);
+                self.remember_end(1, &hit);
             }
         }
         *self.drag.borrow_mut() = Some(Drag {
@@ -476,17 +558,30 @@ impl Surface {
             return false;
         };
         let unit = hit.unit(selection.granularity);
-        selection.extend_to(unit)
+        let changed = selection.extend_to(unit);
+        if changed {
+            self.remember_end(1, &hit);
+        }
+        changed
     }
 
-    /// Ends a press: a click (no drag, one click) leaves nothing selected, and opens the link it
-    /// started and ended on. Returns the link to open.
-    ///
-    /// A click does not make the list follow again (the second click of a double-click must find
-    /// the text where it was): the list stays where it is, like after scrolling up, until it is
-    /// scrolled back down, the "new messages" pill is clicked, or a press outside the chat (say, in
-    /// the input box) or Esc resumes it.
-    fn release(&self, position: Point<Pixels>) -> Option<Arc<str>> {
+    /// A press whose release never arrived (the pointer moved with no button, or the window lost
+    /// focus): forget it, so it cannot hold the list or keep extending.
+    fn abandon_press(&self) -> bool {
+        if self.drag.borrow_mut().take().is_none() {
+            return false;
+        }
+        if !self.has_selection() {
+            self.selection.borrow_mut().take();
+            self.resume_following();
+        }
+        true
+    }
+
+    /// Ends a press. A click (no drag, one click) leaves nothing selected and becomes a
+    /// [`PendingClick`] with the link it started and ended on; returns its id, for the timer that
+    /// settles it after [`DOUBLE_CLICK`].
+    fn release(&self, position: Point<Pixels>) -> Option<u64> {
         let drag = self.drag.borrow_mut().take()?;
         let click = !drag.moved
             && self
@@ -499,35 +594,71 @@ impl Surface {
         }
         // The press already replaced any selection with an empty one: nothing to repaint.
         self.selection.borrow_mut().take();
-        let open = drag.link.filter(|(seq, url)| {
-            self.hit(position)
-                .is_some_and(|hit| hit.seq == *seq && hit.link().as_deref() == Some(&**url))
-        });
-        open.map(|(_, url)| url)
+        let link = drag
+            .link
+            .filter(|(seq, url)| {
+                self.hit(position)
+                    .is_some_and(|hit| hit.seq == *seq && hit.link().as_deref() == Some(&**url))
+            })
+            .map(|(_, url)| url);
+        let id = self.clicks.get() + 1;
+        self.clicks.set(id);
+        *self.pending.borrow_mut() = Some(PendingClick { id, link });
+        Some(id)
     }
 
-    /// While a press is held with something selected: keep the list where it is, and scroll it
-    /// when the pointer is past the top or bottom. Runs every frame of the drag.
+    /// The double-click interval after click `id` passed: if no press came since, the list may
+    /// follow again, and the link is returned to open.
+    fn settle(&self, id: u64) -> Option<Option<Arc<str>>> {
+        let mut pending = self.pending.borrow_mut();
+        if pending.as_ref().is_none_or(|click| click.id != id) {
+            return None;
+        }
+        let click = pending.take()?;
+        drop(pending);
+        if self.drag.borrow().is_none() && !self.has_selection() {
+            self.resume_following();
+        }
+        Some(click.link)
+    }
+
+    /// Whether the list already shows its first (`up`) or last message in full, so scrolling
+    /// further that way does nothing.
+    fn at_end(&self, up: bool, bounds: Bounds<Pixels>) -> bool {
+        let Some(list) = &self.list else {
+            return true;
+        };
+        let first = self.first_seq.get();
+        let rows = self.rows.borrow();
+        if up {
+            rows.iter()
+                .any(|row| row.seq == first && row.bounds.top() >= bounds.top() - px(0.5))
+        } else {
+            let last = (first + list.item_count() as u64).saturating_sub(1);
+            rows.iter()
+                .any(|row| row.seq == last && row.bounds.bottom() <= bounds.bottom() + px(0.5))
+        }
+    }
+
+    /// Each frame: keep the list held while it should be (GPUI re-engages following whenever the
+    /// list is at its end), and scroll it while a drag is past its top or bottom.
     fn tick(&self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
         let Some(list) = &self.list else {
             return false;
         };
-        let dragging = self.drag.borrow().as_ref().is_some_and(|drag| drag.moved);
-        // While something is selected (or being dragged over), keep still. GPUI re-engages
-        // following whenever the list is at its end, so this checks every frame.
-        if !(dragging || self.has_selection()) {
+        let (pressed, dragging) = match self.drag.borrow().as_ref() {
+            Some(drag) => (true, drag.moved),
+            None => (false, false),
+        };
+        let waiting = self.pending.borrow().is_some();
+        if !(pressed || waiting || self.has_selection()) {
             // Following again by other means (scrolled to the end, the pill): nothing to resume.
             if list.is_following_tail() {
                 self.resume.set(false);
             }
             return false;
         }
-        if list.is_following_tail()
-            && let Some(top) = self.scroll_top()
-        {
-            list.scroll_to(top);
-            self.resume.set(true);
-        }
+        self.hold();
         if !dragging {
             return false;
         }
@@ -539,9 +670,11 @@ impl Surface {
         } else {
             return false;
         };
-        let step = (past.abs() / 4.0).clamp(AUTOSCROLL_MIN, AUTOSCROLL_MAX);
-        list.scroll_by(px(step.copysign(past)));
-        window.request_animation_frame();
+        if !self.at_end(past < 0.0, bounds) {
+            let step = (past.abs() / 4.0).clamp(AUTOSCROLL_MIN, AUTOSCROLL_MAX);
+            list.scroll_by(px(step.copysign(past)));
+            window.request_animation_frame();
+        }
         // The rows drawn this frame: the head moves to the first or last of them; the next frame
         // (scrolled) moves it further.
         self.drag_to(pointer)
@@ -555,7 +688,10 @@ impl Surface {
         cx: &mut App,
     ) {
         let view = window.current_view();
-        if self.tick(bounds, window) {
+        // The window was deactivated mid-press: its release may never arrive.
+        let active = window.is_window_active();
+        let lost = self.active.replace(active) && !active && self.abandon_press();
+        if self.tick(bounds, window) || lost {
             cx.notify(view);
         }
 
@@ -574,8 +710,9 @@ impl Surface {
 
         let surface = self.clone();
         let inside = hitbox;
+        let pressing = inside.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-            if !phase.bubble() || !inside.is_hovered(window) {
+            if !phase.bubble() || !pressing.is_hovered(window) {
                 return;
             }
             match event.button {
@@ -590,12 +727,26 @@ impl Surface {
             }
         });
 
+        // Kit opens the context menu on a long press too.
+        let surface = self.clone();
+        let pressed = inside.clone();
+        window.on_mouse_event(move |event: &LongPressEvent, phase, window, _| {
+            if phase.bubble() && event.phase == TouchPhase::Started && pressed.is_hovered(window) {
+                surface.aim_menu(event.start_position);
+            }
+        });
+
         let surface = self.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-            if phase.bubble()
-                && event.pressed_button == Some(MouseButton::Left)
-                && surface.drag_to(event.position)
-            {
+            if !phase.bubble() {
+                return;
+            }
+            let changed = if event.pressed_button == Some(MouseButton::Left) {
+                surface.drag_to(event.position)
+            } else {
+                surface.abandon_press()
+            };
+            if changed {
                 cx.notify(view);
             }
         });
@@ -605,13 +756,29 @@ impl Surface {
             if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
-            if let Some(url) = surface
-                .release(event.position)
-                .filter(|url| selection::openable(url))
-            {
-                cx.open_url(&url);
+            if let Some(id) = surface.release(event.position) {
+                surface.settle_later(id, view, cx);
             }
         });
+    }
+
+    /// Settles click `id` after the double-click interval: lets the list follow again, opens its
+    /// link.
+    fn settle_later(self: &Rc<Self>, id: u64, view: EntityId, cx: &mut App) {
+        let surface = self.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(DOUBLE_CLICK).await;
+            cx.update(|cx| {
+                let Some(link) = surface.settle(id) else {
+                    return;
+                };
+                if let Some(url) = link.filter(|url| selection::openable(url)) {
+                    cx.open_url(&url);
+                }
+                cx.notify(view);
+            });
+        })
+        .detach();
     }
 
     /// Resolves what a right-click at `position` is over, for the menu that is about to open.
@@ -629,6 +796,10 @@ impl Surface {
                 seq: hit.seq,
                 link: hit.link(),
             });
+        #[cfg(test)]
+        {
+            *self.last_aimed.borrow_mut() = target.clone();
+        }
         *self.menu_target.borrow_mut() = target;
     }
 }

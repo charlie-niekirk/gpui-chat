@@ -26,7 +26,7 @@ use gpui_kit::{
 use crate::actions::{ClosePane, SplitDown, SplitRight};
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
-use crate::chat::selection_layer::{ClearSelection, CopySelection};
+use crate::chat::selection_layer::CopySelection;
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
 use crate::splits::view::{DragChip, DraggedPane};
@@ -262,6 +262,8 @@ pub struct ChannelPane {
     in_split: bool,
     /// The header's width at the last paint (narrow splits get a compact header).
     header_width: Rc<Cell<f32>>,
+    /// Give the pane (its input box) keyboard focus at the next frame.
+    refocus: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -295,6 +297,12 @@ impl ChannelPane {
                             .update(cx, |composer, cx| composer.queue_reply(message.clone(), cx));
                     }
                 }
+                // Esc cleared the chat's selection: back to the input box (at the next frame,
+                // which has a window to focus in).
+                ChatViewEvent::SelectionDismissed => {
+                    this.refocus = true;
+                    cx.notify();
+                }
             }),
         );
         Self {
@@ -308,6 +316,7 @@ impl ChannelPane {
             focus_handle: cx.focus_handle(),
             in_split: false,
             header_width: Rc::new(Cell::new(f32::INFINITY)),
+            refocus: false,
             _subscriptions: subscriptions,
         }
     }
@@ -628,23 +637,18 @@ impl ChannelPane {
 }
 
 impl Render for ChannelPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
+        if std::mem::take(&mut self.refocus) {
+            cx.on_next_frame(window, |this, window, cx| this.focus(window, cx));
+        }
         v_flex()
             .id("channel-pane")
             .track_focus(&self.focus_handle)
-            // The chat's selection (PR 5.6). Here rather than on the chat, so the command palette
-            // reaches it with the input box focused too. Esc only acts when there is something to
-            // clear (then focus goes back to the input box); otherwise it goes on.
+            // Copy the chat's selection from the command palette with the input box focused (with
+            // the chat focused, the chat view handles ⌘C itself; PR 5.6).
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 if !this.chat.update(cx, |chat, cx| chat.copy_selection(cx)) {
-                    cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
-                if this.chat.update(cx, |chat, cx| chat.clear_selection(cx)) {
-                    this.focus(window, cx);
-                } else {
                     cx.propagate();
                 }
             }))
