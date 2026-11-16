@@ -4,3 +4,4 @@
 {"at_ms":16000,"to":"7tv","frame":{"op":0,"d":{"type":"emote_set.update","body":{"id":"$SET","kind":3,"updated":[{"key":"emotes","index":0,"type":"object","old_value":{"id":"01F6MQ33FG000FFJ97ZB8MWV52","name":"DemoCool"},"value":{"id":"01F6MQ33FG000FFJ97ZB8MWV52","name":"DemoChill","flags":0}}]}}}}
 {"at_ms":7000,"to":"bttv","frame":{"name":"emote_create","data":{"channel":"twitch:$ROOM","emote":{"id":"54fa925e01e468494b85b54d","code":"DemoOmega","imageType":"png"}}}}
 {"at_ms":14000,"to":"bttv","frame":{"name":"emote_delete","data":{"channel":"twitch:$ROOM","emoteId":"54fa925e01e468494b85b54d"}}}
+{"at_ms":20000,"to":"7tv","frame":{"op":0,"d":{"type":"user.update","body":{"id":"$USER","kind":1,"updated":[{"key":"connections","index":0,"type":"array","value":[{"key":"emote_set","type":"object","old_value":{"id":"$SET"},"value":{"id":"01HM27X8400002ERVESFGFZ97N"}}]}]}}}}

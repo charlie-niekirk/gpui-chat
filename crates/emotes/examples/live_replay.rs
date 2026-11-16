@@ -9,8 +9,8 @@
 //!
 //! Each script line is `{"at_ms": 4000, "to": "7tv" | "bttv", "frame": {...}}`: `frame` is sent
 //! `at_ms` after the app's *first subscription* to that socket. In 7TV frames the string `$SET` is
-//! replaced by the emote set id the app subscribed to, in BTTV frames `$ROOM` by the room id it
-//! joined. The 7TV server says `Hello` as the real one does. Ctrl-C stops it.
+//! replaced by the emote set id the app subscribed to and `$USER` by the 7TV user id it listens
+//! to for set switches, in BTTV frames `$ROOM` by the room id it joined. The 7TV server says `Hello` as the real one does. Ctrl-C stops it.
 
 use std::time::Duration;
 
@@ -73,6 +73,7 @@ async fn serve(
                 let _ = write.send(Message::text(hello)).await;
             }
             let mut started = false;
+            let user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             loop {
                 tokio::select! {
@@ -82,6 +83,11 @@ async fn serve(
                         };
                         println!("[{name}] <- {text}");
                         let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+                        if name == "7tv" && frame["d"]["type"] == "user.update" {
+                            if let Some(id) = frame["d"]["condition"]["object_id"].as_str() {
+                                *user.lock().unwrap() = id.to_owned();
+                            }
+                        }
                         // The first subscription starts the script.
                         let id = if name == "7tv" {
                             (frame["op"] == 35 && frame["d"]["type"] == "emote_set.update")
@@ -97,8 +103,10 @@ async fn serve(
                             for step in steps.iter().filter(|s| s.to == name) {
                                 let (tx, at) = (tx.clone(), step.at);
                                 let frame = step.frame.replace("$SET", &id).replace("$ROOM", &id);
+                                let user = user.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(at).await;
+                                    let frame = frame.replace("$USER", &user.lock().unwrap());
                                     let _ = tx.send(frame);
                                 });
                             }
