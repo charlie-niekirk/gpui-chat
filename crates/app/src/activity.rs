@@ -199,12 +199,24 @@ impl Activity {
     }
 
     /// The user ignored someone (PR 5.7): their hits leave the log, and stop counting as unseen
-    /// mentions. Whether anything left.
-    pub fn drop_ignored(&mut self, ignores: &gpui_chat_core::Ignores) -> bool {
+    /// mentions. The messages that left.
+    pub fn drop_ignored(
+        &mut self,
+        ignores: &gpui_chat_core::Ignores,
+    ) -> Vec<(ChannelId, MessageId)> {
         if ignores.is_empty() {
-            return false;
+            return Vec::new();
         }
-        !self.retain(|e| !ignores.is_ignored(&e.message)).is_empty()
+        let gone: Vec<(ChannelId, MessageId)> = self
+            .mentions
+            .iter()
+            .filter(|e| ignores.is_ignored(&e.message))
+            .map(|e| (e.channel.clone(), e.message.id.clone()))
+            .collect();
+        if !gone.is_empty() {
+            self.retain(|e| !ignores.is_ignored(&e.message));
+        }
+        gone
     }
 
     /// The channel was closed: nothing of it is left to show.

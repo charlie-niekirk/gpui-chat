@@ -206,17 +206,103 @@ pub fn visibility(
     filters: &Filters,
     bots: &BotList,
 ) -> Visibility {
-    if ignores.is_ignored(message) {
-        return if ignores.show_collapsed() && !filters.is_active() {
+    visibility_with(
+        message,
+        || ignores.is_ignored(message),
+        ignores.show_collapsed(),
+        filters,
+        bots,
+    )
+}
+
+/// [`visibility`] with the (expensive) ignore verdict supplied by the caller, who may have it
+/// cached. The filters are checked first: they are a few comparisons, while `ignored` may read the
+/// text and run regular expressions, and a message a filter hides needs no verdict at all.
+pub fn visibility_with(
+    message: &Message,
+    ignored: impl FnOnce() -> bool,
+    show_collapsed: bool,
+    filters: &Filters,
+    bots: &BotList,
+) -> Visibility {
+    if filters.is_active() {
+        if !filters.matches(message, bots) || ignored() {
+            return Visibility::Hidden;
+        }
+        return Visibility::Shown;
+    }
+    if ignored() {
+        return if show_collapsed {
             Visibility::Collapsed
         } else {
             Visibility::Hidden
         };
     }
-    if filters.matches(message, bots) {
-        Visibility::Shown
-    } else {
-        Visibility::Hidden
+    Visibility::Shown
+}
+
+/// The ignore verdict of each message of a store, remembered by sequence number so that a filter
+/// change (typing `from:`, toggling *Links*) never runs the ignore phrases and regular expressions
+/// again over the whole scrollback. The owner forgets what is stale: everything when the ignores
+/// change or the store is renumbered ([`IgnoreCache::clear`]), single messages that were replaced
+/// ([`IgnoreCache::invalidate`]), and the evicted ones ([`IgnoreCache::trim`]).
+#[derive(Debug, Default)]
+pub struct IgnoreCache {
+    first: u64,
+    /// `0` not asked yet, `1` not ignored, `2` ignored; item `i` is message `first + i`.
+    verdicts: std::collections::VecDeque<u8>,
+}
+
+impl IgnoreCache {
+    /// Whether `message` (number `seq`) is ignored under `ignores`, asking only the first time.
+    pub fn ignored(&mut self, seq: u64, message: &Message, ignores: &Ignores) -> bool {
+        if seq < self.first {
+            return ignores.is_ignored(message);
+        }
+        let at = (seq - self.first) as usize;
+        if self.verdicts.len() <= at {
+            self.verdicts.resize(at + 1, 0);
+        }
+        match self.verdicts[at] {
+            0 => {
+                let ignored = ignores.is_ignored(message);
+                self.verdicts[at] = if ignored { 2 } else { 1 };
+                ignored
+            }
+            known => known == 2,
+        }
+    }
+
+    /// Forgets everything (the ignores changed, or the numbers did).
+    pub fn clear(&mut self) {
+        self.verdicts.clear();
+    }
+
+    /// Forgets the verdict of message `seq` (it was replaced by another message).
+    pub fn invalidate(&mut self, seq: u64) {
+        if let Some(at) = seq.checked_sub(self.first)
+            && let Some(slot) = self.verdicts.get_mut(at as usize)
+        {
+            *slot = 0;
+        }
+    }
+
+    /// Drops the verdicts of messages before `first` (evicted from the store).
+    pub fn trim(&mut self, first: u64) {
+        while self.first < first && !self.verdicts.is_empty() {
+            self.verdicts.pop_front();
+            self.first += 1;
+        }
+        self.first = self.first.max(first);
+    }
+
+    /// How many verdicts are remembered (for tests).
+    pub fn len(&self) -> usize {
+        self.verdicts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verdicts.is_empty()
     }
 }
 
@@ -397,5 +483,61 @@ mod tests {
             bots: vec!["fine".into(), "no spaces".into()],
         };
         assert!(bad.first_problem().unwrap().starts_with("bot 2: "));
+    }
+
+    #[test]
+    fn the_ignore_cache_asks_once_and_forgets_what_is_stale() {
+        let (ignores, _) = Ignores::compile(&IgnoreConfig {
+            users: vec!["spam".into()],
+            ..IgnoreConfig::default()
+        });
+        let mut cache = IgnoreCache::default();
+        let spam = said("spam", "x");
+        let fine = said("alice", "x");
+        assert!(cache.ignored(5, &spam, &ignores));
+        assert!(!cache.ignored(6, &fine, &ignores));
+        // Remembered: the answer does not come from the message this time.
+        assert!(cache.ignored(5, &fine, &ignores));
+        cache.invalidate(5);
+        assert!(!cache.ignored(5, &fine, &ignores));
+        // A message before the first remembered one is answered but not remembered.
+        cache.trim(6);
+        assert!(!cache.ignored(2, &fine, &ignores));
+        assert!(cache.ignored(2, &spam, &ignores));
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn filters_are_checked_before_the_ignore_verdict_is_asked() {
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            false
+        };
+        let links = Filters {
+            links: true,
+            ..Filters::default()
+        };
+        let bots = bots();
+        assert_eq!(
+            visibility_with(&said("a", "plain"), ask, false, &links, &bots),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "a message the filter hides needs no verdict"
+        );
+        assert_eq!(
+            visibility_with(&with_link("a"), ask, false, &links, &bots),
+            Visibility::Shown
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            visibility_with(&said("a", "x"), || true, true, &Filters::default(), &bots),
+            Visibility::Collapsed
+        );
     }
 }

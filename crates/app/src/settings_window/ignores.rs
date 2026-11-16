@@ -325,6 +325,7 @@ pub fn page(this: &WeakEntity<SettingsView>) -> SettingPage {
 fn block_row(cx: &App) -> impl IntoElement + use<> {
     let tokens = *cx.global::<Tokens>();
     let status = ignores::current(cx).map(|hub| hub.read(cx).status().clone());
+    let refresh = matches!(status, Some(BlockStatus::Ready(_) | BlockStatus::Failed(_)));
     let (text, enable) = match status {
         None => (
             "Not available in this run (offline modes never use an account).".to_owned(),
@@ -355,6 +356,16 @@ fn block_row(cx: &App) -> impl IntoElement + use<> {
                     .child(text),
             ),
         )
+        .children(refresh.then(|| {
+            Button::new("settings-refresh-block-list")
+                .small()
+                .label("Refresh")
+                .on_click(|_, _, cx| {
+                    if let Some(hub) = ignores::current(cx) {
+                        hub.update(cx, |hub, cx| hub.refresh(cx));
+                    }
+                })
+        }))
         .children(enable.then(|| {
             Button::new("settings-enable-block-list")
                 .small()

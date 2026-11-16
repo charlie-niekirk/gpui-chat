@@ -70,12 +70,18 @@ impl Core {
         }
     }
 
-    /// Takes what is ignored now. Whether the Mentions log changed because of it (entries of
-    /// users who are ignored now leave it).
-    pub fn set_ignores(&mut self, ignores: Arc<Ignores>) -> bool {
-        let dropped = self.activity.drop_ignored(&ignores);
+    /// Takes what is ignored now. Entries of users who are ignored now leave the Mentions log, a
+    /// summary is not held for them and their banners are taken back: whether the log changed, and
+    /// the tags of the notifications to dismiss.
+    pub fn set_ignores(&mut self, ignores: Arc<Ignores>) -> (bool, Vec<String>) {
+        let gone = self.activity.drop_ignored(&ignores);
         self.ignores = ignores;
-        dropped
+        let mut tags = Vec::new();
+        for (channel, id) in &gone {
+            self.coalescer.forget(channel, id);
+            tags.push(notifications::message_tag(channel, id));
+        }
+        (!gone.is_empty(), tags)
     }
 
     /// Takes new rules (what `[highlights]` says now). Whether they differ from the ones in force.
@@ -275,7 +281,11 @@ impl Attention {
             if let Some(hub) = crate::ignores::current(cx) {
                 core.set_ignores(hub.read(cx).engine());
                 subscriptions.push(cx.observe(&hub, |this: &mut Self, hub, cx| {
-                    if this.core.set_ignores(hub.read(cx).engine()) {
+                    let (changed, dismiss) = this.core.set_ignores(hub.read(cx).engine());
+                    for tag in &dismiss {
+                        notify::dismiss(tag, cx);
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }));
@@ -531,17 +541,39 @@ mod tests {
     }
 
     #[test]
+    fn ignoring_someone_takes_their_held_notifications_back_so_no_summary_names_them() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        let t0 = Instant::now();
+        // The first notifies, the next two are held for the summary.
+        for (id, login) in [("1", "alice"), ("2", "spammer"), ("3", "spammer")] {
+            core.process(
+                Some("viewer"),
+                &mut [chat("b", id, login, "hi viewer")],
+                &|_| false,
+                t0,
+            );
+        }
+        assert!(core.coalescer.summary_due().is_some());
+        let (_, tags) = core.set_ignores(ignoring(&["spammer"], &[]));
+        assert_eq!(tags, ["hit:b:2", "hit:b:3"]);
+        assert!(
+            core.coalescer.summary_due().is_none(),
+            "nothing is left to summarise"
+        );
+    }
+
+    #[test]
     fn ignoring_someone_takes_their_earlier_hits_out_of_the_log() {
         let mut core = core_watching(HighlightConfig::default(), "a");
         run(&mut core, &mut [chat("b", "1", "spammer", "hi viewer")]);
         run(&mut core, &mut [chat("b", "2", "alice", "hi viewer")]);
         let b = ChannelId::new("b");
         assert_eq!(core.activity.unseen_mentions(&b), 2);
-        assert!(core.set_ignores(ignoring(&["spammer"], &[])));
+        assert!(core.set_ignores(ignoring(&["spammer"], &[])).0);
         assert_eq!(core.activity.unseen_mentions(&b), 1);
         assert_eq!(core.activity.mention_count(), 1);
         assert!(
-            !core.set_ignores(ignoring(&["spammer"], &[])),
+            !core.set_ignores(ignoring(&["spammer"], &[])).0,
             "nothing more to drop"
         );
     }

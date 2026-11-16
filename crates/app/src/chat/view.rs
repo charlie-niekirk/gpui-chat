@@ -46,7 +46,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_chat_core::{
-    BotList, ChannelRole, Filters, Ignores, Message, MessageId, Rebuild, visibility,
+    BotList, ChannelRole, Filters, IgnoreCache, Ignores, Message, MessageId, Rebuild, Visibility,
+    visibility_with,
 };
 use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -131,6 +132,9 @@ pub enum ChatViewEvent {
         login: String,
         user_id: Option<String>,
     },
+    /// A jump went to a message that is hidden because its author is ignored (PR 5.7): the owner
+    /// says so instead of leaving the user wondering why nothing moved.
+    MessageHidden,
     /// *Unblock on Twitch* was chosen for this user.
     UnblockUser {
         login: String,
@@ -152,8 +156,13 @@ pub struct ChatView {
     ignore_generation: u64,
     /// The find bar's filters (PR 5.7).
     filters: Filters,
-    /// The find bar and its search, while it is open (PR 5.7).
+    /// Whether each message is ignored, asked once ([`IgnoreCache`]).
+    ignore_cache: RefCell<IgnoreCache>,
+    /// The find bar, while it is open (PR 5.7).
     find: Option<find::Find>,
+    /// The search over the store's text: kept after the bar closes (the index is the costly part
+    /// and is only brought up to date while the bar is open).
+    search: gpui_chat_core::Search,
     cache: Rc<RefCell<LayoutCache>>,
     text_config: Option<TextConfig>,
     generation: u64,
@@ -228,15 +237,24 @@ impl ChatView {
             },
         );
         let filters = Filters::default();
+        let ignore_cache = RefCell::new(IgnoreCache::default());
         let (rows, rebuilds_seen) = {
             let messages = store.read(cx).messages();
             let mut rows = Rows::new(messages.first_seq(), messages.next_seq());
             // Ignored users are hidden from the first frame.
             if !engine.is_empty() {
                 let shows = |seq: u64| {
-                    messages.get_by_seq(seq).is_none_or(|message| {
-                        visibility(message, &engine, &filters, &bots).is_visible()
-                    })
+                    messages
+                        .get_by_seq(seq)
+                        .map_or(Visibility::Shown, |message| {
+                            visibility_with(
+                                message,
+                                || ignore_cache.borrow_mut().ignored(seq, message, &engine),
+                                engine.show_collapsed(),
+                                &filters,
+                                &bots,
+                            )
+                        })
                 };
                 rows.show_only(Some(&shows), messages.first_seq(), messages.next_seq());
             }
@@ -282,7 +300,9 @@ impl ChatView {
             bots,
             ignore_generation,
             filters,
+            ignore_cache,
             find: None,
+            search: gpui_chat_core::Search::new(),
             cache,
             text_config: None,
             generation: 0,
@@ -361,6 +381,8 @@ impl ChatView {
         }
         let seq = self.store.read(cx).messages().seq_of(id.as_str());
         if let Some(seq) = seq {
+            // An opened ignored line is the message now (searched, copied, with its menu).
+            self.rows.borrow_mut().open_placeholder(seq);
             self.remeasure_seqs(&[seq]);
         }
         cx.notify();
@@ -605,8 +627,11 @@ impl ChatView {
             .messages()
             .get_by_seq(seq)
             .map(|message| message.id.clone());
-        if let Some(id) = id {
-            self.scroll_to_message(&id, cx);
+        if let Some(id) = id
+            && !self.scroll_to_message(&id, cx)
+            && self.is_hidden_by_ignore(&id, cx)
+        {
+            cx.emit(ChatViewEvent::MessageHidden);
         }
     }
 
@@ -689,10 +714,22 @@ impl ChatView {
         let (replaced, serial) = self.store.read(cx).replaced_since(self.replaced_seen);
         if serial != self.replaced_seen {
             self.replaced_seen = serial;
-            match replaced {
-                Some(seqs) => self.remeasure_seqs(&seqs),
+            // What the replacement says may change: ignored or not, matching or not.
+            match &replaced {
+                Some(seqs) => {
+                    let mut cache = self.ignore_cache.borrow_mut();
+                    seqs.iter().for_each(|&seq| cache.invalidate(seq));
+                }
+                None => self.ignore_cache.borrow_mut().clear(),
+            }
+            match &replaced {
+                Some(seqs) => self.remeasure_seqs(seqs),
                 None => self.list.remeasure(),
             }
+            if self.hiding() {
+                self.update_rows(cx);
+            }
+            self.find_replaced(replaced.as_deref(), cx);
         }
         // Messages struck out: when removed ones are drawn collapsed that is another row height,
         // for those rows only.
@@ -717,10 +754,26 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Whether `message` gets a row: not ignored (or ignored and collapsed) and passing the
-    /// filters (PR 5.7).
-    fn shows(&self, message: &Message) -> bool {
-        visibility(message, &self.engine, &self.filters, &self.bots).is_visible()
+    /// What the chat draws for message `seq`: nothing, itself, or (ignored, with
+    /// `ignores.show_collapsed`) one collapsed line, unless the user opened that line (PR 5.7). The
+    /// filters are checked before the ignores, whose verdicts are cached.
+    pub(super) fn verdict(&self, seq: u64, message: &Message) -> Visibility {
+        let verdict = visibility_with(
+            message,
+            || {
+                self.ignore_cache
+                    .borrow_mut()
+                    .ignored(seq, message, &self.engine)
+            },
+            self.engine.show_collapsed(),
+            &self.filters,
+            &self.bots,
+        );
+        if verdict == Visibility::Collapsed && self.revealed.borrow().contains(&message.id) {
+            Visibility::Shown
+        } else {
+            verdict
+        }
     }
 
     /// Whether any message may be hidden, so the rows are an explicit list.
@@ -731,9 +784,14 @@ impl ChatView {
     /// Moves the list from the range it shows to `first..next` of the store's sequence numbers.
     fn sync_range(&mut self, first: u64, next: u64, cx: &App) {
         let previous_next = self.rows.borrow().next_seq();
+        self.ignore_cache.borrow_mut().trim(first);
         let change: Change = {
             let messages = self.store.read(cx).messages();
-            let shows = |seq: u64| messages.get_by_seq(seq).is_none_or(|m| self.shows(m));
+            let shows = |seq: u64| {
+                messages
+                    .get_by_seq(seq)
+                    .map_or(Visibility::Shown, |m| self.verdict(seq, m))
+            };
             self.rows.borrow_mut().sync(first, next, &shows)
         };
         if !change.is_empty() {
@@ -758,14 +816,21 @@ impl ChatView {
     /// brought are inserted, and everything keyed by an old sequence number is moved to its new one.
     fn apply_rebuild(&mut self, rebuild: &Rebuild, cx: &App) {
         self.sync_range(rebuild.old_first, rebuild.old_next, cx);
+        // Every number moved: the remembered verdicts belong to the old ones.
+        self.ignore_cache.borrow_mut().clear();
         let splices = {
             let messages = self.store.read(cx).messages();
-            let shows = |seq: u64| messages.get_by_seq(seq).is_none_or(|m| self.shows(m));
+            let shows = |seq: u64| {
+                messages
+                    .get_by_seq(seq)
+                    .map_or(Visibility::Shown, |m| self.verdict(seq, m))
+            };
             self.rows.borrow_mut().renumber(
                 &|old| rebuild.map_seq(old),
                 rebuild.new_first,
                 rebuild.new_next,
-                self.hiding().then_some(&shows as &dyn Fn(u64) -> bool),
+                self.hiding()
+                    .then_some(&shows as &dyn Fn(u64) -> Visibility),
             )
         };
         self.apply_splices(&splices);
@@ -782,6 +847,10 @@ impl ChatView {
         self.surface.remap(&map);
         if let Some(panel) = &self.thread {
             panel.surface.remap(&map);
+        }
+        // The match the user was on follows its message (gone: none).
+        if let Some(find) = &mut self.find {
+            find.current = find.current.and_then(|seq| rebuild.map_seq(seq));
         }
         // The row under the pointer is found again by the next mouse move.
         self.hovered.set(None);
@@ -1060,8 +1129,7 @@ impl Render for ChatView {
             deleted: config.deleted,
             revealed: self.revealed.clone(),
             own_login: own_login.clone(),
-            ignored: (self.engine.show_collapsed() && !self.filters.is_active())
-                .then(|| self.engine.clone()),
+            rows: self.rows.clone(),
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -3253,7 +3321,7 @@ mod tests {
             let expected: Vec<u64> = store
                 .messages()
                 .iter_with_seq()
-                .filter(|(_, m)| view.shows(m))
+                .filter(|(seq, m)| view.verdict(*seq, m).is_visible())
                 .map(|(seq, _)| seq)
                 .collect();
             assert_eq!(rows.seqs(), expected);
@@ -3430,7 +3498,8 @@ mod tests {
         cx.update(|window, cx| {
             input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
         });
-        h.view.update(cx, |view, cx| view.find_text_changed(cx));
+        h.view
+            .update(cx, |view, cx| view.find_text_changed(true, cx));
         cx.run_until_parked();
     }
 
@@ -3662,5 +3731,164 @@ mod tests {
         // With the bar closed Esc in the chat does what it did: nothing to clear, so it goes on.
         cx.simulate_keystrokes("escape");
         assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+    }
+
+    fn collapsing(users: &[&str]) -> Settings {
+        let mut settings = ignoring(users);
+        settings.ignores.show_collapsed = true;
+        settings
+    }
+
+    #[gpui_kit::test]
+    fn a_collapsed_ignored_line_is_not_copied_searched_or_offered_a_menu(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, collapsing(&["bo"]), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "one needle"),
+                said(1, "bo", "secret needle words"),
+                said(2, "al", "two"),
+            ],
+            cx,
+        );
+        assert_eq!(h.items(cx), 3);
+        assert!(h.view.read_with(cx, |v, _| v.surface.is_placeholder(1)));
+        // A selection across the placeholder copies the lines around it and nothing of it.
+        let from = point(px(1.0), point_of(&h, 0, 0, cx).y);
+        let to = point(px(799.0), point_of(&h, 2, 0, cx).y);
+        press(from, to, 1, cx);
+        let copied = selected(&h, cx).expect("something is selected");
+        assert!(
+            copied.contains("one needle") && copied.contains("two"),
+            "{copied}"
+        );
+        assert!(
+            !copied.contains("secret") && !copied.to_lowercase().contains("bo"),
+            "{copied}"
+        );
+        // The find bar does not search it: only the shown message counts, and the placeholder's
+        // hidden text and author find nothing.
+        open_find(&h, cx);
+        type_find(&h, "needle", cx);
+        let status = h.view.read_with(cx, |v, _| v.find_status().unwrap());
+        assert_eq!(status.matches, 1, "the ignored line is not a match");
+        type_find(&h, "secret", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            0
+        );
+        type_find(&h, "bo", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            0
+        );
+        // Opened by a click, it is the message: searched and copyable.
+        h.view
+            .update(cx, |view, cx| view.reveal(&MessageId::from("m1"), cx));
+        cx.run_until_parked();
+        assert!(!h.view.read_with(cx, |v, _| v.surface.is_placeholder(1)));
+        type_find(&h, "secret", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            1
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_from_token_waits_until_it_is_finished_and_each_prefix_does_not_filter(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, Settings::default(), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "alice", "x"),
+                said(1, "bob", "y"),
+                said(2, "alice", "z"),
+            ],
+            cx,
+        );
+        open_find(&h, cx);
+        let input = h
+            .view
+            .read_with(cx, |v, _| v.find.as_ref().unwrap().input.clone());
+        let type_text = |text: &str, settled: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+            });
+            h.view
+                .update(cx, |view, cx| view.find_text_changed(settled, cx));
+            cx.run_until_parked();
+        };
+        // Typing `from:alice` letter by letter: nothing is filtered while it may still grow.
+        for prefix in ["from:a", "from:al", "from:ali"] {
+            type_text(prefix, false, cx);
+            assert_eq!(h.items(cx), 3, "{prefix}");
+            assert!(
+                !h.view.read_with(cx, |v, _| v.filters().is_active()),
+                "{prefix}"
+            );
+        }
+        // A pause (the settle timer's call), Enter, or a space after it finishes it.
+        type_text("from:alice", true, cx);
+        assert_eq!(h.items(cx), 2);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.filters().from.clone())
+                .as_deref(),
+            Some("alice")
+        );
+        type_text("from:alice ", false, cx);
+        assert_eq!(h.items(cx), 2);
+        // The timer does fire on its own after the pause.
+        type_text("from:bob", false, cx);
+        assert_eq!(h.items(cx), 2, "still the old one while it may grow");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_match_the_user_is_on_follows_its_message_when_history_renumbers_the_store(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        let events: Vec<_> = (0..10)
+            .map(|n| said(n, "al", &format!("hit {n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        open_find(&h, cx);
+        type_find(&h, "hit", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find.as_ref().unwrap().current),
+            Some(9)
+        );
+        history_before(3, cx, &h);
+        let (current, position, matches) = h.view.read_with(cx, |v, _| {
+            let status = v.find_status().unwrap();
+            (
+                v.find.as_ref().unwrap().current,
+                status.position,
+                status.matches,
+            )
+        });
+        let newest = h.store.read_with(cx, |s, _| s.messages().seq_of("m9"));
+        assert_eq!(
+            current, newest,
+            "the match follows its message to its new number"
+        );
+        assert_eq!((position, matches), (Some(10), 10));
+        // Backspacing the query goes through the saved stages with the new numbers.
+        type_find(&h, "hi", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            10
+        );
     }
 }

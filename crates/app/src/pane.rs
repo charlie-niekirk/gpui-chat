@@ -632,6 +632,14 @@ impl ChannelPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Never the user themselves (the menu and the card do not offer it; a key can).
+        if let Some(hub) = crate::ignores::current(cx)
+            && let Err(why) = hub.read(cx).can_target(login, cx)
+        {
+            self.mod_notice = Some((why.into(), FailureKind::Other));
+            cx.notify();
+            return;
+        }
         if window.has_active_dialog(cx) {
             return;
         }
@@ -1135,6 +1143,13 @@ impl Render for ChannelPane {
                         user_id,
                         action,
                     } => this.user_action(login, user_id.clone(), *action, window, cx),
+                    ChatViewEvent::MessageHidden => {
+                        this.mod_notice = Some((
+                            "That message is hidden (ignored user).".into(),
+                            FailureKind::Other,
+                        ));
+                        cx.notify();
+                    }
                     ChatViewEvent::BlockUser { login, user_id } => {
                         this.confirm_block(login, user_id.clone(), window, cx);
                     }

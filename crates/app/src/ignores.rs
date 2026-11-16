@@ -19,6 +19,7 @@
 //! ([`BlockStatus::NeedsScope`]), nothing is requested and nothing fails.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_chat_core::{BotList, Ignores, ignore_user_problem};
 use gpui_chat_settings::{EditValue, SettingEdit};
@@ -58,9 +59,30 @@ impl BlockStatus {
             Self::Ready(0) => "Synced: nobody is blocked.".to_owned(),
             Self::Ready(1) => "Synced: 1 blocked user is ignored.".to_owned(),
             Self::Ready(n) => format!("Synced: {n} blocked users are ignored."),
-            Self::Failed(why) => format!("Could not load your block list ({why})"),
+            Self::Failed(why) => {
+                format!("Could not load your block list ({why}). Trying again shortly.")
+            }
         }
     }
+}
+
+/// How long to wait before asking for the block list again after a failure: 30 s, doubling to 15 min.
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs(30)
+        .saturating_mul(1 << failures.saturating_sub(1).min(5))
+        .min(REFRESH)
+}
+
+/// How often the synced block list is fetched again while it is in use, to pick up what was blocked
+/// or unblocked on twitch.tv.
+const REFRESH: Duration = Duration::from_secs(15 * 60);
+
+/// What the hub depends on in the account: when this changes, who is ignored may have.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AccountKey {
+    own: Option<String>,
+    user_id: Option<String>,
+    block_list: bool,
 }
 
 /// What is ignored, for the whole app. One per app, created at startup ([`init`]).
@@ -80,6 +102,11 @@ pub struct IgnoreHub {
     /// Numbers block list fetches so a stale answer is dropped.
     fetch: u64,
     _fetching: Option<Task<()>>,
+    /// Fetches the block list again: after a failure (backoff) or on the long refresh interval.
+    _timer: Option<Task<()>>,
+    /// Failed fetches in a row.
+    failures: u32,
+    account_key: AccountKey,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -114,8 +141,12 @@ impl IgnoreHub {
             generation: 0,
             fetch: 0,
             _fetching: None,
+            _timer: None,
+            failures: 0,
+            account_key: AccountKey::default(),
             _subscriptions: Vec::new(),
         };
+        hub.account_key = hub.account_key(cx);
         hub.rebuild(cx);
         let mut subscriptions = vec![cx.observe(&config::store(cx), |this, _, cx| {
             let settings = config::current(cx);
@@ -128,9 +159,15 @@ impl IgnoreHub {
         })];
         if let Some(account) = account::current(cx) {
             // Logging in or out changes who the user is and which block list applies.
+            // (The hub notifies for every step of a sign-in too: only a change of who the user is, or
+            // of what the login may do, matters here.)
             subscriptions.push(cx.observe(&account, |this, _, cx| {
-                this.rebuild(cx);
-                this.sync_block_list(false, cx);
+                let key = this.account_key(cx);
+                if key != this.account_key {
+                    this.account_key = key;
+                    this.rebuild(cx);
+                    this.sync_block_list(false, cx);
+                }
             }));
         }
         hub._subscriptions = subscriptions;
@@ -167,6 +204,32 @@ impl IgnoreHub {
         self.ignores.ignores_user(login)
     }
 
+    fn account_key(&self, cx: &App) -> AccountKey {
+        let block = Self::block_list_enabled(cx);
+        AccountKey {
+            own: self.own_login(cx),
+            user_id: block.as_ref().map(|(_, id)| id.clone()),
+            block_list: block.is_some_and(|(enabled, _)| enabled),
+        }
+    }
+
+    /// Whether `login` is the local user.
+    pub fn is_own(&self, login: &str, cx: &App) -> bool {
+        self.own_login(cx)
+            .is_some_and(|own| own.eq_ignore_ascii_case(login.trim().trim_start_matches('@')))
+    }
+
+    /// Why `login` cannot be ignored or blocked from here (the user themselves, or not a login).
+    pub fn can_target(&self, login: &str, cx: &App) -> Result<(), String> {
+        if self.is_own(login, cx) {
+            return Err("You cannot do that to yourself.".to_owned());
+        }
+        match ignore_user_problem(login) {
+            Some(problem) => Err(problem),
+            None => Ok(()),
+        }
+    }
+
     /// The local user: the account, or the offline stand-in.
     fn own_login(&self, cx: &App) -> Option<String> {
         if self.offline {
@@ -198,9 +261,7 @@ impl IgnoreHub {
     /// Adds `login` to `[ignores] users` (written to `settings.toml`; it takes effect at once).
     pub fn ignore_user(&mut self, login: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let login = gpui_chat_core::highlight::normalise_user(login);
-        if let Some(problem) = ignore_user_problem(&login) {
-            return Err(problem);
-        }
+        self.can_target(&login, cx)?;
         if self.is_listed(&login) {
             return Ok(());
         }
@@ -250,6 +311,8 @@ impl IgnoreHub {
                 // Nothing to use: forget what another account (or an earlier setting) had.
                 self.fetch += 1;
                 self._fetching = None;
+                self._timer = None;
+                self.failures = 0;
                 let changed = !self.blocked.is_empty() || self.status != status;
                 self.blocked.clear();
                 self.blocked_for = None;
@@ -269,8 +332,17 @@ impl IgnoreHub {
         let Some(helix) = crate::user_directory::helix(cx) else {
             return;
         };
+        // Another account's list never applies to this one, not even while its own loads.
+        if self.blocked_for.as_deref() != Some(user_id.as_str())
+            && (!self.blocked.is_empty() || self.blocked_for.is_some())
+        {
+            self.blocked.clear();
+            self.blocked_for = None;
+            self.rebuild(cx);
+        }
         self.fetch += 1;
         let epoch = self.fetch;
+        self._timer = None;
         self.status = BlockStatus::Loading;
         let (done, outcome) = oneshot::channel();
         drop(runtime::spawn_backend(cx, async move {
@@ -289,14 +361,18 @@ impl IgnoreHub {
                         this.status = BlockStatus::Ready(users.len());
                         this.blocked = users;
                         this.blocked_for = Some(user_id);
+                        this.failures = 0;
+                        this.schedule_refresh(REFRESH, cx);
                     }
                     Err(error) => {
                         tracing::info!(%error, "could not load the Twitch block list");
-                        this.status = if error.is_missing_scope() {
-                            BlockStatus::NeedsScope
+                        if error.is_missing_scope() {
+                            this.status = BlockStatus::NeedsScope;
                         } else {
-                            BlockStatus::Failed(error.to_string())
-                        };
+                            this.status = BlockStatus::Failed(error.to_string());
+                            this.failures += 1;
+                            this.schedule_refresh(backoff(this.failures), cx);
+                        }
                     }
                 }
                 this.rebuild(cx);
@@ -304,6 +380,20 @@ impl IgnoreHub {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Fetches the block list again in `delay` (replacing a fetch already due).
+    fn schedule_refresh(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        self._timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| this.sync_block_list(true, cx))
+                .ok();
+        }));
+    }
+
+    /// Fetches the block list now (*Refresh* on the Ignores page, and the retry after a failure).
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.sync_block_list(true, cx);
     }
 
     /// Blocks `login` on Twitch (`user_id` when the message supplied it, else looked up first) and
@@ -340,6 +430,14 @@ impl IgnoreHub {
                 gpui_chat_twitch::auth::AuthError::NotLoggedIn,
             ))));
         };
+        // Never the user themselves, by name or by account id.
+        let own_id = account_id(cx);
+        if self.is_own(&login, cx) || (user_id.is_some() && user_id == own_id) {
+            return Task::ready(Err(BlockError::Rejected {
+                status: 0,
+                message: "You cannot block yourself.".to_owned(),
+            }));
+        }
         // The id of an account is what Twitch blocks; the one the message carried is the account
         // that sent it (a name may have moved to another account since).
         let known = user_id.or_else(|| {
@@ -383,6 +481,15 @@ impl IgnoreHub {
             };
             let id = result?;
             this.update(cx, |this, cx| {
+                // The list is only touched while it is in use and belongs to the account that
+                // blocked (a list another account, or nobody, had must not take this on); with
+                // sync on and nothing loaded yet, the next fetch picks the change up.
+                if !this.ignores.sync_block_list || this.blocked_for.is_none() {
+                    if this.ignores.sync_block_list {
+                        this.sync_block_list(true, cx);
+                    }
+                    return;
+                }
                 this.blocked.retain(|user| user.id != id);
                 if block {
                     this.blocked.push(BlockedUser {
@@ -400,6 +507,15 @@ impl IgnoreHub {
             Ok(())
         })
     }
+}
+
+/// The user id of the logged-in account.
+fn account_id(cx: &App) -> Option<String> {
+    let hub = account::current(cx)?;
+    hub.read(cx)
+        .state()
+        .account()
+        .map(|account| account.user_id.clone())
 }
 
 fn write_users(users: Vec<String>, cx: &mut Context<IgnoreHub>) -> Result<(), String> {
@@ -513,6 +629,31 @@ mod tests {
             assert_eq!(*hub.status(), BlockStatus::Off);
             assert!(!hub.is_blocked("anyone"));
         });
+    }
+
+    #[gpui_kit::test]
+    fn the_user_cannot_be_ignored_or_blocked(cx: &mut TestAppContext) {
+        let hub = start(Settings::default(), cx);
+        let result = hub.update(cx, |hub, cx| {
+            hub.ignore_user(crate::attention::OFFLINE_LOGIN, cx)
+        });
+        assert!(result.unwrap_err().contains("yourself"));
+        let result = hub.update(cx, |hub, cx| hub.ignore_user("@Viewer", cx));
+        assert!(result.is_err(), "whatever the capitals");
+        hub.read_with(cx, |hub, cx| {
+            assert!(hub.is_own("VIEWER", cx) && !hub.is_own("someone", cx));
+            assert!(hub.can_target("someone", cx).is_ok());
+            assert!(hub.can_target("viewer", cx).is_err());
+            assert!(hub.can_target("not a login", cx).is_err());
+        });
+    }
+
+    #[test]
+    fn a_failed_block_list_is_asked_again_with_growing_pauses_up_to_the_refresh_interval() {
+        let pauses: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(pauses, [30, 60, 120, 240, 480, 900, 900, 900]);
+        assert_eq!(backoff(0).as_secs(), 30);
+        assert_eq!(REFRESH.as_secs(), 900);
     }
 
     #[test]

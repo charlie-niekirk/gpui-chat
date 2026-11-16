@@ -486,9 +486,18 @@ impl AppShell {
         if let (Some(id), Some(pane)) = (message, self.panes.get(channel).cloned()) {
             let found = pane.update(cx, |pane, cx| pane.show_message(id, cx));
             if !found {
-                // It left the scrollback while the hit sat in the log: say so instead of showing
-                // the channel as if nothing had been asked.
-                self.show_notice("That message is no longer in the scrollback.", cx);
+                // It left the scrollback while the hit sat in the log (or is hidden because its
+                // author is ignored): say so instead of showing the channel as if nothing had
+                // been asked.
+                let ignored = pane.read(cx).chat().read(cx).is_hidden_by_ignore(id, cx);
+                self.show_notice(
+                    if ignored {
+                        "That message is hidden (ignored user)."
+                    } else {
+                        "That message is no longer in the scrollback."
+                    },
+                    cx,
+                );
             }
         }
         self.attention

@@ -41,7 +41,10 @@ pub use event::{
     ChannelRole, ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState,
     RoomStateUpdate,
 };
-pub use filter::{BotList, DEFAULT_BOTS, FilterConfig, Filters, MAX_BOTS, Visibility, visibility};
+pub use filter::{
+    BotList, DEFAULT_BOTS, FilterConfig, Filters, IgnoreCache, MAX_BOTS, Visibility, visibility,
+    visibility_with,
+};
 pub use highlight::{
     HighlightColor, HighlightConfig, HighlightRule, HighlightUser, Highlights, Hit, HitReason, Own,
     ProblemKind, RuleKind, RuleProblem, rule_problem, user_problem,

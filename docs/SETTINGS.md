@@ -306,7 +306,8 @@ name. A bad rule makes the file invalid like any other bad value (`ignores.rules
   already said and unignoring brings it back (it is still in the scrollback); an entry already in the Mentions log leaves it
   when its author is ignored. A message that was already counted as unread before the ignore is not un-counted.
 - **Collapsed.** `show_collapsed = true` draws each ignored message as one muted line, `1 ignored message` (no name, no text),
-  that a click opens. A chat with a find-bar filter on shows no placeholders.
+  that a click opens. The line is only a placeholder: it is not searched, not copied with a selection and has no menu until it is
+  opened. A chat with a find-bar filter on shows no placeholders.
 - **Where to ignore.** The settings window's *Ignores* page (one entry per line; phrases take `{anywhere}`), the right-click
   menu of a message (*Ignore user* / *Unignore user*), the user card, and the `IgnoreUser` / `UnignoreUser` actions (the author
   of the selected message; ⌘K).
@@ -317,7 +318,9 @@ name. A bad rule makes the file invalid like any other bad value (`ignores.rules
   scopes are opt-in**, like the moderation ones: a normal login does not ask for them, nobody is told to log in again, and
   they are requested together by **Enable block list sync…** (account menu, *Settings → Account* or *Ignores*, or the button on
   the strip a failed block shows). Logging in again later keeps them. Without them nothing is requested and nothing fails: the
-  page says the list is not synced, and a block attempt says how to enable it. Offline runs never use an account.
+  page says the list is not synced, and a block attempt says how to enable it. The list is fetched again every 15 minutes while sync is on, after a failure with a growing
+  pause (30 s up to 15 min) and by the **Refresh** button on the Ignores page. You can never ignore or block yourself. Offline runs
+  never use an account.
 
 `[filters] bots` is the list the find bar's **No bots** filter hides (the default is nightbot, streamelements, streamlabs,
 moobot, fossabot, wizebot, sery_bot); a bot's *chat* lines are hidden, its event cards are not.
@@ -326,9 +329,10 @@ moobot, fossabot, wizebot, sery_bot); a bot's *chat* lines are hidden, its event
 messages (case-insensitive, the author's name and login, the body with emotes by code), the bar shows `3 of 12`, Enter / ↓ goes to
 the next (newer) match, Shift-Enter / ↑ to the previous (older), wrapping; matches are drawn behind the text in the theme's warning
 colour and the current one stronger; Esc closes the bar and gives the input box focus back. `from:login` in the text is a filter
-(only that user's messages), not a search term. **Mentions**, **Links** and **No bots** toggle the other filters (mentions and
+(only that user's messages), not a search term; it applies once the token is finished (a space, Enter, or a short pause), not on each
+letter. **Mentions**, **Links** and **No bots** toggle the other filters (mentions and
 highlights only, messages with a link only, bots hidden). Filtering hides the rows that do not match and a strip says
-`Showing 12 of 1000 messages · from alice · mentions` with **Clear filter**, whether the bar is open or not (Esc closes the
+`Showing 12 of 1000 messages · from alice · mentions` (`(incl. ignored)` after the count while anything is ignored) with **Clear filter**, whether the bar is open or not (Esc closes the
 bar, not the filters). Clicking a Mentions row for a message a filter hides clears the filter first. The search keeps an index of
 the channel's text and updates it incrementally (typing looks only at what matched before, a new message is checked once),
 so it stays smooth at the largest scrollback (100 000) and at `--firehose 1000`.

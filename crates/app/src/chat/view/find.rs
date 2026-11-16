@@ -19,7 +19,7 @@
 //! [`ChatViewEvent::SelectionDismissed`]); it does not touch the box's own Esc chain (completion
 //! list, then reply mode), which only runs while the box is focused.
 
-use gpui_chat_core::{Filters, Needle, Search, parse_query};
+use gpui_chat_core::{Filters, Needle, Visibility, parse_query};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{
@@ -50,24 +50,83 @@ pub fn bindings() -> Vec<gpui_kit::KeyBinding> {
 }
 
 /// What the rows draw for the text being searched for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SearchHighlight {
     pub needle: Needle,
     /// The match the list was scrolled to.
     pub current: Option<u64>,
+    /// Where each row's matches are, remembered while the row's layout stays the same (the rows
+    /// ask every frame; the text and the needle change far less often).
+    pub ranges: std::rc::Rc<std::cell::RefCell<RangeCache>>,
+}
+
+/// The matches in the rows drawn lately, by message and layout (the address of the shaped message,
+/// which a new layout replaces).
+/// The byte ranges of the matches in one row.
+pub type Ranges = std::rc::Rc<[std::ops::Range<usize>]>;
+
+#[derive(Debug, Default)]
+pub struct RangeCache {
+    entries: std::collections::HashMap<u64, (usize, Ranges)>,
+}
+
+impl RangeCache {
+    /// Most rows kept; more than a screenful of rows is more than a frame ever asks for.
+    const LIMIT: usize = 512;
+
+    /// The matches of `needle` in `text`, the display text of message `seq` as laid out at
+    /// `layout` (an address that changes whenever the layout does).
+    pub fn get(
+        &mut self,
+        seq: u64,
+        layout: usize,
+        text: &str,
+        needle: &Needle,
+    ) -> std::rc::Rc<[std::ops::Range<usize>]> {
+        if let Some((at, ranges)) = self.entries.get(&seq)
+            && *at == layout
+        {
+            return ranges.clone();
+        }
+        if self.entries.len() >= Self::LIMIT {
+            self.entries.clear();
+        }
+        let ranges: std::rc::Rc<[std::ops::Range<usize>]> =
+            gpui_chat_core::find_ranges(text, needle).into();
+        self.entries.insert(seq, (layout, ranges.clone()));
+        ranges
+    }
 }
 
 /// An open find bar.
 pub(super) struct Find {
     pub(super) input: Entity<InputState>,
-    pub(super) search: Search,
     /// The match the list was last scrolled to; stepping goes on from it.
-    current: Option<u64>,
+    pub(super) current: Option<u64>,
     /// The text last read from the field.
     text: String,
+    /// Waits a moment after a `from:` token was typed before filtering by it, so each prefix of
+    /// a login does not filter the whole chat (see [`SETTLE`]).
+    settle: Option<gpui_kit::Task<()>>,
+    /// The highlight cache of the rows; a new one whenever the query changes.
+    ranges: std::rc::Rc<std::cell::RefCell<RangeCache>>,
     /// Text to put in the field at the next draw (a filter set from outside rewrites `from:`).
     pending_text: Option<String>,
     _subscription: Subscription,
+}
+
+/// How long a `from:` token that is still being typed waits before it filters (Enter or a space
+/// after it does not wait).
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether the last word of `text` is a `from:` token the user may still be typing.
+fn from_is_unfinished(text: &str) -> bool {
+    !text.ends_with(char::is_whitespace)
+        && text
+            .split_whitespace()
+            .next_back()
+            .and_then(|word| word.get(..5))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("from:"))
 }
 
 /// What the bar says about the matches.
@@ -97,22 +156,38 @@ impl FindStatus {
 }
 
 /// `Showing 12 of 1000 messages · from alice · mentions`.
-pub fn strip_label(shown: usize, total: usize, filters: &Filters) -> String {
+/// `total` counts every message the chat holds; with something ignored that includes the ignored
+/// ones (they are never counted as hidden by the filter), and the strip says so.
+pub fn strip_label(shown: usize, total: usize, filters: &Filters, ignoring: bool) -> String {
     format!(
-        "Showing {shown} of {total} message{} · {}",
+        "Showing {shown} of {total} message{}{} · {}",
         if total == 1 { "" } else { "s" },
+        if ignoring { " (incl. ignored)" } else { "" },
         filters.describe()
     )
+}
+
+impl ChatView {
+    /// Whether message `id` is in the scrollback but has no row because it is ignored (nothing else
+    /// hides it once the filters are off).
+    pub fn is_hidden_by_ignore(&self, id: &gpui_chat_core::MessageId, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .messages()
+            .seq_of(id.as_str())
+            .is_some_and(|seq| !self.rows.borrow().contains(seq))
+    }
 }
 
 impl ChatView {
     /// The text being searched for, for the rows to draw.
     pub(super) fn search_highlight(&self) -> Option<std::rc::Rc<SearchHighlight>> {
         let find = self.find.as_ref()?;
-        let needle = find.search.needle()?.clone();
+        let needle = self.search.needle()?.clone();
         Some(std::rc::Rc::new(SearchHighlight {
             needle,
             current: find.current,
+            ranges: find.ranges.clone(),
         }))
     }
 
@@ -126,12 +201,12 @@ impl ChatView {
     pub fn find_status(&self) -> Option<FindStatus> {
         let find = self.find.as_ref()?;
         Some(FindStatus {
-            matches: find.search.count(),
+            matches: self.search.count(),
             position: find
                 .current
-                .and_then(|seq| find.search.position_of(seq))
+                .and_then(|seq| self.search.position_of(seq))
                 .map(|at| at + 1),
-            searching: find.search.needle().is_some(),
+            searching: self.search.needle().is_some(),
         })
     }
 
@@ -175,21 +250,27 @@ impl ChatView {
                 &input,
                 window,
                 |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::Change => this.find_text_changed(cx),
-                    InputEvent::PressEnter { shift, .. } => this.find_step(!*shift, cx),
+                    InputEvent::Change => this.find_text_changed(false, cx),
+                    InputEvent::PressEnter { shift, .. } => {
+                        // Enter finishes a `from:` token being typed, then steps.
+                        this.find_text_changed(true, cx);
+                        this.find_step(!*shift, cx);
+                    }
                     InputEvent::Focus | InputEvent::Blur => {}
                 },
             );
-        let mut search = Search::new();
+        // The index outlives the bar (it is only brought up to date here, not rebuilt).
         let rows = self.rows.clone();
-        search.sync(self.store.read(cx).messages(), &move |seq| {
-            rows.borrow().contains(seq)
-        });
+        self.search
+            .sync(self.store.read(cx).messages(), &move |seq| {
+                rows.borrow().is_shown(seq)
+            });
         self.find = Some(Find {
             input,
-            search,
             current: None,
             text: start,
+            settle: None,
+            ranges: Default::default(),
             pending_text: None,
             _subscription: subscription,
         });
@@ -202,23 +283,50 @@ impl ChatView {
         if self.find.take().is_none() {
             return false;
         }
+        // No query, no matches; the index stays for the next time.
+        self.search.set_query("", &|_| false);
         cx.emit(ChatViewEvent::SelectionDismissed);
         cx.notify();
         true
     }
 
-    pub(super) fn find_text_changed(&mut self, cx: &mut Context<Self>) {
+    /// The field's text changed. `settled`: apply a `from:` token even if it may still be being
+    /// typed (Enter, or the pause after the last key); otherwise such a token waits for [`SETTLE`]
+    /// so each prefix of a login does not filter the whole chat.
+    pub(super) fn find_text_changed(&mut self, settled: bool, cx: &mut Context<Self>) {
         let Some(find) = &mut self.find else {
             return;
         };
         let text = find.input.read(cx).value().to_string();
-        if text == find.text {
+        if text == find.text && !settled {
             return;
         }
         find.text = text.clone();
-        let query = parse_query(&text);
+        let unfinished = !settled && from_is_unfinished(&text);
+        // A token still being typed is neither searched for nor applied yet.
+        let searched = if unfinished {
+            text.rsplit_once(char::is_whitespace)
+                .map_or("", |(rest, _)| rest)
+                .to_owned()
+        } else {
+            text.clone()
+        };
+        let typed = parse_query(&text);
+        let query = parse_query(&searched);
+        let from = if unfinished {
+            self.filters.from.clone()
+        } else {
+            typed.from.clone()
+        };
+        find.settle = (unfinished && typed.from != self.filters.from).then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SETTLE).await;
+                this.update(cx, |this, cx| this.find_text_changed(true, cx))
+                    .ok();
+            })
+        });
         let mut filters = self.filters.clone();
-        filters.set_from(query.from.as_deref());
+        filters.set_from(from.as_deref());
         if filters != self.filters {
             self.filters = filters;
             self.update_rows(cx);
@@ -226,20 +334,24 @@ impl ChatView {
             self.after_rows_changed(cx);
         }
         let rows = self.rows.clone();
-        let allowed = move |seq: u64| rows.borrow().contains(seq);
+        let allowed = move |seq: u64| rows.borrow().is_shown(seq);
+        let before = self.search.needle().cloned();
+        self.search.set_query(&query.text, &allowed);
         let Some(find) = &mut self.find else {
             return;
         };
-        find.search.set_query(&query.text, &allowed);
+        if self.search.needle() != before.as_ref() {
+            find.ranges = Default::default();
+        }
         // Typing keeps the match the user is on while it still matches, else goes to the newest.
         let keep = find
             .current
-            .is_some_and(|seq| find.search.position_of(seq).is_some());
+            .is_some_and(|seq| self.search.position_of(seq).is_some());
         let target = if keep {
             None
         } else {
             find.current = None;
-            find.search.step(None, false)
+            self.search.step(None, false)
         };
         if let Some(seq) = target {
             find.current = Some(seq);
@@ -253,7 +365,7 @@ impl ChatView {
         let Some(find) = &mut self.find else {
             return;
         };
-        let target = find.search.step(find.current, forward);
+        let target = self.search.step(find.current, forward);
         if let Some(seq) = target {
             find.current = Some(seq);
             self.jump_to_match(seq, cx);
@@ -278,18 +390,39 @@ impl ChatView {
     /// Takes the store's new messages into the search (after the rows took them).
     pub(super) fn sync_find(&mut self, cx: &mut Context<Self>) {
         let rows = self.rows.clone();
-        let allowed = move |seq: u64| rows.borrow().contains(seq);
+        let allowed = move |seq: u64| rows.borrow().is_shown(seq);
         let store = self.store.read(cx).messages();
         let Some(find) = &mut self.find else {
             return;
         };
-        find.search.sync(store, &allowed);
+        self.search.sync(store, &allowed);
         // The match the user was on left the scrollback.
         if find
             .current
-            .is_some_and(|seq| find.search.position_of(seq).is_none())
+            .is_some_and(|seq| self.search.position_of(seq).is_none())
         {
             find.current = None;
+        }
+    }
+
+    /// Messages were replaced in place (`None`: too many to name): their text is read again.
+    pub(super) fn find_replaced(&mut self, seqs: Option<&[u64]>, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            // The index is not kept up to date while the bar is closed: read it all at the next ⌘F.
+            self.search.invalidate_all();
+            return;
+        }
+        let rows = self.rows.clone();
+        let allowed = move |seq: u64| rows.borrow().is_shown(seq);
+        match seqs {
+            Some(seqs) => {
+                let store = self.store.read(cx).messages();
+                self.search.replaced(store, seqs, &allowed);
+            }
+            None => {
+                self.search.invalidate_all();
+                self.sync_find(cx);
+            }
         }
     }
 
@@ -358,12 +491,12 @@ impl ChatView {
     /// The rows follow the search: its matches are among the rows shown.
     fn after_rows_changed(&mut self, cx: &mut Context<Self>) {
         let rows = self.rows.clone();
-        let allowed = move |seq: u64| rows.borrow().contains(seq);
+        let allowed = move |seq: u64| rows.borrow().is_shown(seq);
         if let Some(find) = &mut self.find {
-            find.search.refilter(&allowed);
+            self.search.refilter(&allowed);
             if find
                 .current
-                .is_some_and(|seq| find.search.position_of(seq).is_none())
+                .is_some_and(|seq| self.search.position_of(seq).is_none())
             {
                 find.current = None;
             }
@@ -390,9 +523,14 @@ impl ChatView {
         };
         let splices = {
             let messages = self.store.read(cx).messages();
-            let shows = |seq: u64| messages.get_by_seq(seq).is_none_or(|m| self.shows(m));
+            let shows = |seq: u64| {
+                messages
+                    .get_by_seq(seq)
+                    .map_or(Visibility::Shown, |m| self.verdict(seq, m))
+            };
             self.rows.borrow_mut().show_only(
-                self.hiding().then_some(&shows as &dyn Fn(u64) -> bool),
+                self.hiding()
+                    .then_some(&shows as &dyn Fn(u64) -> Visibility),
                 first,
                 next,
             )
@@ -418,6 +556,8 @@ impl ChatView {
         let collapsing = self.engine.show_collapsed() || engine.show_collapsed();
         self.engine = engine;
         self.bots = bots;
+        // The verdicts remembered are the old ignores'.
+        self.ignore_cache.borrow_mut().clear();
         self.update_rows(cx);
         if collapsing {
             // A message is drawn as one line or in full: another height.
@@ -616,6 +756,7 @@ impl ChatView {
                     shown,
                     total,
                     &self.filters,
+                    !self.engine.is_empty(),
                 )))
                 .child(
                     Button::new("filter-clear")
@@ -662,12 +803,16 @@ mod tests {
         filters.set_from(Some("alice"));
         filters.mentions = true;
         assert_eq!(
-            strip_label(12, 1000, &filters),
+            strip_label(12, 1000, &filters, false),
             "Showing 12 of 1000 messages · from alice · mentions"
         );
         assert_eq!(
-            strip_label(1, 1, &filters),
+            strip_label(1, 1, &filters, false),
             "Showing 1 of 1 message · from alice · mentions"
+        );
+        assert_eq!(
+            strip_label(3, 40, &filters, true),
+            "Showing 3 of 40 messages (incl. ignored) · from alice · mentions"
         );
     }
 }

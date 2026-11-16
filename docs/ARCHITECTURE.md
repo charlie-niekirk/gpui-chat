@@ -588,10 +588,18 @@ tested in `gpui-chat-core`; the app only draws it.
   ascending list of the sequence numbers that have a row. `sync` (evictions at the front, appended messages at the back, each
   asked whether it gets a row), `show_only` (the filter changed: the new list is diffed against the old one, `diff_rows`) and
   `renumber` (a history merge: old rows renumbered through `Rebuild::map_seq`, the new store range filtered, diffed) all return
-  `Splice`s, so the list is still only ever *spliced*: measured rows and the scroll position of what stays survive every change.
+  `Splice`s (and a row can be a *placeholder*, `Rows::is_placeholder`: the `1 ignored message` line of an ignored message
+  with `show_collapsed`; it is a row, but the message is not on screen, so it is not searched, not copied and has no
+  right-click menu, until a click opens it), so the list is still only ever *spliced*: measured rows and the scroll position of what stays survive every change.
   Everything that mapped a message to an item through `first_seq` goes through `Rows` now (`index_of` / `seq_at`): the render
   closure, `scroll_to_message`, `remeasure_seqs`, the pill's count (`rows_from`), and the selection surface (`set_rows`: scrolling
   to hold the list, the autoscroll's first / last row, and **copying skips hidden rows** between the two ends of a selection).
+- **Visibility is cheap per keystroke.** `core::visibility_with` checks the filters (a few comparisons) *before* it asks whether
+  a message is ignored, and the ignore verdict (text read, phrases, `RegexSet`) is cached per message
+  (`core::IgnoreCache`, forgotten when the ignores change, the store is renumbered or a message is replaced in place). Typing
+  `from:` therefore never runs the ignore rules again over the scrollback, and a `from:` token that may still be being typed is
+  not applied until it is finished (a space after it, Enter, or 250 ms without a key), so each prefix of a login is not a filter
+  of its own.
 - **The view (`chat/view/find.rs`).** `ChatView` has the `Rows`, the engine / bots it last got from the hub (its `generation`
   says when to recompute), the `Filters` and, while the bar is open, a `Find` (the Kit `Input`, the `Search`, the current match).
   `sync` takes the store's changes into the rows first and then the search (`allowed` = has a row). The bar is a `h_flex` above
@@ -601,7 +609,12 @@ tested in `gpui-chat-core`; the app only draws it.
   context, following paused, the row flashed); closing emits `ChatViewEvent::SelectionDismissed`, which the pane already turns into
   "focus the input box", so the box's own Esc chain (completion list, then reply mode, then propagate) is untouched: it only runs
   while the box is focused. ⌘F / ⌘G / ⇧⌘G are shell-level bindings that act on the focused pane's chat (`AppShell::with_chat`).
-  Matches are painted by `MessageElement::paint_search` from `MessageStyle::search` (`SearchHighlight`: the needle and the current
+  The `Search` (index and matches) lives on the `ChatView`, not on the bar: ⌘F again only catches the index up (new messages,
+  evictions, a renumbering) instead of reading every message; while the bar is closed it is not kept current. A query only
+  matches messages that are shown as themselves (`Rows::is_shown`: not hidden by a filter, not an ignored placeholder); a message
+  replaced in place (an echo swapped for Twitch's copy) is read again (`Search::replaced`, `IgnoreCache::invalidate`) and
+  its visibility re-checked; after a history merge the saved stages are dropped and the current match follows
+  `Rebuild::map_seq`. Matches are painted by `MessageElement::paint_search` from `MessageStyle::search` (`SearchHighlight`: the needle and the current
   seq): `find_ranges` over the row's display text, skipping the timestamp and badge spans, theme `warning` at 38 % (70 % for the
   current match), behind the text and after the selection. The strip below the bar ("Showing N of M messages · from alice ·
   mentions", **Clear filter**) is drawn whenever a filter is on.
@@ -609,9 +622,17 @@ tested in `gpui-chat-core`; the app only draws it.
   `message_row` draws them with `MessageElement::ignored(true)`: another display text (`display::build_ignored`, `1 ignored
   message`, no name), another `LayoutKey` (`ignored`), no tints or reply line; a click reveals the message through the same
   `revealed` set as a collapsed removed message.
+- **Block list upkeep.** The fetch is keyed by the account's user id (another account's list is cleared the moment a fetch for
+  this one starts and never applies to it), a failure is retried with a 30 s → 15 min backoff, and while sync is on the list is
+  fetched again every 15 minutes (so blocks made on twitch.tv are picked up) or on **Refresh** (Settings → Ignores). A block or
+  unblock from the app only edits the list when sync is on and a list is loaded. The hub rebuilds (and every chat view
+  re-checks its rows) only when the user's own login, the account id or the block-list scope state actually changed, not on every
+  `AccountHub` notification. The user can never be ignored or blocked (`IgnoreHub::can_target`, checked in `ignore_user`,
+  `block`, the pane's confirmation and the key-bound actions).
 - **Attention.** `Core::set_ignores` takes the engine; an ignored message is stamped as usual but never counted (no dot, no
   Mentions entry, no notification), and `Activity::drop_ignored` takes an ignored author's earlier entries out of the log when the
-  engine changes.
+  engine changes, `Coalescer::forget` takes their held notifications out of the summary and their banners are dismissed.
+  A jump (Mentions, a notification, the user card) to a message hidden by an ignore says *That message is hidden (ignored user).*
 
 ### Domain model (`crates/core`)
 

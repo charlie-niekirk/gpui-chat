@@ -20,8 +20,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    ChannelId, ChannelRole, DEFAULT_TIMEOUT_SECS, Ignores, Message, MessageId, RowActions,
-    TIMEOUT_PRESETS, row_actions,
+    ChannelId, ChannelRole, DEFAULT_TIMEOUT_SECS, Message, MessageId, RowActions, TIMEOUT_PRESETS,
+    row_actions,
 };
 use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -37,6 +37,7 @@ use gpui_kit::{
 use super::element::{MessageElement, MessageStyle};
 use super::events;
 use super::layout::LayoutCache;
+use super::list_sync::Rows;
 use super::selection::{self};
 use super::selection_layer::Surface;
 use super::view::ChatView;
@@ -67,8 +68,8 @@ pub struct RowContext {
     pub revealed: Rc<RefCell<HashSet<MessageId>>>,
     /// The logged-in user's login: no moderation controls on their own messages.
     pub own_login: Option<Arc<str>>,
-    /// What is ignored, when ignored messages are shown as one collapsed line (PR 5.7).
-    pub ignored: Option<Arc<Ignores>>,
+    /// The list's rows: which of them are only the placeholder of an ignored message (PR 5.7).
+    pub rows: Rc<RefCell<Rows>>,
 }
 
 /// The row for `message`: the plain element, or with the hover buttons (Reply, and for a
@@ -83,11 +84,7 @@ pub fn message_row(
 ) -> AnyElement {
     let revealed = row.revealed.borrow().contains(&message.id);
     // An ignored message (PR 5.7) is one line "1 ignored message" until it is clicked open.
-    let ignored = !revealed
-        && row
-            .ignored
-            .as_ref()
-            .is_some_and(|ignores| ignores.is_ignored(message));
+    let ignored = !revealed && row.rows.borrow().is_placeholder(seq);
     let collapsed = !ignored && is_collapsed(message, row.deleted, revealed);
     let element = MessageElement::new(seq, message.clone(), style, cache)
         .collapsed(collapsed)
@@ -257,6 +254,10 @@ pub fn row_menu(
         let Some(target) = surface.take_menu_target() else {
             return menu;
         };
+        // An ignored message's placeholder offers nothing: not its text, not its author.
+        if surface.is_placeholder(target.seq) {
+            return menu;
+        }
         let store = store.read(cx);
         let Some(message) = store.messages().get_by_seq(target.seq).cloned() else {
             return menu;

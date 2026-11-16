@@ -6,6 +6,10 @@
 //! back". [`ListMirror::sync`] turns that into at most two splices; nothing is reset, so
 //! measured heights and the scroll anchor of untouched items survive every batch.
 
+use std::collections::BTreeSet;
+
+use gpui_chat_core::Visibility;
+
 /// The edit that brings the list up to date: remove `removed` items at the front, then append
 /// `appended` items at the back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,6 +126,9 @@ pub struct Rows {
     mirror: ListMirror,
     /// `None`: every message of the mirror is a row.
     shown: Option<Vec<u64>>,
+    /// The rows that are only a placeholder, `1 ignored message` (PR 5.7): they are rows, but the
+    /// message is not on screen, so it is not searched, copied or offered a menu.
+    placeholders: BTreeSet<u64>,
 }
 
 impl Rows {
@@ -129,6 +136,7 @@ impl Rows {
         Self {
             mirror: ListMirror::new(first_seq, next_seq),
             shown: None,
+            placeholders: BTreeSet::new(),
         }
     }
 
@@ -180,6 +188,22 @@ impl Rows {
         self.index_of(seq).is_some()
     }
 
+    /// Whether message `seq` has a row that only stands in for it (an ignored message drawn as one
+    /// collapsed line).
+    pub fn is_placeholder(&self, seq: u64) -> bool {
+        self.placeholders.contains(&seq)
+    }
+
+    /// Whether message `seq` is on screen as itself: it has a row, and not a placeholder.
+    pub fn is_shown(&self, seq: u64) -> bool {
+        self.contains(seq) && !self.is_placeholder(seq)
+    }
+
+    /// The user opened the placeholder of `seq`: it is the message now.
+    pub fn open_placeholder(&mut self, seq: u64) -> bool {
+        self.placeholders.remove(&seq)
+    }
+
     /// The message of the last row.
     pub fn last_seq(&self) -> Option<u64> {
         match &self.shown {
@@ -215,7 +239,7 @@ impl Rows {
     /// Moves to the store's current range `first..next`: the edit for the list, as for
     /// [`ListMirror::sync`] (rows dropped at the front, rows appended at the back). `shows` says
     /// whether a message that arrived gets a row.
-    pub fn sync(&mut self, first: u64, next: u64, shows: &dyn Fn(u64) -> bool) -> Change {
+    pub fn sync(&mut self, first: u64, next: u64, shows: &dyn Fn(u64) -> Visibility) -> Change {
         let Some(shown) = &mut self.shown else {
             return self.mirror.sync(first, next);
         };
@@ -228,12 +252,26 @@ impl Rows {
             shown.partition_point(|&seq| seq < first)
         };
         shown.drain(..removed);
+        if reset {
+            self.placeholders.clear();
+        } else {
+            self.placeholders = self.placeholders.split_off(&first);
+        }
         let from = if reset { first } else { old_next.max(first) };
         let before = shown.len();
         if reset {
             shown.clear();
         }
-        shown.extend((from..next).filter(|&seq| shows(seq)));
+        for seq in from..next {
+            match shows(seq) {
+                Visibility::Hidden => {}
+                Visibility::Shown => shown.push(seq),
+                Visibility::Collapsed => {
+                    shown.push(seq);
+                    self.placeholders.insert(seq);
+                }
+            }
+        }
         let appended = shown.len() - if reset { 0 } else { before };
         self.mirror = ListMirror::new(first, next);
         Change { removed, appended }
@@ -244,21 +282,17 @@ impl Rows {
     /// list is built, so call it when the answer changed, not per message.
     pub fn show_only(
         &mut self,
-        shows: Option<&dyn Fn(u64) -> bool>,
+        shows: Option<&dyn Fn(u64) -> Visibility>,
         first: u64,
         next: u64,
     ) -> Vec<Splice> {
         let old: Vec<Option<u64>> = self.seqs().into_iter().map(Some).collect();
         let new_mirror = ListMirror::new(first, next);
-        let new: Vec<u64> = match shows {
-            Some(shows) => (new_mirror.first_seq()..new_mirror.next_seq())
-                .filter(|&seq| shows(seq))
-                .collect(),
-            None => (new_mirror.first_seq()..new_mirror.next_seq()).collect(),
-        };
+        let (new, placeholders) = build(shows, new_mirror);
         let splices = diff_rows(&old, &new);
         self.mirror = new_mirror;
         self.shown = shows.map(|_| new);
+        self.placeholders = placeholders;
         splices
     }
 
@@ -271,26 +305,54 @@ impl Rows {
         map: &dyn Fn(u64) -> Option<u64>,
         first: u64,
         next: u64,
-        shows: Option<&dyn Fn(u64) -> bool>,
+        shows: Option<&dyn Fn(u64) -> Visibility>,
     ) -> Vec<Splice> {
         let old: Vec<Option<u64>> = self.seqs().into_iter().map(map).collect();
         let new_mirror = ListMirror::new(first, next);
-        let new: Vec<u64> = match shows {
-            Some(shows) => (first..new_mirror.next_seq())
-                .filter(|&seq| shows(seq))
-                .collect(),
-            None => (first..new_mirror.next_seq()).collect(),
-        };
+        let (new, placeholders) = build(shows, new_mirror);
         let splices = diff_rows(&old, &new);
         self.mirror = new_mirror;
         self.shown = shows.map(|_| new);
+        self.placeholders = placeholders;
         splices
     }
+}
+
+/// The rows of the store range `mirror` under `shows`, and which of them are placeholders.
+fn build(
+    shows: Option<&dyn Fn(u64) -> Visibility>,
+    mirror: ListMirror,
+) -> (Vec<u64>, BTreeSet<u64>) {
+    let range = mirror.first_seq()..mirror.next_seq();
+    let Some(shows) = shows else {
+        return (range.collect(), BTreeSet::new());
+    };
+    let mut rows = Vec::new();
+    let mut placeholders = BTreeSet::new();
+    for seq in range {
+        match shows(seq) {
+            Visibility::Hidden => {}
+            Visibility::Shown => rows.push(seq),
+            Visibility::Collapsed => {
+                rows.push(seq);
+                placeholders.insert(seq);
+            }
+        }
+    }
+    (rows, placeholders)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v(shown: bool) -> Visibility {
+        if shown {
+            Visibility::Shown
+        } else {
+            Visibility::Hidden
+        }
+    }
 
     /// Applies `change` to a plain vector of sequence numbers, as the list would.
     fn apply(items: &mut Vec<u64>, change: Change, mirror: ListMirror) {
@@ -488,7 +550,7 @@ mod tests {
         );
         assert_eq!(rows.last_seq(), Some(14));
         assert_eq!(
-            rows.sync(12, 20, &|_| false),
+            rows.sync(12, 20, &|_| Visibility::Hidden),
             Change {
                 removed: 2,
                 appended: 5
@@ -500,7 +562,7 @@ mod tests {
 
     #[test]
     fn a_filter_shows_only_what_it_says_and_follows_the_store() {
-        let even = |seq: u64| seq.is_multiple_of(2);
+        let even = |seq: u64| v(seq.is_multiple_of(2));
         let mut rows = Rows::new(0, 10);
         let mut items = some(&rows.seqs());
         let splices = rows.show_only(Some(&even), 0, 10);
@@ -537,7 +599,7 @@ mod tests {
 
     #[test]
     fn a_store_that_went_backwards_replaces_every_row_of_a_filtered_list() {
-        let all = |_: u64| true;
+        let all = |_: u64| Visibility::Shown;
         let mut rows = Rows::new(5, 9);
         rows.show_only(Some(&all), 5, 9);
         assert_eq!(
@@ -554,7 +616,7 @@ mod tests {
     fn a_renumbering_keeps_the_rows_that_stay_and_inserts_the_new_ones() {
         // Rows 2, 4 of the store 0..6; history puts two messages before them (numbers shift by 2)
         // and the filter lets the new even ones in.
-        let even = |seq: u64| seq.is_multiple_of(2);
+        let even = |seq: u64| v(seq.is_multiple_of(2));
         let mut rows = Rows::new(0, 6);
         rows.show_only(Some(&even), 0, 6);
         assert_eq!(rows.seqs(), [0, 2, 4]);
@@ -566,9 +628,14 @@ mod tests {
         assert_eq!(items, some(&[0, 2, 4, 6]));
         // A message that left (the front was trimmed by the cap) is removed.
         let mut rows = Rows::new(0, 4);
-        rows.show_only(Some(&|_| true), 0, 4);
+        rows.show_only(Some(&|_| Visibility::Shown), 0, 4);
         let mut items = vec![None, None, Some(0), Some(1)];
-        let splices = rows.renumber(&|old| old.checked_sub(2), 0, 2, Some(&|_| true));
+        let splices = rows.renumber(
+            &|old| old.checked_sub(2),
+            0,
+            2,
+            Some(&|_| Visibility::Shown),
+        );
         apply_splices(&mut items, &splices, &rows.seqs());
         assert_eq!(items, some(&[0, 1]));
     }
@@ -591,7 +658,7 @@ mod tests {
             if state.is_multiple_of(5) {
                 // Another filter (modulus 1: nothing hidden).
                 modulus = state / 7 % 4 + 1;
-                let shows = move |seq: u64| seq.is_multiple_of(modulus);
+                let shows = move |seq: u64| v(seq.is_multiple_of(modulus));
                 let splices = if modulus == 1 {
                     rows.show_only(None, first_before, next)
                 } else {
@@ -601,7 +668,7 @@ mod tests {
             } else {
                 next += state % 25;
                 let first = next.saturating_sub(cap);
-                let shows = move |seq: u64| seq.is_multiple_of(modulus);
+                let shows = move |seq: u64| v(seq.is_multiple_of(modulus));
                 let change = rows.sync(first, next, &shows);
                 items.drain(..change.removed);
                 let seqs = rows.seqs();

@@ -422,7 +422,7 @@ impl Surface {
             // A message the chat hides (ignored, filtered out) is not on screen: not copied.
             if order
                 .as_ref()
-                .is_some_and(|rows| !rows.borrow().contains(seq))
+                .is_some_and(|rows| !rows.borrow().is_shown(seq))
             {
                 continue;
             }
@@ -886,6 +886,15 @@ impl Surface {
                 Some(row.seq) == last && row.bounds.bottom() <= bounds.bottom() + px(0.5)
             })
         }
+    }
+
+    /// Whether the row of message `seq` is only a placeholder (`1 ignored message`): nothing of the
+    /// message may be copied or offered from it.
+    pub fn is_placeholder(&self, seq: u64) -> bool {
+        self.order
+            .borrow()
+            .as_ref()
+            .is_some_and(|rows| rows.borrow().is_placeholder(seq))
     }
 
     /// Whether message `seq` was drawn this frame and is entirely inside the surface (nothing to

@@ -220,6 +220,18 @@ impl SearchIndex {
         self.docs.get(at).map(|doc| &**doc)
     }
 
+    /// Reads the text of messages `seqs` again.
+    pub fn refresh(&mut self, store: &MessageStore, seqs: &[u64]) {
+        for &seq in seqs {
+            if let Some(at) = seq.checked_sub(self.first_seq).map(|at| at as usize)
+                && let Some(doc) = self.docs.get_mut(at)
+                && let Some(message) = store.get_by_seq(seq)
+            {
+                *doc = search_text(message).into_boxed_str();
+            }
+        }
+    }
+
     /// Brings the index up to date with `store`. Cost: the messages that arrived since the last
     /// call (the whole store the first time, and after a history merge renumbered it).
     pub fn sync(&mut self, store: &MessageStore) -> IndexChange {
@@ -328,6 +340,8 @@ impl Search {
         match self.index.sync(store) {
             IndexChange::None => false,
             IndexChange::Rebuilt => {
+                // Every number moved (or the store was cleared): the saved stages hold the old ones.
+                self.stages.clear();
                 self.recompute(allowed);
                 true
             }
@@ -340,6 +354,42 @@ impl Search {
                 evicted > 0 || self.matches.len() != before
             }
         }
+    }
+
+    /// The messages `seqs` were replaced in place (an echo swapped for Twitch's copy): their text
+    /// is read again and each is checked once more. Returns whether the matches changed.
+    pub fn replaced(
+        &mut self,
+        store: &MessageStore,
+        seqs: &[u64],
+        allowed: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        self.index.refresh(store, seqs);
+        // The saved stages may hold the old verdicts of these messages.
+        self.stages.clear();
+        let Some(needle) = &self.needle else {
+            return false;
+        };
+        let before = self.matches.clone();
+        for &seq in seqs {
+            if let Ok(at) = self.matches.binary_search(&seq) {
+                self.matches.remove(at);
+            }
+            if self.index.get(seq).is_some_and(|doc| needle.is_in(doc)) && allowed(seq) {
+                let at = self.matches.partition_point(|&m| m < seq);
+                self.matches.insert(at, seq);
+            }
+        }
+        before != self.matches
+    }
+
+    /// Forgets the index: the next [`Search::sync`] reads every message again (what to do when too
+    /// many messages were replaced to name them).
+    pub fn invalidate_all(&mut self) {
+        self.index = SearchIndex::new();
+        self.stages.clear();
+        self.matches.clear();
+        self.scanned = 0;
     }
 
     /// Looks for `query` (what the user typed, `from:` already taken out). Returns whether the
@@ -774,5 +824,52 @@ mod tests {
         search.sync(&store, &counting);
         assert_eq!(search.count(), 101);
         assert_eq!(looked.get(), 1, "the new message is the only one looked at");
+    }
+
+    #[test]
+    fn a_renumbering_does_not_leave_stale_stages_for_backspace() {
+        let mut store = store(&[("a", "abc one"), ("a", "abd two"), ("a", "zzz")]);
+        let mut search = Search::new();
+        search.sync(&store, &all);
+        search.set_query("a", &all);
+        search.set_query("ab", &all);
+        search.set_query("abc", &all);
+        assert_eq!(matches_of(&search), [0]);
+        let older = Arc::new(Message::chat(
+            "old",
+            Timestamp(-10),
+            Author::new("a", "a"),
+            vec![Fragment::Text("abc earlier".into())],
+        ));
+        store.merge_history(vec![older]);
+        assert!(search.sync(&store, &all));
+        assert_eq!(matches_of(&search), [3, 4], "everything got a new number");
+        // Backspace: the saved "ab" stage held the old numbers (0, 1); they must not come back.
+        search.set_query("ab", &all);
+        let texts: Vec<_> = search
+            .matches()
+            .iter()
+            .map(|&seq| store.get_by_seq(seq).unwrap().plain_text())
+            .collect();
+        assert_eq!(texts, ["abc earlier", "abc one", "abd two"]);
+    }
+
+    #[test]
+    fn a_replaced_message_is_read_again() {
+        let mut store = store(&[("a", "echo text"), ("a", "other")]);
+        let mut search = Search::new();
+        search.sync(&store, &all);
+        search.set_query("kappa", &all);
+        assert!(search.matches().is_empty());
+        let real = chat(0, "a", "echo text Kappa");
+        assert_eq!(store.replace(real), Some(0));
+        assert!(search.replaced(&store, &[0], &all));
+        assert_eq!(matches_of(&search), [0]);
+        // And the other way: the text no longer matches.
+        assert_eq!(store.replace(chat(0, "a", "gone")), Some(0));
+        assert!(search.replaced(&store, &[0], &all));
+        assert!(search.matches().is_empty());
+        search.invalidate_all();
+        assert!(!search.sync(&store, &all) || search.count() == 0);
     }
 }

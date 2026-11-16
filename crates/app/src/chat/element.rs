@@ -606,7 +606,11 @@ impl MessageElement {
         };
         let MessageLayout { shaped, flow } = layout;
         let text = &shaped.display.text;
-        let ranges = gpui_chat_core::find_ranges(text, &search.needle);
+        let layout_id = Rc::as_ptr(&layout.shaped) as usize;
+        let ranges = search
+            .ranges
+            .borrow_mut()
+            .get(self.seq, layout_id, text, &search.needle);
         if ranges.is_empty() {
             return;
         }
@@ -616,7 +620,7 @@ impl MessageElement {
             .palette
             .rule_color(HighlightColor::Yellow)
             .opacity(if current { 0.7 } else { 0.38 });
-        for range in ranges {
+        for range in ranges.iter().cloned() {
             let role = shaped
                 .display
                 .spans
