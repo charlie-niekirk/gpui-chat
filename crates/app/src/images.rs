@@ -153,10 +153,14 @@ pub fn animation_wake(
 }
 
 /// The URL `url` for the light theme (Twitch's CDN serves `light` and `dark` variants of a few
-/// emotes); other providers' URLs are unchanged.
+/// emotes, and of every cheermote, PR 5.1); other providers' URLs are unchanged.
 pub fn themed_url(url: &str, light: bool) -> std::borrow::Cow<'_, str> {
     const TWITCH_CDN: &str = "https://static-cdn.jtvnw.net/emoticons/";
-    if light && url.starts_with(TWITCH_CDN) && url.contains("/dark/") {
+    const CHEER_CDN: &str = "https://d3aqoihi2n8ty8.cloudfront.net/actions/";
+    if light
+        && (url.starts_with(TWITCH_CDN) || url.starts_with(CHEER_CDN))
+        && url.contains("/dark/")
+    {
         std::borrow::Cow::Owned(url.replacen("/dark/", "/light/", 1))
     } else {
         std::borrow::Cow::Borrowed(url)

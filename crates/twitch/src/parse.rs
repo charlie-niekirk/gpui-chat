@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use gpui_chat_core::message::RawTags;
 use gpui_chat_core::{
-    Author, BadgeId, ChannelId, ChatEvent, ClearTarget, DEFAULT_CHEERMOTE_PREFIXES, FollowersOnly,
-    Fragment, Message, MessageFlags, MessageId, MessageKind, ReplyRef, Rgb, RoomStateUpdate,
+    AnnouncementColor, Author, BadgeId, ChannelId, ChatEvent, ClearTarget,
+    DEFAULT_CHEERMOTE_PREFIXES, EventKind, FollowersOnly, Fragment, Message, MessageFlags,
+    MessageId, MessageKind, Recipient, ReplyRef, Rgb, RoomStateUpdate, SharedChat, SubPlan,
     Timestamp, Tokenizer, twitch_emote_ranges,
 };
 use twitch_irc::message::{IRCMessage, IRCParseError, IRCPrefix};
@@ -193,7 +194,12 @@ fn raw_tags(msg: &IRCMessage) -> RawTags {
 
 /// `moderator/1,subscriber/12` → badge ids. Entries without a version are skipped.
 fn badges(msg: &IRCMessage) -> Vec<BadgeId> {
-    tag(msg, "badges")
+    badge_list(msg, "badges")
+}
+
+/// The badges listed in tag `key` (`badges`, or `source-badges` in shared chat).
+fn badge_list(msg: &IRCMessage, key: &str) -> Vec<BadgeId> {
+    tag(msg, key)
         .into_iter()
         .flat_map(|v| v.split(','))
         .filter_map(|entry| {
@@ -246,6 +252,111 @@ fn fragments(
     (out.fragments, out.mentions_self)
 }
 
+/// Shared chat tags (`source-room-id`, `source-id`, `source-badges`); `None` outside a session.
+fn shared_chat(msg: &IRCMessage) -> Option<SharedChat> {
+    Some(SharedChat {
+        source_room_id: tag(msg, "source-room-id")?.to_owned(),
+        source_id: tag(msg, "source-id").map(MessageId::from),
+        source_badges: badge_list(msg, "source-badges"),
+        source_name: None,
+    })
+}
+
+/// The login Twitch gives every anonymous gifter.
+const ANONYMOUS_GIFTER: &str = "ananonymousgifter";
+
+/// What a USERNOTICE's `msg-id` and `msg-param-*` tags say. A notice whose tags are too
+/// incomplete to build its variant from, or one this build has no variant for, is
+/// [`EventKind::Other`]: the UI then draws Twitch's own `system-msg`.
+fn event_kind(msg: &IRCMessage) -> EventKind {
+    let msg_id = tag(msg, "msg-id").unwrap_or_default();
+    let plan = || SubPlan::from_tag(tag(msg, "msg-param-sub-plan").unwrap_or("1000"));
+    let count = |key: &'static str| number::<u32>(msg, key);
+    let anonymous = msg_id.starts_with("anon") || tag(msg, "login") == Some(ANONYMOUS_GIFTER);
+    let other = || EventKind::Other {
+        msg_id: msg_id.to_owned(),
+    };
+    match msg_id {
+        "sub" => EventKind::Sub {
+            plan: plan(),
+            months: count("msg-param-cumulative-months").unwrap_or(1).max(1),
+        },
+        "resub" => EventKind::Resub {
+            plan: plan(),
+            months: count("msg-param-cumulative-months").unwrap_or(1).max(1),
+            streak: (flag(msg, "msg-param-should-share-streak") == Some(true))
+                .then(|| count("msg-param-streak-months"))
+                .flatten()
+                .filter(|&streak| streak > 0),
+        },
+        "subgift" | "anonsubgift" => {
+            let Some(login) = tag(msg, "msg-param-recipient-user-name") else {
+                return other();
+            };
+            EventKind::Gift {
+                plan: plan(),
+                recipient: Recipient {
+                    login: login.to_owned(),
+                    display_name: tag(msg, "msg-param-recipient-display-name")
+                        .unwrap_or(login)
+                        .to_owned(),
+                    user_id: tag(msg, "msg-param-recipient-id").map(str::to_owned),
+                },
+                months: count("msg-param-gift-months").unwrap_or(1).max(1),
+                gifter_total: count("msg-param-sender-count").filter(|&n| n > 0),
+                anonymous,
+                community: tag(msg, "msg-param-community-gift-id").is_some(),
+            }
+        }
+        "submysterygift" | "anonsubmysterygift" => match count("msg-param-mass-gift-count") {
+            Some(n) if n > 0 => EventKind::MysteryGift {
+                plan: plan(),
+                count: n,
+                gifter_total: count("msg-param-sender-count").filter(|&n| n > 0),
+                anonymous,
+            },
+            _ => other(),
+        },
+        "giftpaidupgrade" | "anongiftpaidupgrade" => EventKind::GiftPaidUpgrade {
+            gifter: if anonymous {
+                None
+            } else {
+                tag(msg, "msg-param-sender-name")
+                    .or_else(|| tag(msg, "msg-param-sender-login"))
+                    .map(str::to_owned)
+            },
+            promo: tag(msg, "msg-param-promo-name").map(str::to_owned),
+        },
+        "primepaidupgrade" => EventKind::PrimePaidUpgrade { plan: plan() },
+        "raid" => {
+            let from_login = tag(msg, "msg-param-login").or_else(|| tag(msg, "login"));
+            match (from_login, count("msg-param-viewerCount")) {
+                (Some(login), Some(viewers)) => EventKind::Raid {
+                    from_login: login.to_owned(),
+                    from_name: tag(msg, "msg-param-displayName")
+                        .or_else(|| tag(msg, "display-name"))
+                        .unwrap_or(login)
+                        .to_owned(),
+                    viewers,
+                    profile_image: tag(msg, "msg-param-profileImageURL").map(str::to_owned),
+                },
+                _ => other(),
+            }
+        }
+        "announcement" => EventKind::Announcement {
+            color: AnnouncementColor::from_tag(tag(msg, "msg-param-color").unwrap_or_default()),
+        },
+        "ritual" if tag(msg, "msg-param-ritual-name") == Some("new_chatter") => {
+            EventKind::NewChatter
+        }
+        "bitsbadgetier" => match count("msg-param-threshold") {
+            Some(tier) => EventKind::BitsBadgeTier { tier },
+            None => other(),
+        },
+        _ => other(),
+    }
+}
+
 // ---- commands --------------------------------------------------------------------
 
 fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseError> {
@@ -270,6 +381,9 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
         system_text: None,
         notice_id: None,
         bits,
+        event: None,
+        reward_id: tag(msg, "custom-reward-id").map(str::to_owned),
+        shared: shared_chat(msg),
         raw_tags: raw_tags(msg),
         flags: MessageFlags {
             mention: mentions_self,
@@ -304,6 +418,9 @@ fn usernotice(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, Par
         system_text: tag(msg, "system-msg").map(str::to_owned),
         notice_id: tag(msg, "msg-id").map(str::to_owned),
         bits,
+        event: Some(event_kind(msg)),
+        reward_id: None,
+        shared: shared_chat(msg),
         raw_tags: raw_tags(msg),
         flags: MessageFlags {
             mention: mentions_self,

@@ -301,10 +301,9 @@ pub fn message_line(message: &Message) -> String {
         (MessageKind::Chat, Some(name)) => format!("{name}: {body}"),
         (MessageKind::Action, Some(name)) => format!("{name} {body}"),
         (MessageKind::UserNotice, name) => {
-            let mut rest = message
-                .system_text
-                .as_deref()
-                .map(one_line)
+            // Our own wording of the event (PR 5.1) where we have one, else Twitch's.
+            let mut rest = super::events::notice_line(message)
+                .or_else(|| message.system_text.as_deref().map(one_line))
                 .unwrap_or_default();
             if !message.fragments.is_empty() {
                 if !rest.is_empty() {

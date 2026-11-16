@@ -13,15 +13,18 @@
 //!   the live dot, the header stream info and the followed-live sidebar.
 //! * [`history`]: [`HistoryClient`], the recent-messages service behind the history shown on join
 //!   and after a reconnect (PR 5.5).
+//! * [`cheermotes`]: `Get Cheermotes`, a channel's cheermote set, for bits messages (PR 5.1).
 //! * [`user_emotes`]: `Get User Emotes`, the Twitch emotes the logged-in user may use (PR 3.3).
 
 pub mod auth;
 mod chat_send;
+pub mod cheermotes;
 mod client;
 pub mod helix;
 pub mod history;
 mod limits;
 mod parse;
+pub mod room_names;
 pub mod streams;
 pub mod user_emotes;
 
@@ -37,6 +40,7 @@ pub use history::{
 };
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
+pub use room_names::RoomNames;
 pub use user_emotes::UserEmote;
 
 #[cfg(test)]

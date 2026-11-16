@@ -280,7 +280,14 @@ impl ShapedMessage {
     /// Cuts `layout` (the shaped `display.text`) into grapheme-cluster atoms, and each emote of
     /// `display.emotes` whose box (`boxes`, in the same order) is an image into one inline atom.
     pub fn from_layout(display: DisplayText, layout: &LineLayout, boxes: &[EmoteBox]) -> Self {
-        let atoms = cut_atoms(&display.text, layout);
+        let mut atoms = cut_atoms(&display.text, layout);
+        // The hard line breaks of an event row (the space they were shaped as takes no room).
+        for &offset in &display.breaks {
+            if let Ok(i) = atoms.binary_search_by_key(&offset, |atom| atom.range.start) {
+                atoms[i].kind = AtomKind::Break;
+                atoms[i].width = 0.0;
+            }
+        }
         let (atoms, inlines) = inline_emotes(atoms, &display, boxes);
         let atom_spans = atoms
             .iter()
@@ -1015,6 +1022,7 @@ mod tests {
             emotes: Vec::new(),
             badges: Vec::new(),
             links: Vec::new(),
+            breaks: Vec::new(),
         };
         assert_eq!(visual.len(), text.chars().count());
         let glyphs = visual
@@ -1039,6 +1047,60 @@ mod tests {
             len: text.len(),
         };
         ShapedMessage::from_layout(display, &layout, &[])
+    }
+
+    #[test]
+    fn a_hard_break_becomes_a_zero_width_break_atom() {
+        let text = "ab cd";
+        let mut s = {
+            let display = DisplayText {
+                text: text.into(),
+                spans: vec![crate::chat::display::Span {
+                    range: 0..text.len(),
+                    role: crate::chat::display::Role::Text,
+                }],
+                emotes: Vec::new(),
+                badges: Vec::new(),
+                links: Vec::new(),
+                breaks: vec![2],
+            };
+            let glyphs = (0..text.len())
+                .map(|i| ShapedGlyph {
+                    id: GlyphId(i as u32),
+                    position: point(px(i as f32 * 10.0), px(0.0)),
+                    index: i,
+                    is_emoji: false,
+                })
+                .collect();
+            let layout = LineLayout {
+                font_size: px(10.0),
+                width: px(50.0),
+                ascent: px(8.0),
+                descent: px(2.0),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs,
+                }],
+                len: text.len(),
+            };
+            ShapedMessage::from_layout(display, &layout, &[])
+        };
+        let kinds: Vec<_> = s.atoms.iter().map(|a| (a.kind, a.width)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (AtomKind::Glyphs, 10.0),
+                (AtomKind::Glyphs, 10.0),
+                (AtomKind::Break, 0.0),
+                (AtomKind::Glyphs, 10.0),
+                (AtomKind::Glyphs, 10.0)
+            ]
+        );
+        let flow = flow::flow(&s.atoms, 1000.0, 10.0);
+        assert_eq!(flow.line_count(), 2);
+        assert_eq!(flow.placements[3].line, 1);
+        assert_eq!(flow.placements[3].x, 0.0);
+        s.atoms.clear();
     }
 
     /// `(text, src_x, width)` per atom.
@@ -1137,6 +1199,7 @@ mod tests {
             emotes: Vec::new(),
             badges: Vec::new(),
             links: Vec::new(),
+            breaks: Vec::new(),
         };
         let xs = [0.0, 8.7, 16.1, 25.3, 33.9];
         let glyphs = xs

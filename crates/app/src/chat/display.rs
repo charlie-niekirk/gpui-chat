@@ -38,14 +38,24 @@ pub enum Role {
     /// [`DisplayText::badges`].
     Badge,
     Emoji,
+    /// The amount of a cheermote (`100` of `Cheer100`; the word itself is an image, or text in
+    /// this role when the channel's cheermotes are not known).
     Cheer,
-    /// Notices, system lines and the system part of a `USERNOTICE` (muted).
+    /// Notices and system lines (muted).
     System,
+    /// The line above an event's message (PR 5.1): `Alice subscribed at Tier 1`, `Announcement`,
+    /// `First message`. Drawn in the event's accent colour.
+    Header,
+    /// Where a shared-chat message was sent (`[OtherChan]`), muted.
+    Source,
 }
 
 impl Role {
     pub fn is_bold(self) -> bool {
-        matches!(self, Self::Name | Self::Mention | Self::SelfMention)
+        matches!(
+            self,
+            Self::Name | Self::Mention | Self::SelfMention | Self::Cheer
+        )
     }
 }
 
@@ -106,6 +116,9 @@ pub struct DisplayText {
     pub badges: Vec<DisplayBadge>,
     /// Every link, in text order.
     pub links: Vec<DisplayLink>,
+    /// Byte offsets of the hard line breaks (each is one space character in `text`, so copying
+    /// and hit-testing see a space), in text order.
+    pub breaks: Vec<usize>,
 }
 
 /// Settings that change what is drawn (and therefore the layout).
@@ -147,10 +160,22 @@ impl DisplayText {
         }
     }
 
+    /// Appends a hard line break (see [`DisplayText::breaks`]).
+    fn push_break(&mut self) {
+        self.breaks.push(self.text.len());
+        self.push(" ", Role::Separator);
+    }
+
     /// Appends an emote's name as its own [`Role::Emote`] span.
     fn push_emote(&mut self, emote: &Arc<Emote>, overlay: bool) {
+        self.push_emote_as(&emote.name, emote, overlay);
+    }
+
+    /// Appends `text` as the [`Role::Emote`] span of `emote` (a cheermote drawn from the prefix as
+    /// typed, `cheer`, not the set's `Cheer`).
+    fn push_emote_as(&mut self, text: &str, emote: &Arc<Emote>, overlay: bool) {
         let span = self.spans.len();
-        self.push(&emote.name, Role::Emote);
+        self.push(text, Role::Emote);
         if self.spans.len() > span {
             self.emotes.push(DisplayEmote {
                 span,
@@ -254,7 +279,19 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                     });
                 }
             }
-            Fragment::Cheer { prefix, bits } => out.push(&format!("{prefix}{bits}"), Role::Cheer),
+            // With its image (the channel's cheermotes are known) the word is a box and the
+            // amount follows it as text; without, the whole `Cheer100` is text.
+            Fragment::Cheer {
+                prefix,
+                bits,
+                image: Some(image),
+            } => {
+                out.push_emote_as(prefix, image, false);
+                out.push(&bits.to_string(), Role::Cheer);
+            }
+            Fragment::Cheer { prefix, bits, .. } => {
+                out.push(&format!("{prefix}{bits}"), Role::Cheer)
+            }
         }
     }
 }
@@ -293,37 +330,63 @@ pub fn body_fragments(message: &Message) -> Cow<'_, [Fragment]> {
 }
 
 /// The display text of `message`; `badges` are drawn before the author's name.
+///
+/// An event row (PR 5.1, [`super::events`]) has its header first and the message on the line
+/// after a hard break; the timestamp is on the header of a `USERNOTICE`, on the message of a chat
+/// line that only carries a marker (`First message`). A message sent in another channel of a
+/// shared chat session starts with that channel's name.
 pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -> DisplayText {
     let mut out = DisplayText::default();
-    if options.timestamps {
-        out.push(&clock(message.timestamp.unix_millis()), Role::Timestamp);
-        out.push(" ", Role::Separator);
-    }
     let author = message.author.as_ref();
-    match message.kind {
-        MessageKind::Chat => {
-            if let Some(author) = author {
-                out.push_badges(badges);
-                out.push(author_name(author), Role::Name);
-                out.push(": ", Role::Separator);
-            }
-            push_body(&mut out, &body_fragments(message), Role::Text);
+    let header = super::events::header(message);
+    let stamp = |out: &mut DisplayText| {
+        if options.timestamps {
+            out.push(&clock(message.timestamp.unix_millis()), Role::Timestamp);
+            out.push(" ", Role::Separator);
         }
-        MessageKind::Action => {
-            if let Some(author) = author {
-                out.push_badges(badges);
-                out.push(author_name(author), Role::Name);
+    };
+    let header_has_stamp = header.as_ref().is_none_or(|header| header.is_notice);
+    if header_has_stamp {
+        stamp(&mut out);
+    }
+    // Whether the header is followed by a message line.
+    let has_message_line = match message.kind {
+        MessageKind::UserNotice => !message.fragments.is_empty(),
+        _ => true,
+    };
+    if let Some(header) = &header {
+        out.push(&header.text, Role::Header);
+        if has_message_line {
+            out.push_break();
+        }
+    }
+    if !header_has_stamp {
+        stamp(&mut out);
+    }
+    match message.kind {
+        MessageKind::Chat | MessageKind::Action => {
+            if let Some(label) = super::events::source_label(message) {
+                out.push(&label, Role::Source);
                 out.push(" ", Role::Separator);
             }
-            push_body(&mut out, &body_fragments(message), Role::ActionText);
+            let chat = message.kind == MessageKind::Chat;
+            if let Some(author) = author {
+                out.push_badges(badges);
+                out.push(author_name(author), Role::Name);
+                out.push(if chat { ": " } else { " " }, Role::Separator);
+            }
+            let role = if chat { Role::Text } else { Role::ActionText };
+            push_body(&mut out, &body_fragments(message), role);
         }
         MessageKind::UserNotice => {
-            let header_end = out.text.len();
-            if let Some(system) = &message.system_text {
-                out.push(system, Role::System);
+            if header.is_none() {
+                // A notice we have no line for: system text and the user's message on one line.
+                if let Some(system) = &message.system_text {
+                    out.push(system, Role::System);
+                }
             }
             if !message.fragments.is_empty() {
-                if out.text.len() > header_end {
+                if header.is_none() && !out.text.is_empty() && !out.text.ends_with(' ') {
                     out.push(" ", Role::Separator);
                 }
                 if let Some(author) = author {
@@ -498,6 +561,226 @@ mod tests {
         assert!(bodies.contains(&"Gina: agreed"));
     }
 
+    // ---- event rows (PR 5.1) ------------------------------------------------------------------
+
+    /// The messages of `fixtures/irc/events.irc` by the last digits of their id.
+    fn event(n: &str) -> Arc<Message> {
+        let path = format!(
+            "{}/../../fixtures/irc/events.irc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let tail = format!("8000-{n:0>12};");
+        let line = text
+            .lines()
+            .find(|line| line.contains(&tail))
+            .unwrap_or_else(|| panic!("no event {n}"));
+        match gpui_chat_twitch::parse_line(line).unwrap().unwrap() {
+            gpui_chat_core::ChatEvent::Message { message, .. } => message,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn timed(message: &Message) -> DisplayText {
+        build(message, DisplayOptions { timestamps: true }, &[])
+    }
+
+    /// The text with each hard break shown as `⏎`.
+    fn with_breaks(display: &DisplayText) -> String {
+        let mut text = display.text.clone();
+        for &at in display.breaks.iter().rev() {
+            text.replace_range(at..at + 1, "⏎");
+        }
+        text
+    }
+
+    #[test]
+    fn a_sub_with_a_message_is_a_header_line_then_the_message_line() {
+        // 12 months, streak shared, the user's message after the break; the stamp is on the header.
+        let display = timed(&event("12"));
+        assert_eq!(
+            with_breaks(&display),
+            "22:15 LongSub resubscribed at Tier 1 for 12 months, 12 month streak⏎LongSub: a year Kappa, art at https://example.com/art"
+        );
+        let header = display
+            .spans
+            .iter()
+            .find(|span| span.role == Role::Header)
+            .unwrap();
+        assert_eq!(
+            &display.text[header.range.clone()],
+            "LongSub resubscribed at Tier 1 for 12 months, 12 month streak"
+        );
+        assert_eq!(display.breaks.len(), 1);
+        assert!(
+            display
+                .link_at(display.text.find("example").unwrap())
+                .is_some()
+        );
+        // Without a message there is no break at all.
+        let bare = timed(&event("13"));
+        assert!(bare.breaks.is_empty());
+        assert_eq!(
+            bare.text,
+            "22:15 BigSub resubscribed at Tier 3 for 27 months"
+        );
+    }
+
+    #[test]
+    fn announcements_gifts_raids_and_unknown_notices() {
+        assert_eq!(
+            with_breaks(&timed(&event("42"))),
+            "22:15 Announcement⏎ModUser: Giveaway winner will be drawn at the end of stream Kappa and also a very long announcement line that has to wrap onto a second line in a narrow pane"
+        );
+        assert_eq!(
+            timed(&event("20")).text,
+            "22:15 Gifter gifted a Tier 1 sub to Lucky (50 gifted in total)"
+        );
+        assert_eq!(
+            timed(&event("30")).text,
+            "22:15 1234 raiders from RaidingChannel have joined"
+        );
+        assert_eq!(
+            timed(&event("31")).text,
+            "22:15 1 raider from TinyChannel has joined"
+        );
+        // A msg-id this build does not know: Twitch's own line.
+        assert_eq!(
+            timed(&event("52")).text,
+            "22:15 Payer is paying forward the Gift they got from Gifter to Lucky!"
+        );
+        assert_eq!(
+            with_breaks(&timed(&event("50"))),
+            "22:15 Fresh is new here⏎Fresh: @everyone say hi"
+        );
+    }
+
+    #[test]
+    fn a_marked_chat_line_has_its_marker_above_and_the_time_on_the_message() {
+        assert_eq!(
+            with_breaks(&timed(&event("72"))),
+            "First message⏎22:15 Newbie: hi everyone, first time here"
+        );
+        assert_eq!(
+            with_breaks(&timed(&event("60"))),
+            "Cheered 100 bits⏎22:15 Cheerer: Cheer100 nice play"
+        );
+        assert_eq!(
+            with_breaks(&timed(&event("71"))),
+            "Redeemed a reward⏎22:15 Redeemer: please hydrate Kappa"
+        );
+        assert_eq!(
+            with_breaks(&timed(&event("73"))),
+            "First message⏎22:15 Newbie2 waves hello"
+        );
+        // Without timestamps the marker is simply the first line.
+        let untimed = build(&event("70"), DisplayOptions::default(), &[]);
+        assert_eq!(
+            with_breaks(&untimed),
+            "Highlighted message⏎Highlighter: this message cost channel points"
+        );
+    }
+
+    #[test]
+    fn a_message_from_another_shared_channel_starts_with_that_channels_name() {
+        assert_eq!(
+            timed(&event("82")).text,
+            "22:15 [shared chat] Visitor: shared chat says hi"
+        );
+        let mut named = (*event("82")).clone();
+        named.shared.as_mut().unwrap().source_name = Some("OtherChan".into());
+        let display = timed(&named);
+        assert_eq!(
+            display.text,
+            "22:15 [OtherChan] Visitor: shared chat says hi"
+        );
+        assert!(display.spans.iter().any(|s| s.role == Role::Source));
+        // Sent in this channel (source = this room): no label.
+        assert_eq!(
+            timed(&event("83")).text,
+            "22:15 Host: welcome everyone, both chats"
+        );
+    }
+
+    #[test]
+    fn a_cheermote_with_its_image_is_a_box_and_its_amount() {
+        let mut message = (*event("60")).clone();
+        let mut image = Emote::twitch("cheer:cheer:100", "Cheer");
+        image.width = Some(28);
+        let image = Arc::new(image);
+        let Fragment::Cheer { image: slot, .. } = &mut message.fragments[0] else {
+            panic!("a cheer")
+        };
+        *slot = Some(image.clone());
+        let display = build(&message, DisplayOptions::default(), &[]);
+        assert_eq!(
+            with_breaks(&display),
+            "Cheered 100 bits⏎Cheerer: Cheer100 nice play"
+        );
+        let cheer = &display.emotes[0];
+        assert_eq!(
+            &display.text[display.spans[cheer.span].range.clone()],
+            "Cheer"
+        );
+        assert!(Arc::ptr_eq(&cheer.emote, &image));
+        let amount = display
+            .spans
+            .iter()
+            .find(|s| s.role == Role::Cheer)
+            .unwrap();
+        assert_eq!(&display.text[amount.range.clone()], "100");
+        assert!(Role::Cheer.is_bold());
+        // Typed in another case, shown as typed.
+        let big = event("61");
+        assert!(
+            build(&big, DisplayOptions::default(), &[])
+                .text
+                .contains("cheer1000 Kappa500 cheer250")
+        );
+    }
+
+    #[test]
+    fn a_notice_with_no_event_keeps_the_old_one_line_layout() {
+        // Messages built without the event model (as before PR 5.1) still draw system + message.
+        let mut message = chat(vec![Fragment::Text("hype".into())]);
+        message.kind = MessageKind::UserNotice;
+        message.system_text = Some("Alice subscribed!".into());
+        let display = timed(&message);
+        assert_eq!(display.text, "01:01 Alice subscribed! Alice: hype");
+        assert!(display.breaks.is_empty());
+    }
+
+    #[test]
+    fn every_event_fixture_builds_a_coherent_display() {
+        let path = format!(
+            "{}/../../fixtures/irc/events.irc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut rows = 0;
+        for line in text.lines() {
+            let Ok(Some(gpui_chat_core::ChatEvent::Message { message, .. })) =
+                gpui_chat_twitch::parse_line(line)
+            else {
+                continue;
+            };
+            rows += 1;
+            let display = timed(&message);
+            let mut at = 0;
+            for span in &display.spans {
+                assert_eq!(span.range.start, at, "{}", display.text);
+                at = span.range.end;
+            }
+            assert_eq!(at, display.text.len());
+            for &b in &display.breaks {
+                assert_eq!(&display.text[b..b + 1], " ", "a break is one space");
+            }
+            assert!(display.breaks.len() <= 1, "{}", display.text);
+            assert!(!display.text.is_empty());
+        }
+        assert!(rows > 35, "{rows} messages");
+    }
+
     #[test]
     fn clock_formats_utc_time_of_day() {
         assert_eq!(clock(0), "00:00");
@@ -570,6 +853,7 @@ mod tests {
             Fragment::Cheer {
                 prefix: "Cheer".into(),
                 bits: 100,
+                image: None,
             },
         ]);
         let display = build(&message, DisplayOptions { timestamps: true }, &[]);

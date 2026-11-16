@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::emote::{BadgeId, Emote};
 use crate::ids::MessageId;
+use crate::special::{EventKind, SharedChat};
 
 /// Milliseconds since the Unix epoch (the IRC `tmi-sent-ts` tag, or a clock reading
 /// taken by whoever creates the message). Core never reads the clock itself.
@@ -177,8 +178,15 @@ pub enum Fragment {
     },
     /// A link. `text` is as typed; `url` always has a scheme (bare domains get `https://`).
     Link { text: String, url: String },
-    /// A cheermote such as `Cheer100`: prefix as typed and the bit amount.
-    Cheer { prefix: String, bits: u32 },
+    /// A cheermote such as `Cheer100`: prefix as typed and the bit amount. `image` is the
+    /// cheermote's image for that amount (a tier of its set, named by the prefix) once the
+    /// channel's cheermotes are known ([`crate::CheermoteSet::resolve`]); without it the text is
+    /// drawn.
+    Cheer {
+        prefix: String,
+        bits: u32,
+        image: Option<Arc<Emote>>,
+    },
 }
 
 impl Fragment {
@@ -200,7 +208,7 @@ impl Fragment {
             Self::Emoji { text } | Self::Mention { text, .. } | Self::Link { text, .. } => {
                 out.push_str(text);
             }
-            Self::Cheer { prefix, bits } => {
+            Self::Cheer { prefix, bits, .. } => {
                 out.push_str(prefix);
                 let _ = write!(out, "{bits}");
             }
@@ -252,6 +260,13 @@ pub struct Message {
     pub notice_id: Option<String>,
     /// Bits cheered with this message (the IRC `bits` tag).
     pub bits: Option<u32>,
+    /// What a [`MessageKind::UserNotice`] announced (PR 5.1); `None` for every other kind.
+    pub event: Option<EventKind>,
+    /// The channel-points custom reward this message redeemed (`custom-reward-id`; Twitch does
+    /// not send its name).
+    pub reward_id: Option<String>,
+    /// Where the message was sent when it comes from a shared chat session.
+    pub shared: Option<SharedChat>,
     /// All raw IRC tags as received; empty for synthetic messages.
     pub raw_tags: RawTags,
     pub flags: MessageFlags,
@@ -275,6 +290,9 @@ impl Message {
             system_text: None,
             notice_id: None,
             bits: None,
+            event: None,
+            reward_id: None,
+            shared: None,
             raw_tags: RawTags::default(),
             flags: MessageFlags::default(),
             reply: None,
@@ -298,6 +316,9 @@ impl Message {
             system_text: None,
             notice_id: None,
             bits: None,
+            event: None,
+            reward_id: None,
+            shared: None,
             raw_tags: RawTags::default(),
             flags: MessageFlags::default(),
             reply: None,
@@ -317,6 +338,15 @@ impl Message {
     /// reply (a message with replies is the root of its thread).
     pub fn thread_root(&self) -> &MessageId {
         self.reply.as_ref().map_or(&self.id, ReplyRef::root_id)
+    }
+
+    /// The id to tell a message from its other copies by: in shared chat every channel of the
+    /// session gets its own copy with an id of its own, and `source-id` names the original.
+    pub fn dedupe_id(&self) -> &MessageId {
+        self.shared
+            .as_ref()
+            .and_then(|shared| shared.source_id.as_ref())
+            .unwrap_or(&self.id)
     }
 
     /// The body as plain text (see [`Fragment::write_plain_text`]).

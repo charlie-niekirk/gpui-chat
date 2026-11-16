@@ -16,6 +16,10 @@
 //!   lines around them. Lines are stacked top to bottom; text and boxes are centred vertically
 //!   in their line by the painter.
 //!
+//! * An [`AtomKind::Break`] atom (a hard line break, PR 5.1: the system line of an event above the
+//!   user's message) has no width and ends its line; what follows starts the next one. A break at
+//!   the very end ends nothing (no empty last line).
+//!
 //! [`AtomKind::Inline`] atoms (emote images with a known logical size, PR 2.2) wrap like glyph
 //! clusters; the painter draws an image instead of glyphs. Selection (PR 5.6) hit-tests with
 //! [`Flow::line_at`] and [`Flow::index_at`] (a caret between atoms) or [`Flow::atom_at`] (the
@@ -33,6 +37,8 @@ pub enum AtomKind {
     Glyphs,
     /// An inline box of known size (an emote image). Unbreakable, like a glyph cluster.
     Inline,
+    /// A forced line break: zero width, never drawn.
+    Break,
 }
 
 /// One unbreakable piece of a message: a grapheme cluster or an inline box.
@@ -119,8 +125,9 @@ impl Flow {
         for i in line.atoms.clone() {
             let atom = &atoms[i];
             let left = self.placements[i].x;
-            if atom.kind == AtomKind::Space && left >= line.width {
-                break; // a hanging space past the content
+            if (atom.kind == AtomKind::Space && left >= line.width) || atom.kind == AtomKind::Break
+            {
+                break; // a hanging space past the content, or the break that ends the line
             }
             if x < left + atom.width / 2.0 {
                 return atom.range.start;
@@ -228,6 +235,15 @@ pub fn flow(atoms: &[Atom], max_width: f32, line_height: f32) -> Flow {
     };
     let mut i = 0;
     while i < atoms.len() {
+        if atoms[i].kind == AtomKind::Break {
+            placements[i] = at.place(&atoms[i]);
+            i += 1;
+            // Nothing after the break means no line after it.
+            if i < atoms.len() {
+                at.break_before(i, &mut lines);
+            }
+            continue;
+        }
         if atoms[i].kind == AtomKind::Space {
             // Spaces always follow content (or open the message), so they stay on this line and
             // hang past its edge if the next word wraps.
@@ -237,7 +253,7 @@ pub fn flow(atoms: &[Atom], max_width: f32, line_height: f32) -> Flow {
         }
         let word_end = atoms[i..]
             .iter()
-            .position(|atom| atom.kind == AtomKind::Space)
+            .position(|atom| matches!(atom.kind, AtomKind::Space | AtomKind::Break))
             .map_or(atoms.len(), |n| i + n);
         // Both fit checks add the word's atoms one by one, exactly as placement advances `x`
         // (from the current x, or from 0 after a break), and allow a hair of slack: a word that
@@ -281,6 +297,7 @@ mod tests {
             .map(|(i, c)| {
                 let (width, height, kind) = match c {
                     ' ' => (w, 0.0, AtomKind::Space),
+                    '\n' => (0.0, 0.0, AtomKind::Break),
                     '#' => (3.0 * w, 2.0, AtomKind::Inline),
                     '%' => (w, 0.5, AtomKind::Inline),
                     _ => (w, 0.0, AtomKind::Glyphs),
@@ -466,6 +483,27 @@ mod tests {
             (f.lines[0].height, f.lines[1].top, f.lines[1].height),
             (2.0, 2.0, 1.0)
         );
+    }
+
+    #[test]
+    fn a_break_ends_its_line_and_has_no_width() {
+        // The header and the message of an event row, with the header alone wide enough to wrap.
+        assert_eq!(wrap("sub!\nhello world", 80.0), ["sub!", "hello world"]);
+        assert_eq!(wrap("sub!\nhello world", 5.0), ["sub!", "hello", "world"]);
+        assert_eq!(wrap("one two three\nx", 7.0), ["one two", "three", "x"]);
+        // A break at the very end, or two in a row.
+        assert_eq!(wrap("sub!\n", 80.0), ["sub!"]);
+        assert_eq!(wrap("a\n\nb", 80.0), ["a", "", "b"]);
+        let text = "ab\ncd";
+        let atoms = atoms(text, 1.0);
+        let f = flow(&atoms, 80.0, 1.0);
+        assert_eq!(f.placements[2].line, 0, "the break is on the line it ends");
+        assert_eq!(f.placements[3], Placement { line: 1, x: 0.0 });
+        // A caret past the end of the first line stays on it, before the break.
+        assert_eq!(f.index_at(&atoms, 0, 50.0), 2);
+        assert_eq!(f.index_at(&atoms, 1, 50.0), 5);
+        assert_eq!(f.line_count(), 2);
+        assert!((f.height() - 2.0).abs() < 1e-6);
     }
 
     #[test]

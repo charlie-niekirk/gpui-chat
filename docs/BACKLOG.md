@@ -176,3 +176,12 @@ an entry here instead of expanding a PR. Format:
 - **Synthetic clicks do not activate Kit popup-menu items** (found in PR 5.6) — with CGEvent clicks (the scripting in `docs/`/memory notes) a Kit `PopupMenu` shows no hover and an item click only dismisses it, on `main` too (sidebar Remove); ↓/Return works. Check with a real mouse; if real clicks work, note it in the scripting guide.
 - **Selection extras** (found in PR 5.6) — an I-beam cursor over selectable text, ⌘A (select all visible), copying a selection as rich text/HTML, and selecting the reply context line; none is in scope.
 - **Rows evicted while the list is held** (found in PR 5.6 review) — at a high message rate at the scrollback cap, messages of a held (paused) list are evicted from the front: they silently drop out of a selection's copy and the held top row can jump. Holding could pin the store's front, or the copy could warn.
+
+- **Collapse the lines of a mystery gift** (found in PR 5.1) — a 50-sub gift is 51 rows (the gift line, then one muted line per recipient); fold them into the gift row with an expander.
+- **Source channel avatar in shared chat** (found in PR 5.1) — rows show the source channel's name only; the avatar (`api.ivr.fi` has `logo`) could be an inline image like a badge.
+- **Setting to keep shared-chat copies** (found in PR 5.1) — the copy of a shared-chat message is dropped when the source channel is open; some may prefer every pane to show the whole session.
+- **Cheermotes for the first messages of a channel** (found in PR 5.1) — a bits message that arrives before the channel's cheermote set has loaded keeps its text; re-resolve the retained messages when the set arrives (needs a store replace per message) or hold bits messages for the first load.
+- **Name of a channel-point reward** (found in PR 5.1) — the IRC tag has only `custom-reward-id`; EventSub (or Helix `Get Custom Reward`, broadcaster scope) is needed for the reward title and cost.
+- **Timeouts strike through a user's sub / raid notices** (found in PR 5.1) — `MessageStore::mark_user_deleted` marks every message of the login, `USERNOTICE`s included; PR 5.2 should decide what a timed-out user's events look like (and `mark_all_deleted` marks system lines).
+- **Notice kinds without a variant** (found in PR 5.1) — `standardpayforward`, `communitypayforward`, `unraid`, `viewermilestone` and others are `EventKind::Other` (Twitch's line, accent as a sub); give the frequent ones their own wording.
+

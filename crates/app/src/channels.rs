@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageKind,
+    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, Message, MessageKind,
     MessageStore, Moderation, RoomState,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
@@ -347,6 +347,19 @@ impl ChannelHub {
         let started = Instant::now();
         let count = events.len();
         let (groups, unrouted) = split_by_channel(events);
+        // Rooms that the batch itself announces, for the shared-chat check below: a replay (or a
+        // join burst) can deliver a channel's `ROOMSTATE` and the first shared messages together.
+        let announced: Vec<(ChannelId, String)> = groups
+            .iter()
+            .flat_map(|(channel, events)| {
+                events.iter().filter_map(move |event| match event {
+                    ChatEvent::RoomState { update, .. } => {
+                        update.room_id.clone().map(|id| (channel.clone(), id))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
         let mut changed = false;
         for event in unrouted {
             match event {
@@ -361,6 +374,7 @@ impl ChannelHub {
             }
         }
         for (channel, events) in groups {
+            let events = self.without_shared_copies(&channel, events, &announced, cx);
             let store = match self.stores.get(&channel) {
                 Some(store) => store.clone(),
                 None if self.auto_create && !self.closed.contains(&channel) => {
@@ -379,6 +393,66 @@ impl ChannelHub {
         self.diagnostics
             .record_batch(started, count, started.elapsed());
         changed
+    }
+
+    /// Drops the copies of shared-chat messages that another open channel already shows (PR 5.1).
+    /// In a shared chat session Twitch delivers each message to every channel of it, with the room
+    /// it was sent in as `source-room-id`; with both channels open the same message would be in two
+    /// panes. The copy goes when the channel it came from is open (that channel has the original,
+    /// from its own connection); a copy from a channel that is not open stays, labelled with its
+    /// source. History batches are filtered the same way.
+    fn without_shared_copies(
+        &self,
+        channel: &ChannelId,
+        events: Vec<ChatEvent>,
+        announced: &[(ChannelId, String)],
+        cx: &App,
+    ) -> Vec<ChatEvent> {
+        let is_shared = |message: &Message| message.shared.is_some();
+        let any = events.iter().any(|event| match event {
+            ChatEvent::Message { message, .. } => is_shared(message),
+            ChatEvent::History { messages, .. } => messages.iter().any(|m| is_shared(m)),
+            _ => false,
+        });
+        if !any {
+            return events;
+        }
+        // The rooms of the other open channels, as far as their `ROOMSTATE`s told (and this
+        // batch's).
+        let open: HashSet<String> = self
+            .stores
+            .iter()
+            .filter(|(other, _)| *other != channel)
+            .filter_map(|(_, store)| store.read(cx).room().room_id.clone())
+            .chain(
+                announced
+                    .iter()
+                    .filter(|(other, _)| other != channel)
+                    .map(|(_, id)| id.clone()),
+            )
+            .collect();
+        let is_copy = |message: &Message| {
+            message.shared.as_ref().is_some_and(|shared| {
+                shared.is_copy_in(message.raw_tags.get("room-id"))
+                    && open.contains(&shared.source_room_id)
+            })
+        };
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                ChatEvent::Message { message, .. } if is_copy(&message) => None,
+                ChatEvent::History {
+                    channel,
+                    messages,
+                    moderation,
+                } => Some(ChatEvent::History {
+                    channel,
+                    messages: messages.into_iter().filter(|m| !is_copy(m)).collect(),
+                    moderation,
+                }),
+                other => Some(other),
+            })
+            .collect()
     }
 
     fn ensure_quiet(
@@ -992,6 +1066,123 @@ mod tests {
         assert_eq!(busy.read_with(cx, |s, _| s.messages().len()), 1000);
         assert_eq!(busy_notifies.get(), 2);
         drop(task);
+    }
+
+    fn room(channel: &str, room_id: &str) -> ChatEvent {
+        ChatEvent::RoomState {
+            channel: ChannelId::new(channel),
+            update: RoomStateUpdate {
+                room_id: Some(room_id.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A message of `channel` (whose room is `room_id`) that was sent in `source`.
+    fn shared(channel: &str, room_id: &str, id: &str, source: &str, source_id: &str) -> ChatEvent {
+        use gpui_chat_core::{SharedChat, message::RawTags};
+        let ChatEvent::Message { channel, message } = chat(channel, id, "guest") else {
+            unreachable!()
+        };
+        let mut message = (*message).clone();
+        message.raw_tags = RawTags::new([("room-id".to_owned(), room_id.to_owned())]);
+        message.shared = Some(SharedChat {
+            source_room_id: source.into(),
+            source_id: Some(MessageId::from(source_id)),
+            source_badges: Vec::new(),
+            source_name: None,
+        });
+        ChatEvent::Message {
+            channel,
+            message: Arc::new(message),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_copy_of_a_shared_chat_message_is_dropped_when_its_source_channel_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = cx.new(|_| ChannelHub::new(100, Diagnostics::new()));
+        let ids = |hub: &Entity<ChannelHub>, channel: &str, cx: &mut TestAppContext| {
+            hub.read_with(cx, |hub, cx| {
+                hub.store(&ChannelId::new(channel))
+                    .unwrap()
+                    .read(cx)
+                    .messages()
+                    .iter()
+                    .map(|m| m.id.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(vec![room("main", "1000"), room("other", "2000")], cx);
+            hub.apply_batch(
+                vec![
+                    // Sent in #other: its own copy there, and the copy delivered to #main.
+                    shared("other", "2000", "o1", "2000", "o1"),
+                    shared("main", "1000", "m1", "2000", "o1"),
+                    // Sent in a channel that is not open: shown in #main, once.
+                    shared("main", "1000", "m2", "3000", "x1"),
+                    // Sent in #main itself.
+                    shared("main", "1000", "m3", "1000", "m3"),
+                    // The copy of that in #other.
+                    shared("other", "2000", "o2", "1000", "m3"),
+                    chat("main", "m4", "plain"),
+                ],
+                cx,
+            );
+        });
+        assert_eq!(ids(&hub, "main", cx), ["m2", "m3", "m4"]);
+        assert_eq!(ids(&hub, "other", cx), ["o1"]);
+    }
+
+    #[gpui_kit::test]
+    fn the_rooms_of_the_same_batch_count(cx: &mut TestAppContext) {
+        let hub = cx.new(|_| ChannelHub::new(100, Diagnostics::new()));
+        hub.update(cx, |hub, cx| {
+            // One batch, as `--replay-speed 0` and a join burst deliver it.
+            hub.apply_batch(
+                vec![
+                    room("main", "1000"),
+                    room("other", "2000"),
+                    shared("main", "1000", "m1", "2000", "o1"),
+                    shared("other", "2000", "o1", "2000", "o1"),
+                ],
+                cx,
+            );
+        });
+        let len = |channel: &str, cx: &mut TestAppContext| {
+            hub.read_with(cx, |hub, cx| {
+                hub.store(&ChannelId::new(channel))
+                    .unwrap()
+                    .read(cx)
+                    .messages()
+                    .len()
+            })
+        };
+        assert_eq!((len("main", cx), len("other", cx)), (0, 1));
+    }
+
+    #[gpui_kit::test]
+    fn a_shared_copy_stays_until_the_source_channels_room_is_known(cx: &mut TestAppContext) {
+        let hub = cx.new(|_| ChannelHub::new(100, Diagnostics::new()));
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(
+                vec![
+                    room("main", "1000"),
+                    shared("main", "1000", "m1", "2000", "o1"),
+                ],
+                cx,
+            );
+        });
+        let len = hub.read_with(cx, |hub, cx| {
+            hub.store(&ChannelId::new("main"))
+                .unwrap()
+                .read(cx)
+                .messages()
+                .len()
+        });
+        assert_eq!(len, 1);
     }
 
     #[gpui_kit::test]

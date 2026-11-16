@@ -35,6 +35,7 @@ use gpui_kit::{
 
 use super::colors;
 use super::display::{self, BadgeSlot, DisplayEmote, DisplayOptions, Role};
+use super::events;
 use super::flow::{AtomKind, Flow};
 use super::layout::{LayoutCache, LayoutKey, MessageLayout, ReplyFit, ReplyLine, ShapedMessage};
 use super::selection_layer::Surface;
@@ -57,6 +58,8 @@ pub struct Palette {
     pub mention_bg: Hsla,
     /// Behind a highlighted message (channel points, rules).
     pub highlight_bg: Hsla,
+    /// The accent colours of event rows (PR 5.1).
+    pub events: events::Colors,
 }
 
 impl Palette {
@@ -70,12 +73,16 @@ impl Palette {
             self_mention: link,
             mention_bg: tokens.accent.opacity(0.18),
             highlight_bg: tokens.accent.opacity(0.09),
+            events: events::Colors::from_tokens(tokens),
         }
     }
 
-    fn role(&self, role: Role, name: Hsla) -> Hsla {
+    /// The colour of a span. `name` is the author's, `header` the event header's (see
+    /// [`events::Colors::header_text`]).
+    fn role(&self, role: Role, name: Hsla, header: Hsla) -> Hsla {
         match role {
-            Role::Timestamp | Role::System => self.muted,
+            Role::Timestamp | Role::System | Role::Source => self.muted,
+            Role::Header => header,
             Role::Name | Role::ActionText => name,
             Role::SelfMention => self.self_mention,
             Role::Link => self.link,
@@ -704,11 +711,25 @@ impl Element for MessageElement {
         }
 
         window.paint_layer(bounds, |window| {
+            // Event rows (PR 5.1) have a bar and a tint of their own, which also covers a
+            // channel-points highlight; a mention of the viewer is the stronger signal.
+            let look = events::look(message);
             if flags.mention {
                 window.paint_quad(fill(bounds, palette.mention_bg));
-            } else if flags.highlighted {
+            } else if look.is_none() && flags.highlighted {
                 window.paint_quad(fill(bounds, palette.highlight_bg));
             }
+            if let Some(look) = &look {
+                // A mention keeps its own tint behind the bar.
+                look.paint(bounds, &palette.events, !flags.mention, window);
+            }
+            let header_color = look.as_ref().map_or(palette.muted, |look| {
+                if look.quiet {
+                    palette.muted
+                } else {
+                    palette.events.header_text(look.accent, palette.background)
+                }
+            });
 
             let name = message.author.as_ref().map_or(palette.text, |author| {
                 let color = author
@@ -762,7 +783,7 @@ impl Element for MessageElement {
                     let color = if flags.deleted {
                         palette.muted
                     } else {
-                        palette.role(role, name)
+                        palette.role(role, name, header_color)
                     };
                     window.paint_glyph(position, glyph.font_id, glyph.id, style.font_size, color)
                 };
