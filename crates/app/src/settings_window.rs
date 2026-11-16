@@ -10,6 +10,7 @@
 //! One window: opening it again focuses the existing one.
 
 mod fields;
+mod highlights;
 
 use std::rc::Rc;
 
@@ -207,6 +208,7 @@ impl SettingsView {
             appearance_page(&this, cx),
             chat_page(&this),
             emotes_page(&this),
+            highlights::page(&this),
             streamlink_page(),
             account_page(),
         ]

@@ -405,6 +405,7 @@ fn privmsg(msg: &IRCMessage, options: &ParseOptions) -> Result<ChatEvent, ParseE
             mention: mentions_self,
             first_message: flag(msg, "first-msg").unwrap_or(false),
             highlighted: tag(msg, "msg-id") == Some("highlighted-message"),
+            highlight: None,
             deleted: false,
             removal: Removal::None,
             history: tag(msg, "historical") == Some("1"),

@@ -8,8 +8,8 @@ use crate::actions::{
     About, AddChannel, ClosePane, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious,
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow,
     MoveChannelDown, MoveChannelUp, OpenChannelSwitcher, OpenPalette, OpenSettings, Quit,
-    ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight,
-    ToggleDebugHud, ToggleSidebar,
+    ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown,
+    SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 
 use crate::chat::selection_layer::ClearSelection;
@@ -17,6 +17,7 @@ use crate::chat::selection_layer::ClearSelection;
 pub mod keychain;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod notify;
 #[cfg(not(target_os = "macos"))]
 mod other;
 
@@ -60,6 +61,7 @@ fn view_menu() -> Menu {
         MenuItem::action("Command Palette…", OpenPalette),
         MenuItem::separator(),
         MenuItem::action("Toggle Sidebar", ToggleSidebar),
+        MenuItem::action("Show Mentions", ShowMentions),
         MenuItem::action("Toggle Debug HUD", ToggleDebugHud),
         MenuItem::separator(),
         MenuItem::action("Split Right", SplitRight),

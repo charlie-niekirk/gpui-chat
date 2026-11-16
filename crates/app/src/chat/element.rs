@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_chat_core::{ChannelId, Message, MessageId, ReplyRef};
+use gpui_chat_core::{ChannelId, HighlightColor, Message, MessageId, ReplyRef};
 use gpui_kit::{
     App, AvailableSpace, Bounds, Corners, CursorStyle, Element, ElementId, Font, GlobalElementId,
     Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton,
@@ -56,8 +56,11 @@ pub struct Palette {
     pub self_mention: Hsla,
     /// Behind a message that mentions the viewer.
     pub mention_bg: Hsla,
-    /// Behind a highlighted message (channel points, rules).
+    /// Behind a message Twitch highlighted (channel points).
     pub highlight_bg: Hsla,
+    /// The colours a highlight rule can name (PR 5.3), from the theme's own: accent, danger,
+    /// success, warning.
+    pub rule_colors: [Hsla; 4],
     /// The accent colours of event rows (PR 5.1).
     pub events: events::Colors,
 }
@@ -73,8 +76,19 @@ impl Palette {
             self_mention: link,
             mention_bg: tokens.accent.opacity(0.18),
             highlight_bg: tokens.accent.opacity(0.09),
+            rule_colors: [tokens.accent, tokens.danger, tokens.success, tokens.warning],
             events: events::Colors::from_tokens(tokens),
         }
+    }
+
+    /// The theme colour a highlight rule named.
+    pub fn rule_color(&self, color: HighlightColor) -> Hsla {
+        self.rule_colors[match color {
+            HighlightColor::Accent => 0,
+            HighlightColor::Red => 1,
+            HighlightColor::Green => 2,
+            HighlightColor::Yellow => 3,
+        }]
     }
 
     /// The colour of a span. `name` is the author's, `header` the event header's (see
@@ -123,6 +137,9 @@ pub type OpenThread = Rc<dyn Fn(&MessageId, &mut Window, &mut App)>;
 /// that has it in its style keeps it current, and the view shows the Reply button on that row
 /// only and resolves the right-click menu against it.
 pub type HoveredRow = Rc<Cell<Option<u64>>>;
+
+/// Opacity of the tint behind a row a highlight rule hit.
+const RULE_TINT: f32 = 0.16;
 
 /// The reply context line is a fraction of the text's size: it is a quotation, not the message.
 const REPLY_SCALE: f32 = 0.85;
@@ -785,14 +802,34 @@ impl Element for MessageElement {
             // Event rows (PR 5.1) have a bar and a tint of their own, which also covers a
             // channel-points highlight; a mention of the viewer is the stronger signal.
             let look = shaped.look;
-            if flags.mention {
+            // A highlight rule's colour (PR 5.3): a tint and a bar like an event card's, in the
+            // rule's theme colour. A removed message is struck and dimmed, not highlighted.
+            let rule = flags
+                .highlight
+                .filter(|_| !flags.deleted)
+                .map(|color| palette.rule_color(color));
+            if let Some(color) = rule {
+                window.paint_quad(fill(bounds, color.opacity(RULE_TINT)));
+                if look.is_none() {
+                    let bar = Bounds::new(
+                        bounds.origin,
+                        size(px(events::BAR_WIDTH), bounds.size.height),
+                    );
+                    window.paint_quad(fill(bar, color.opacity(0.9)));
+                }
+            } else if flags.mention {
                 window.paint_quad(fill(bounds, palette.mention_bg));
             } else if look.is_none() && flags.highlighted {
                 window.paint_quad(fill(bounds, palette.highlight_bg));
             }
             if let Some(look) = &look {
                 // A mention keeps its own tint behind the bar.
-                look.paint(bounds, &palette.events, !flags.mention, window);
+                look.paint(
+                    bounds,
+                    &palette.events,
+                    !(flags.mention || rule.is_some()),
+                    window,
+                );
             }
             let header_color = look.as_ref().map_or(palette.muted, |look| {
                 if look.quiet {

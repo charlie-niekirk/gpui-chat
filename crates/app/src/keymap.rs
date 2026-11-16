@@ -100,6 +100,7 @@ catalog![
         true "Chat" CopySelection "Copy Selection",
         false "Chat" ClearSelection "Clear Selection",
         true "View" ToggleSidebar "Toggle Sidebar",
+        true "View" ShowMentions "Show Mentions",
         true "View" ToggleDebugHud "Toggle Debug HUD",
         true "Account" LogIn "Log In to Twitch…",
         true "Account" LogOut "Log Out",

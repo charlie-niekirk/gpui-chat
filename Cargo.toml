@@ -58,6 +58,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 
 # Text
 unicode-segmentation = "1.13"
+# Highlight rules (PR 5.3): user-written regexes run on the `regex` crate, which matches in time
+# linear in the message (no backtracking), so a pathological pattern cannot stall chat.
+regex = "1.13"
 
 # Errors and logging
 thiserror = "2.0"

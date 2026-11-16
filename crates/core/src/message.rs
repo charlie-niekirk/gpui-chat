@@ -138,8 +138,11 @@ pub struct MessageFlags {
     pub mention: bool,
     /// The author's first message in this channel.
     pub first_message: bool,
-    /// Highlighted by a rule or a channel-points highlight.
+    /// Highlighted by Twitch's channel-points "highlight my message" (`msg-id=highlighted-message`).
     pub highlighted: bool,
+    /// Hit by one of the user's highlight rules (PR 5.3, [`crate::highlight`]): the colour the row
+    /// is tinted with. Set by the app when a message arrives, never by the parser.
+    pub highlight: Option<crate::highlight::HighlightColor>,
     /// Removed by a moderator / timeout / ban; kept so the UI can strike it through.
     pub deleted: bool,
     /// Why (`deleted` is `removal != Removal::None`).

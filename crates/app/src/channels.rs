@@ -20,6 +20,7 @@ use gpui_chat_core::{
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
 
+use crate::attention::Attention;
 use crate::diagnostics::Diagnostics;
 
 /// Messages and state of one channel.
@@ -489,6 +490,8 @@ pub struct ChannelHub {
     connection: Option<ConnectionState>,
     /// Other events that named no channel (connection-wide notices); nothing shows them yet.
     unrouted: u64,
+    /// Runs every batch through the highlight rules before the stores see it (PR 5.3).
+    attention: Option<Entity<Attention>>,
 }
 
 impl ChannelHub {
@@ -506,7 +509,13 @@ impl ChannelHub {
             closed: HashSet::new(),
             connection: None,
             unrouted: 0,
+            attention: None,
         }
+    }
+
+    /// Has every batch pass through `attention` (highlights, unread, notifications) first.
+    pub fn set_attention(&mut self, attention: Entity<Attention>) {
+        self.attention = Some(attention);
     }
 
     /// See the `auto_create` field.
@@ -575,9 +584,12 @@ impl ChannelHub {
     /// The `apply` of the bridge: one frame's events. Each touched store is updated and
     /// notified once. Returns `true` when the hub itself changed (a channel appeared or the
     /// connection state did), so its observers have something new to show.
-    pub fn apply_batch(&mut self, events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
+    pub fn apply_batch(&mut self, mut events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let count = events.len();
+        if let Some(attention) = &self.attention {
+            attention.update(cx, |attention, cx| attention.process(&mut events, cx));
+        }
         let (groups, unrouted) = split_by_channel(events);
         // Rooms that the batch itself announces, for the shared-chat check below: a replay (or a
         // join burst) can deliver a channel's `ROOMSTATE` and the first shared messages together.
@@ -1964,6 +1976,73 @@ mod tests {
             hub.apply_batch(vec![chat("busy", "4", "u")], cx);
             let sizes = hub.sizes(cx);
             assert_eq!(sizes.iter().find(|s| s.channel == channel).unwrap().len, 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_hub_runs_every_batch_through_the_highlight_rules_before_the_stores(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_chat_core::{HighlightColor, HighlightRule};
+        use gpui_chat_settings::Settings;
+
+        let mut settings = Settings::default();
+        settings.highlights.rules = vec![HighlightRule {
+            pattern: "hype".into(),
+            color: HighlightColor::Yellow,
+            ..HighlightRule::default()
+        }];
+        let (hub, attention) = cx.update(|cx| {
+            crate::config::install_for_test(settings, cx);
+            let attention = crate::attention::Attention::start(true, cx);
+            let hub = cx.new(|_| {
+                let mut hub = ChannelHub::new(10, Diagnostics::new());
+                hub.set_attention(attention.clone());
+                hub
+            });
+            (hub, attention)
+        });
+        let say = |channel: &str, id: &str, text: &str| {
+            let ChatEvent::Message { channel, message } = chat(channel, id, "alice") else {
+                unreachable!()
+            };
+            let mut message = (*message).clone();
+            message.fragments = vec![gpui_chat_core::Fragment::Text(text.into())];
+            ChatEvent::Message {
+                channel,
+                message: Arc::new(message),
+            }
+        };
+        let (watched, other) = (ChannelId::new("watched"), ChannelId::new("other"));
+        attention.update(cx, |attention, cx| {
+            attention.set_view(vec![watched.clone()], Some(watched.clone()), true, cx);
+        });
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(
+                vec![
+                    say("watched", "1", "so much HYPE"),
+                    say("other", "2", "hello @viewer"),
+                    say("other", "3", "nothing special"),
+                ],
+                cx,
+            );
+        });
+        let flags = |hub: &ChannelHub, channel: &ChannelId, cx: &App| {
+            let store = hub.store(channel).unwrap().read(cx);
+            store.messages().iter().map(|m| m.flags).collect::<Vec<_>>()
+        };
+        hub.read_with(cx, |hub, cx| {
+            let f = flags(hub, &watched, cx);
+            assert_eq!(f[0].highlight, Some(HighlightColor::Yellow));
+            let f = flags(hub, &other, cx);
+            assert!(f[0].mention && f[0].highlight == Some(HighlightColor::Accent));
+            assert_eq!(f[1].highlight, None);
+        });
+        attention.read_with(cx, |attention, _| {
+            let activity = attention.activity();
+            assert_eq!(activity.unread(&watched), 0, "the watched channel is seen");
+            assert_eq!(activity.unread(&other), 2);
+            assert_eq!(activity.unseen_mentions(&other), 1);
         });
     }
 }

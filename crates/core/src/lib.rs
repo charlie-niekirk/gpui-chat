@@ -13,6 +13,7 @@ pub mod complete;
 pub mod compose;
 pub mod emote;
 pub mod event;
+pub mod highlight;
 pub mod ids;
 pub mod message;
 pub mod moderation;
@@ -33,6 +34,10 @@ pub use emote::{Badge, BadgeId, Emote, EmoteProvider, ImageScale, ImageUrls};
 pub use event::{
     ChannelRole, ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState,
     RoomStateUpdate,
+};
+pub use highlight::{
+    HighlightColor, HighlightConfig, HighlightRule, HighlightUser, Highlights, Hit, HitReason, Own,
+    ProblemKind, RuleKind, RuleProblem,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
 pub use message::{

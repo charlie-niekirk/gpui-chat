@@ -2445,6 +2445,10 @@ dependencies = [
 [[package]]
 name = "gpui-chat-core"
 version = "0.0.0"
+dependencies = [
+ "regex",
+ "serde",
+]
 
 [[package]]
 name = "gpui-chat-emotes"

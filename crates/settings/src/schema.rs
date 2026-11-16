@@ -10,6 +10,7 @@
 //! * Bump [`SCHEMA_VERSION`] only for changes a default cannot express
 //!   (renames, changed meaning). Adding a field is not such a change.
 
+use gpui_chat_core::HighlightConfig;
 use serde::{Deserialize, Serialize};
 
 /// Version written to new files. Files without `schema_version` are treated as
@@ -47,6 +48,8 @@ pub struct Settings {
     pub chat: ChatSettings,
     pub emotes: EmoteSettings,
     pub streamlink: StreamlinkSettings,
+    /// `[highlights]` and its `[[highlights.rules]]` / `[[highlights.users]]` tables (PR 5.3).
+    pub highlights: HighlightConfig,
     // Later phases add sections here, each `#[serde(default)]`:
     // account (3.x: non-secret bits only; tokens live in the keychain).
 }
@@ -59,6 +62,7 @@ impl Default for Settings {
             chat: ChatSettings::default(),
             emotes: EmoteSettings::default(),
             streamlink: StreamlinkSettings::default(),
+            highlights: HighlightConfig::default(),
         }
     }
 }
@@ -291,6 +295,14 @@ impl Settings {
                 format!("{quality:?} is not a quality such as \"best\" or \"720p60\""),
             ));
         }
+        if let Some(problem) = self.highlights.first_problem() {
+            // The index is in the reason: the field is one static name for the whole table.
+            let field = match problem.kind {
+                gpui_chat_core::ProblemKind::User(_) => "highlights.users",
+                _ => "highlights.rules",
+            };
+            return Err((field, problem.to_string()));
+        }
         Ok(())
     }
 }
@@ -321,6 +333,40 @@ mod tests {
             chain,
             ["JetBrainsMono Nerd Font", "JetBrains Mono", "monospace"]
         );
+    }
+
+    #[test]
+    fn highlights_default_to_mentions_on_with_no_rules() {
+        let h = Settings::default().highlights;
+        assert!(h.mentions && h.mention_notify && h.notifications);
+        assert!(h.rules.is_empty() && h.users.is_empty());
+    }
+
+    #[test]
+    fn validate_names_the_bad_rule_or_user() {
+        use gpui_chat_core::{HighlightRule, HighlightUser, RuleKind};
+        let mut s = Settings::default();
+        s.highlights.rules = vec![
+            HighlightRule {
+                pattern: "ok".into(),
+                ..HighlightRule::default()
+            },
+            HighlightRule {
+                kind: RuleKind::Regex,
+                pattern: "(".into(),
+                ..HighlightRule::default()
+            },
+        ];
+        let (field, reason) = s.validate().unwrap_err();
+        assert_eq!(field, "highlights.rules");
+        assert_eq!(reason, "rule 2: `(`: unclosed group");
+
+        let mut s = Settings::default();
+        s.highlights.users = vec![HighlightUser {
+            login: "no spaces".into(),
+            ..HighlightUser::default()
+        }];
+        assert_eq!(s.validate().unwrap_err().0, "highlights.users");
     }
 
     #[test]

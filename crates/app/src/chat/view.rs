@@ -42,9 +42,9 @@ use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div,
-    font, list, point, px,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Window, canvas, div, font, list, point, px,
 };
 
 use super::display::DisplayOptions;
@@ -66,6 +66,8 @@ use crate::theme::Tokens;
 
 /// Rows rendered beyond the viewport, so short scrolls do not pop in.
 const OVERDRAW: Pixels = px(240.0);
+/// Rows shown above a message jumped to (the Mentions view, a notification).
+const JUMP_CONTEXT_ROWS: usize = 3;
 const PADDING_X: Pixels = px(8.0);
 const PADDING_Y: Pixels = px(1.0);
 
@@ -252,6 +254,28 @@ impl ChatView {
             self.remeasure_seqs(&[seq]);
         }
         cx.notify();
+    }
+
+    /// Scrolls the list so that message `id` is in view, a few rows below the top (so the lines
+    /// before it show, as when following a link to a message). Pauses following, like any scroll
+    /// away from the bottom. `false` when the store no longer holds it (it left the scrollback).
+    pub fn scroll_to_message(&mut self, id: &MessageId, cx: &mut Context<Self>) -> bool {
+        let Some(seq) = self.store.read(cx).messages().seq_of(id.as_str()) else {
+            return false;
+        };
+        let Some(ix) = seq
+            .checked_sub(self.mirror.first_seq())
+            .map(|ix| ix as usize)
+            .filter(|&ix| ix < self.mirror.len())
+        else {
+            return false;
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix: ix.saturating_sub(JUMP_CONTEXT_ROWS),
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+        true
     }
 
     /// The pointer entered (`true`) or left a row's moderation strip. While it is on it the list
@@ -1797,6 +1821,47 @@ mod tests {
         assert!(h.following(cx));
         assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
         assert!(!h.view.read_with(cx, |v, _| v.pill_shown()));
+    }
+
+    #[gpui_kit::test]
+    fn jumping_to_a_message_shows_it_a_few_rows_from_the_top_and_stops_following(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        assert!(h.following(cx));
+        let id = |n: u64| MessageId::from(format!("m{n}"));
+        let found = h
+            .view
+            .update(cx, |view, cx| view.scroll_to_message(&id(50), cx));
+        cx.run_until_parked();
+        assert!(found);
+        assert!(
+            !h.following(cx),
+            "a jump away from the bottom pauses following"
+        );
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(top.item_ix, 50 - JUMP_CONTEXT_ROWS);
+        // A message the store no longer holds is not found, and nothing moves.
+        let missing = h.view.update(cx, |view, cx| {
+            view.scroll_to_message(&MessageId::from("gone"), cx)
+        });
+        assert!(!missing);
+        let again = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(again.item_ix, top.item_ix);
+        // The first rows clamp at the top.
+        assert!(
+            h.view
+                .update(cx, |view, cx| view.scroll_to_message(&id(1), cx))
+        );
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(top.item_ix, 0);
     }
 
     fn history_before(count: i64, cx: &mut VisualTestContext, h: &Harness) {

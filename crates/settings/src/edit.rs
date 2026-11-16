@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use crate::error::SettingsError;
 use crate::schema::Settings;
@@ -29,6 +29,10 @@ pub enum EditValue {
     Float(f64),
     Str(String),
     StrList(Vec<String>),
+    /// An array of tables, written as `[[section.key]]` blocks, one per row (each row is its
+    /// `key = value` pairs, scalars only). An empty list removes the key. The old blocks are
+    /// replaced as a whole, so comments inside them are lost.
+    Tables(Vec<Vec<(&'static str, EditValue)>>),
 }
 
 impl EditValue {
@@ -44,6 +48,8 @@ impl EditValue {
             Self::Float(v) => Value::from(v),
             Self::Str(v) => Value::from(v),
             Self::StrList(items) => Value::Array(items.into_iter().collect::<Array>()),
+            // Handled before a value is made (see `apply_one`); a row holds scalars only.
+            Self::Tables(_) => Value::Array(Array::new()),
         }
     }
 }
@@ -148,6 +154,22 @@ fn apply_one(doc: &mut DocumentMut, path: &Path, edit: &SettingEdit) -> Result<(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_like_mut()
         .ok_or_else(|| wrong_shape(&format!("`{section}` is not a table")))?;
+    if let EditValue::Tables(rows) = value {
+        if rows.is_empty() {
+            table.remove(key);
+            return Ok(());
+        }
+        let mut blocks = ArrayOfTables::new();
+        for row in rows {
+            let mut block = Table::new();
+            for (name, value) in row {
+                block.insert(name, Item::Value(value.into_toml()));
+            }
+            blocks.push(block);
+        }
+        table.insert(key, Item::ArrayOfTables(blocks));
+        return Ok(());
+    }
     // A whole number is written as an integer (`font_size = 16`) unless the value already there
     // is a float literal (`14.0`): the file keeps the style its author used.
     let existing_is_float = table
@@ -320,6 +342,94 @@ x = 1
         assert_eq!(
             set("[appearance]\nfont_size = 14\n", 14.5).0,
             "[appearance]\nfont_size = 14.5\n"
+        );
+    }
+
+    fn rule(pattern: &str, color: &str) -> Vec<(&'static str, EditValue)> {
+        vec![
+            ("kind", EditValue::Str("phrase".into())),
+            ("pattern", EditValue::Str(pattern.into())),
+            ("color", EditValue::Str(color.into())),
+            ("notify", EditValue::Bool(true)),
+        ]
+    }
+
+    #[test]
+    fn a_list_of_tables_becomes_blocks_and_the_rest_of_the_file_stays() {
+        let text = "# mine\n[highlights]\nmentions = false # off\n\n[chat]\ntimestamps = false\n";
+        let (out, settings) = edit(
+            text,
+            &[SettingEdit::set(
+                "highlights.rules",
+                EditValue::Tables(vec![rule("nice play", "green"), rule("gg", "red")]),
+            )],
+        );
+        assert_eq!(settings.highlights.rules.len(), 2);
+        assert_eq!(settings.highlights.rules[0].pattern, "nice play");
+        assert_eq!(
+            settings.highlights.rules[1].color,
+            gpui_chat_core::HighlightColor::Red
+        );
+        assert!(!settings.highlights.mentions);
+        assert!(
+            out.contains("# mine") && out.contains("mentions = false # off"),
+            "{out}"
+        );
+        assert!(out.contains("[[highlights.rules]]"), "{out}");
+        // Replacing the list replaces every block; nothing of the old ones is left.
+        let (again, settings) = edit(
+            &out,
+            &[SettingEdit::set(
+                "highlights.rules",
+                EditValue::Tables(vec![rule("only", "yellow")]),
+            )],
+        );
+        assert_eq!(settings.highlights.rules.len(), 1);
+        assert!(!again.contains("nice play"), "{again}");
+        assert!(again.contains("timestamps = false"), "{again}");
+        // An empty list removes the key.
+        let (none, settings) = edit(
+            &again,
+            &[SettingEdit::set(
+                "highlights.rules",
+                EditValue::Tables(vec![]),
+            )],
+        );
+        assert!(settings.highlights.rules.is_empty());
+        assert!(!none.contains("[[highlights.rules]]"), "{none}");
+    }
+
+    #[test]
+    fn a_missing_section_gets_the_blocks_and_a_bad_pattern_is_refused_untouched() {
+        let (out, _) = edit(
+            "",
+            &[SettingEdit::set(
+                "highlights.users",
+                EditValue::Tables(vec![vec![
+                    ("login", EditValue::Str("alice".into())),
+                    ("color", EditValue::Str("green".into())),
+                ]]),
+            )],
+        );
+        assert!(
+            out.contains("[[highlights.users]]") && out.contains("login = \"alice\""),
+            "{out}"
+        );
+        let err = apply_edits(
+            "",
+            p(),
+            &[SettingEdit::set(
+                "highlights.rules",
+                EditValue::Tables(vec![vec![
+                    ("kind", EditValue::Str("regex".into())),
+                    ("pattern", EditValue::Str("(".into())),
+                ]]),
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SettingsError::Invalid { field: "highlights.rules", reason, .. } if reason.contains("unclosed group")),
+            "{err}"
         );
     }
 

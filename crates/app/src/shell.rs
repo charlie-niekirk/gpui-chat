@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent};
+use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent, MessageId};
 use gpui_chat_settings::SettingsError;
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::streams::StreamInfo;
@@ -39,9 +39,11 @@ use crate::actions::{
     About, AddChannel, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
     FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
     OpenChannelSwitcher, OpenPalette, ReloadEmotes, RemoveChannel, SHELL_CONTEXT,
-    SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
+    SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleDebugHud,
+    ToggleSidebar,
 };
 use crate::add_channel;
+use crate::attention::{Attention, AttentionEvent};
 use crate::bridge::BridgeSender;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
@@ -53,7 +55,9 @@ use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
 use crate::keymap::{self, KeymapState};
 use crate::live::LiveSource;
+use crate::mentions;
 use crate::moderation::Moderator;
+use crate::notifications::Target;
 use crate::palette;
 use crate::pane::{ChannelPane, PaneTools};
 use crate::sign_in;
@@ -143,6 +147,9 @@ pub fn flush_state(cx: &App) {
 /// source that feeds them and the measurements behind the debug HUD.
 pub struct ShellParts {
     pub hub: Entity<ChannelHub>,
+    /// Highlights, unread dots, the Mentions log (PR 5.3); every batch passes through it before
+    /// the hub's stores see it.
+    pub attention: Entity<Attention>,
     /// The channels to open at launch (from `state.toml`); empty for the offline sources.
     pub channels: ChannelList,
     /// The live client; `None` with `--firehose` / `--replay`, which then also keep the channel
@@ -162,6 +169,11 @@ pub struct AppShell {
     sidebar_collapsed: bool,
     diagnostics: Diagnostics,
     hub: Entity<ChannelHub>,
+    attention: Entity<Attention>,
+    /// The Mentions panel is open beside the panes.
+    mentions_open: bool,
+    /// Whether this window is the active one (a channel is only being watched while it is).
+    window_active: bool,
     hud: Entity<DebugHud>,
     list: ChannelList,
     live: Option<LiveSource>,
@@ -193,6 +205,7 @@ impl AppShell {
     pub fn new(window: &mut Window, parts: ShellParts, cx: &mut Context<Self>) -> Self {
         let ShellParts {
             hub,
+            attention,
             channels,
             live,
             account,
@@ -230,6 +243,18 @@ impl AppShell {
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.placement_changed(window, cx);
             }),
+            // Dots and the Mentions list follow the attention state.
+            cx.observe(&attention, |_, _, cx| cx.notify()),
+            // A clicked notification shows its message (or the Mentions view).
+            cx.subscribe_in(&attention, window, |this, _, event, window, cx| {
+                let AttentionEvent::Show(target) = event;
+                this.show_target(target, window, cx);
+            }),
+            // What a channel's dots mean depends on whether the window is the one in front.
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.window_active = window.is_window_active();
+                this.push_view(cx);
+            }),
         ];
         let stream_info = match &account {
             Some(account) => {
@@ -260,6 +285,9 @@ impl AppShell {
             sidebar_collapsed: false,
             diagnostics,
             hub,
+            attention,
+            mentions_open: false,
+            window_active: window.is_window_active(),
             hud,
             list: channels,
             live,
@@ -394,6 +422,7 @@ impl AppShell {
                 pane.update(cx, |pane, cx| pane.set_in_split(in_split, cx));
             }
         }
+        self.push_view(cx);
         let focus = (
             self.layout.focused(),
             self.layout.focused_channel().cloned(),
@@ -402,6 +431,64 @@ impl AppShell {
             self.last_focus = focus;
             self.focus_pending = true;
         }
+    }
+
+    /// Tells the attention state what is on screen: which channels the panes show, which one has
+    /// focus and whether the window is in front. This is what clears a channel's dots.
+    fn push_view(&self, cx: &mut Context<Self>) {
+        let visible: Vec<ChannelId> = self
+            .layout
+            .leaves()
+            .iter()
+            .filter_map(|leaf| leaf.channel.clone())
+            .collect();
+        let focused = self.layout.focused_channel().cloned();
+        let active = self.window_active;
+        self.attention.update(cx, |attention, cx| {
+            attention.set_view(visible, focused, active, cx);
+        });
+    }
+
+    /// Shows `message` of `channel` (the Mentions view, a notification): the channel in the focused
+    /// pane (or its own pane, focused), scrolled to the message when it is still there.
+    fn show_message(
+        &mut self,
+        channel: &ChannelId,
+        message: Option<&MessageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.list.contains(channel) {
+            return;
+        }
+        self.show_channel(channel);
+        self.list_changed(cx);
+        self.focus_pending = true;
+        if let (Some(id), Some(pane)) = (message, self.panes.get(channel)) {
+            pane.update(cx, |pane, cx| pane.show_message(id, cx));
+        }
+        self.attention
+            .update(cx, |attention, cx| attention.mark_seen(channel, cx));
+        window.activate_window();
+        cx.notify();
+    }
+
+    /// What a clicked notification asked for.
+    fn show_target(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            Target::Message(channel, id) => self.show_message(channel, Some(id), window, cx),
+            Target::Mentions => {
+                self.mentions_open = true;
+                window.activate_window();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Opens or closes the Mentions panel.
+    fn toggle_mentions(&mut self, cx: &mut Context<Self>) {
+        self.mentions_open = !self.mentions_open;
+        cx.notify();
     }
 
     /// Every edit of the channel list or the layout ends here.
@@ -475,6 +562,8 @@ impl AppShell {
             live.part(channel);
         }
         self.hub.update(cx, |hub, cx| hub.remove(channel, cx));
+        self.attention
+            .update(cx, |attention, cx| attention.forget(channel, cx));
         self.list_changed(cx);
     }
 
@@ -915,6 +1004,21 @@ impl AppShell {
                 }
                 None => (HashMap::new(), None),
             };
+        // What is unread in each open channel (PR 5.3), copied out like the live state.
+        let activity: HashMap<ChannelId, Dots> = {
+            let activity = self.attention.read(cx).activity();
+            self.list
+                .channels()
+                .iter()
+                .filter_map(|channel| {
+                    let dots = Dots {
+                        unread: activity.unread(channel),
+                        mentions: activity.unseen_mentions(channel),
+                    };
+                    dots.any().then(|| (channel.clone(), dots))
+                })
+                .collect()
+        };
         // Open and followed rows can be dragged into a split (PR 4.1).
         let items: Vec<(SidebarMenuItem, Option<ChannelId>)> = if self.list.is_empty() {
             vec![(
@@ -937,6 +1041,7 @@ impl AppShell {
                         index > 0,
                         index + 1 < count,
                         live.get(channel),
+                        activity.get(channel).copied().unwrap_or_default(),
                         &shell,
                     );
                     (item, Some(channel.clone()))
@@ -1063,6 +1168,32 @@ impl AppShell {
             )
     }
 
+    /// The Mentions panel (PR 5.3), when it is open.
+    fn mentions_panel(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.mentions_open {
+            return None;
+        }
+        let rows = mentions::rows(self.attention.read(cx).activity().mentions());
+        let shell = cx.entity().downgrade();
+        let close = shell.clone();
+        let pick: mentions::Pick = std::rc::Rc::new(move |channel, id, window, cx| {
+            let (channel, id) = (channel.clone(), id.clone());
+            shell
+                .update(cx, |shell, cx| {
+                    shell.show_message(&channel, Some(&id), window, cx);
+                })
+                .ok();
+        });
+        Some(mentions::panel(rows, tokens, pick, move |_, cx| {
+            close
+                .update(cx, |shell, cx| {
+                    shell.mentions_open = false;
+                    cx.notify();
+                })
+                .ok();
+        }))
+    }
+
     fn main_area(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let area = div().flex().flex_1().min_h_0().w_full().bg(tokens.main_bg);
         // Nothing open and nothing split: the welcome text instead of an empty pane.
@@ -1074,7 +1205,9 @@ impl AppShell {
                 drop: self.drop_target,
                 tokens: *tokens,
             };
-            return area.child(splits.render(cx));
+            return area
+                .child(splits.render(cx))
+                .children(self.mentions_panel(tokens, cx));
         }
         area.items_center().justify_center().child(
             v_flex()
@@ -1123,6 +1256,7 @@ fn channel_item(
     can_move_up: bool,
     can_move_down: bool,
     live: Option<&StreamInfo>,
+    dots: Dots,
     shell: &WeakEntity<AppShell>,
 ) -> SidebarMenuItem {
     let act = |shell: &WeakEntity<AppShell>,
@@ -1140,15 +1274,28 @@ fn channel_item(
         .on_click(act(&click_shell, &click_channel, |shell, channel, cx| {
             shell.select_channel(channel, cx);
         }));
-    if let Some(info) = live {
-        let info = info.clone();
-        item = item
-            .accessibility_label(format!(
-                "{}, live, {} viewers",
-                channel.login(),
+    if live.is_some() || dots.any() {
+        let info = live.cloned();
+        let mut label = channel.login().to_owned();
+        if let Some(info) = &info {
+            label.push_str(&format!(
+                ", live, {} viewers",
                 stream_info::format_viewers(info.viewers)
-            ))
-            .suffix(move |_, cx| live_suffix(&info, false, cx));
+            ));
+        }
+        if let Some(text) = dots.description() {
+            label.push_str(&format!(", {text}"));
+        }
+        let id = SharedString::from(format!("activity-{channel}"));
+        item = item.accessibility_label(label).suffix(move |_, cx| {
+            h_flex()
+                .flex_none()
+                .gap_1p5()
+                .items_center()
+                .children(dots.element(id.clone(), cx))
+                .children(info.as_ref().map(|info| live_suffix(info, false, cx)))
+                .into_any_element()
+        });
     }
     item.context_menu(move |menu: PopupMenu, _, _| {
         menu.item(
@@ -1174,6 +1321,80 @@ fn channel_item(
             },
         )))
     })
+}
+
+/// A channel's unread state for the sidebar (PR 5.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Dots {
+    /// Messages since the channel was last looked at.
+    unread: u32,
+    /// Highlight hits among them nobody has looked at.
+    mentions: usize,
+}
+
+impl Dots {
+    fn any(self) -> bool {
+        self.unread > 0 || self.mentions > 0
+    }
+
+    /// "3 unread, 1 mention", for the tooltip and the screen reader.
+    fn description(self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.mentions > 0 {
+            parts.push(format!(
+                "{} {}",
+                self.mentions,
+                if self.mentions == 1 {
+                    "mention"
+                } else {
+                    "mentions"
+                }
+            ));
+        }
+        if self.unread > 0 {
+            parts.push(format!("{} unread", self.unread));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+
+    /// A pill with the number of mentions (accent) and a dot for unread messages (muted), with the
+    /// numbers in a tooltip.
+    fn element(self, id: SharedString, cx: &App) -> Option<AnyElement> {
+        let text = self.description()?;
+        let tokens = *cx.global::<Tokens>();
+        Some(
+            h_flex()
+                .id(id)
+                .flex_none()
+                .gap_1()
+                .items_center()
+                .children((self.mentions > 0).then(|| {
+                    div()
+                        .min_w(px(16.0))
+                        .h(px(16.0))
+                        .px_1()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(tokens.accent)
+                        .text_color(tokens.accent_text)
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .child(if self.mentions > 9 {
+                            "9+".to_owned()
+                        } else {
+                            self.mentions.to_string()
+                        })
+                }))
+                .children(
+                    (self.unread > 0 && self.mentions == 0)
+                        .then(|| div().size(px(7.0)).rounded_full().bg(tokens.text)),
+                )
+                .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                .into_any_element(),
+        )
+    }
 }
 
 /// The right end of a live row: the live dot, the category (followed rows) and the viewers. The
@@ -1283,6 +1504,7 @@ impl Render for AppShell {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
             .on_action(cx.listener(|_, _: &About, window, cx| Self::show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowMentions, _, cx| this.toggle_mentions(cx)))
             .on_action(cx.listener(|this, _: &ToggleDebugHud, _, cx| {
                 this.hud.update(cx, |hud, cx| hud.toggle(cx));
             }))

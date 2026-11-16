@@ -41,6 +41,8 @@ impl Default for WatchOptions {
 
 /// What the watcher reports.
 #[derive(Debug, Clone)]
+// A reload is rare and the queue is tiny, so the size of the settings is not worth a box.
+#[allow(clippy::large_enum_variant)]
 pub enum SettingsEvent {
     /// The file changed and now yields these settings (deleting the file
     /// yields the defaults). Not sent when the result equals the previously
