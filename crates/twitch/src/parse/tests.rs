@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, FollowersOnly, Fragment, Message, MessageKind, Rgb,
-    RoomState, Timestamp,
+    AnnouncementColor, ChannelId, ChatEvent, ClearTarget, EventKind, FollowersOnly, Fragment,
+    Message, MessageKind, Rgb, RoomState, SubPlan, Timestamp,
 };
 
 use super::*;
@@ -76,6 +76,7 @@ fn every_fixture_line_parses() {
     for name in [
         "privmsg.irc",
         "usernotice.irc",
+        "events.irc",
         "clearchat.irc",
         "clearmsg.irc",
         "roomstate.irc",
@@ -260,7 +261,7 @@ fn first_message_bits_highlight_history() {
     assert_eq!(cheer.bits, Some(100));
     assert!(matches!(
         &cheer.fragments[0],
-        Fragment::Cheer { prefix, bits: 100 } if prefix == "Cheer"
+        Fragment::Cheer { prefix, bits: 100, .. } if prefix == "Cheer"
     ));
 
     assert!(privmsg("00000000000a").flags.highlighted);
@@ -773,4 +774,479 @@ fn clearchat_carries_its_time_when_the_line_has_one() {
     );
     assert_eq!(at(":tmi.twitch.tv CLEARCHAT #c"), None);
     assert_eq!(at("@tmi-sent-ts=oops :tmi.twitch.tv CLEARCHAT #c"), None);
+}
+
+// ---- event messages (PR 5.1, fixtures/irc/events.irc) ----------------------------------------
+
+fn event_message(n: &str) -> Arc<Message> {
+    message("events.irc", &format!("0000-4000-8000-{n:0>12}")).1
+}
+
+fn kind(n: &str) -> EventKind {
+    event_message(n).event.clone().expect("a user notice")
+}
+
+#[test]
+fn subs_and_resubs() {
+    assert_eq!(
+        kind("10"),
+        EventKind::Sub {
+            plan: SubPlan::Tier1,
+            months: 1
+        }
+    );
+    let prime = event_message("11");
+    assert_eq!(
+        prime.event,
+        Some(EventKind::Sub {
+            plan: SubPlan::Prime,
+            months: 1
+        })
+    );
+    assert_eq!(prime.plain_text(), "hello Kappa first month");
+    assert_eq!(
+        kind("12"),
+        EventKind::Resub {
+            plan: SubPlan::Tier1,
+            months: 12,
+            streak: Some(12)
+        }
+    );
+    let long = event_message("12");
+    assert!(
+        long.fragments
+            .iter()
+            .any(|f| matches!(f, Fragment::Link { url, .. } if url == "https://example.com/art")),
+        "the user's message is tokenized"
+    );
+    // The streak is only reported when the user shared it.
+    assert_eq!(
+        kind("13"),
+        EventKind::Resub {
+            plan: SubPlan::Tier3,
+            months: 27,
+            streak: None
+        }
+    );
+}
+
+#[test]
+fn gifts() {
+    let EventKind::Gift {
+        plan,
+        recipient,
+        months,
+        gifter_total,
+        anonymous,
+        community_gift_id,
+    } = kind("20")
+    else {
+        panic!("a gift")
+    };
+    assert_eq!(plan, SubPlan::Tier1);
+    assert_eq!(
+        (
+            recipient.login.as_str(),
+            recipient.name(),
+            recipient.user_id.as_deref()
+        ),
+        ("lucky", "Lucky", Some("2010"))
+    );
+    assert_eq!(
+        (months, gifter_total, anonymous, community_gift_id),
+        (1, Some(50), false, None)
+    );
+
+    let EventKind::Gift {
+        plan,
+        anonymous,
+        gifter_total,
+        ..
+    } = kind("21")
+    else {
+        panic!("an anonymous gift")
+    };
+    assert_eq!(
+        (plan, anonymous, gifter_total),
+        (SubPlan::Tier2, true, None)
+    );
+
+    assert_eq!(
+        kind("22"),
+        EventKind::MysteryGift {
+            plan: SubPlan::Tier1,
+            count: 3,
+            gifter_total: Some(103),
+            anonymous: false,
+            origin_id: Some("11 22 33".into()),
+            recipients: Vec::new(),
+        }
+    );
+    // The per-recipient lines of a mystery gift name it (`community-gift-id` = its origin id) and
+    // carry no running total (Twitch sends 0 there).
+    for n in ["23", "24", "25"] {
+        assert!(kind(n).is_community_gift(), "{n}");
+        assert_eq!(kind(n).community_gift_id(), Some("11 22 33"));
+        assert!(matches!(
+            kind(n),
+            EventKind::Gift {
+                gifter_total: None,
+                ..
+            }
+        ));
+    }
+    assert!(!kind("20").is_community_gift());
+    assert_eq!(
+        kind("26"),
+        EventKind::MysteryGift {
+            plan: SubPlan::Tier1,
+            count: 20,
+            gifter_total: None,
+            anonymous: true,
+            origin_id: Some("44 55 66".into()),
+            recipients: Vec::new(),
+        }
+    );
+    assert_eq!(
+        kind("27"),
+        EventKind::GiftPaidUpgrade {
+            gifter: Some("Generous".into()),
+            promo: None
+        }
+    );
+    assert_eq!(
+        kind("28"),
+        EventKind::GiftPaidUpgrade {
+            gifter: None,
+            promo: None
+        }
+    );
+    assert_eq!(
+        kind("29"),
+        EventKind::PrimePaidUpgrade {
+            plan: SubPlan::Tier1
+        }
+    );
+}
+
+#[test]
+fn raids_announcements_and_the_rest() {
+    assert_eq!(
+        kind("30"),
+        EventKind::Raid {
+            from_login: "raidingchannel".into(),
+            from_name: "RaidingChannel".into(),
+            viewers: 1234,
+            profile_image: Some(
+                "https://static-cdn.jtvnw.net/jtv_user_pictures/x-profile_image-70x70.png".into()
+            )
+        }
+    );
+    assert!(matches!(
+        kind("31"),
+        EventKind::Raid {
+            viewers: 1,
+            profile_image: None,
+            ..
+        }
+    ));
+    let colours: Vec<_> = ["40", "41", "42", "43", "44"]
+        .map(|n| match kind(n) {
+            EventKind::Announcement { color } => color,
+            other => panic!("{other:?}"),
+        })
+        .into();
+    assert_eq!(
+        colours,
+        [
+            AnnouncementColor::Primary,
+            AnnouncementColor::Blue,
+            AnnouncementColor::Green,
+            AnnouncementColor::Orange,
+            AnnouncementColor::Purple
+        ]
+    );
+    // The announcement's text is the user's message; there is no system-msg.
+    let announcement = event_message("42");
+    assert_eq!(announcement.system_text, None);
+    assert_eq!(emotes(&announcement), [("25", "Kappa")]);
+    assert_eq!(kind("50"), EventKind::NewChatter);
+    assert_eq!(kind("51"), EventKind::BitsBadgeTier { tier: 1000 });
+    // Unknown msg-ids keep Twitch's own line.
+    assert_eq!(
+        kind("52"),
+        EventKind::Other {
+            msg_id: "standardpayforward".into()
+        }
+    );
+    assert!(
+        event_message("52")
+            .system_text
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Payer is paying forward"))
+    );
+    assert_eq!(
+        kind("53"),
+        EventKind::Other {
+            msg_id: "unraid".into()
+        }
+    );
+}
+
+#[test]
+fn an_incomplete_notice_falls_back_to_its_system_line() {
+    let parse = |tags: &str| {
+        let line = format!(
+            "@id=1;login=x;system-msg=hello;tmi-sent-ts=5;{tags} :tmi.twitch.tv USERNOTICE #c"
+        );
+        match parse_line(&line).unwrap().unwrap() {
+            ChatEvent::Message { message, .. } => message,
+            other => panic!("{other:?}"),
+        }
+    };
+    let other = |m: &Message| matches!(m.event, Some(EventKind::Other { .. }));
+    // A subgift with no recipient, a mystery gift with no count, a raid with no viewer count.
+    assert!(other(&parse("msg-id=subgift")));
+    assert!(other(&parse("msg-id=submysterygift")));
+    assert!(other(&parse(
+        "msg-id=submysterygift;msg-param-mass-gift-count=0"
+    )));
+    assert!(other(&parse("msg-id=raid;msg-param-login=x")));
+    assert!(other(&parse("msg-id=ritual;msg-param-ritual-name=other")));
+    assert!(other(&parse("msg-id=")));
+    assert_eq!(
+        parse("msg-id=raid;msg-param-login=x")
+            .system_text
+            .as_deref(),
+        Some("hello")
+    );
+    // Missing numbers do not fail a sub.
+    assert_eq!(
+        parse("msg-id=sub").event,
+        Some(EventKind::Sub {
+            plan: SubPlan::Tier1,
+            months: 1
+        })
+    );
+    // An unknown plan is kept as sent.
+    assert_eq!(
+        parse("msg-id=sub;msg-param-sub-plan=9000").event,
+        Some(EventKind::Sub {
+            plan: SubPlan::Other("9000".into()),
+            months: 1
+        })
+    );
+}
+
+#[test]
+fn chat_lines_have_no_event_kind() {
+    assert_eq!(privmsg("000000000001").event, None);
+    assert_eq!(event_message("1").event, None);
+}
+
+#[test]
+fn bits_cheermotes_highlights_rewards_and_first_messages() {
+    let cheer = event_message("60");
+    assert_eq!(cheer.bits, Some(100));
+    assert!(matches!(
+        &cheer.fragments[0],
+        Fragment::Cheer { prefix, bits: 100, image: None } if prefix == "Cheer"
+    ));
+    // Every cheermote of the message is found, in any case, with its own amount.
+    let big = event_message("61");
+    assert_eq!(big.bits, Some(1750));
+    let cheers: Vec<_> = big
+        .fragments
+        .iter()
+        .filter_map(|f| match f {
+            Fragment::Cheer { prefix, bits, .. } => Some((prefix.as_str(), *bits)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cheers, [("cheer", 1000), ("Kappa", 500), ("cheer", 250)]);
+    // A prefix this build does not know is text until the channel's cheermotes are known.
+    let odd = event_message("62");
+    assert_eq!(odd.bits, Some(50));
+    assert!(
+        !odd.fragments
+            .iter()
+            .any(|f| matches!(f, Fragment::Cheer { .. }))
+    );
+
+    let highlighted = event_message("70");
+    assert!(highlighted.flags.highlighted);
+    assert_eq!(highlighted.reward_id, None);
+    let reward = event_message("71");
+    assert_eq!(
+        reward.reward_id.as_deref(),
+        Some("a1b2c3d4-0000-4000-8000-00000000aaaa")
+    );
+    assert!(!reward.flags.highlighted);
+    assert_eq!(emotes(&reward), [("25", "Kappa")]);
+    let first = event_message("72");
+    assert!(first.flags.first_message);
+    assert_eq!(first.kind, MessageKind::Chat);
+    let first_action = event_message("73");
+    assert!(first_action.flags.first_message);
+    assert_eq!(first_action.kind, MessageKind::Action);
+    assert_eq!(first_action.plain_text(), "waves hello");
+}
+
+#[test]
+fn shared_chat_tags() {
+    let own = event_message("80");
+    let shared = own.shared.as_ref().expect("shared");
+    assert_eq!(shared.source_room_id, "2000");
+    assert_eq!(
+        shared.source_id.as_ref().map(|id| id.as_str()),
+        Some(own.id.as_str())
+    );
+    assert!(!shared.is_copy_in(own.raw_tags.get("room-id")));
+
+    // The copy in the other channel: another id, the original's in `source-id`.
+    let copy = event_message("81");
+    let shared = copy.shared.as_ref().expect("shared");
+    assert!(shared.is_copy_in(copy.raw_tags.get("room-id")));
+    assert_ne!(copy.id, own.id);
+    assert_eq!(
+        shared.source_id.as_ref(),
+        Some(&own.id),
+        "`source-id` names the original"
+    );
+    assert_eq!(
+        (&shared.source_login, &shared.source_name),
+        (&None, &None),
+        "the parser cannot know the name"
+    );
+
+    let visitor = event_message("82");
+    let shared = visitor.shared.as_ref().unwrap();
+    assert_eq!(shared.source_room_id, "3000");
+    let badges: Vec<_> = shared
+        .source_badges
+        .iter()
+        .map(|b| (&*b.set, &*b.version))
+        .collect();
+    assert_eq!(badges, [("moderator", "1"), ("subscriber", "12")]);
+    // The author's own badges are the ones of the room the line was delivered in.
+    assert!(visitor.author.as_ref().unwrap().badges.is_empty());
+
+    // Sent in this room itself: not a copy.
+    let host = event_message("83");
+    assert!(
+        !host
+            .shared
+            .as_ref()
+            .unwrap()
+            .is_copy_in(host.raw_tags.get("room-id"))
+    );
+    // Outside shared chat there is nothing.
+    assert_eq!(event_message("1").shared, None);
+}
+
+#[test]
+fn history_events_are_flagged() {
+    let old = event_message("90");
+    assert!(old.flags.history);
+    assert!(matches!(old.event, Some(EventKind::Sub { .. })));
+    assert_eq!(old.timestamp, Timestamp(1_700_000_099_000));
+}
+
+#[test]
+fn a_notice_of_another_shared_channel_is_dispatched_on_its_source_kind() {
+    // msg-id=sharedchatnotice, the real kind in source-msg-id, with that kind's msg-param-*.
+    let raid = event_message("100");
+    assert_eq!(raid.notice_id.as_deref(), Some("sharedchatnotice"));
+    assert_eq!(
+        raid.event,
+        Some(EventKind::Raid {
+            from_login: "bigraider".into(),
+            from_name: "BigRaider".into(),
+            viewers: 2500,
+            profile_image: Some(
+                "https://static-cdn.jtvnw.net/jtv_user_pictures/x-profile_image-70x70.png".into()
+            )
+        })
+    );
+    // It is marked as coming from the other room, so it is drawn as that channel's raid.
+    let shared = raid.shared.as_ref().expect("shared");
+    assert_eq!(shared.source_room_id, "2000");
+    assert!(shared.is_copy_in(raid.raw_tags.get("room-id")));
+
+    let announcement = event_message("101");
+    assert_eq!(
+        announcement.event,
+        Some(EventKind::Announcement {
+            color: AnnouncementColor::Blue
+        })
+    );
+    assert_eq!(announcement.system_text, None, "an empty system-msg");
+    assert_eq!(
+        announcement.plain_text(),
+        "Both chats: raffle in ten minutes"
+    );
+    assert_eq!(
+        announcement.shared.as_ref().unwrap().source_badges[0]
+            .set
+            .as_ref(),
+        "moderator"
+    );
+
+    assert_eq!(
+        event_message("102").event,
+        Some(EventKind::Resub {
+            plan: SubPlan::Tier1,
+            months: 6,
+            streak: None
+        })
+    );
+    assert_eq!(
+        event_message("102").shared.as_ref().unwrap().source_room_id,
+        "3000"
+    );
+
+    // Without a source kind there is nothing to dispatch on.
+    let parse = |tags: &str| {
+        let line = format!("@id=1;login=x;tmi-sent-ts=5;{tags} :tmi.twitch.tv USERNOTICE #c");
+        match parse_line(&line).unwrap().unwrap() {
+            ChatEvent::Message { message, .. } => message,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        parse("msg-id=sharedchatnotice").event,
+        Some(EventKind::Other {
+            msg_id: String::new()
+        })
+    );
+}
+
+#[test]
+fn the_gift_bomb_fixture_has_one_row_and_a_line_per_recipient() {
+    let mystery = event_message("103");
+    let Some(EventKind::MysteryGift {
+        count, origin_id, ..
+    }) = &mystery.event
+    else {
+        panic!("a mystery gift")
+    };
+    assert_eq!((*count, origin_id.as_deref()), (12, Some("77 88 99")));
+    let lines: Vec<_> = (104..116)
+        .map(|n| match kind(&n.to_string()) {
+            EventKind::Gift {
+                recipient,
+                community_gift_id,
+                gifter_total,
+                ..
+            } => (recipient.name().to_owned(), community_gift_id, gifter_total),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(lines.len(), 12);
+    assert!(
+        lines
+            .iter()
+            .all(|(_, id, total)| id.as_deref() == Some("77 88 99") && total.is_none())
+    );
+    assert_eq!((lines[0].0.as_str(), lines[11].0.as_str()), ("Ann", "Lea"));
 }

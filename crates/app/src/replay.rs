@@ -122,6 +122,10 @@ pub async fn run(
     speed: Speed,
     counters: Arc<IngestCounters>,
 ) {
+    // `GPUI_CHAT_DEMO_CHEERMOTES=1`: cheermote images without Helix (a look-and-feel aid).
+    let cheermotes = std::env::var_os(crate::special_service::DEMO_ENV)
+        .is_some_and(|value| value == "1")
+        .then(crate::special_service::demo_cheermotes);
     let timed = log.lines().any(|line| sent_ts(line).is_some());
     let mut pacer = Pacer::new(speed, timed);
     let start = Instant::now();
@@ -135,6 +139,13 @@ pub async fn run(
                 tracing::debug!(%error, line, "replay: skipping a line that did not parse");
                 continue;
             }
+        };
+        let event = match (&cheermotes, event) {
+            (Some(set), ChatEvent::Message { channel, message }) => ChatEvent::Message {
+                channel,
+                message: crate::special_service::with_cheermotes(set, message),
+            },
+            (_, event) => event,
         };
         let due = start + pacer.offset(sent_ts(line));
         let now = Instant::now();

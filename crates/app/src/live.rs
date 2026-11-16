@@ -29,6 +29,7 @@ use crate::emote_service::{self, EmoteService};
 use crate::history_service::HistoryService;
 use crate::moderation::{ModRequest, local_line};
 use crate::runtime;
+use crate::special_service::SpecialService;
 
 /// Handle to the running client; the shell owns it.
 #[derive(Clone)]
@@ -41,6 +42,8 @@ pub struct LiveSource {
     badges: Option<BadgeService>,
     /// Recent messages on join and after a reconnect (PR 5.5); `None` if it could not start.
     history: Option<HistoryService>,
+    /// Cheermotes and shared-chat source names (PR 5.1).
+    special: SpecialService,
     /// The login owner and its Helix client; `None` if they could not be built (no sending).
     account: Option<(Auth, HelixClient)>,
     /// Where a sent message's echo goes: the same path as every incoming event.
@@ -102,10 +105,12 @@ impl LiveSource {
         let enabled = emote_service::providers(&config::current(cx).emotes);
         let emotes = EmoteService::start(enabled, cx);
         let badges = BadgeService::start(account.clone(), cx);
+        let special = SpecialService::start(account.clone(), cx);
         let history = HistoryService::start(
             config::current(cx).chat.history,
             sender.clone(),
             emotes.clone(),
+            special.clone(),
             cx,
         );
         // Dropped on purpose: the task ends when the client's event channel closes or the UI
@@ -118,6 +123,7 @@ impl LiveSource {
                 emotes.clone(),
                 badges.clone(),
                 history.clone(),
+                special.clone(),
             ),
         ));
         Self {
@@ -125,6 +131,7 @@ impl LiveSource {
             emotes,
             badges,
             history,
+            special,
             account,
             sender,
         }
@@ -243,6 +250,7 @@ impl LiveSource {
         if let Some(history) = &self.history {
             history.forget(channel);
         }
+        self.special.forget(channel);
     }
 
     /// Applies `chat.history`: whether the joins that follow load recent messages.
@@ -377,6 +385,7 @@ async fn forward(
     emotes: Option<EmoteService>,
     badges: Option<BadgeService>,
     history: Option<HistoryService>,
+    special: SpecialService,
 ) {
     while let Some(event) = events.recv().await {
         if let Some(badges) = &badges {
@@ -389,6 +398,7 @@ async fn forward(
             Some(emotes) => emotes.process(event),
             None => event,
         };
+        let event = special.process(event);
         if sender.send(event).await.is_err() {
             // The UI is gone; dropping `events` shuts the client down.
             break;
@@ -551,7 +561,14 @@ mod tests {
     async fn forward_passes_events_in_order_and_stops_when_the_ui_is_gone() {
         let (events_tx, events_rx) = mpsc::channel(8);
         let (sender, mut receiver) = bridge::channel(8, 8);
-        let task = tokio::spawn(forward(events_rx, sender, None, None, None));
+        let task = tokio::spawn(forward(
+            events_rx,
+            sender,
+            None,
+            None,
+            None,
+            SpecialService::inert(),
+        ));
         let connection = |state| ChatEvent::Connection {
             channel: None,
             state,

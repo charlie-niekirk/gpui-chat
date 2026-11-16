@@ -32,6 +32,7 @@ use crate::bridge::BridgeSender;
 use crate::emote_service::EmoteService;
 use crate::live::now;
 use crate::runtime;
+use crate::special_service::SpecialService;
 
 struct Inner {
     client: HistoryClient,
@@ -39,6 +40,7 @@ struct Inner {
     tracker: Mutex<HistoryTracker>,
     sender: BridgeSender<ChatEvent>,
     emotes: Option<EmoteService>,
+    special: SpecialService,
 }
 
 impl Inner {
@@ -60,6 +62,7 @@ impl HistoryService {
         enabled: bool,
         sender: BridgeSender<ChatEvent>,
         emotes: Option<EmoteService>,
+        special: SpecialService,
         cx: &App,
     ) -> Option<Self> {
         let client = match runtime::enter(cx, HistoryClient::new) {
@@ -76,6 +79,7 @@ impl HistoryService {
                 tracker: Mutex::new(HistoryTracker::new(enabled)),
                 sender,
                 emotes,
+                special,
             }),
         })
     }
@@ -134,7 +138,9 @@ impl HistoryService {
                     let mut messages: Vec<Arc<Message>> = history
                         .messages
                         .into_iter()
-                        .map(|message| resolve(inner.emotes.as_ref(), &channel, message))
+                        .map(|message| {
+                            resolve(inner.emotes.as_ref(), &inner.special, &channel, message)
+                        })
                         .collect();
                     if missing && let Some(oldest) = messages.first() {
                         // Right before the oldest message the answer reached back to: where the
@@ -162,19 +168,22 @@ impl HistoryService {
 /// `message` with the channel's third-party emotes resolved, as a live message would be.
 fn resolve(
     emotes: Option<&EmoteService>,
+    special: &SpecialService,
     channel: &ChannelId,
     message: Arc<Message>,
 ) -> Arc<Message> {
-    let Some(emotes) = emotes else {
-        return message;
-    };
-    match emotes.process(ChatEvent::Message {
+    let event = ChatEvent::Message {
         channel: channel.clone(),
         message,
-    }) {
+    };
+    let event = match emotes {
+        Some(emotes) => emotes.process(event),
+        None => event,
+    };
+    match special.process(event) {
         ChatEvent::Message { message, .. } => message,
         // `process` hands a message event back as a message event.
-        _ => unreachable!("EmoteService::process keeps a message a message"),
+        _ => unreachable!("process keeps a message a message"),
     }
 }
 
@@ -251,7 +260,12 @@ mod tests {
             MessageKind::Chat,
             "Kappa",
         ));
-        let same = resolve(None, &ChannelId::new("a"), message.clone());
+        let same = resolve(
+            None,
+            &SpecialService::inert(),
+            &ChannelId::new("a"),
+            message.clone(),
+        );
         assert!(Arc::ptr_eq(&same, &message));
     }
 }

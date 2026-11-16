@@ -39,6 +39,7 @@ mod runtime;
 mod settings_window;
 mod shell;
 mod sign_in;
+mod special_service;
 mod splits;
 mod state;
 mod stream_info;

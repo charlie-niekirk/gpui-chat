@@ -172,7 +172,8 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   context menu around a message, PR 3.4; Copy message / username, Open / Copy link, PR 5.6),
   `thread` (the thread popover, PR 3.4), `selection` (selecting text across messages and what
   copying gives, pure, PR 5.6), `selection_layer` (the window side of selection and links: one
-  `Surface` per list / popover, PR 5.6).
+  `Surface` per list / popover, PR 5.6), `events` (header line, accent bar and shared-chat label of
+  event rows, PR 5.1).
 - `streams.rs` (PR 1.6) — `StreamHub`, a GPUI entity created by the shell: owns the `Streams` tracker from
   `crates/streamlink`, turns its events (from worker threads, through a bridge channel) into a per-channel
   `StreamStates` (`Starting` → `Running` → `Stopping`, or `Ended` with the error until dismissed; events
@@ -364,6 +365,70 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   file that is not TOML at all is moved to `state.toml.bad` before a new one is started. Restore
   normalises every saved login (`Forsen`, `#forsen` still restore) and drops invalid or duplicate ones
   and a stale selection.
+
+### Event messages (PR 5.1)
+
+- **Model** (`core::special`, plain data; the parser in `crates/twitch/src/parse.rs` fills it, every tag also stays in
+  `raw_tags`). `Message::event: Option<EventKind>` for a `USERNOTICE` — `Sub` / `Resub` (plan, months, streak),
+  `Gift` (recipient, months, the gifter's total, anonymous, `community` = one of a mystery gift's lines),
+  `MysteryGift`, `GiftPaidUpgrade`, `PrimePaidUpgrade`, `Raid`, `Announcement { color }`, `NewChatter`
+  (`ritual`), `BitsBadgeTier` and `Other { msg_id }`: a notice whose tags are too incomplete for its variant
+  (a subgift without recipient, a raid without a count) and any `msg-id` this build does not know are `Other`,
+  drawn from Twitch's own `system-msg`. `Message::reward_id` (`custom-reward-id`; Twitch sends no name),
+  `flags.highlighted` (`msg-id=highlighted-message`), `flags.first_message`, `bits`, and
+  `Message::shared: Option<SharedChat>` (`source-room-id`, `source-id`, `source-badges`; `source_login` /
+  `source_name` are filled in later by the app). In shared chat a notice of the *other* channel is
+  `msg-id=sharedchatnotice` with the real kind in `source-msg-id` (and that kind's `msg-param-*`): the parser
+  dispatches on that, and the row is labelled with its source like a chat line.
+- **Rows** (`chat/events.rs`, pure except `Look::paint`). The *header* is a line of text in the row's display text
+  (`Role::Header`) followed by a hard break and the user's message: `22:15 Alice resubscribed at Tier 1 for 12
+  months, 12 month streak⏎Alice: a year Kappa`. A `USERNOTICE` carries the timestamp on the header; a chat line that
+  is only marked (`First message`, `Highlighted message`, `Redeemed a reward`, `Cheered 100 bits`, joined by ` · `) has
+  the marker above and the timestamp on the message. The wording is ours where the tags give enough, Twitch's
+  `system-msg` for `Other`. Being text, headers are selected and copied like any other (`selection::message_line`
+  uses `events::notice_line`; the menu's *Copy message* adds the event line, `events::copy_text`; the marker of a
+  chat line is not copied). `Look` is the accent (`Accent`: support, raid, bits, points, first message, announcement
+  colour; mapped to theme tokens by `Colors`, only announcement blue and purple are fixed hues) drawn as a 3 px bar in
+  the row's left padding plus a 8 % tint, by `MessageElement::paint` before the text (a mention keeps its own tint;
+  a per-recipient line whose gift bomb row is not there is `quiet`: no bar, muted). The look is decided once, when the
+  message is shaped (`ShapedMessage::look`), not at every paint, and nothing about it enters the layout cache key.
+  A message sent in another channel of a shared chat session starts with `[OtherChan]` (`[shared chat]` while the
+  name is not known; `Role::Source`, muted; on the header line for a notice) and shows the badges the author has
+  *there* (`source-badges`, looked up in the source channel's sets when it is open, else the generic ones). A whole-row
+  copy keeps the label and the marker, like a partial selection. History rows are the same, dimmed by the existing
+  history opacity.
+- **Gift bombs.** `submysterygift` is one row (`EventKind::MysteryGift { origin_id, recipients, .. }`); Twitch then sends
+  a `subgift` line per recipient (`community_gift_id` = that `origin_id`, running total 0). `ChannelStore` does not
+  show those lines: it appends the recipient to the row (`EventKind::with_recipient`, each name once) and replaces
+  the row in place (the same `replaced` log as an echo, so the view remeasures it), and the header reads
+  `Bomber is gifting 12 Tier 1 subs to the community (512 gifted in total): Ann, Ben, Cleo and 9 others`. History
+  batches are folded before they are merged (`fold_gifts`). A line whose row is not retained (evicted, not in the
+  history answer) is shown on its own, quietly. Not handled: history lines folded into a row that was already shown live
+  are not added to it.
+- **Hard breaks.** `DisplayText::breaks` lists byte offsets of a one-space character that `ShapedMessage::from_layout`
+  turns into an `AtomKind::Break` atom (zero width); `flow` ends the line after it (no empty line after a trailing
+  break) and `index_at` never puts a caret after it. Everything else (glyph painting, hit-testing, selection)
+  treats it as a space.
+- **Cheermotes.** `Fragment::Cheer { prefix, bits, image }`; `image` is the tier's image (an `Emote` named by the
+  prefix, 28 px at 1x) once the channel's `CheermoteSet` (`core::cheer`; `resolve` also finds a channel's own
+  prefix in a message with bits) has been applied. `HelixClient::get_cheermotes` (`crates/twitch/src/cheermotes.rs`,
+  `GET /helix/bits/cheermotes?broadcaster_id=`, needs a login, no scope) builds the set: the dark image of each
+  tier, animated when there is one (`themed_url` swaps `/dark/` for `/light/` on a light theme). The word is drawn
+  as an image box through the emote path (so animation, tooltip, placeholders and size handling are the emotes'), the
+  amount follows as bold text. Without a set (logged out, not loaded yet, failed) the text stays and the marker line
+  says how many bits. `special_service.rs` (`SpecialService`, live source) loads a channel's set when its `ROOMSTATE`
+  supplies the room id and the user is logged in (and for every channel on login), once per room id, again after a
+  failure when `ROOMSTATE` repeats; `process` runs on every live event and in `HistoryService`. Messages that arrive
+  before the set keep their text. `GPUI_CHAT_DEMO_CHEERMOTES=1` with `--replay` applies a built-in `Cheer` / `Kappa`
+  set (public CDN, no login) to look at the images offline.
+- **Shared chat.** Twitch delivers a shared-chat message to every channel of the session, each copy with an id of its
+  own and the room it was sent in as `source-room-id`. Every channel **keeps its copy** (replies, threads and
+  mentions resolve inside one channel; what is shown never depends on which other channels happen to be open).
+  The source is named so the row can say where it came from: `ChannelHub::name_shared_sources` fills `source_login`
+  (and `source_name`) from the other open channels' `ROOMSTATE` room ids (also those announced in the same batch), no
+  lookup; a source that is not open is looked up once per room id by `SpecialService`
+  (`gpui_chat_twitch::RoomNames`, `api.ivr.fi/v2/twitch/user?id=`, so it works logged out; only the public room id is
+  sent) and named on the messages that arrive after the answer; until then `[shared chat]`.
 
 ### Replies and threads (PR 3.4)
 

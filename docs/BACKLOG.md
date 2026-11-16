@@ -181,4 +181,11 @@ an entry here instead of expanding a PR. Format:
 - **Moderation: `/announce` colours, `/commercial`, `/marker`, `/vips`, `/mods`, `/w`** (found in PR 5.2) — the Helix endpoints exist; not wired to commands yet. `/shield` (shield mode) too.
 - **Moderation: a reason prompt** (found in PR 5.2) — the buttons and menu send timeouts and bans without a reason; a "Timeout…/Ban…" dialog with a reason field, and the user card of PR 5.4, are the places for one.
 - **Moderation: confirm `/clear` and mass actions typed in the box** (found in PR 5.2) — typed commands never ask (they are deliberate); `/clear` on a big channel might deserve a prompt.
+- **Source channel avatar in shared chat** (found in PR 5.1) — rows show the source channel's name only; the avatar (`api.ivr.fi` has `logo`) could be an inline image like a badge.
+- **Collapse shared-chat copies when both channels are open** (found in PR 5.1) — every channel keeps its copy of a shared-chat message; with both panes open you see each message twice. Hide the copy visually (keeping it in the store so replies resolve) or make it an option.
+- **Cheermotes for the first messages of a channel** (found in PR 5.1) — a bits message that arrives before the channel's cheermote set has loaded keeps its text; re-resolve the retained messages when the set arrives (needs a store replace per message) or hold bits messages for the first load.
+- **Name of a channel-point reward** (found in PR 5.1) — the IRC tag has only `custom-reward-id`; EventSub (or Helix `Get Custom Reward`, broadcaster scope) is needed for the reward title and cost.
+- **Timeouts strike through a user's sub / raid notices** (found in PR 5.1) — `MessageStore::mark_user_deleted` marks every message of the login, `USERNOTICE`s included; PR 5.2 should decide what a timed-out user's events look like (and `mark_all_deleted` marks system lines).
+- **Gift bomb recipients from history** (found in PR 5.1) — recipient lines in a history answer are folded into a bomb row in the same answer, not into one already shown live; the row then lacks those names.
+- **Notice kinds without a variant** (found in PR 5.1) — `standardpayforward`, `communitypayforward`, `unraid`, `viewermilestone` and others are `EventKind::Other` (Twitch's line, accent as a sub); give the frequent ones their own wording.
 

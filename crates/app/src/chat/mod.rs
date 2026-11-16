@@ -10,12 +10,15 @@
 //! * [`row`] — a row with its reply button and context menu; [`thread`] — the thread popover.
 //! * [`selection`] — selecting text across messages, and what copying it gives (pure);
 //!   [`selection_layer`] — the mouse, the highlight, links and autoscroll in the window.
+//! * [`events`] — what event rows (subs, raids, cheers, ...) add: header line, accent bar, shared-chat
+//!   label (PR 5.1).
 //! * [`tooltip`] — emote hover tooltips (preview, name, provider).
 //! * [`view`] — the `ChatView` entity: list, follow-bottom, "new messages" pill, live settings.
 
 pub mod colors;
 pub mod display;
 pub mod element;
+pub mod events;
 pub mod flow;
 pub mod layout;
 pub mod list_sync;

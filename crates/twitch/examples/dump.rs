@@ -121,7 +121,7 @@ fn summarize(fragments: &[Fragment]) -> String {
             Fragment::Emoji { text } => parts.push(format!("emoji({text})")),
             Fragment::Mention { login, .. } => parts.push(format!("mention({login})")),
             Fragment::Link { url, .. } => parts.push(format!("link({url})")),
-            Fragment::Cheer { prefix, bits } => parts.push(format!("cheer({prefix}{bits})")),
+            Fragment::Cheer { prefix, bits, .. } => parts.push(format!("cheer({prefix}{bits})")),
         }
     }
     format!("fragments: {words} words; {}", parts.join(" "))

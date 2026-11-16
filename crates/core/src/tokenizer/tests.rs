@@ -62,7 +62,7 @@ fn shape(fragments: &[Fragment]) -> Vec<String> {
             Fragment::Emoji { text } => format!("J:{text}"),
             Fragment::Mention { text, is_self, .. } => format!("M:{text}:{is_self}"),
             Fragment::Link { text, .. } => format!("L:{text}"),
-            Fragment::Cheer { prefix, bits } => format!("C:{prefix}:{bits}"),
+            Fragment::Cheer { prefix, bits, .. } => format!("C:{prefix}:{bits}"),
         })
         .collect()
 }
