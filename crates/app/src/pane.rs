@@ -239,7 +239,10 @@ fn room_buttons(
             .dropdown_caret(true)
             .accessibility_label(label.clone().unwrap_or_else(|| "Chat modes".to_owned()));
         match label {
-            Some(label) => button.label(label),
+            // Kit's `xsmall` text button is 20 px tall with 4 px side padding: with the caret on
+            // the right the label hugs the left border and its descenders the bottom one. Caller
+            // styles are refined last (`Button::render`), so these win over the size's padding.
+            Some(label) => button.label(label).h_6().pl_2().pr_1p5(),
             None => button.icon(Icon::new(gpui_kit::assets::IconName::Settings2)),
         }
     };
