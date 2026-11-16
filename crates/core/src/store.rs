@@ -1193,5 +1193,26 @@ mod tests {
         assert!(store.mark_user_deleted("alice", None).is_empty());
         assert!(store.mark_all_deleted().is_empty());
         assert!(!store.get("n").unwrap().flags.deleted);
+        // The same through history's moderation, and for a card that carries system text.
+        let mut card = (*msg_by("c", "alice")).clone();
+        card.kind = MessageKind::UserNotice;
+        card.system_text = Some("alice subscribed".into());
+        store.push(Arc::new(card));
+        for action in [
+            Moderation::Clear {
+                target: ClearTarget::Channel,
+                at: Timestamp(i64::MAX),
+            },
+            Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "alice".into(),
+                    duration: None,
+                },
+                at: Timestamp(i64::MAX),
+            },
+        ] {
+            assert!(store.apply_moderation(&action).is_empty());
+        }
+        assert!(store.iter().all(|m| !m.flags.deleted));
     }
 }

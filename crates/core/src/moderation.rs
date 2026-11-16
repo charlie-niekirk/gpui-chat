@@ -716,7 +716,9 @@ impl RowActions {
 
 /// The moderation controls `message` gets in `channel` for a user who is `role` there and whose
 /// own login is `own_login` (when known): none for viewers, for lines nobody wrote, for
-/// events (a `USERNOTICE` card is not a chat line), for the user's own messages and for the
+/// events (a `USERNOTICE` card is not a chat line, whatever user text it carries: Twitch does
+/// not document deleting those, so there is no Delete for them), for shared-chat copies of a
+/// message sent in another channel, for the user's own messages and for the
 /// broadcaster's; no timeout, ban or unban of another moderator unless the user is the
 /// broadcaster (Twitch refuses it). Delete only for a chat line that is not yet removed; a
 /// timeout or ban stays possible after a delete (the usual order); Unban only for a message
@@ -733,7 +735,14 @@ pub fn row_actions(
     let Some(author) = &message.author else {
         return RowActions::default();
     };
-    if author.login.is_empty()
+    // A shared-chat copy was sent in another room (`source-room-id`): the user is a moderator of
+    // this room, not of that one, and the message there is not this room's to delete.
+    let shared_copy = message
+        .shared
+        .as_ref()
+        .is_some_and(|shared| shared.is_copy_in(message.raw_tags.get("room-id")));
+    if shared_copy
+        || author.login.is_empty()
         || author.login.eq_ignore_ascii_case(channel.login())
         || own_login.is_some_and(|own| author.login.eq_ignore_ascii_case(own))
         || !matches!(message.kind, MessageKind::Chat | MessageKind::Action)
@@ -1189,6 +1198,55 @@ mod tests {
         notice.kind = MessageKind::UserNotice;
         assert!(!actions(ChannelRole::Moderator, &notice).any());
         assert!(!actions(ChannelRole::Broadcaster, &notice).any());
+    }
+
+    fn shared(source_room: &str, delivered_in: &str) -> Message {
+        use crate::message::RawTags;
+        use crate::special::SharedChat;
+        let mut m = message("alice", &[]);
+        m.shared = Some(SharedChat {
+            source_room_id: source_room.into(),
+            source_id: None,
+            source_badges: Vec::new(),
+            source_login: Some("otherchan".into()),
+            source_name: None,
+        });
+        m.raw_tags = RawTags::new([("room-id".to_owned(), delivered_in.to_owned())]);
+        m
+    }
+
+    #[test]
+    fn a_shared_chat_copy_from_another_channel_gets_no_controls_here() {
+        // Sent in room 20, delivered in room 10 (this one): not ours to moderate.
+        let copy = shared("20", "10");
+        assert!(!actions(ChannelRole::Moderator, &copy).any());
+        assert!(!actions(ChannelRole::Broadcaster, &copy).any());
+        // A message sent in this very room carries it as its source: a normal message.
+        assert_eq!(
+            actions(ChannelRole::Moderator, &shared("10", "10")),
+            ALL_LIVE
+        );
+        // Removed or not, a copy stays without controls (no Unban of someone else's room either).
+        let removed = shared("20", "10").with_removal(Removal::Banned);
+        assert!(!actions(ChannelRole::Broadcaster, &removed).any());
+    }
+
+    #[test]
+    fn an_event_card_with_user_text_has_no_controls_either() {
+        let mut resub = message("alice", &[]);
+        resub.kind = MessageKind::UserNotice;
+        resub.system_text = Some("alice subscribed for 12 months".into());
+        resub.notice_id = Some("resub".into());
+        assert!(!resub.fragments.is_empty() || resub.system_text.is_some());
+        assert!(!actions(ChannelRole::Broadcaster, &resub).any());
+        // Not even once removed.
+        assert!(
+            !actions(
+                ChannelRole::Broadcaster,
+                &resub.with_removal(Removal::Banned)
+            )
+            .any()
+        );
     }
 
     #[test]

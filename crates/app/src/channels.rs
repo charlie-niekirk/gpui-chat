@@ -968,6 +968,39 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_strikes_a_shared_chat_copy_and_still_leaves_one_line() {
+        use gpui_chat_core::{SharedChat, message::RawTags};
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        let mut copy = (*by_login("copy", "spam", 100, false)).clone();
+        copy.shared = Some(SharedChat {
+            source_room_id: "20".into(),
+            source_id: Some("origin-1".into()),
+            source_badges: Vec::new(),
+            source_login: Some("otherchan".into()),
+            source_name: None,
+        });
+        copy.raw_tags = RawTags::new([("room-id".to_owned(), "10".to_owned())]);
+        store.apply(ChatEvent::Message {
+            channel: ChannelId::new("a"),
+            message: Arc::new(copy),
+        });
+        store.apply(timeout("spam", 600, 200));
+        // The same timeout seen again from history is the same line, whoever sent what.
+        store.apply(history_with(
+            vec![],
+            vec![gpui_chat_core::Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "spam".into(),
+                    duration: Some(std::time::Duration::from_secs(600)),
+                },
+                at: Timestamp(200),
+            }],
+        ));
+        assert_eq!(deleted(&store), [("copy".into(), true)]);
+        assert_eq!(lines(&store), ["spam was timed out for 10m."]);
+    }
+
+    #[test]
     fn a_timeout_in_history_has_its_line_once_whether_or_not_it_was_seen_live() {
         // Live first, then history repeating it: one line.
         let mut store = ChannelStore::new(ChannelId::new("a"), 50);
