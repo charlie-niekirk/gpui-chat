@@ -176,3 +176,9 @@ an entry here instead of expanding a PR. Format:
 - **Synthetic clicks do not activate Kit popup-menu items** (found in PR 5.6) — with CGEvent clicks (the scripting in `docs/`/memory notes) a Kit `PopupMenu` shows no hover and an item click only dismisses it, on `main` too (sidebar Remove); ↓/Return works. Check with a real mouse; if real clicks work, note it in the scripting guide.
 - **Selection extras** (found in PR 5.6) — an I-beam cursor over selectable text, ⌘A (select all visible), copying a selection as rich text/HTML, and selecting the reply context line; none is in scope.
 - **Rows evicted while the list is held** (found in PR 5.6 review) — at a high message rate at the scrollback cap, messages of a held (paused) list are evicted from the front: they silently drop out of a selection's copy and the held top row can jump. Holding could pin the store's front, or the copy could warn.
+- **Moderation: collapse repeated timeouts** (found in PR 5.2) — a raid of bans prints one system line each; merge consecutive ones ("12 users were banned") like Chatterino.
+- **Moderation: who did it** (found in PR 5.2) — `CLEARCHAT` / `CLEARMSG` do not name the moderator; EventSub `channel.moderate` (scope `moderator:read:*`) would, for "alice was timed out by ModGuy for 10m" and AutoMod holds.
+- **Moderation: `/announce` colours, `/commercial`, `/marker`, `/vips`, `/mods`, `/w`** (found in PR 5.2) — the Helix endpoints exist; not wired to commands yet. `/shield` (shield mode) too.
+- **Moderation: a reason prompt** (found in PR 5.2) — the buttons and menu send timeouts and bans without a reason; a "Timeout…/Ban…" dialog with a reason field, and the user card of PR 5.4, are the places for one.
+- **Moderation: confirm `/clear` and mass actions typed in the box** (found in PR 5.2) — typed commands never ask (they are deliberate); `/clear` on a big channel might deserve a prompt.
+
