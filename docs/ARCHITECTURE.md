@@ -333,8 +333,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (a subgift without recipient, a raid without a count) and any `msg-id` this build does not know are `Other`,
   drawn from Twitch's own `system-msg`. `Message::reward_id` (`custom-reward-id`; Twitch sends no name),
   `flags.highlighted` (`msg-id=highlighted-message`), `flags.first_message`, `bits`, and
-  `Message::shared: Option<SharedChat>` (`source-room-id`, `source-id`, `source-badges`; `source_name` is filled in
-  later by the app). `Message::dedupe_id()` is `source-id` or the id.
+  `Message::shared: Option<SharedChat>` (`source-room-id`, `source-id`, `source-badges`; `source_login` /
+  `source_name` are filled in later by the app). In shared chat a notice of the *other* channel is
+  `msg-id=sharedchatnotice` with the real kind in `source-msg-id` (and that kind's `msg-param-*`): the parser
+  dispatches on that, and the row is labelled with its source like a chat line.
 - **Rows** (`chat/events.rs`, pure except `Look::paint`). The *header* is a line of text in the row's display text
   (`Role::Header`) followed by a hard break and the user's message: `22:15 Alice resubscribed at Tier 1 for 12
   months, 12 month streak⏎Alice: a year Kappa`. A `USERNOTICE` carries the timestamp on the header; a chat line that
@@ -345,9 +347,21 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   chat line is not copied). `Look` is the accent (`Accent`: support, raid, bits, points, first message, announcement
   colour; mapped to theme tokens by `Colors`, only announcement blue and purple are fixed hues) drawn as a 3 px bar in
   the row's left padding plus a 8 % tint, by `MessageElement::paint` before the text (a mention keeps its own tint;
-  the lines of a mystery gift are `quiet`: no bar, muted). Nothing about it enters the layout cache key.
+  a per-recipient line whose gift bomb row is not there is `quiet`: no bar, muted). The look is decided once, when the
+  message is shaped (`ShapedMessage::look`), not at every paint, and nothing about it enters the layout cache key.
   A message sent in another channel of a shared chat session starts with `[OtherChan]` (`[shared chat]` while the
-  name is not known; `Role::Source`, muted). History rows are the same, dimmed by the existing history opacity.
+  name is not known; `Role::Source`, muted; on the header line for a notice) and shows the badges the author has
+  *there* (`source-badges`, looked up in the source channel's sets when it is open, else the generic ones). A whole-row
+  copy keeps the label and the marker, like a partial selection. History rows are the same, dimmed by the existing
+  history opacity.
+- **Gift bombs.** `submysterygift` is one row (`EventKind::MysteryGift { origin_id, recipients, .. }`); Twitch then sends
+  a `subgift` line per recipient (`community_gift_id` = that `origin_id`, running total 0). `ChannelStore` does not
+  show those lines: it appends the recipient to the row (`EventKind::with_recipient`, each name once) and replaces
+  the row in place (the same `replaced` log as an echo, so the view remeasures it), and the header reads
+  `Bomber is gifting 12 Tier 1 subs to the community (512 gifted in total): Ann, Ben, Cleo and 9 others`. History
+  batches are folded before they are merged (`fold_gifts`). A line whose row is not retained (evicted, not in the
+  history answer) is shown on its own, quietly. Not handled: history lines folded into a row that was already shown live
+  are not added to it.
 - **Hard breaks.** `DisplayText::breaks` lists byte offsets of a one-space character that `ShapedMessage::from_layout`
   turns into an `AtomKind::Break` atom (zero width); `flow` ends the line after it (no empty line after a trailing
   break) and `index_at` never puts a caret after it. Everything else (glyph painting, hit-testing, selection)
@@ -364,12 +378,14 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   failure when `ROOMSTATE` repeats; `process` runs on every live event and in `HistoryService`. Messages that arrive
   before the set keep their text. `GPUI_CHAT_DEMO_CHEERMOTES=1` with `--replay` applies a built-in `Cheer` / `Kappa`
   set (public CDN, no login) to look at the images offline.
-- **Shared chat.** Twitch delivers a shared-chat message to every channel of the session. `ChannelHub::apply_batch`
-  drops the *copy* (`SharedChat::is_copy_in(room-id)`: the source room is not this one) when the source channel is
-  open too (its `RoomState::room_id`, or announced by the same batch), because that channel's pane has the original;
-  history batches are filtered the same way. A copy from a channel that is not open stays, labelled with the source:
-  `SpecialService` looks the room id up once through `gpui_chat_twitch::RoomNames` (`api.ivr.fi/v2/twitch/user?id=`,
-  only the public room id is sent) and puts the name on the messages that arrive after the answer.
+- **Shared chat.** Twitch delivers a shared-chat message to every channel of the session, each copy with an id of its
+  own and the room it was sent in as `source-room-id`. Every channel **keeps its copy** (replies, threads and
+  mentions resolve inside one channel; what is shown never depends on which other channels happen to be open).
+  The source is named so the row can say where it came from: `ChannelHub::name_shared_sources` fills `source_login`
+  (and `source_name`) from the other open channels' `ROOMSTATE` room ids (also those announced in the same batch), no
+  lookup; a source that is not open is looked up once per room id by `SpecialService`
+  (`gpui_chat_twitch::RoomNames`, `api.ivr.fi/v2/twitch/user?id=`, so it works logged out; only the public room id is
+  sent) and named on the messages that arrive after the answer; until then `[shared chat]`.
 
 ### Replies and threads (PR 3.4)
 

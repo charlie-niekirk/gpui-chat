@@ -116,9 +116,11 @@ pub enum EventKind {
         /// The gifter chose to stay anonymous (the message's author is then the anonymous
         /// gifter user, `ananonymousgifter`).
         anonymous: bool,
-        /// One of the gifts of a mystery (community) gift: Twitch sends one line per recipient
-        /// after the `submysterygift` one, and the UI shows those quietly.
-        community: bool,
+        /// The id of the mystery (community) gift this is one of (`msg-param-community-gift-id`,
+        /// the `origin_id` of the [`EventKind::MysteryGift`]): Twitch sends one line per recipient
+        /// after the `submysterygift` one. The channel folds those into that row
+        /// ([`EventKind::with_recipient`]); one whose mystery row is not there is shown quietly.
+        community_gift_id: Option<String>,
     },
     /// `submysterygift` / `anonsubmysterygift`: a number of random viewers got a sub.
     MysteryGift {
@@ -126,6 +128,10 @@ pub enum EventKind {
         count: u32,
         gifter_total: Option<u32>,
         anonymous: bool,
+        /// `msg-param-origin-id`: what the per-recipient lines refer to.
+        origin_id: Option<String>,
+        /// The names of the recipients whose lines arrived so far, in order (each once).
+        recipients: Vec<String>,
     },
     /// `giftpaidupgrade` / `anongiftpaidupgrade`: continuing a gifted sub.
     GiftPaidUpgrade {
@@ -153,15 +159,49 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// A gift that belongs to a mystery gift (drawn quietly).
+    /// A gift that belongs to a mystery gift.
     pub fn is_community_gift(&self) -> bool {
-        matches!(
-            self,
+        self.community_gift_id().is_some()
+    }
+
+    /// The mystery gift this is one of the gifts of.
+    pub fn community_gift_id(&self) -> Option<&str> {
+        match self {
             Self::Gift {
-                community: true,
-                ..
-            }
-        )
+                community_gift_id, ..
+            } => community_gift_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// This mystery gift with `name` among its recipients, or `None` when this is not a mystery
+    /// gift or `name` is already there (a line seen twice, e.g. live and in history).
+    #[must_use]
+    pub fn with_recipient(&self, name: &str) -> Option<Self> {
+        let Self::MysteryGift {
+            plan,
+            count,
+            gifter_total,
+            anonymous,
+            origin_id,
+            recipients,
+        } = self
+        else {
+            return None;
+        };
+        if recipients.iter().any(|known| known == name) {
+            return None;
+        }
+        let mut recipients = recipients.clone();
+        recipients.push(name.to_owned());
+        Some(Self::MysteryGift {
+            plan: plan.clone(),
+            count: *count,
+            gifter_total: *gifter_total,
+            anonymous: *anonymous,
+            origin_id: origin_id.clone(),
+            recipients,
+        })
     }
 }
 
@@ -175,8 +215,11 @@ pub struct SharedChat {
     pub source_id: Option<MessageId>,
     /// The author's badges in that room (`source-badges`).
     pub source_badges: Vec<BadgeId>,
-    /// The source channel's display name, when known. The parser cannot know it (the tags only
-    /// carry the room id); the app fills it in from the channels it has joined, or by lookup.
+    /// The source channel's login, when known. The parser cannot know it (the tags only carry the
+    /// room id); the app fills it in from the channels it has open (`ChannelHub`) or by lookup
+    /// (`SpecialService`).
+    pub source_login: Option<String>,
+    /// Its display name, when known (the login when only that is).
     pub source_name: Option<String>,
 }
 
@@ -224,6 +267,7 @@ mod tests {
             source_room_id: "10".into(),
             source_id: None,
             source_badges: Vec::new(),
+            source_login: None,
             source_name: None,
         };
         assert!(shared.is_copy_in(Some("20")));

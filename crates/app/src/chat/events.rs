@@ -158,6 +158,30 @@ fn months(n: u32) -> String {
     plural(n, "month", "months")
 }
 
+/// How many recipients of a mystery gift are named before the rest are counted.
+const NAMED_RECIPIENTS: usize = 3;
+
+/// `Ann`, `Ann and Ben`, `Ann, Ben, Cleo and 9 others`.
+fn recipient_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        many if many.len() <= NAMED_RECIPIENTS => {
+            let (last, head) = many.split_last().expect("not empty");
+            format!("{} and {last}", head.join(", "))
+        }
+        many => {
+            let (named, rest) = many.split_at(NAMED_RECIPIENTS);
+            format!(
+                "{} and {}",
+                named.join(", "),
+                plural(rest.len() as u32, "other", "others")
+            )
+        }
+    }
+}
+
 /// `at Tier 1`, `with Prime`.
 fn plan_how(plan: &SubPlan) -> String {
     match plan {
@@ -230,6 +254,8 @@ pub fn notice_line(message: &Message) -> Option<String> {
             count,
             gifter_total,
             anonymous,
+            recipients,
+            ..
         } => {
             let gifter = if *anonymous {
                 "An anonymous user"
@@ -243,6 +269,10 @@ pub fn notice_line(message: &Message) -> Option<String> {
             );
             if let Some(total) = gifter_total {
                 line.push_str(&format!(" ({total} gifted in total)"));
+            }
+            if !recipients.is_empty() {
+                line.push_str(": ");
+                line.push_str(&recipient_list(recipients));
             }
             line
         }
@@ -338,7 +368,10 @@ pub struct Header {
 /// session: that channel's name in brackets (`[shared chat]` while it is not known). `None` for every other
 /// message, and for one that was sent in this very channel.
 pub fn source_label(message: &Message) -> Option<String> {
-    if !matches!(message.kind, MessageKind::Chat | MessageKind::Action) {
+    if !matches!(
+        message.kind,
+        MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
+    ) {
         return None;
     }
     let shared: &SharedChat = message.shared.as_ref()?;
@@ -431,7 +464,7 @@ mod tests {
             months,
             gifter_total,
             anonymous,
-            community: false,
+            community_gift_id: None,
         };
         assert_eq!(
             line(gift(false, 1, Some(50))),
@@ -450,6 +483,8 @@ mod tests {
             count,
             gifter_total: total,
             anonymous,
+            origin_id: None,
+            recipients: Vec::new(),
         };
         assert_eq!(
             line(mystery(5, false, Some(103))),
@@ -478,6 +513,36 @@ mod tests {
                 plan: SubPlan::Tier1
             }),
             "Alice converted from a Prime sub to Tier 1"
+        );
+    }
+
+    #[test]
+    fn a_gift_bomb_lists_its_first_recipients_and_counts_the_rest() {
+        let bomb = |recipients: &[&str]| EventKind::MysteryGift {
+            plan: SubPlan::Tier1,
+            count: 12,
+            gifter_total: Some(512),
+            anonymous: false,
+            origin_id: Some("o".into()),
+            recipients: recipients.iter().map(|n| (*n).to_owned()).collect(),
+        };
+        let base = "Alice is gifting 12 Tier 1 subs to the community (512 gifted in total)";
+        assert_eq!(line(bomb(&[])), base);
+        assert_eq!(line(bomb(&["Ann"])), format!("{base}: Ann"));
+        assert_eq!(line(bomb(&["Ann", "Ben"])), format!("{base}: Ann and Ben"));
+        assert_eq!(
+            line(bomb(&["Ann", "Ben", "Cleo"])),
+            format!("{base}: Ann, Ben and Cleo")
+        );
+        assert_eq!(
+            line(bomb(&["Ann", "Ben", "Cleo", "Dan"])),
+            format!("{base}: Ann, Ben, Cleo and 1 other")
+        );
+        let many: Vec<String> = (0..12).map(|n| format!("u{n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(
+            line(bomb(&many)),
+            format!("{base}: u0, u1, u2 and 9 others")
         );
     }
 
@@ -627,13 +692,13 @@ mod tests {
                 quiet: false
             }
         );
-        let community = |community| EventKind::Gift {
+        let community = |community: bool| EventKind::Gift {
             plan: SubPlan::Tier1,
             recipient: recipient(),
             months: 1,
             gifter_total: None,
             anonymous: false,
-            community,
+            community_gift_id: community.then(|| "origin".to_owned()),
         };
         assert!(look_of(community(true)).quiet);
         assert!(!look_of(community(false)).quiet);
@@ -651,6 +716,7 @@ mod tests {
             source_room_id: source.into(),
             source_id: Some(MessageId::from("orig")),
             source_badges: Vec::new(),
+            source_login: None,
             source_name: name.map(str::to_owned),
         });
         message
@@ -670,6 +736,19 @@ mod tests {
             source_label(&shared(Some("  "), "2000", "1000")).as_deref(),
             Some("[shared chat]")
         );
+        // A notice of the other channel is labelled too (a partner's raid is not ours).
+        let mut raid = notice(
+            EventKind::Raid {
+                from_login: "x".into(),
+                from_name: "X".into(),
+                viewers: 3,
+                profile_image: None,
+            },
+            None,
+        );
+        raid.raw_tags = RawTags::new([("room-id".to_owned(), "1000".to_owned())]);
+        raid.shared = shared(Some("OtherChan"), "2000", "1000").shared;
+        assert_eq!(source_label(&raid).as_deref(), Some("[OtherChan]"));
         // Sent in this channel: nothing to say about where it came from.
         assert_eq!(source_label(&shared(Some("Me"), "1000", "1000")), None);
         // No room id tag (a synthetic message): nothing either.

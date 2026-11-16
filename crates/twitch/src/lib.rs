@@ -40,7 +40,7 @@ pub use history::{
 };
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
-pub use room_names::RoomNames;
+pub use room_names::{RoomName, RoomNames};
 pub use user_emotes::UserEmote;
 
 #[cfg(test)]

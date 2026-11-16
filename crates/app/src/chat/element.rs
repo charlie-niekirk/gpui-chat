@@ -215,9 +215,29 @@ fn badge_slots(
     window: &Window,
     cx: &mut App,
 ) -> Vec<BadgeSlot> {
-    let Some(author) = message.author.as_ref().filter(|a| !a.badges.is_empty()) else {
+    let Some(author) = message.author.as_ref() else {
         return Vec::new();
     };
+    // A message sent in another channel of a shared chat session shows the badges the author has
+    // *there* (`source-badges`), looked up in that channel's sets (the generic ones when that
+    // channel is not known: this channel's own subscriber badge is not theirs).
+    let (ids, channel) = match message
+        .shared
+        .as_ref()
+        .filter(|_| events::source_label(message).is_some())
+    {
+        Some(shared) => (
+            &shared.source_badges,
+            shared.source_login.as_deref().map_or_else(
+                || ChannelId::new(shared.source_room_id.as_str()),
+                ChannelId::new,
+            ),
+        ),
+        None => (&author.badges, style.channel.clone()),
+    };
+    if ids.is_empty() {
+        return Vec::new();
+    }
     let (Some(badges), true) = (cx.try_global::<Badges>(), cx.has_global::<Images>()) else {
         return Vec::new();
     };
@@ -225,11 +245,9 @@ fn badge_slots(
     let scale = window.scale_factor();
     let size = style.badges.size;
     let images = cx.global_mut::<Images>();
-    author
-        .badges
-        .iter()
+    ids.iter()
         .filter_map(|id| {
-            let badge = registry.lookup(&style.channel, id)?;
+            let badge = registry.lookup(&channel, id)?;
             let url = images.badge_box(&badge, size, scale)?;
             Some(BadgeSlot { badge, url, size })
         })
@@ -280,7 +298,8 @@ fn shape(message: &Message, style: &MessageStyle, window: &Window, cx: &mut App)
     let layout = window
         .text_system()
         .layout_line(&display.text, style.font_size, &runs, None);
-    let shaped = ShapedMessage::from_layout(display, &layout, &boxes);
+    let shaped =
+        ShapedMessage::from_layout(display, &layout, &boxes).with_look(events::look(message));
     match &message.reply {
         Some(reply) if style.reply_line => shaped.with_reply(shape_reply(reply, style, window)),
         _ => shaped,
@@ -713,7 +732,7 @@ impl Element for MessageElement {
         window.paint_layer(bounds, |window| {
             // Event rows (PR 5.1) have a bar and a tint of their own, which also covers a
             // channel-points highlight; a mention of the viewer is the stronger signal.
-            let look = events::look(message);
+            let look = shaped.look;
             if flags.mention {
                 window.paint_quad(fill(bounds, palette.mention_bg));
             } else if look.is_none() && flags.highlighted {

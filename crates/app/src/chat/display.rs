@@ -354,6 +354,13 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
         MessageKind::UserNotice => !message.fragments.is_empty(),
         _ => true,
     };
+    let source = super::events::source_label(message);
+    // The label of a notice from another channel starts its header; a chat line's starts the
+    // message line (below).
+    if let (Some(label), MessageKind::UserNotice, Some(_)) = (&source, message.kind, &header) {
+        out.push(label, Role::Source);
+        out.push(" ", Role::Separator);
+    }
     if let Some(header) = &header {
         out.push(&header.text, Role::Header);
         if has_message_line {
@@ -365,8 +372,8 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
     }
     match message.kind {
         MessageKind::Chat | MessageKind::Action => {
-            if let Some(label) = super::events::source_label(message) {
-                out.push(&label, Role::Source);
+            if let Some(label) = &source {
+                out.push(label, Role::Source);
                 out.push(" ", Role::Separator);
             }
             let chat = message.kind == MessageKind::Chat;
@@ -700,6 +707,24 @@ mod tests {
             timed(&event("83")).text,
             "22:15 Host: welcome everyone, both chats"
         );
+    }
+
+    #[test]
+    fn a_notice_of_another_shared_channel_is_labelled_on_its_header() {
+        // A partner's raid is not ours: the label comes first, the stamp before it.
+        assert_eq!(
+            timed(&event("100")).text,
+            "22:15 [shared chat] 2500 raiders from BigRaider have joined"
+        );
+        assert_eq!(
+            with_breaks(&timed(&event("101"))),
+            "22:15 [shared chat] Announcement⏎OtherMod: Both chats: raffle in ten minutes"
+        );
+        let mut named = (*event("100")).clone();
+        named.shared.as_mut().unwrap().source_name = Some("OtherChan".into());
+        let display = timed(&named);
+        assert!(display.text.starts_with("22:15 [OtherChan] 2500 raiders"));
+        assert_eq!(display.spans[2].role, Role::Source);
     }
 
     #[test]

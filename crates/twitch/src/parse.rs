@@ -258,6 +258,7 @@ fn shared_chat(msg: &IRCMessage) -> Option<SharedChat> {
         source_room_id: tag(msg, "source-room-id")?.to_owned(),
         source_id: tag(msg, "source-id").map(MessageId::from),
         source_badges: badge_list(msg, "source-badges"),
+        source_login: None,
         source_name: None,
     })
 }
@@ -265,11 +266,16 @@ fn shared_chat(msg: &IRCMessage) -> Option<SharedChat> {
 /// The login Twitch gives every anonymous gifter.
 const ANONYMOUS_GIFTER: &str = "ananonymousgifter";
 
-/// What a USERNOTICE's `msg-id` and `msg-param-*` tags say. A notice whose tags are too
+/// What a USERNOTICE's `msg-id` and `msg-param-*` tags say. In shared chat a notice of the
+/// *other* channel arrives as `msg-id=sharedchatnotice` with the real kind in `source-msg-id` (and
+/// the `msg-param-*` of that kind), so that is what is dispatched on. A notice whose tags are too
 /// incomplete to build its variant from, or one this build has no variant for, is
 /// [`EventKind::Other`]: the UI then draws Twitch's own `system-msg`.
 fn event_kind(msg: &IRCMessage) -> EventKind {
-    let msg_id = tag(msg, "msg-id").unwrap_or_default();
+    let msg_id = match tag(msg, "msg-id") {
+        Some("sharedchatnotice") => tag(msg, "source-msg-id").unwrap_or_default(),
+        other => other.unwrap_or_default(),
+    };
     let plan = || SubPlan::from_tag(tag(msg, "msg-param-sub-plan").unwrap_or("1000"));
     let count = |key: &'static str| number::<u32>(msg, key);
     let anonymous = msg_id.starts_with("anon") || tag(msg, "login") == Some(ANONYMOUS_GIFTER);
@@ -293,6 +299,7 @@ fn event_kind(msg: &IRCMessage) -> EventKind {
             let Some(login) = tag(msg, "msg-param-recipient-user-name") else {
                 return other();
             };
+            let community_gift_id = tag(msg, "msg-param-community-gift-id").map(str::to_owned);
             EventKind::Gift {
                 plan: plan(),
                 recipient: Recipient {
@@ -303,9 +310,14 @@ fn event_kind(msg: &IRCMessage) -> EventKind {
                     user_id: tag(msg, "msg-param-recipient-id").map(str::to_owned),
                 },
                 months: count("msg-param-gift-months").unwrap_or(1).max(1),
-                gifter_total: count("msg-param-sender-count").filter(|&n| n > 0),
+                // Twitch sends the gifter's running total on the line that announces a mystery
+                // gift, and 0 on the per-recipient lines of it.
+                gifter_total: community_gift_id
+                    .is_none()
+                    .then(|| count("msg-param-sender-count").filter(|&n| n > 0))
+                    .flatten(),
                 anonymous,
-                community: tag(msg, "msg-param-community-gift-id").is_some(),
+                community_gift_id,
             }
         }
         "submysterygift" | "anonsubmysterygift" => match count("msg-param-mass-gift-count") {
@@ -314,6 +326,8 @@ fn event_kind(msg: &IRCMessage) -> EventKind {
                 count: n,
                 gifter_total: count("msg-param-sender-count").filter(|&n| n > 0),
                 anonymous,
+                origin_id: tag(msg, "msg-param-origin-id").map(str::to_owned),
+                recipients: Vec::new(),
             },
             _ => other(),
         },

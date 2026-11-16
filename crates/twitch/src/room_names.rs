@@ -25,15 +25,32 @@ struct User {
     display_name: String,
 }
 
-/// The display name in an `api.ivr.fi` user answer (an array of users; empty for an unknown id):
-/// the display name, else the login.
-pub fn parse_name(body: &[u8]) -> Option<String> {
+/// A room's channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomName {
+    /// Lowercase login (`otherchan`).
+    pub login: String,
+    /// Display name (the login when Twitch has none).
+    pub display_name: String,
+}
+
+/// The channel in an `api.ivr.fi` user answer (an array of users; empty for an unknown id). `None`
+/// when there is no login to name it by.
+pub fn parse_name(body: &[u8]) -> Option<RoomName> {
     let users: Vec<User> = serde_json::from_slice(body).ok()?;
     let user = users.into_iter().next()?;
-    [user.display_name, user.login]
-        .into_iter()
-        .map(|name| name.trim().to_owned())
-        .find(|name| !name.is_empty())
+    let login = user.login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        return None;
+    }
+    let display_name = match user.display_name.trim() {
+        "" => login.clone(),
+        name => name.to_owned(),
+    };
+    Some(RoomName {
+        login,
+        display_name,
+    })
 }
 
 /// Looks room ids up and remembers what it learned. Cheap to clone; clones share the memory.
@@ -41,7 +58,7 @@ pub fn parse_name(body: &[u8]) -> Option<String> {
 pub struct RoomNames {
     http: reqwest::Client,
     base: Arc<str>,
-    known: Arc<Mutex<HashMap<String, Option<Arc<str>>>>>,
+    known: Arc<Mutex<HashMap<String, Option<Arc<RoomName>>>>>,
 }
 
 impl RoomNames {
@@ -64,7 +81,7 @@ impl RoomNames {
 
     /// What is known about `room_id`: `None` when it has not been looked up, `Some(None)` when the
     /// lookup failed or found nobody (not asked again), `Some(Some(name))` otherwise.
-    pub fn known(&self, room_id: &str) -> Option<Option<Arc<str>>> {
+    pub fn known(&self, room_id: &str) -> Option<Option<Arc<RoomName>>> {
         self.known
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -85,8 +102,8 @@ impl RoomNames {
 
     /// Asks the service for the name of `room_id` and remembers the answer. A room id that is not
     /// digits is not sent (it names nobody). Returns the name.
-    pub async fn lookup(&self, room_id: &str) -> Option<Arc<str>> {
-        let name = self.fetch(room_id).await.map(Arc::<str>::from);
+    pub async fn lookup(&self, room_id: &str) -> Option<Arc<RoomName>> {
+        let name = self.fetch(room_id).await.map(Arc::new);
         self.known
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -94,7 +111,7 @@ impl RoomNames {
         name
     }
 
-    async fn fetch(&self, room_id: &str) -> Option<String> {
+    async fn fetch(&self, room_id: &str) -> Option<RoomName> {
         if room_id.is_empty() || !room_id.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
@@ -125,9 +142,18 @@ mod tests {
     #[test]
     fn the_display_name_wins_over_the_login() {
         let body = br#"[{"id":"1","login":"somechan","displayName":"SomeChan","logo":"x"}]"#;
-        assert_eq!(parse_name(body).as_deref(), Some("SomeChan"));
+        let name = parse_name(body).unwrap();
+        assert_eq!(
+            (name.login.as_str(), name.display_name.as_str()),
+            ("somechan", "SomeChan")
+        );
         let no_display = br#"[{"login":"somechan","displayName":""}]"#;
-        assert_eq!(parse_name(no_display).as_deref(), Some("somechan"));
+        assert_eq!(parse_name(no_display).unwrap().display_name, "somechan");
+        assert_eq!(
+            parse_name(br#"[{"displayName":"X"}]"#),
+            None,
+            "no login, no name"
+        );
         assert_eq!(parse_name(b"[]"), None, "an unknown id");
         assert_eq!(parse_name(b"not json"), None);
         assert_eq!(parse_name(br#"[{"id":"1"}]"#), None);
@@ -149,8 +175,12 @@ mod tests {
         assert_eq!(names.known("2000"), None);
         assert!(names.claim("2000"));
         assert!(!names.claim("2000"), "only the first caller looks it up");
-        assert_eq!(names.lookup("2000").await.as_deref(), Some("OtherChan"));
-        assert_eq!(names.known("2000"), Some(Some(Arc::from("OtherChan"))));
+        let name = names.lookup("2000").await.unwrap();
+        assert_eq!(
+            (name.login.as_str(), name.display_name.as_str()),
+            ("otherchan", "OtherChan")
+        );
+        assert_eq!(names.known("2000"), Some(Some(name)));
     }
 
     #[tokio::test]

@@ -72,11 +72,16 @@ impl CheermoteSet {
     /// `fragments` with the cheermotes of this set drawn: a `Cheer` fragment gets the image of its
     /// tier, and a word that is a prefix of this set and an amount (`Cheer100`, also a channel's
     /// own prefix the tokenizer does not know) in a text run becomes one. `None` when nothing
-    /// changed. Call it for messages that carry bits only: without bits `Cheer100` is just text.
-    pub fn resolve(&self, fragments: &[Fragment]) -> Option<Vec<Fragment>> {
+    /// changed. Call it for messages that carry bits only (without bits `Cheer100` is just text),
+    /// with the message's `bits` as `max_bits`: Twitch counts the cheermotes of a message from the
+    /// left and a word only is one while the running total stays within the amount actually
+    /// cheered (cheermotes the tokenizer already found count towards it, too), so `Cheer100`
+    /// typed after the bits ran out stays text.
+    pub fn resolve(&self, fragments: &[Fragment], max_bits: u32) -> Option<Vec<Fragment>> {
         if self.is_empty() {
             return None;
         }
+        let mut used: u32 = 0;
         let mut out: Vec<Fragment> = Vec::with_capacity(fragments.len());
         let mut changed = false;
         let push_text = |out: &mut Vec<Fragment>, text: &str| {
@@ -95,7 +100,8 @@ impl CheermoteSet {
                     bits,
                     image: None,
                 } => match self.tier(prefix, *bits) {
-                    Some(tier) => {
+                    Some(tier) if used.saturating_add(*bits) <= max_bits => {
+                        used += bits;
                         changed = true;
                         out.push(Fragment::Cheer {
                             prefix: prefix.clone(),
@@ -103,8 +109,15 @@ impl CheermoteSet {
                             image: Some(tier.image.clone()),
                         });
                     }
-                    None => out.push(fragment.clone()),
+                    _ => {
+                        used = used.saturating_add(*bits);
+                        out.push(fragment.clone());
+                    }
                 },
+                Fragment::Cheer { bits, .. } => {
+                    used = used.saturating_add(*bits);
+                    out.push(fragment.clone());
+                }
                 Fragment::Text(text) => {
                     let mut pos = 0;
                     for_each_word(text, |range| {
@@ -118,6 +131,7 @@ impl CheermoteSet {
                         let found = (!glued)
                             .then(|| split_cheer(word, |p| self.is_prefix(p)))
                             .flatten()
+                            .filter(|&(_, bits)| used.saturating_add(bits) <= max_bits)
                             .and_then(|(prefix, bits)| {
                                 self.tier(prefix, bits).map(|tier| (prefix, bits, tier))
                             });
@@ -126,6 +140,7 @@ impl CheermoteSet {
                         match found {
                             Some((prefix, bits, tier)) => {
                                 changed = true;
+                                used += bits;
                                 out.push(Fragment::Cheer {
                                     prefix: prefix.to_owned(),
                                     bits,
@@ -202,7 +217,7 @@ mod tests {
     #[test]
     fn words_in_text_become_cheermotes_including_a_channels_own_prefix() {
         let resolved = set()
-            .resolve(&[text("gg streamerCheer50 cheer1000 Cheer0 hello")])
+            .resolve(&[text("gg streamerCheer50 cheer1000 Cheer0 hello")], 1050)
             .expect("changed");
         let cheers: Vec<_> = resolved
             .iter()
@@ -241,15 +256,56 @@ mod tests {
             bits: 150,
             image: None,
         }];
-        let resolved = set().resolve(&fragments).unwrap();
+        let resolved = set().resolve(&fragments, 150).unwrap();
         assert!(matches!(
             &resolved[0],
             Fragment::Cheer { image: Some(i), .. } if i.id.as_str() == "Cheer100"
         ));
         // Nothing to do: no change reported.
-        assert!(set().resolve(&resolved).is_none());
-        assert!(set().resolve(&[text("hello")]).is_none());
-        assert!(CheermoteSet::default().resolve(&fragments).is_none());
+        assert!(set().resolve(&resolved, 150).is_none());
+        assert!(set().resolve(&[text("hello")], 150).is_none());
+        assert!(CheermoteSet::default().resolve(&fragments, 150).is_none());
+    }
+
+    #[test]
+    fn only_as_many_words_are_cheermotes_as_the_bits_paid_for() {
+        let resolved = |text_: &str, bits| {
+            set()
+                .resolve(&[text(text_)], bits)
+                .map(|f| {
+                    f.iter()
+                        .filter_map(|f| match f {
+                            Fragment::Cheer { prefix, bits, .. } => Some(format!("{prefix}{bits}")),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        // 100 bits paid: the first word uses them all, the second is text.
+        assert_eq!(resolved("Cheer100 Cheer100", 100), ["Cheer100"]);
+        assert_eq!(resolved("Cheer100 Cheer100", 200), ["Cheer100", "Cheer100"]);
+        // A word that would go over the total is text, a later smaller one still fits.
+        assert_eq!(resolved("Cheer150 Cheer50", 100), ["Cheer50"]);
+        // No bits, no cheermotes.
+        assert!(resolved("Cheer1", 0).is_empty());
+        // Cheers the tokenizer already found count towards the total.
+        let fragments = [
+            Fragment::Cheer {
+                prefix: "Cheer".into(),
+                bits: 100,
+                image: None,
+            },
+            text(" Cheer100"),
+        ];
+        let out = set().resolve(&fragments, 100).unwrap();
+        assert_eq!(
+            out.iter()
+                .filter(|f| matches!(f, Fragment::Cheer { image: Some(_), .. }))
+                .count(),
+            1,
+            "the second word is text"
+        );
     }
 
     #[test]
@@ -260,6 +316,6 @@ mod tests {
                 text: "👍".into()
             },
         ];
-        assert!(set().resolve(&fragments).is_none());
+        assert!(set().resolve(&fragments, 100).is_none());
     }
 }

@@ -809,7 +809,7 @@ fn gifts() {
         months,
         gifter_total,
         anonymous,
-        community,
+        community_gift_id,
     } = kind("20")
     else {
         panic!("a gift")
@@ -824,8 +824,8 @@ fn gifts() {
         ("lucky", "Lucky", Some("2010"))
     );
     assert_eq!(
-        (months, gifter_total, anonymous, community),
-        (1, Some(50), false, false)
+        (months, gifter_total, anonymous, community_gift_id),
+        (1, Some(50), false, None)
     );
 
     let EventKind::Gift {
@@ -848,12 +848,23 @@ fn gifts() {
             plan: SubPlan::Tier1,
             count: 3,
             gifter_total: Some(103),
-            anonymous: false
+            anonymous: false,
+            origin_id: Some("11 22 33".into()),
+            recipients: Vec::new(),
         }
     );
-    // The per-recipient lines of a mystery gift are marked, to be drawn quietly.
+    // The per-recipient lines of a mystery gift name it (`community-gift-id` = its origin id) and
+    // carry no running total (Twitch sends 0 there).
     for n in ["23", "24", "25"] {
         assert!(kind(n).is_community_gift(), "{n}");
+        assert_eq!(kind(n).community_gift_id(), Some("11 22 33"));
+        assert!(matches!(
+            kind(n),
+            EventKind::Gift {
+                gifter_total: None,
+                ..
+            }
+        ));
     }
     assert!(!kind("20").is_community_gift());
     assert_eq!(
@@ -862,7 +873,9 @@ fn gifts() {
             plan: SubPlan::Tier1,
             count: 20,
             gifter_total: None,
-            anonymous: true
+            anonymous: true,
+            origin_id: Some("44 55 66".into()),
+            recipients: Vec::new(),
         }
     );
     assert_eq!(
@@ -1060,15 +1073,22 @@ fn shared_chat_tags() {
         Some(own.id.as_str())
     );
     assert!(!shared.is_copy_in(own.raw_tags.get("room-id")));
-    assert_eq!(own.dedupe_id(), &own.id);
 
     // The copy in the other channel: another id, the original's in `source-id`.
     let copy = event_message("81");
     let shared = copy.shared.as_ref().expect("shared");
     assert!(shared.is_copy_in(copy.raw_tags.get("room-id")));
     assert_ne!(copy.id, own.id);
-    assert_eq!(copy.dedupe_id(), &own.id, "both copies are one message");
-    assert_eq!(shared.source_name, None, "the parser cannot know the name");
+    assert_eq!(
+        shared.source_id.as_ref(),
+        Some(&own.id),
+        "`source-id` names the original"
+    );
+    assert_eq!(
+        (&shared.source_login, &shared.source_name),
+        (&None, &None),
+        "the parser cannot know the name"
+    );
 
     let visitor = event_message("82");
     let shared = visitor.shared.as_ref().unwrap();
@@ -1101,4 +1121,103 @@ fn history_events_are_flagged() {
     assert!(old.flags.history);
     assert!(matches!(old.event, Some(EventKind::Sub { .. })));
     assert_eq!(old.timestamp, Timestamp(1_700_000_099_000));
+}
+
+#[test]
+fn a_notice_of_another_shared_channel_is_dispatched_on_its_source_kind() {
+    // msg-id=sharedchatnotice, the real kind in source-msg-id, with that kind's msg-param-*.
+    let raid = event_message("100");
+    assert_eq!(raid.notice_id.as_deref(), Some("sharedchatnotice"));
+    assert_eq!(
+        raid.event,
+        Some(EventKind::Raid {
+            from_login: "bigraider".into(),
+            from_name: "BigRaider".into(),
+            viewers: 2500,
+            profile_image: Some(
+                "https://static-cdn.jtvnw.net/jtv_user_pictures/x-profile_image-70x70.png".into()
+            )
+        })
+    );
+    // It is marked as coming from the other room, so it is drawn as that channel's raid.
+    let shared = raid.shared.as_ref().expect("shared");
+    assert_eq!(shared.source_room_id, "2000");
+    assert!(shared.is_copy_in(raid.raw_tags.get("room-id")));
+
+    let announcement = event_message("101");
+    assert_eq!(
+        announcement.event,
+        Some(EventKind::Announcement {
+            color: AnnouncementColor::Blue
+        })
+    );
+    assert_eq!(announcement.system_text, None, "an empty system-msg");
+    assert_eq!(
+        announcement.plain_text(),
+        "Both chats: raffle in ten minutes"
+    );
+    assert_eq!(
+        announcement.shared.as_ref().unwrap().source_badges[0]
+            .set
+            .as_ref(),
+        "moderator"
+    );
+
+    assert_eq!(
+        event_message("102").event,
+        Some(EventKind::Resub {
+            plan: SubPlan::Tier1,
+            months: 6,
+            streak: None
+        })
+    );
+    assert_eq!(
+        event_message("102").shared.as_ref().unwrap().source_room_id,
+        "3000"
+    );
+
+    // Without a source kind there is nothing to dispatch on.
+    let parse = |tags: &str| {
+        let line = format!("@id=1;login=x;tmi-sent-ts=5;{tags} :tmi.twitch.tv USERNOTICE #c");
+        match parse_line(&line).unwrap().unwrap() {
+            ChatEvent::Message { message, .. } => message,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        parse("msg-id=sharedchatnotice").event,
+        Some(EventKind::Other {
+            msg_id: String::new()
+        })
+    );
+}
+
+#[test]
+fn the_gift_bomb_fixture_has_one_row_and_a_line_per_recipient() {
+    let mystery = event_message("103");
+    let Some(EventKind::MysteryGift {
+        count, origin_id, ..
+    }) = &mystery.event
+    else {
+        panic!("a mystery gift")
+    };
+    assert_eq!((*count, origin_id.as_deref()), (12, Some("77 88 99")));
+    let lines: Vec<_> = (104..116)
+        .map(|n| match kind(&n.to_string()) {
+            EventKind::Gift {
+                recipient,
+                community_gift_id,
+                gifter_total,
+                ..
+            } => (recipient.name().to_owned(), community_gift_id, gifter_total),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(lines.len(), 12);
+    assert!(
+        lines
+            .iter()
+            .all(|(_, id, total)| id.as_deref() == Some("77 88 99") && total.is_none())
+    );
+    assert_eq!((lines[0].0.as_str(), lines[11].0.as_str()), ("Ann", "Lea"));
 }

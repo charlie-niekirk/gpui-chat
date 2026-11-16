@@ -26,13 +26,18 @@ struct RawCheermote {
     tiers: Vec<RawTier>,
 }
 
+/// `format -> scale -> url` of one theme.
+type Formats = HashMap<String, Option<HashMap<String, String>>>;
+
 #[derive(Debug, Deserialize)]
 struct RawTier {
     min_bits: u32,
     #[serde(default = "yes")]
     can_cheer: bool,
+    /// `theme -> format -> scale -> url`; any level may be missing or `null` (one odd tier must not
+    /// cost the whole set).
     #[serde(default)]
-    images: HashMap<String, HashMap<String, HashMap<String, String>>>,
+    images: Option<HashMap<String, Option<Formats>>>,
 }
 
 fn yes() -> bool {
@@ -53,10 +58,15 @@ fn scale_of(key: &str) -> Option<ImageScale> {
 impl RawTier {
     /// The dark images, animated if the tier has them, else static.
     fn emote(&self, prefix: &str) -> Option<Emote> {
-        let dark = self.images.get("dark")?;
-        let (formats, animated) = match dark.get("animated").filter(|urls| !urls.is_empty()) {
+        let dark = self.images.as_ref()?.get("dark")?.as_ref()?;
+        let usable = |format: &str| {
+            dark.get(format)
+                .and_then(Option::as_ref)
+                .filter(|urls| !urls.is_empty())
+        };
+        let (formats, animated) = match usable("animated") {
             Some(urls) => (urls, true),
-            None => (dark.get("static")?, false),
+            None => (usable("static")?, false),
         };
         let mut urls = ImageUrls::new();
         for (key, url) in formats {
@@ -205,13 +215,24 @@ mod tests {
                     tier("chancheer", 1, false, true),
                 ]},
                 { "prefix": "Broken", "tiers": [ { "min_bits": 1, "images": {} } ] },
+                // `null` images, formats and scales on one tier: that tier is skipped, the
+                // others (and the cheermote) stay.
+                { "prefix": "Nully", "tiers": [
+                    { "min_bits": 1, "images": null },
+                    { "min_bits": 100, "images": { "dark": null } },
+                    { "min_bits": 1000, "images": { "dark": { "animated": null, "static": null } } },
+                    tier("nully", 5000, false, true),
+                ]},
             ]})))
             .expect(1)
             .mount(&server)
             .await;
 
         let set = helix.get_cheermotes("7").await.unwrap();
-        assert_eq!(set.len(), 2, "a cheermote with no usable image is dropped");
+        assert_eq!(set.len(), 3, "a cheermote with no usable image is dropped");
+        // The tiers with `null` images are skipped, the good one of that cheermote is kept.
+        assert_eq!(set.tier("Nully", 9999).unwrap().min_bits, 5000);
+        assert!(set.tier("Nully", 20).is_none());
 
         let hundred = set.tier("Cheer", 250).unwrap();
         assert_eq!(hundred.min_bits, 100);

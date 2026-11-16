@@ -340,15 +340,6 @@ impl Message {
         self.reply.as_ref().map_or(&self.id, ReplyRef::root_id)
     }
 
-    /// The id to tell a message from its other copies by: in shared chat every channel of the
-    /// session gets its own copy with an id of its own, and `source-id` names the original.
-    pub fn dedupe_id(&self) -> &MessageId {
-        self.shared
-            .as_ref()
-            .and_then(|shared| shared.source_id.as_ref())
-            .unwrap_or(&self.id)
-    }
-
     /// The body as plain text (see [`Fragment::write_plain_text`]).
     pub fn plain_text(&self) -> String {
         let mut out = String::new();

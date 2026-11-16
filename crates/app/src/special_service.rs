@@ -9,8 +9,9 @@
 //!   failed load) the text stays and the row says how many bits were cheered.
 //! * **Shared-chat source names.** A message from another channel of a shared chat session
 //!   carries that channel's room id only; the name is looked up once per id
-//!   ([`gpui_chat_twitch::RoomNames`]) and put on the messages that arrive after the answer. (The
-//!   UI fills in names of channels it has open without any lookup, see `ChannelHub`.)
+//!   ([`gpui_chat_twitch::RoomNames`], `api.ivr.fi`, so it works logged out too) and put on the
+//!   messages that arrive after the answer. (`ChannelHub` names the channels it has open itself,
+//!   from their `ROOMSTATE`s, with no lookup: `name_shared_sources`.)
 //!
 //! Every event passes [`SpecialService::process`] on its way to the UI (live messages in `forward`,
 //! history in `HistoryService`); `--firehose` / `--replay` have none: no network, no login.
@@ -22,7 +23,7 @@ use gpui_chat_core::{
     ChannelId, ChatEvent, CheerTier, Cheermote, CheermoteSet, Emote, EmoteId, EmoteProvider,
     ImageScale, ImageUrls, Message, MessageKind,
 };
-use gpui_chat_twitch::{Auth, HelixClient, RoomNames};
+use gpui_chat_twitch::{Auth, HelixClient, RoomName, RoomNames};
 use gpui_kit::App;
 use tokio::runtime::Handle;
 
@@ -81,7 +82,7 @@ pub fn with_cheermotes(set: &CheermoteSet, message: Arc<Message>) -> Arc<Message
     {
         return message;
     }
-    match set.resolve(&message.fragments) {
+    match set.resolve(&message.fragments, message.bits.unwrap_or(0)) {
         Some(fragments) => {
             let mut message = (*message).clone();
             message.fragments = fragments;
@@ -312,14 +313,15 @@ impl SpecialService {
         };
         let mut message = (*message).clone();
         if let Some(shared) = message.shared.as_mut() {
-            shared.source_name = Some(name.to_string());
+            shared.source_login = Some(name.login.clone());
+            shared.source_name = Some(name.display_name.clone());
         }
         Arc::new(message)
     }
 
     /// The name of a source room if it is known; otherwise (first time this room is seen) a
     /// lookup starts and the answer serves the messages that follow it.
-    fn source_name(&self, room_id: &str) -> Option<Arc<str>> {
+    fn source_name(&self, room_id: &str) -> Option<Arc<RoomName>> {
         let names = self.inner.names.as_ref()?;
         if let Some(known) = names.known(room_id) {
             return known;
@@ -447,6 +449,7 @@ mod tests {
             source_room_id: "3000".into(),
             source_id: Some(MessageId::from("x")),
             source_badges: Vec::new(),
+            source_login: None,
             source_name: None,
         });
         let message = Arc::new(message);

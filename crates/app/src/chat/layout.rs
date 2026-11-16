@@ -181,6 +181,8 @@ pub struct ShapedMessage {
     pub descent: Pixels,
     /// The context line of a reply, drawn above the text.
     pub reply: Option<ReplyLine>,
+    /// How an event row is dressed (PR 5.1), decided once here rather than at every paint.
+    pub look: Option<super::events::Look>,
 }
 
 /// Cuts the shaped `text` into one atom per extended grapheme cluster, each with its advance.
@@ -303,7 +305,15 @@ impl ShapedMessage {
             ascent: layout.ascent,
             descent: layout.descent,
             reply: None,
+            look: None,
         }
+    }
+
+    /// With the look of an event row.
+    #[must_use]
+    pub fn with_look(mut self, look: Option<super::events::Look>) -> Self {
+        self.look = look;
+        self
     }
 
     /// With the context line of a reply drawn above the text.
