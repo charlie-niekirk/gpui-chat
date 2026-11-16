@@ -31,20 +31,20 @@
 //!   it (and asks the owner to focus the input box again); with nothing selected both go on. The
 //!   pane also handles Copy, so the command palette reaches it from the input box.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_chat_core::{ChannelRole, Message, MessageId, Rebuild};
 use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
-    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div,
-    font, list, point, px,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, Window, canvas, div, font, list, point, px,
 };
 
 use super::display::DisplayOptions;
@@ -66,6 +66,10 @@ use crate::theme::Tokens;
 
 /// Rows rendered beyond the viewport, so short scrolls do not pop in.
 const OVERDRAW: Pixels = px(240.0);
+/// Rows shown above a message jumped to (the Mentions view, a notification).
+const JUMP_CONTEXT_ROWS: usize = 3;
+/// How long a jumped-to row flashes.
+const FLASH: Duration = Duration::from_millis(1800);
 const PADDING_X: Pixels = px(8.0);
 const PADDING_Y: Pixels = px(1.0);
 
@@ -157,6 +161,12 @@ pub struct ChatView {
     thread: Option<ThreadPanel>,
     /// Text selection and links in the list.
     surface: Rc<Surface>,
+    /// A message was jumped to (the Mentions view, a notification): the list stands still, so a busy
+    /// channel does not scroll it away, until the user scrolls or goes back to the latest messages.
+    jump_hold: bool,
+    /// The jumped-to row, painted with a flash for a moment (see [`FLASH`]).
+    flash: Rc<Cell<Option<u64>>>,
+    flash_task: Option<Task<()>>,
     /// Focused by a press in the chat, so ⌘C and Esc reach the selection.
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -210,6 +220,9 @@ impl ChatView {
             revealed: Rc::default(),
             struck_seen: 0,
             strip_hold: None,
+            jump_hold: false,
+            flash: Rc::default(),
+            flash_task: None,
             thread: None,
             _subscriptions: subscriptions,
         }
@@ -254,6 +267,39 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Scrolls the list so that message `id` is in view, a few rows below the top (so the lines
+    /// before it show, as when following a link to a message). Pauses following, like any scroll
+    /// away from the bottom. `false` when the store no longer holds it (it left the scrollback).
+    pub fn scroll_to_message(&mut self, id: &MessageId, cx: &mut Context<Self>) -> bool {
+        let Some(seq) = self.store.read(cx).messages().seq_of(id.as_str()) else {
+            return false;
+        };
+        let Some(ix) = seq
+            .checked_sub(self.mirror.first_seq())
+            .map(|ix| ix as usize)
+            .filter(|&ix| ix < self.mirror.len())
+        else {
+            return false;
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix: ix.saturating_sub(JUMP_CONTEXT_ROWS),
+            offset_in_item: px(0.0),
+        });
+        // Near the end the list would be following again at once and new messages would carry the
+        // target away: it stands still instead, behind the "new messages" pill.
+        self.jump_hold = true;
+        self.update_hold();
+        self.flash.set(Some(seq));
+        let flash = self.flash.clone();
+        self.flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FLASH).await;
+            flash.set(None);
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+        cx.notify();
+        true
+    }
+
     /// The pointer entered (`true`) or left a row's moderation strip. While it is on it the list
     /// stands still, so no message can arrive and slide another row under the pointer between aiming
     /// at a button and clicking it (a Delete or a 10-minute timeout asks no confirmation); the
@@ -267,15 +313,27 @@ impl ChatView {
             // Stopped where it is, the way a selection stops it (a bare pause would re-engage at
             // the bottom as soon as the next message is laid out).
             self.strip_hold = Some(self.surface.freeze_list());
-            self.surface.keep_frozen(true);
-        } else {
-            self.surface.keep_frozen(false);
-            if self.strip_hold.take() == Some(true) {
-                self.list.set_follow_mode(FollowMode::Tail);
-                self.unseen_from = None;
-            }
+        } else if self.strip_hold.take() == Some(true) && !self.jump_hold {
+            self.list.set_follow_mode(FollowMode::Tail);
+            self.unseen_from = None;
         }
+        self.update_hold();
         cx.notify();
+    }
+
+    /// The list is held every frame while a moderation strip or a jump asks for it.
+    fn update_hold(&self) {
+        self.surface
+            .keep_frozen(self.strip_hold.is_some() || self.jump_hold);
+    }
+
+    /// The user took over (scrolled, or went back to the latest messages): the jump no longer
+    /// holds the list. Following resumes by itself if the view is at the end.
+    fn end_jump(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.jump_hold) {
+            self.update_hold();
+            cx.notify();
+        }
     }
 
     /// Reply was chosen on `message`: tell the owner.
@@ -459,6 +517,8 @@ impl ChatView {
     }
 
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.jump_hold = false;
+        self.update_hold();
         self.list.set_follow_mode(FollowMode::Tail);
         self.unseen_from = None;
         cx.notify();
@@ -690,6 +750,7 @@ impl Render for ChatView {
             }),
             hovered_row: track_hover.then(|| self.hovered.clone()),
             selection: Some(self.surface.clone()),
+            flash: Some(self.flash.clone()),
         });
         let handle = cx.entity().downgrade();
         let rows = |id, hovered: &HoveredRow| RowContext {
@@ -712,6 +773,7 @@ impl Render for ChatView {
                 hover: panel.hover.clone(),
                 hovered_row: track_hover.then(|| panel.hovered.clone()),
                 selection: Some(panel.surface.clone()),
+                flash: None,
                 ..(*style).clone()
             });
             let view = thread::thread_view(self.store.read(cx).messages(), panel.root.as_str());
@@ -824,6 +886,8 @@ impl Render for ChatView {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    // The user scrolling takes the list back from a jump.
+                    .on_scroll(cx.listener(|this, _, _, cx| this.end_jump(cx)))
                     // First, so the rows and what is drawn over them see a press before it does.
                     .child(self.surface.layer())
                     .child(messages)
@@ -1797,6 +1861,93 @@ mod tests {
         assert!(h.following(cx));
         assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
         assert!(!h.view.read_with(cx, |v, _| v.pill_shown()));
+    }
+
+    #[gpui_kit::test]
+    fn jumping_to_a_message_shows_it_a_few_rows_from_the_top_and_stops_following(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        assert!(h.following(cx));
+        let id = |n: u64| MessageId::from(format!("m{n}"));
+        let found = h
+            .view
+            .update(cx, |view, cx| view.scroll_to_message(&id(50), cx));
+        cx.run_until_parked();
+        assert!(found);
+        assert!(
+            !h.following(cx),
+            "a jump away from the bottom pauses following"
+        );
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(top.item_ix, 50 - JUMP_CONTEXT_ROWS);
+        // A message the store no longer holds is not found, and nothing moves.
+        let missing = h.view.update(cx, |view, cx| {
+            view.scroll_to_message(&MessageId::from("gone"), cx)
+        });
+        assert!(!missing);
+        let again = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(again.item_ix, top.item_ix);
+        // The first rows clamp at the top.
+        assert!(
+            h.view
+                .update(cx, |view, cx| view.scroll_to_message(&id(1), cx))
+        );
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert_eq!(top.item_ix, 0);
+    }
+
+    #[gpui_kit::test]
+    fn a_jump_to_a_recent_message_stays_put_while_the_channel_keeps_talking(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        let last = MessageId::from("m199");
+        assert!(
+            h.view
+                .update(cx, |view, cx| view.scroll_to_message(&last, cx))
+        );
+        cx.run_until_parked();
+        h.next_frame(cx);
+        // The newest rows fit on screen, so the list is at its end: without the hold it would be
+        // following again and the next messages would carry the target away.
+        assert!(!h.following(cx), "the jump holds the list");
+        h.push(30, "more", cx);
+        h.next_frame(cx);
+        assert!(!h.following(cx), "still held while messages arrive");
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 30);
+        assert_eq!(h.view.read_with(cx, |v, _| v.flash.get()), Some(199));
+        // The target is still on screen: it is not past the top.
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        assert!(top.item_ix <= 199);
+        // Going back to the latest messages (the pill) lets go of the hold.
+        h.view.update(cx, |view, cx| view.jump_to_latest(cx));
+        cx.run_until_parked();
+        h.next_frame(cx);
+        assert!(h.following(cx));
+        assert!(!h.view.read_with(cx, |v, _| v.jump_hold));
+        // So does scrolling.
+        assert!(
+            h.view
+                .update(cx, |view, cx| view.scroll_to_message(&last, cx))
+        );
+        cx.run_until_parked();
+        assert!(h.view.read_with(cx, |v, _| v.jump_hold));
+        h.scroll(200.0, cx);
+        assert!(
+            !h.view.read_with(cx, |v, _| v.jump_hold),
+            "the user took over"
+        );
     }
 
     fn history_before(count: i64, cx: &mut VisualTestContext, h: &Harness) {

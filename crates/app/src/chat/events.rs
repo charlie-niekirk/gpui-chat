@@ -87,8 +87,8 @@ impl Colors {
     }
 }
 
-/// Width of the accent bar.
-const BAR_WIDTH: f32 = 3.0;
+/// Width of the accent bar (also the bar of a highlighted row, PR 5.3).
+pub const BAR_WIDTH: f32 = 3.0;
 /// Opacity of the tint behind an event row.
 const TINT: f32 = 0.08;
 

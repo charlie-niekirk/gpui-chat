@@ -32,7 +32,8 @@ actions!(
         FocusPaneUp,
         FocusPaneDown,
         OpenPalette,
-        OpenChannelSwitcher
+        OpenChannelSwitcher,
+        ShowMentions
     ]
 );
 

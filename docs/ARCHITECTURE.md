@@ -80,7 +80,7 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 - `settings_window.rs` (PR 4.2) — the settings window (⌘, / the app menu's "Settings…", `OpenSettings`;
   one window, a second ⌘, focuses it, and the app quits when the last *chat* window closes, not when
   only settings remain). A Kit `Settings` (sidebar with search, pages Appearance / Chat / Emote
-  providers / Streamlink / Account) over `settings.toml`: every control writes through
+  providers / Highlights / Streamlink / Account) over `settings.toml`: every control writes through
   `config::edit`, which calls `Settings::update_file` (`gpui-chat-settings`, `toml_edit`: only the
   edited keys change, comments and unknown keys stay, nothing is written unless the *result* is valid
   settings) and then puts the result in the `SettingsStore` at once; the file watcher reports the same
@@ -275,6 +275,35 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   recent-messages history (`ChannelStore::with_clear_lines`, lines older than anything shown are left out) are one line, and
   it is flagged `history` like the messages around it. `mark_all_deleted` and a history channel clear only touch chat lines,
   never system lines (the line a clear made must not be struck by it).
+- **Highlights, unread dots, Mentions, notifications** (PR 5.3). `core::highlight` is the pure part (tested there):
+  `HighlightConfig` (the `[highlights]` section, embedded as is in `Settings`), `Highlights` (compiled once: phrases are
+  escaped and compiled as case-insensitive `regex`es with a manual whole-word check, regexes are the user's own; the `regex`
+  crate never backtracks, patterns get a size limit and one that matches the empty text is refused) and
+  `Highlights::evaluate(&Message) -> Option<Hit>` (colour of the first match: own name, then rules in order, then users;
+  `notify` if any match says so; never the user's own messages). `MessageFlags::highlight` carries the colour,
+  `flags.mention` is set from the own-name rule (so it also covers history, whose parser did not know the login).
+  `attention.rs`: `Core` (no GPUI: engine + `activity::Activity` + `notifications::Coalescer`, all tested) and the
+  `Attention` entity, which `ChannelHub::apply_batch` calls with each channel's events **after routing** (only for a channel that
+  has a store, so a closed or never-opened channel counts for nothing) and before its store sees them: it stamps messages
+  (cloning only the ones a rule hit), counts unread / unseen mentions for channels that are not *watched*, logs hits for the
+  Mentions panel and returns notifications to post and banners to dismiss. The hub also tells it which messages are the *copy*
+  of a shared-chat line another open channel shows (`ChannelHub::open_rooms`): drawn, never counted. Matching runs all regexes in
+  one `RegexSet` pass and looks users up in a map; unseen mentions are kept per channel (`Activity::unseen`, O(1) for the
+  sidebar) and the log has a `generation` the panel's cached rows follow. Own login: the account (`account::own_login`), `viewer` for the
+  offline sources; the display name is learned from the user's own messages. History is stamped but never counted;
+  deletes / timeouts / clears take hits out of the log. `activity.rs` is the state: a channel is watched while a pane shows it
+  and the window is active (`AppShell::push_view` tells `Attention::set_view` from `sync_layout` and window-activation
+  changes); showing it in the *focused* pane clears its unread count and unseen mentions. The sidebar row's suffix draws the
+  mention pill or unread dot (`shell::Dots`), `mentions.rs` the panel beside the panes (a `uniform_list` of fixed-height rows) (`View ▸ Show Mentions`, ⇧⌘M; click =
+  `AppShell::show_message`: show the channel, `ChatView::scroll_to_message`, mark seen; the view holds still (`jump_hold`, ended by
+  scrolling or the pill), flashes the row and the shell says so when the message left the scrollback). `notifications.rs` builds the text and
+  the tag (`hit:<channel>:<message id>` / `summary`, parsed back on a click) and rate-limits (one per 5 s, the rest one summary
+  after a timer); `platform/notify.rs` is the only place that calls GPUI's `show_system_notification` /
+  `on_system_notification_response` (macOS `UNUserNotificationCenter`; authorisation is requested by GPUI on the first
+  notification, nothing happens outside an app bundle). A click emits `AttentionEvent::Show`, which the shell turns into
+  `show_message` / opening the panel. The settings window's Highlights page (`settings_window/highlights.rs`) edits the lists as
+  one-per-line text (`{green, notify} pattern`) and writes `[[highlights.rules]]` / `[[highlights.users]]` through
+  `EditValue::Tables`.
 - `account.rs` / `sign_in.rs` / `platform/keychain.rs` (PR 3.1) — the Twitch account. `AccountHub` (GPUI
   entity, live source only: offline runs never touch the keychain) mirrors `gpui_chat_twitch::Auth`'s
   `AuthState` (a `watch` channel) into the UI: on start the backend restores the stored login and then

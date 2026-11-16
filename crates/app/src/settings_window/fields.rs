@@ -90,12 +90,16 @@ fn with_reset(field: SettingField<SharedString>, reset: Reset) -> SettingField<S
     )
 }
 
-fn error_line(error: Option<&SharedString>, cx: &App) -> Option<impl IntoElement + use<>> {
+fn error_line(
+    error: Option<&SharedString>,
+    width: f32,
+    cx: &App,
+) -> Option<impl IntoElement + use<>> {
     let error = error?.clone();
     let danger = cx.global::<Tokens>().danger_text;
     Some(
         div()
-            .max_w(px(TEXT_WIDTH))
+            .max_w(px(width))
             .text_xs()
             .text_color(danger)
             .child(error),
@@ -189,7 +193,7 @@ pub fn text(
                 .gap_1()
                 .items_end()
                 .child(Input::new(&state.input).aria_label(title).w(px(TEXT_WIDTH)))
-                .children(error_line(state.error.as_ref(), cx))
+                .children(error_line(state.error.as_ref(), TEXT_WIDTH, cx))
         },
     );
     with_reset(field, reset)
@@ -348,7 +352,7 @@ pub fn number(
                         .accessibility_label(title)
                         .w(px(NUMBER_WIDTH)),
                 )
-                .children(error_line(state.error.as_ref(), cx))
+                .children(error_line(state.error.as_ref(), TEXT_WIDTH, cx))
         },
     );
     with_reset(field, reset)
@@ -384,13 +388,45 @@ pub fn lines(
     commit: Commit<Vec<String>>,
     reset: Reset,
 ) -> SettingField<SharedString> {
+    lines_sized(
+        key,
+        title,
+        placeholder,
+        Size {
+            width: TEXT_WIDTH,
+            rows: 3,
+        },
+        current,
+        commit,
+        reset,
+    )
+}
+
+/// How big a multi-line field is: its width in pixels and its height in rows.
+#[derive(Clone, Copy)]
+pub struct Size {
+    pub width: f32,
+    pub rows: usize,
+}
+
+/// [`lines`] with a size of its own, for lists whose entries are longer than a program argument
+/// (highlight rules).
+pub fn lines_sized(
+    key: &'static str,
+    title: &'static str,
+    placeholder: &'static str,
+    size: Size,
+    current: impl Fn(&App) -> Vec<String> + 'static,
+    commit: Commit<Vec<String>>,
+    reset: Reset,
+) -> SettingField<SharedString> {
     let field = SettingField::render(
         move |_: &RenderOptions, window: &mut Window, cx: &mut App| {
             let value = current(cx).join("\n");
             let state = window.use_keyed_state(key, cx, |window, cx| {
                 let input = cx.new(|cx| {
                     TextareaState::new(window, cx)
-                        .rows(3)
+                        .rows(size.rows)
                         .placeholder(placeholder)
                         .default_value(value.clone())
                 });
@@ -443,9 +479,9 @@ pub fn lines(
                 .child(
                     Textarea::new(&state.input)
                         .aria_label(title)
-                        .w(px(TEXT_WIDTH)),
+                        .w(px(size.width)),
                 )
-                .children(error_line(state.error.as_ref(), cx))
+                .children(error_line(state.error.as_ref(), size.width, cx))
         },
     );
     with_reset(field, reset)

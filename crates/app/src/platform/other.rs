@@ -10,7 +10,8 @@ use crate::actions::{
     AddChannel, CHAT_CONTEXT, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown,
     FocusPaneLeft, FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp,
     OpenChannelSwitcher, OpenPalette, OpenSettings, Quit, RemoveChannel, SHELL_CONTEXT,
-    SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
+    SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleDebugHud,
+    ToggleSidebar,
 };
 use crate::chat::selection_layer::CopySelection;
 use crate::completion::ComposerToggleEmotePicker;
@@ -24,6 +25,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-b", ToggleSidebar, None),
         KeyBinding::new("ctrl-\\", ToggleSidebar, None),
         KeyBinding::new("ctrl-shift-d", ToggleDebugHud, None),
+        KeyBinding::new("ctrl-shift-m", ShowMentions, None),
         KeyBinding::new("ctrl-n", AddChannel, None),
         KeyBinding::new("ctrl-k", OpenPalette, None),
         KeyBinding::new("ctrl-t", OpenChannelSwitcher, None),

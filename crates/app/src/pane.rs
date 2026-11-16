@@ -471,6 +471,13 @@ impl ChannelPane {
         }
     }
 
+    /// Scrolls the chat to message `id` (the Mentions view, a clicked notification); `false` when
+    /// the message is no longer in the scrollback.
+    pub fn show_message(&mut self, id: &gpui_chat_core::MessageId, cx: &mut Context<Self>) -> bool {
+        self.chat
+            .update(cx, |chat, cx| chat.scroll_to_message(id, cx))
+    }
+
     pub fn set_in_split(&mut self, in_split: bool, cx: &mut Context<Self>) {
         if self.in_split != in_split {
             self.in_split = in_split;

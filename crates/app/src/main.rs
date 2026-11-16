@@ -5,8 +5,10 @@
 
 mod account;
 mod actions;
+mod activity;
 mod add_channel;
 mod assets;
+mod attention;
 mod badges;
 mod bridge;
 mod channel_list;
@@ -28,8 +30,11 @@ mod hud;
 mod images;
 mod keymap;
 mod live;
+mod logging;
 mod login;
+mod mentions;
 mod moderation;
+mod notifications;
 mod palette;
 mod pane;
 mod platform;
@@ -131,6 +136,9 @@ fn start_chat(
         hub.set_auto_create(offline);
         hub
     });
+    // Highlights, unread dots and notifications: every batch passes through it before the stores.
+    let attention = attention::Attention::start(offline, cx);
+    hub.update(cx, |hub, _| hub.set_attention(attention.clone()));
     let (sender, receiver) = bridge::channel(INGEST_QUEUE, INGEST_BATCH);
     bridge::attach(
         &hub,
@@ -178,6 +186,7 @@ fn start_chat(
     }
     ShellParts {
         hub,
+        attention,
         channels,
         live,
         account,
@@ -199,6 +208,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    logging::init();
     // Read the log before any window exists, so a bad path fails with a message, not a blank app.
     let replay_log: Option<Arc<str>> = cli.replay.as_ref().map(|path| {
         std::fs::read_to_string(path)
