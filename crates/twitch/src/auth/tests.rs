@@ -647,6 +647,38 @@ impl TokenStore for CorruptStore {
     }
 }
 
+/// A store that is unavailable (not corrupt) logs out with the notice the UI recognises.
+struct LockedStore;
+
+impl TokenStore for LockedStore {
+    fn load(&self) -> Result<Option<StoredToken>, StoreError> {
+        Err(StoreError::Unavailable("keychain is locked".into()))
+    }
+    fn save(&self, _: &StoredToken) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_store_logs_out_with_the_recognised_notice() {
+    let server = MockServer::start().await;
+    let oauth = OAuthClient::with_base(CLIENT, server.uri()).unwrap();
+    let auth = Auth::with_scopes(oauth, Arc::new(LockedStore), WANTED);
+    let AuthState::LoggedOut {
+        notice: Some(notice),
+    } = auth.restore().await
+    else {
+        panic!("expected a logout notice");
+    };
+    assert!(
+        notice.starts_with(super::STORE_UNAVAILABLE_NOTICE),
+        "{notice}"
+    );
+}
+
 #[tokio::test]
 async fn an_unreadable_stored_login_logs_out_with_a_notice() {
     let server = MockServer::start().await;

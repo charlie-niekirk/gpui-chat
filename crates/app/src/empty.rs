@@ -40,11 +40,22 @@ pub fn empty_state(
         .into_any_element()
 }
 
+/// The state of the Twitch login as the welcome shows it. Only [`WelcomeLogin::LoggedIn`] hides
+/// the button and claims a login: while the saved login is still being checked, or after a logout
+/// or a failure, the welcome offers to log in.
+pub enum WelcomeLogin {
+    /// Logged in: no button, and the text says so.
+    LoggedIn,
+    /// Not logged in (or not known yet): *Log in to Twitch* runs the callback.
+    Offered(Callback),
+    /// There is no account in this run (the login could not be set up): no button.
+    Unavailable,
+}
+
 /// What the three welcome buttons do. The shell implements them (it owns the dialogs and windows).
 pub struct WelcomeActions {
     pub add_channel: Callback,
-    /// `None` when there is nothing to log in to (already logged in, or an offline source).
-    pub log_in: Option<Callback>,
+    pub login: WelcomeLogin,
     pub choose_theme: Callback,
 }
 
@@ -64,14 +75,21 @@ pub fn welcome(
 ) -> AnyElement {
     let WelcomeActions {
         add_channel,
-        log_in,
+        login,
         choose_theme,
     } = actions;
     let add_label = match add_shortcut {
         Some(keys) => format!("Add a channel  {keys}"),
         None => "Add a channel".to_owned(),
     };
-    let logged_out = log_in.is_some();
+    let (log_in, note) = match login {
+        WelcomeLogin::LoggedIn => (None, "You are logged in, so you can send messages too."),
+        WelcomeLogin::Offered(callback) => (
+            Some(callback),
+            "Log in only if you want to send messages, see who you follow, or moderate.",
+        ),
+        WelcomeLogin::Unavailable => (None, "Logging in is not available in this run."),
+    };
     let mut buttons = h_flex().gap_2().flex_wrap().justify_center().child(
         Button::new("welcome-add-channel")
             .primary()
@@ -132,11 +150,7 @@ pub fn welcome(
                         "Add a channel to read its chat. You do not need an account for that.",
                     ),
                 )
-                .child(div().text_color(muted).child(if logged_out {
-                    "Log in only if you want to send messages, see who you follow, or moderate."
-                } else {
-                    "You are logged in, so you can send messages too."
-                })),
+                .child(div().text_color(muted).child(note)),
         )
         .child(buttons)
         .children(

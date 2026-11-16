@@ -168,6 +168,49 @@ pub struct Palette {
     pub success: Color,
     /// Connecting / reconnecting / caution.
     pub warning: Color,
+    /// The keyboard focus ring: `accent`, moved towards `text` until it has
+    /// [`FOCUS_CONTRAST`] (3:1, WCAG 1.4.11) on every surface it can be drawn on.
+    pub focus_ring: Color,
+}
+
+/// Contrast the focus ring reaches on every surface (non-text UI components, WCAG 1.4.11).
+pub const FOCUS_CONTRAST: f32 = 3.0;
+
+impl Palette {
+    /// The five surfaces text is drawn on, by name.
+    pub fn surfaces(&self) -> [(&'static str, Color); 5] {
+        [
+            ("background", self.background),
+            ("window", self.window),
+            ("title bar", self.title_bar),
+            ("sidebar", self.sidebar),
+            ("surface", self.surface),
+        ]
+    }
+
+    /// The backgrounds `text` is drawn on: the five surfaces and the tinted strips (danger,
+    /// warning and accent at 14 %) over the main background, by name.
+    pub fn text_backgrounds(&self) -> Vec<(&'static str, Color)> {
+        let mut all: Vec<_> = self.surfaces().into();
+        for (name, tint) in [
+            ("error strip", self.danger),
+            ("warning strip", self.warning),
+            ("info strip", self.accent),
+        ] {
+            all.push((name, self.background.mix(tint, 0.14)));
+        }
+        all
+    }
+
+    /// The background the body text reads worst on, and the ratio there.
+    pub fn weakest_text(&self) -> (&'static str, f32) {
+        self.text_backgrounds()
+            .into_iter()
+            .map(|(name, background)| (name, self.text.contrast(background)))
+            .fold(("background", f32::INFINITY), |worst, next| {
+                if next.1 < worst.1 { next } else { worst }
+            })
+    }
 }
 
 /// Contrast the derived `danger_text` / `accent_link` reach on the surfaces they sit on.
@@ -328,6 +371,7 @@ impl RawPalette {
             accent_link: readable_on(accent),
             success: color("success", &self.success)?.unwrap_or(status.success),
             warning: color("warning", &self.warning)?.unwrap_or(status.warning),
+            focus_ring: accent.with_contrast(text, &surfaces, FOCUS_CONTRAST),
         })
     }
 }
@@ -397,11 +441,13 @@ pub enum ThemeError {
     },
     /// The theme loads, but its text is hard to read on its background.
     #[error(
-        "theme {source_name}: the {variant} text on the background has only {ratio}:1 contrast (aim for 4.5:1 or more)"
+        "theme {source_name}: the {variant} text on the {surface} has only {ratio}:1 contrast (aim for 4.5:1 or more)"
     )]
     LowContrast {
         source_name: String,
         variant: &'static str,
+        /// Where it reads worst: a surface or a tinted strip.
+        surface: &'static str,
         ratio: String,
     },
 }

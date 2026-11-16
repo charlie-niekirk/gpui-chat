@@ -397,8 +397,9 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
 
 ### Onboarding, problems and accessibility (PR 6.3)
 
-- **First run.** `ShellParts::first_run` is true when the live source starts with no `[channels]` section in
-  `state.toml` (the first channel added writes it, so removing every channel later is *not* a first run). While it is
+- **First run.** `ShellParts::first_run` is true when the live source starts with a missing `state.toml`, or one with no
+  `[channels]` section (the first channel added writes it, so removing every channel later is *not* a first run; a file
+  that exists but is corrupt is not one either: the user has been here, and the "could not be read" strip says so). While it is
   true and no channel is open the main pane shows `empty::welcome`: what the app is, then *Add a channel* (opens the
   ⌘N dialog; this button has keyboard focus, `apply_focus`), *Log in to Twitch* (only while logged out) and *Choose a
   theme* (opens Settings, which lands on Appearance). `AppShell::add_channel` clears the flag, so it is never shown
@@ -418,8 +419,14 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `problems::init`; no-ops before `init`, so tests and offline runs are unaffected): the emote providers and the
   FFZ / Chatterino badge lists (`emotes`), badge loads (`badges`), the stream poll (`streams`), keychain writes
   (`keychain`), a missing settings folder (`location`), file watchers that could not start (`watch`), the image cache
-  (`images`) and a corrupt `state.toml` (`state`). Raw error text goes behind *Copy details*; the strip says what it
-  means and what to do (`problems::plain` cuts absolute paths to file names).
+  (`images`) and a corrupt `state.toml` (`state`). Raw error text goes behind *Copy details*, which writes the home
+  directory as `~` (`problems::scrub_home`); the strip says what it means and what to do (`problems::plain` cuts
+  absolute paths to file names). **Offline is one strip:** `problems/network.rs` collects the sources whose request got no
+  answer at all (chat reconnecting from the 2nd attempt, emote providers, Twitch badge loads, the stream poll;
+  `is_transport_error` / the typed `EmoteError::Http(Timeout | Network)`) into one `network` problem with fixed wording. A
+  provider timing out while chat is `Connected` is that provider being down, so `Network::failure` declines and the source
+  files its own strip; chat connecting drops every provider entry. Optional cosmetic sources (FFZ / Chatterino badge lists)
+  never file a strip: `problems::set_status` keeps a quiet line shown under Settings → Badges and paints.
 - **Accessibility.** GPUI exposes roles and labels through AccessKit (`.role(Role::…)`, `.aria_label`,
   `.aria_selected`, `Button::accessibility_label`); every icon-only button has a label and the clickable rows, cells and
   tabs have a role (`Role::Alert` for strips, `Status` for empty states, `Dialog` for the user card, `Complementary` for
@@ -427,12 +434,17 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   Home / End / Page keys move a ringed row, Enter shows it, Esc closes and gives focus back to the pane); the user card
   takes focus when it opens (Tab walks its buttons with Kit's focus ring, Esc closes and focus returns to the chat); the
   find bar's buttons are Tab stops. **Reduce motion:** `gpui_kit::init` reads the macOS setting into
-  `App::reduce_motion`; `config::animate_emotes` is `emotes.animate && !reduce_motion` (everything that animates reads
+  `App::reduce_motion` and the shell re-reads it (`gpui_kit::base::apply_system_reduce_motion`) whenever the window
+  becomes active; `config::animate_emotes` is `emotes.animate && !reduce_motion` (everything that animates reads
   it), and `GPUI_CHAT_REDUCE_MOTION=1` forces it for a run. **Text:** the settings window uses the chat font size like
   the main window (and scales its sidebar with it); chrome text is `text_sm` / `text_xs` (rem-relative, rem = font
   size). **Contrast:** `crates/settings` pulls a theme's `text_muted` and `accent_text` to 4.5:1 on every surface they sit
   on, and a test over every bundled theme and variant asserts text, muted text, the text on an accent fill, `danger_text`
-  and `accent_link` all reach 4.5:1 on all five surfaces. *Increase contrast* is not exposed by GPUI and is not honoured
+  and `accent_link` all reach 4.5:1 on all five surfaces, text reaches it on the error / warning / info strip tints, and
+  the keyboard focus ring (`Palette::focus_ring`, accent pulled to 3:1; Kit's `ring`, the Mentions row) reaches 3:1 on every
+  surface. A user theme whose text reads below 4.5:1 on any surface or strip tint is reported in the theme strip. Kit's
+  `link` colour is `accent_link`. **Chrome that is not text** (Mentions panel width and rows, the user card, the sidebar,
+  the settings sidebar) scales with `fonts::chrome_scale` (font size / 14, never below 1). *Increase contrast* is not exposed by GPUI and is not honoured
   (BACKLOG).
 
 ### Event messages (PR 5.1)

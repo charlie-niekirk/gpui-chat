@@ -165,6 +165,7 @@ pub fn panel(
     waiting: usize,
     scroll: &UniformListScrollHandle,
     keys: Keys,
+    scale: f32,
     tokens: &Tokens,
     actions: PanelActions,
 ) -> AnyElement {
@@ -244,7 +245,7 @@ pub fn panel(
     } else {
         let count = rows.len();
         let (selected, ring) = (keys.selected.get().min(count - 1), keys.focused);
-        let accent = tokens.accent;
+        let accent = tokens.focus_ring;
         uniform_list("mentions-list", count, move |range, _, _| {
             range
                 .filter_map(|index| rows.get(index).map(|row| (index, row.clone())))
@@ -263,7 +264,7 @@ pub fn panel(
                         .aria_label(SharedString::from(label))
                         .aria_selected(index == selected)
                         .w_full()
-                        .h(px(ROW_HEIGHT))
+                        .h(px(ROW_HEIGHT * scale))
                         .overflow_hidden()
                         .cursor_pointer()
                         .hover(|style| style.bg(surface))
@@ -349,7 +350,7 @@ pub fn panel(
             cx.stop_propagation();
         })
         .flex_none()
-        .w(px(WIDTH))
+        .w(px(WIDTH * scale))
         .h_full()
         .min_h_0()
         .occlude()

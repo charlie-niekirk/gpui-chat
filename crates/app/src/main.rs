@@ -157,9 +157,8 @@ fn start_chat(
     let (channels, live, account) = if offline {
         (ChannelList::default(), None, None)
     } else {
-        let saved = state::load().channels;
-        first_run = saved.is_none();
-        let saved = saved.unwrap_or_default();
+        first_run = state::is_first_run();
+        let saved = state::load().channels.unwrap_or_default();
         let account = AccountHub::create(cx);
         let live = LiveSource::start(sender.clone(), account.clone(), cx);
         let account = account.map(|(auth, helix)| AccountHub::start(auth, helix, cx));

@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent, ConnectionState, MessageId};
-use gpui_chat_twitch::auth::AuthState;
+use gpui_chat_twitch::auth::{AuthState, STORE_UNAVAILABLE_NOTICE};
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -288,6 +288,13 @@ impl AppShell {
             // What a channel's dots mean depends on whether the window is the one in front.
             cx.observe_window_activation(window, |this, window, cx| {
                 this.window_active = window.is_window_active();
+                // macOS posts no change notification Base can follow without a window: read the
+                // system "Reduce motion" again whenever the window comes to the front. The
+                // `GPUI_CHAT_REDUCE_MOTION` override is left alone (Base never overrides a flag
+                // the app set).
+                if this.window_active {
+                    gpui_kit::base::apply_system_reduce_motion(cx);
+                }
                 this.push_view(cx);
             }),
         ];
@@ -1143,7 +1150,7 @@ impl AppShell {
         Sidebar::<SidebarGroup<ChannelRows>>::new("channel-sidebar")
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(self.sidebar_collapsed)
-            .w(SIDEBAR_WIDTH)
+            .w(SIDEBAR_WIDTH * crate::fonts::chrome_scale(cx))
             .header(
                 SidebarHeader::new().child(
                     h_flex()
@@ -1238,12 +1245,27 @@ impl AppShell {
             Some(problem) => problems::report("account", problem, cx),
             None => problems::clear("account", cx),
         }
-        // The chat connection (live source only): a short blip is the header's business, a
-        // connection that keeps failing is a strip.
+        // The chat connection (live source only). A short blip is the header's business; a
+        // connection that keeps failing is the "offline" strip, which the providers' transport
+        // failures share (see `problems::network`); one that gave up is its own strip.
         if self.live.is_some() {
-            match connection_problem(self.hub.read(cx).connection()) {
-                Some(problem) => problems::report("connection", problem, cx),
-                None => problems::clear("connection", cx),
+            let link = chat_link(self.hub.read(cx).connection());
+            match &link {
+                ChatLink::Up => problems::network::chat_up(true),
+                ChatLink::Outage(reason) => problems::network::chat_outage(reason),
+                ChatLink::Blip => problems::network::chat_up(false),
+                ChatLink::GaveUp(_) => problems::network::chat_up(false),
+            }
+            match link {
+                ChatLink::GaveUp(reason) => {
+                    let mut problem = Problem::error("Disconnected from Twitch chat")
+                        .line("Chat stopped trying. Restart the app to connect again.");
+                    if let Some(reason) = reason {
+                        problem = problem.details(reason);
+                    }
+                    problems::report("connection", problem, cx);
+                }
+                _ => problems::clear("connection", cx),
             }
         }
     }
@@ -1340,7 +1362,10 @@ impl AppShell {
         let (rows, waiting) = {
             let activity = self.attention.read(cx).activity();
             self.mentions_feed.borrow_mut().update(
-                self.mentions_hover.get(),
+                feed_held(
+                    self.mentions_hover.get(),
+                    self.mentions_focus.contains_focused(window, cx),
+                ),
                 activity.generation(),
                 activity.added(),
                 || mentions::rows(activity.mentions()),
@@ -1366,6 +1391,7 @@ impl AppShell {
                 selected: self.mentions_selected.clone(),
                 focused: self.mentions_focus.contains_focused(window, cx),
             },
+            crate::fonts::chrome_scale(cx),
             tokens,
             mentions::PanelActions {
                 on_pick,
@@ -1424,9 +1450,17 @@ impl AppShell {
             }
         };
         if self.welcome_shown() {
-            let logged_out = self.account.as_ref().is_some_and(|account| {
-                matches!(account.read(cx).state(), AuthState::LoggedOut { .. })
-            });
+            // Anything but `LoggedIn` (still restoring, logged out, a failed restore) offers the
+            // login; no account at all offers nothing.
+            let login = match &self.account {
+                None => empty::WelcomeLogin::Unavailable,
+                Some(account) if matches!(account.read(cx).state(), AuthState::LoggedIn(_)) => {
+                    empty::WelcomeLogin::LoggedIn
+                }
+                Some(_) => empty::WelcomeLogin::Offered(Box::new(on(|shell, window, cx| {
+                    shell.log_in(window, cx)
+                }))),
+            };
             return area.child(empty::welcome(
                 APP_NAME,
                 welcome_hint(cx),
@@ -1436,8 +1470,7 @@ impl AppShell {
                     add_channel: Box::new(on(|shell, window, cx| {
                         shell.open_add_dialog(window, cx)
                     })),
-                    log_in: logged_out
-                        .then(|| Box::new(on(|shell, window, cx| shell.log_in(window, cx))) as _),
+                    login,
                     choose_theme: Box::new(|_, cx| settings_window::open(cx)),
                 },
                 tokens,
@@ -1483,7 +1516,7 @@ impl AppShell {
 /// ("token store unavailable: keychain error: …"), which goes behind Copy details; the strip says
 /// what it means and what still works.
 fn login_notice_problem(notice: &str) -> Problem {
-    if notice.starts_with("Could not read the saved Twitch login") {
+    if notice.starts_with(STORE_UNAVAILABLE_NOTICE) {
         Problem::error("The system keychain is not available")
             .line("Your saved Twitch login could not be read. Chat still works; log in again to send messages.")
             .fix("Log in", Fix::LogIn)
@@ -1493,25 +1526,26 @@ fn login_notice_problem(notice: &str) -> Problem {
     }
 }
 
-/// The strip for the chat connection, if it needs one: from the second failed attempt on (a single
-/// reconnect is a blip the pane header already shows), or when it gave up.
-fn connection_problem(state: Option<&ConnectionState>) -> Option<Problem> {
-    match state? {
-        ConnectionState::Reconnecting { attempt } if *attempt >= 2 => Some(
-            // The wording is the same from attempt to attempt, so a dismissed strip stays hidden
-            // while the outage lasts.
-            Problem::warning("Can't reach Twitch chat: trying again")
-                .line("Check your internet connection. It keeps trying by itself."),
-        ),
-        ConnectionState::Disconnected { reason } => {
-            let mut problem = Problem::error("Disconnected from Twitch chat")
-                .line("Check your internet connection.");
-            if let Some(reason) = reason {
-                problem = problem.details(reason.clone());
-            }
-            Some(problem)
+/// How the chat connection looks for the problem strips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatLink {
+    Up,
+    /// Not up yet, or one reconnect in progress: the pane header says so, no strip.
+    Blip,
+    /// Failing repeatedly (from the second attempt): "offline".
+    Outage(String),
+    /// The client stopped trying.
+    GaveUp(Option<String>),
+}
+
+fn chat_link(state: Option<&ConnectionState>) -> ChatLink {
+    match state {
+        Some(ConnectionState::Connected) => ChatLink::Up,
+        Some(ConnectionState::Reconnecting { attempt }) if *attempt >= 2 => {
+            ChatLink::Outage(format!("reconnect attempt {attempt} failed"))
         }
-        _ => None,
+        Some(ConnectionState::Disconnected { reason }) => ChatLink::GaveUp(reason.clone()),
+        _ => ChatLink::Blip,
     }
 }
 
@@ -1969,6 +2003,13 @@ impl Render for AppShell {
     }
 }
 
+/// The Mentions rows stand still while the pointer is on the panel *or* the panel has keyboard
+/// focus: Up / Down + Enter pick a row by its index, so the list must not slide under the
+/// highlighted row between the key and the pick.
+fn feed_held(pointer_on_panel: bool, panel_focused: bool) -> bool {
+    pointer_on_panel || panel_focused
+}
+
 /// The welcome is for the live source's first run, until a channel is open.
 fn welcome_visible(first_run: bool, live: bool, no_channels: bool) -> bool {
     first_run && live && no_channels
@@ -1977,6 +2018,25 @@ fn welcome_visible(first_run: bool, live: bool, no_channels: bool) -> bool {
 #[cfg(test)]
 mod problem_tests {
     use super::*;
+
+    #[test]
+    fn a_keychain_notice_is_recognised_by_its_constant_and_keeps_the_raw_text_behind_details() {
+        let raw = format!("{STORE_UNAVAILABLE_NOTICE}: token store unavailable: locked");
+        let keychain = login_notice_problem(&raw);
+        assert_eq!(keychain.title, "The system keychain is not available");
+        assert_eq!(keychain.details.as_deref(), Some(raw.as_str()));
+        let expired =
+            login_notice_problem("Your Twitch login expired or was revoked. Log in again.");
+        assert!(expired.title.starts_with("Your Twitch login expired"));
+        assert!(expired.details.is_none());
+    }
+
+    #[test]
+    fn mentions_rows_are_held_for_the_pointer_and_for_keyboard_focus() {
+        assert!(!feed_held(false, false));
+        assert!(feed_held(true, false));
+        assert!(feed_held(false, true));
+    }
 
     #[test]
     fn the_welcome_shows_on_a_first_live_run_with_no_channel_and_never_otherwise() {
@@ -1990,20 +2050,22 @@ mod problem_tests {
     }
 
     #[test]
-    fn a_connection_blip_is_no_strip_and_an_outage_is_one_with_stable_words() {
-        assert!(connection_problem(None).is_none());
-        assert!(connection_problem(Some(&ConnectionState::Connected)).is_none());
-        assert!(connection_problem(Some(&ConnectionState::Reconnecting { attempt: 1 })).is_none());
-        let two = connection_problem(Some(&ConnectionState::Reconnecting { attempt: 2 })).unwrap();
-        let nine = connection_problem(Some(&ConnectionState::Reconnecting { attempt: 9 })).unwrap();
+    fn a_connection_blip_is_no_strip_and_a_repeated_failure_is_an_outage() {
+        assert_eq!(chat_link(None), ChatLink::Blip);
+        assert_eq!(chat_link(Some(&ConnectionState::Connected)), ChatLink::Up);
         assert_eq!(
-            two, nine,
-            "dismissing it keeps it dismissed through the outage"
+            chat_link(Some(&ConnectionState::Reconnecting { attempt: 1 })),
+            ChatLink::Blip
         );
-        let gone = connection_problem(Some(&ConnectionState::Disconnected {
-            reason: Some("refused".into()),
-        }))
-        .unwrap();
-        assert_eq!(gone.details.as_deref(), Some("refused"));
+        assert!(matches!(
+            chat_link(Some(&ConnectionState::Reconnecting { attempt: 2 })),
+            ChatLink::Outage(_)
+        ));
+        assert_eq!(
+            chat_link(Some(&ConnectionState::Disconnected {
+                reason: Some("refused".into())
+            })),
+            ChatLink::GaveUp(Some("refused".into()))
+        );
     }
 }

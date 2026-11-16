@@ -297,6 +297,9 @@ pub fn row_text(message: &Message, deleted: DeletedMessages) -> String {
 pub struct Env<'a> {
     /// The card's focus handle (a tab stop): it has focus while the card is open.
     pub focus: FocusHandle,
+    /// Chrome scale for the font size (`fonts::chrome_scale`): the card's fixed measurements grow
+    /// with the text.
+    pub scale: f32,
     pub tokens: Tokens,
     pub view: WeakEntity<ChatView>,
     pub owner: EntityId,
@@ -315,6 +318,7 @@ pub struct Env<'a> {
 pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> AnyElement {
     let Env {
         focus,
+        scale,
         tokens,
         view,
         owner,
@@ -340,8 +344,8 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     let avatar = match (avatar_show(model.avatar.as_deref(), failed), avatar_key) {
         (AvatarShow::Image, Some(key)) => emote_thumb::image_with(
             Some(key),
-            AVATAR,
-            AVATAR / 2.0,
+            AVATAR * scale,
+            AVATAR * scale / 2.0,
             tokens.border,
             images.clone(),
             owner,
@@ -349,7 +353,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
         )
         .into_any_element(),
         _ => div()
-            .size(px(AVATAR))
+            .size(px(AVATAR * scale))
             .rounded_full()
             .bg(tokens.border)
             .flex()
@@ -473,7 +477,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     let moderation = moderation_rows(model, &view, &tokens);
 
     // --- messages ---
-    let list = message_list(model, deleted, &tokens, &view);
+    let list = message_list(model, deleted, scale, &tokens, &view);
 
     let close_on_outside = view.clone();
     // Where the card is, for the surfaces under it: a press inside it keeps their selection.
@@ -498,7 +502,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
         .track_focus(&focus)
         .relative()
         .occlude()
-        .w(px(WIDTH))
+        .w(px(WIDTH * scale))
         .max_w_full()
         .gap_2()
         .p_3()
@@ -511,7 +515,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
         // A press anywhere else closes it (the press itself still reaches what it was on).
         .on_mouse_down_out(move |_, _, cx| {
             close_on_outside
-                .update(cx, |view, cx| view.close_user_card(cx))
+                .update(cx, |view, cx| view.close_user_card_for_press(cx))
                 .ok();
         })
         // A press on the card is not a press on the chat under it.
@@ -534,8 +538,8 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
             })
             .position(anchor)
             .offset(point(
-                px(OFFSET.0),
-                px(if upward { -OFFSET.1 } else { OFFSET.1 }),
+                px(OFFSET.0 * scale),
+                px((if upward { -OFFSET.1 } else { OFFSET.1 }) * scale),
             ))
             .child(card),
     )
@@ -853,6 +857,7 @@ fn moderation_rows(
 fn message_list(
     model: &CardModel,
     deleted: DeletedMessages,
+    scale: f32,
     tokens: &Tokens,
     view: &WeakEntity<ChatView>,
 ) -> AnyElement {
@@ -862,11 +867,15 @@ fn message_list(
     let list = uniform_list("user-card-messages", count, move |range, _, _| {
         range
             .filter_map(|ix| messages.get(ix))
-            .map(|(seq, message)| message_row(*seq, message, deleted, &tokens_for_rows, &view))
+            .map(|(seq, message)| {
+                message_row(*seq, message, deleted, scale, &tokens_for_rows, &view)
+            })
             .collect::<Vec<_>>()
     })
     .w_full()
-    .h(px((count as f32 * ROW_HEIGHT).min(LIST_HEIGHT)));
+    .h(px(
+        (count as f32 * ROW_HEIGHT * scale).min(LIST_HEIGHT * scale)
+    ));
     v_flex()
         .gap_1()
         .child(
@@ -885,6 +894,7 @@ fn message_row(
     seq: u64,
     message: &Arc<Message>,
     deleted: DeletedMessages,
+    scale: f32,
     tokens: &Tokens,
     view: &WeakEntity<ChatView>,
 ) -> AnyElement {
@@ -914,7 +924,7 @@ fn message_row(
         .id(SharedString::from(format!("user-card-row-{seq}")))
         .role(Role::ListItem)
         .w_full()
-        .h(px(ROW_HEIGHT))
+        .h(px(ROW_HEIGHT * scale))
         .gap_2()
         .items_start()
         .px_1()

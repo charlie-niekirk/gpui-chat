@@ -217,6 +217,24 @@ pub fn load_from(path: &Path) -> AppState {
     }
 }
 
+/// Whether the app has never had a channel: the file is missing, or it parses and has no
+/// `[channels]` section (the first channel added writes one). A file that exists but cannot be read
+/// or parsed is **not** a first run: the user had state, it is damaged, and the welcome would
+/// greet someone who has been here before (the "could not be read" strip says what happened).
+pub fn is_first_run_at(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<toml::Table>()
+            .is_ok_and(|table| !table.contains_key("channels")),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// [`is_first_run_at`] for the real state file (no config dir: first run, nothing is saved).
+pub fn is_first_run() -> bool {
+    state_path().is_none_or(|path| is_first_run_at(&path))
+}
+
 /// Writes `text` to `path`, creating its directory. Written atomically via a temp file.
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -398,6 +416,25 @@ mod tests {
             display(PRIMARY, true, 1512.0, 982.0),
             display(EXTERNAL, false, 2560.0, 1440.0),
         ]
+    }
+
+    #[test]
+    fn only_a_missing_or_channel_less_file_is_a_first_run() {
+        let dir = std::env::temp_dir().join(format!("gpui-chat-first-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+        let _ = std::fs::remove_file(&path);
+        assert!(is_first_run_at(&path), "no file");
+        std::fs::write(&path, "[window]\nx = 1.0\n").unwrap();
+        assert!(is_first_run_at(&path), "window placement only");
+        std::fs::write(&path, "[channels]\nopen = []\n").unwrap();
+        assert!(
+            !is_first_run_at(&path),
+            "channels were saved once, even if now empty"
+        );
+        std::fs::write(&path, "\u{0}\u{0} not toml [[").unwrap();
+        assert!(!is_first_run_at(&path), "a damaged file is not a first run");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use crate::schema::{AppearanceSettings, ThemeMode};
-use crate::theme::{Palette, Theme, ThemeError, ThemeOrigin, ThemeVariant, normalize_id};
+use crate::theme::{
+    Palette, TEXT_CONTRAST, Theme, ThemeError, ThemeOrigin, ThemeVariant, normalize_id,
+};
 
 /// Id of the built-in theme, the fallback for an unknown `theme_name`.
 pub const DEFAULT_THEME_ID: &str = "default";
@@ -147,11 +149,12 @@ pub fn load_user_themes(dir: &Path, previous: &[Theme]) -> LoadReport {
                     (ThemeVariant::Light, theme.light),
                 ] {
                     let Some(palette) = palette else { continue };
-                    let ratio = palette.text.contrast(palette.background);
+                    let (surface, ratio) = palette.weakest_text();
                     if ratio < MIN_USER_CONTRAST {
                         report.errors.push(ThemeError::LowContrast {
                             source_name: shown.clone(),
                             variant: variant.key(),
+                            surface,
                             ratio: format!("{ratio:.1}"),
                         });
                     }
@@ -181,8 +184,9 @@ pub fn load_user_themes(dir: &Path, previous: &[Theme]) -> LoadReport {
     report
 }
 
-/// Below this text/background contrast a user theme gets a warning.
-const MIN_USER_CONTRAST: f32 = 3.0;
+/// Below this contrast of the text on any surface or strip tint a user theme gets a warning (WCAG
+/// AA for body text).
+const MIN_USER_CONTRAST: f32 = TEXT_CONTRAST;
 
 fn origin_name(theme: &Theme) -> String {
     match &theme.origin {
@@ -305,7 +309,7 @@ impl ThemeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{Color, TEXT_CONTRAST};
+    use crate::theme::{Color, FOCUS_CONTRAST, TEXT_CONTRAST};
 
     fn appearance(mode: ThemeMode, name: &str, light: Option<&str>) -> AppearanceSettings {
         AppearanceSettings {
@@ -369,6 +373,22 @@ mod tests {
                             "{at}: {what} on {surface_name} is {ratio:.2}:1"
                         );
                     }
+                }
+                // The text on the tinted strips (error, warning, info) over the main background.
+                for (name, background) in palette.text_backgrounds() {
+                    let ratio = palette.text.contrast(background);
+                    assert!(
+                        ratio >= TEXT_CONTRAST,
+                        "{at}: text on the {name} is {ratio:.2}:1"
+                    );
+                }
+                // The keyboard focus ring reaches 3:1 on every surface (WCAG 1.4.11).
+                for (name, surface) in palette.surfaces() {
+                    let ratio = palette.focus_ring.contrast(surface);
+                    assert!(
+                        ratio >= FOCUS_CONTRAST,
+                        "{at}: focus ring on the {name} is {ratio:.2}:1"
+                    );
                 }
                 let ratio = palette.accent_text.contrast(palette.accent);
                 assert!(
@@ -656,13 +676,16 @@ mod tests {
                 source_name,
                 variant,
                 ratio,
+                ..
             },
         ] = &report.errors[..]
         else {
             panic!("expected one LowContrast, got {:?}", report.errors);
         };
         assert!(source_name.ends_with("murky.toml"));
-        assert_eq!((*variant, ratio.as_str()), ("dark", "1.3"));
+        assert_eq!(*variant, "dark");
+        // Reported where it reads worst (a strip tint is below the plain background here).
+        assert!(ratio.parse::<f32>().unwrap() < 1.4, "{ratio}");
     }
 
     #[test]

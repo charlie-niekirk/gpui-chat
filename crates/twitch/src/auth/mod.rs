@@ -23,7 +23,10 @@ mod token;
 #[cfg(test)]
 mod tests;
 
-pub use manager::{Account, Auth, AuthState, DevicePolling, SESSION_EXPIRED_NOTICE, TokenLease};
+pub use manager::{
+    Account, Auth, AuthState, DevicePolling, SESSION_EXPIRED_NOTICE, STORE_UNAVAILABLE_NOTICE,
+    TokenLease,
+};
 pub use oauth::{
     AuthError, DeviceCode, ID_BASE_URL, OAuthClient, PollOutcome, TokenResponse, Validation,
 };

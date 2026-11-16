@@ -59,6 +59,22 @@ pub struct FontConfig {
 
 impl Global for FontConfig {}
 
+/// The size the app's fixed-size chrome (side panels, cards, row heights drawn for 14 pt text) was
+/// designed at.
+const DESIGN_SIZE: f32 = 14.0;
+
+/// How much to scale a pixel measurement made for 14 pt text so it still fits the text at the
+/// font size in settings (never below 1: a small font does not shrink panels). Text itself uses
+/// `text_sm` / `text_xs`, which follow the font size; this is for the boxes around it.
+pub fn chrome_scale(cx: &gpui_kit::App) -> f32 {
+    cx.try_global::<FontConfig>()
+        .map_or(1.0, |font| scale_for(font.size.as_f32()))
+}
+
+fn scale_for(size: f32) -> f32 {
+    (size / DESIGN_SIZE).max(1.0)
+}
+
 /// Bytes of a bundled font addressed by asset path (`fonts/<file>.ttf`).
 pub fn embedded(path: &str) -> Option<&'static [u8]> {
     FONT_FILES
@@ -146,6 +162,13 @@ pub fn pick_family<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chrome_grows_with_the_font_and_never_shrinks() {
+        assert_eq!(super::scale_for(14.0), 1.0);
+        assert_eq!(super::scale_for(10.0), 1.0);
+        assert!((super::scale_for(24.0) - 24.0 / 14.0).abs() < 1e-6);
+    }
+
     use super::*;
 
     fn names(names: &[&str]) -> Vec<String> {

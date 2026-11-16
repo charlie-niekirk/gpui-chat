@@ -14,7 +14,10 @@
 //! is the one component every banner uses, so spacing, colours (theme tokens only) and the
 //! accessibility role are the same everywhere.
 
+pub mod network;
+
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, PoisonError};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -64,9 +67,6 @@ pub struct Problem {
     pub fix: Option<(&'static str, Fix)>,
     /// Text for a bug report (the raw error); shown behind "Copy details" and never in the strip.
     pub details: Option<String>,
-    /// Whether the strip has a Dismiss button. Problems the user cannot fix by dismissing the
-    /// cause (they go when the cause does) are still dismissible: hiding is never blocked.
-    pub dismissible: bool,
 }
 
 impl Problem {
@@ -77,7 +77,6 @@ impl Problem {
             lines: Vec::new(),
             fix: None,
             details: None,
-            dismissible: true,
         }
     }
 
@@ -108,12 +107,6 @@ impl Problem {
         self
     }
 
-    /// No Dismiss button: the strip goes when the cause does.
-    pub fn pinned(mut self) -> Self {
-        self.dismissible = false;
-        self
-    }
-
     pub fn details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(details.into());
         self
@@ -129,8 +122,17 @@ impl Problem {
         )
     }
 
-    /// The text "Copy details" puts on the clipboard: the title, the lines and the raw detail.
+    /// The text "Copy details" puts on the clipboard: the title, the lines and the raw detail,
+    /// with the user's home directory written as `~` (a bug report should not carry their
+    /// account name).
     pub fn report(&self, app: &str, version: &str) -> String {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok();
+        scrub_home(&self.report_raw(app, version), home.as_deref())
+    }
+
+    fn report_raw(&self, app: &str, version: &str) -> String {
         let mut text = format!("{app} {version}\n{}", self.title);
         for line in &self.lines {
             text.push('\n');
@@ -141,6 +143,15 @@ impl Problem {
             text.push_str(details);
         }
         text
+    }
+}
+
+/// `text` with every occurrence of the home directory `home` written as `~`, quoted paths and
+/// paths inside messages included. Nothing is replaced for an empty or root-only home.
+pub fn scrub_home(text: &str, home: Option<&str>) -> String {
+    match home.map(|home| home.trim_end_matches(['/', '\\'])) {
+        Some(home) if home.len() > 1 => text.replace(home, "~"),
+        _ => text.to_owned(),
     }
 }
 
@@ -263,6 +274,8 @@ fn notify(cx: &mut App) {
 enum Op {
     Report(&'static str, Problem),
     Clear(&'static str),
+    /// Redraw: a status line changed.
+    Refresh,
 }
 
 static SINK: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Op>> =
@@ -281,6 +294,7 @@ pub fn init(cx: &mut App) {
             cx.update(|cx| match op {
                 Op::Report(key, problem) => report(key, problem, cx),
                 Op::Clear(key) => clear(key, cx),
+                Op::Refresh => cx.refresh_windows(),
             });
         }
     })
@@ -297,12 +311,49 @@ pub fn report_from_anywhere(key: &'static str, problem: Problem) {
 /// A file watcher could not start: edits to `what` are only seen after a restart. One strip for all
 /// the watchers, listing the files in the details.
 pub fn report_watch_failure(what: &str, error: &str) {
+    static FAILED: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+    let details = {
+        let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+        failed.insert(what.to_owned(), error.to_owned());
+        failed
+            .iter()
+            .map(|(what, error)| format!("{what}: {error}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     report_from_anywhere(
         "watch",
         Problem::warning("Edits to settings, themes or keymap are not picked up live")
             .line("Restart the app after editing those files.")
-            .details(format!("{what}: {error}")),
+            .details(details),
     );
+}
+
+static STATUS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// A quiet status line for an optional source (`"FFZ badges"` → `"unavailable; …"`): shown in
+/// Settings, never as a strip. `None` removes it. Redraws the windows when it changed.
+pub fn set_status(name: &str, status: Option<String>) {
+    let changed = {
+        let mut map = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
+        match status {
+            Some(status) => map.insert(name.to_owned(), status.clone()) != Some(status),
+            None => map.remove(name).is_some(),
+        }
+    };
+    if changed && let Some(sink) = SINK.get() {
+        sink.send(Op::Refresh).ok();
+    }
+}
+
+/// The quiet status lines, by name.
+pub fn statuses() -> Vec<(String, String)> {
+    STATUS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(name, status)| (name.clone(), status.clone()))
+        .collect()
 }
 
 /// [`clear`] from any thread.
@@ -335,20 +386,6 @@ pub fn plain(line: &str) -> String {
         .join(" ")
 }
 
-/// A strip with no buttons the caller handles: Dismiss does nothing, so use it for problems that
-/// have `dismissible: false`.
-pub fn static_strip(id: &'static str, problem: &Problem, tokens: &Tokens) -> AnyElement {
-    strip(
-        id,
-        problem,
-        tokens,
-        StripActions {
-            on_fix: Box::new(|_, _, _| {}),
-            on_dismiss: Box::new(|_, _| {}),
-        },
-    )
-}
-
 /// Draws `problem` as a full-width strip. `id` must be unique among the strips on screen (the
 /// cause key does).
 pub fn strip(
@@ -363,10 +400,13 @@ pub fn strip(
         Severity::Info => (tokens.accent, tokens.accent_link),
     };
     let StripActions { on_fix, on_dismiss } = actions;
+    // Element ids are global in the window: a strip's own id never collides with another
+    // element's.
+    let element_id = SharedString::from(format!("problem-{id}"));
     let mut buttons = h_flex().flex_none().items_center().gap_1();
     if let Some((label, fix)) = problem.fix {
         buttons = buttons.child(
-            Button::new(SharedString::from(format!("{id}-fix")))
+            Button::new(SharedString::from(format!("{element_id}-fix")))
                 .small()
                 .label(label)
                 .on_click(move |_: &ClickEvent, window, cx| on_fix(fix, window, cx)),
@@ -375,7 +415,7 @@ pub fn strip(
     if problem.details.is_some() {
         let report = problem.report(gpui_chat_core::APP_NAME, env!("CARGO_PKG_VERSION"));
         buttons = buttons.child(
-            Button::new(SharedString::from(format!("{id}-copy")))
+            Button::new(SharedString::from(format!("{element_id}-copy")))
                 .small()
                 .ghost()
                 .label("Copy details")
@@ -385,18 +425,16 @@ pub fn strip(
                 }),
         );
     }
-    if problem.dismissible {
-        buttons = buttons.child(
-            Button::new(SharedString::from(format!("{id}-dismiss")))
-                .small()
-                .ghost()
-                .icon(Icon::new(IconName::Close))
-                .accessibility_label(format!("Dismiss: {}", problem.title))
-                .on_click(move |_: &ClickEvent, window, cx| on_dismiss(window, cx)),
-        );
-    }
+    buttons = buttons.child(
+        Button::new(SharedString::from(format!("{element_id}-dismiss")))
+            .small()
+            .ghost()
+            .icon(Icon::new(IconName::Close))
+            .accessibility_label(format!("Dismiss: {}", problem.title))
+            .on_click(move |_: &ClickEvent, window, cx| on_dismiss(window, cx)),
+    );
     h_flex()
-        .id(id)
+        .id(element_id)
         .role(Role::Alert)
         .aria_label(SharedString::from(problem.title.clone()))
         .w_full()
@@ -500,6 +538,29 @@ mod tests {
         assert!(!set.dismiss("nothing"));
         set.report("nothing", offline());
         assert_eq!(set.visible().len(), 1, "no stale dismissal waits for it");
+    }
+
+    #[test]
+    fn copy_details_never_carries_the_home_directory() {
+        let home = Some("/Users/alice");
+        assert_eq!(
+            scrub_home(
+                "could not read /Users/alice/.config/app/settings.toml",
+                home
+            ),
+            "could not read ~/.config/app/settings.toml"
+        );
+        assert_eq!(
+            scrub_home(
+                "path \"/Users/alice/Library/x\": denied; also /Users/alice/y",
+                home
+            ),
+            "path \"~/Library/x\": denied; also ~/y"
+        );
+        assert_eq!(scrub_home("/Users/bob/z", home), "/Users/bob/z");
+        assert_eq!(scrub_home("/anything", Some("/")), "/anything");
+        assert_eq!(scrub_home("/anything", None), "/anything");
+        assert_eq!(scrub_home("/Users/alice/q", Some("/Users/alice/")), "~/q");
     }
 
     #[test]

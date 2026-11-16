@@ -107,6 +107,9 @@ pub struct SettingsView {
     /// Why the last change from a toggle or menu was not saved. Cleared when the settings
     /// change (the file loaded, or a write worked).
     edit_error: Option<SharedString>,
+    /// The banner text the user dismissed; it stays hidden while it reads the same, and comes
+    /// back when the problem changes or the file has loaded cleanly in between.
+    dismissed_banner: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -124,8 +127,11 @@ impl SettingsView {
             true
         });
         let mut subscriptions = vec![
-            cx.observe(&config::store(cx), |this, _, cx| {
+            cx.observe(&config::store(cx), |this, store, cx| {
                 this.edit_error = None;
+                if store.read(cx).error().is_none() {
+                    this.dismissed_banner = None;
+                }
                 cx.notify();
             }),
             // The theme and font follow the settings: redraw in the new colours. A theme file
@@ -143,6 +149,7 @@ impl SettingsView {
         Self {
             focus_handle,
             edit_error: None,
+            dismissed_banner: None,
             _subscriptions: subscriptions,
         }
     }
@@ -160,7 +167,7 @@ impl SettingsView {
         .ok();
     }
 
-    fn banner(&self, tokens: &Tokens, cx: &App) -> Option<AnyElement> {
+    fn banner(&self, tokens: &Tokens, view: WeakEntity<Self>, cx: &App) -> Option<AnyElement> {
         let load_error = config::store(cx).read(cx).error().map(ToString::to_string);
         if load_error.is_none() && self.edit_error.is_none() {
             return None;
@@ -181,14 +188,30 @@ impl SettingsView {
             (None, Some(error)) => ("The change was not saved.", error.to_string()),
             (None, None) => unreachable!("checked above"),
         };
-        let problem = Problem::error(headline)
-            .pinned()
-            .lines(detail.lines().map(str::to_owned));
+        let fingerprint = format!("{headline}\n{detail}");
+        if self.dismissed_banner.as_deref() == Some(fingerprint.as_str()) {
+            return None;
+        }
+        let problem = Problem::error(headline).lines(detail.lines().map(str::to_owned));
         let problem = match &load_error {
             Some(error) => problem.details(error.clone()),
             None => problem,
         };
-        Some(problems::static_strip("settings-banner", &problem, tokens))
+        Some(problems::strip(
+            "settings-banner",
+            &problem,
+            tokens,
+            problems::StripActions {
+                on_fix: Box::new(|_, _, _| {}),
+                on_dismiss: Box::new(move |_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.dismissed_banner = Some(fingerprint.clone());
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+            },
+        ))
     }
 
     fn pages(&self, cx: &mut Context<Self>) -> Vec<SettingPage> {
@@ -216,7 +239,7 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.global::<Tokens>();
         let font = cx.global::<FontConfig>().clone();
-        let banner = self.banner(&tokens, cx);
+        let banner = self.banner(&tokens, cx.entity().downgrade(), cx);
         let location = config::file(cx).map(|path| path.display().to_string());
         let pages = self.pages(cx);
         v_flex()
@@ -728,6 +751,7 @@ fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                         "Supporter, contributor and developer badges.",
                         "badges.chatterino",
                     ),
+                    SettingItem::render(|_, _, cx: &mut App| badge_status_rows(cx)),
                 ]),
             SettingGroup::new().title("Name paints").items([switch(
                 "7TV paints",
@@ -736,6 +760,20 @@ fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                 "badges.paints",
             )]),
         ])
+}
+
+/// Which optional badge sources could not be loaded (a quiet status line each, not a strip over
+/// the chat), or nothing.
+fn badge_status_rows(cx: &App) -> impl IntoElement + use<> {
+    let tokens = *cx.global::<Tokens>();
+    v_flex()
+        .gap_1()
+        .children(problems::statuses().into_iter().map(|(name, status)| {
+            div()
+                .text_sm()
+                .text_color(tokens.text_muted)
+                .child(format!("{name}: {status}"))
+        }))
 }
 
 fn streamlink_page() -> SettingPage {
