@@ -87,6 +87,14 @@ pub struct DisplayBadge {
     pub slot: BadgeSlot,
 }
 
+/// A detected link: where its text is and what it opens. Two links with nothing between them
+/// share one [`Role::Link`] span but stay two entries here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayLink {
+    pub range: Range<usize>,
+    pub url: Arc<str>,
+}
+
 /// The display text and its spans. Spans are contiguous, in order, and cover the whole text.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayText {
@@ -96,6 +104,8 @@ pub struct DisplayText {
     pub emotes: Vec<DisplayEmote>,
     /// Every [`Role::Badge`] span, in text order (before the author's name).
     pub badges: Vec<DisplayBadge>,
+    /// Every link, in text order.
+    pub links: Vec<DisplayLink>,
 }
 
 /// Settings that change what is drawn (and therefore the layout).
@@ -167,6 +177,12 @@ impl DisplayText {
         }
     }
 
+    /// The link whose text contains byte `index`.
+    pub fn link_at(&self, index: usize) -> Option<&DisplayLink> {
+        let i = self.links.partition_point(|link| link.range.end <= index);
+        self.links.get(i).filter(|link| link.range.start <= index)
+    }
+
     /// Index of the span containing byte `index`.
     pub fn span_at(&self, index: usize) -> Option<usize> {
         let i = self.spans.partition_point(|span| span.range.end <= index);
@@ -193,7 +209,8 @@ pub fn clock(unix_millis: i64) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-fn name(author: &Author) -> &str {
+/// The name a message shows for its author: the display name, or the login when that is blank.
+pub fn author_name(author: &Author) -> &str {
     if author.display_name.trim().is_empty() {
         &author.login
     } else {
@@ -226,7 +243,17 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                     Role::Mention
                 },
             ),
-            Fragment::Link { text, .. } => out.push(text, Role::Link),
+            Fragment::Link { text, url } => {
+                let start = out.text.len();
+                out.push(text, Role::Link);
+                let end = out.text.len();
+                if end > start {
+                    out.links.push(DisplayLink {
+                        range: start..end,
+                        url: Arc::from(url.as_str()),
+                    });
+                }
+            }
             Fragment::Cheer { prefix, bits } => out.push(&format!("{prefix}{bits}"), Role::Cheer),
         }
     }
@@ -277,7 +304,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
         MessageKind::Chat => {
             if let Some(author) = author {
                 out.push_badges(badges);
-                out.push(name(author), Role::Name);
+                out.push(author_name(author), Role::Name);
                 out.push(": ", Role::Separator);
             }
             push_body(&mut out, &body_fragments(message), Role::Text);
@@ -285,7 +312,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
         MessageKind::Action => {
             if let Some(author) = author {
                 out.push_badges(badges);
-                out.push(name(author), Role::Name);
+                out.push(author_name(author), Role::Name);
                 out.push(" ", Role::Separator);
             }
             push_body(&mut out, &body_fragments(message), Role::ActionText);
@@ -301,7 +328,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                 }
                 if let Some(author) = author {
                     out.push_badges(badges);
-                    out.push(name(author), Role::Name);
+                    out.push(author_name(author), Role::Name);
                     out.push(": ", Role::Separator);
                 }
                 push_body(&mut out, &body_fragments(message), Role::Text);
@@ -516,6 +543,15 @@ mod tests {
                 ("@me", Role::SelfMention),
             ]
         );
+        // The link keeps where it opens, found by any byte of its text.
+        assert_eq!(display.links.len(), 1);
+        let link = &display.links[0];
+        assert_eq!(&display.text[link.range.clone()], "x.com");
+        assert_eq!(&*link.url, "https://x.com");
+        assert_eq!(display.link_at(link.range.start), Some(link));
+        assert_eq!(display.link_at(link.range.end - 1), Some(link));
+        assert_eq!(display.link_at(link.range.end), None);
+        assert_eq!(display.link_at(0), None);
         let untimed = build(&message, DisplayOptions { timestamps: false }, &[]);
         assert!(untimed.text.starts_with("Alice: "));
     }

@@ -25,6 +25,7 @@ use super::element::HoveredRow;
 use super::element::MessageStyle;
 use super::layout::LayoutCache;
 use super::row::{RowContext, message_row, row_menu};
+use super::selection_layer::Surface;
 use super::tooltip::EmoteHover;
 use super::view::ChatView;
 use crate::channels::ChannelStore;
@@ -42,16 +43,31 @@ pub struct ThreadPanel {
     pub hover: Rc<RefCell<EmoteHover>>,
     /// The popover's row the pointer is over.
     pub hovered: HoveredRow,
+    /// Text selection and links in the popover (it does not scroll the list).
+    pub surface: Rc<Surface>,
 }
 
 impl ThreadPanel {
     pub fn new(root: MessageId) -> Self {
+        let cache: Rc<RefCell<LayoutCache>> = Rc::default();
         Self {
             root,
-            cache: Rc::default(),
+            surface: Surface::new(None, cache.clone()),
+            cache,
             hover: Rc::default(),
             hovered: Rc::default(),
         }
+    }
+}
+
+impl ThreadView {
+    /// The sequence numbers of the rows it shows, in order.
+    pub fn seqs(&self) -> Vec<u64> {
+        self.root
+            .iter()
+            .chain(&self.replies)
+            .map(|(seq, _)| *seq)
+            .collect()
     }
 }
 
@@ -205,6 +221,8 @@ pub fn render(
                 .rounded_lg()
                 .shadow_lg()
                 .overflow_hidden()
+                // First, so the rows and buttons drawn after it see a press before it does.
+                .child(panel.surface.layer())
                 .child(header)
                 .child(
                     div()
@@ -214,7 +232,12 @@ pub fn render(
                         .overflow_y_scroll()
                         .child(body),
                 )
-                .context_menu(row_menu(rows.view.clone(), store, panel.hovered.clone())),
+                .context_menu(row_menu(
+                    rows.view.clone(),
+                    store,
+                    panel.surface.clone(),
+                    rows.can_reply,
+                )),
         )
         .into_any_element()
 }

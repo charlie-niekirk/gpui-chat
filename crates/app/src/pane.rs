@@ -26,6 +26,7 @@ use gpui_kit::{
 use crate::actions::{ClosePane, SplitDown, SplitRight};
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
+use crate::chat::selection_layer::{ClearSelection, CopySelection};
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
 use crate::splits::view::{DragChip, DraggedPane};
@@ -632,6 +633,21 @@ impl Render for ChannelPane {
         v_flex()
             .id("channel-pane")
             .track_focus(&self.focus_handle)
+            // The chat's selection (PR 5.6). Here rather than on the chat, so the command palette
+            // reaches it with the input box focused too. Esc only acts when there is something to
+            // clear (then focus goes back to the input box); otherwise it goes on.
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                if !this.chat.update(cx, |chat, cx| chat.copy_selection(cx)) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                if this.chat.update(cx, |chat, cx| chat.clear_selection(cx)) {
+                    this.focus(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
             .size_full()
             .child(self.header(
                 &tokens,

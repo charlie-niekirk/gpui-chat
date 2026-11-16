@@ -39,6 +39,10 @@ actions!(
 /// Key context set on the root shell view.
 pub const SHELL_CONTEXT: &str = "AppShell";
 
+/// Key context of a chat view (the list of messages), focused by a press in it: where ⌘C copies
+/// the selection and Esc clears it (PR 5.6).
+pub const CHAT_CONTEXT: &str = "ChatView";
+
 /// Key context of a pane's input box; its ↑/↓ bindings (see `platform::default_bindings`) are
 /// scoped to the text input inside it so they win over the input's own cursor movement.
 pub const COMPOSER_CONTEXT: &str = "ChatComposer";

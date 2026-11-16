@@ -36,6 +36,7 @@ use gpui_kit::{
 
 use crate::actions::*;
 use crate::bridge::{self, BridgeReceiver};
+use crate::chat::selection_layer::{ClearSelection, CopySelection};
 use crate::completion::{
     ComposerComplete, ComposerCompletePrevious, ComposerCompletionDismiss,
     ComposerToggleEmotePicker,
@@ -96,6 +97,8 @@ catalog![
         true "Pane" FocusPaneRight "Focus Pane Right",
         true "Pane" FocusPaneUp "Focus Pane Above",
         true "Pane" FocusPaneDown "Focus Pane Below",
+        true "Chat" CopySelection "Copy Selection",
+        false "Chat" ClearSelection "Clear Selection",
         true "View" ToggleSidebar "Toggle Sidebar",
         true "View" ToggleDebugHud "Toggle Debug HUD",
         true "Account" LogIn "Log In to Twitch…",
