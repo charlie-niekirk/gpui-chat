@@ -189,3 +189,4 @@ an entry here instead of expanding a PR. Format:
 - **Notice kinds without a variant** (found in PR 5.1) — `standardpayforward`, `communitypayforward`, `unraid`, `viewermilestone` and others are `EventKind::Other` (Twitch's line, accent as a sub); give the frequent ones their own wording.
 
 - **Command completion list truncates names** (found checking PR 5.2) — the composer's slash-command list is narrower than its content, so rows show `/timeout <ι` and `/untimeou`; size it to the longest command + hint or wrap the hint.
+- **Flaky media cache test** (found on PR #29's CI) — `cache::tests::get_if_ready_and_status_follow_the_load` (`crates/media/src/cache/tests.rs:166`) asserts the `on_ready` list right after the handle resolves, but the callback can run a moment later on another worker; wait for it with a short timeout (the assert's poisoned mutex then also panics the worker at :151).
