@@ -54,6 +54,7 @@ use gpui_kit::{
 
 use super::display::{self, DisplayOptions, DisplayText};
 use super::layout::{LayoutCache, MessageLayout, ShapedMessage};
+use super::list_sync::Rows;
 use super::selection::{
     self, CopyRow, Granularity, RowSide, Selection, TextPos, atom_under, caret_at, highlight,
     row_at, unit_at,
@@ -215,8 +216,9 @@ pub struct Surface {
     pointer: Cell<Point<Pixels>>,
     /// The list the rows are in, to freeze and scroll it; `None` for the thread popover.
     list: Option<ListState>,
-    /// Sequence number of the list's first item.
-    first_seq: Cell<u64>,
+    /// Which message each of the list's items shows (some are hidden by ignores and filters,
+    /// PR 5.7); `None` for the thread popover.
+    order: RefCell<Option<Rc<RefCell<Rows>>>>,
     /// The selection stopped the list following new messages: clearing it resumes.
     resume: Cell<bool>,
     /// Someone else (the moderation strip, PR 5.2) asked the list to stand still: it is held again
@@ -256,7 +258,7 @@ impl Surface {
             drag: RefCell::default(),
             pointer: Cell::new(Point::default()),
             list,
-            first_seq: Cell::new(0),
+            order: RefCell::default(),
             resume: Cell::new(false),
             keep_frozen: Cell::new(false),
             ends: RefCell::default(),
@@ -276,13 +278,18 @@ impl Surface {
         })
     }
 
+    /// The list's rows: which message each item shows. Hidden messages are not copied with a
+    /// selection that spans them, and scrolling maps messages to items through it.
+    pub fn set_rows(&self, rows: Rc<RefCell<Rows>>) {
+        *self.order.borrow_mut() = Some(rows);
+    }
+
     /// Called by the view each render. `generation` changes when display texts may have changed
     /// (timestamps on or off, badge definitions): that moves offsets, so it drops the selection.
     /// Font, line height or theme changes only lay the same text out again and keep it.
     pub fn begin_frame(
         &self,
         generation: u64,
-        first_seq: u64,
         options: DisplayOptions,
         color: Hsla,
         members: Option<Vec<u64>>,
@@ -290,7 +297,6 @@ impl Surface {
         if self.generation.replace(generation) != generation {
             self.clear();
         }
-        self.first_seq.set(first_seq);
         self.options.set(options);
         self.color.set(color);
         *self.members.borrow_mut() = members;
@@ -405,11 +411,19 @@ impl Surface {
             return None;
         }
         let members = self.members.borrow();
+        let order = self.order.borrow().clone();
         let cache = self.cache.borrow();
         let options = self.options.get();
         let mut parts = Vec::new();
         for seq in selection.seqs() {
             if members.as_ref().is_some_and(|m| !m.contains(&seq)) {
+                continue;
+            }
+            // A message the chat hides (ignored, filtered out) is not on screen: not copied.
+            if order
+                .as_ref()
+                .is_some_and(|rows| !rows.borrow().contains(seq))
+            {
                 continue;
             }
             let Some(message) = store.get_by_seq(seq) else {
@@ -676,13 +690,14 @@ impl Surface {
     fn scroll_top(&self) -> Option<ListOffset> {
         let bounds = self.bounds.get()?;
         let rows = self.rows.borrow();
-        let first = self.first_seq.get();
+        let order = self.order.borrow().clone()?;
+        let order = order.borrow();
         rows.iter()
             .filter(|row| row.bounds.bottom() > bounds.top())
             .min_by(|a, b| a.bounds.top().as_f32().total_cmp(&b.bounds.top().as_f32()))
             .and_then(|row| {
                 Some(ListOffset {
-                    item_ix: usize::try_from(row.seq.checked_sub(first)?).ok()?,
+                    item_ix: order.index_of(row.seq)?,
                     offset_in_item: (bounds.top() - row.bounds.top()).max(px(0.0)),
                 })
             })
@@ -853,18 +868,23 @@ impl Surface {
     /// Whether the list already shows its first (`up`) or last message in full, so scrolling
     /// further that way does nothing.
     fn at_end(&self, up: bool, bounds: Bounds<Pixels>) -> bool {
-        let Some(list) = &self.list else {
+        let Some(order) = self.order.borrow().clone() else {
             return true;
         };
-        let first = self.first_seq.get();
+        if self.list.is_none() {
+            return true;
+        }
+        let order = order.borrow();
         let rows = self.rows.borrow();
         if up {
+            let first = order.seq_at(0);
             rows.iter()
-                .any(|row| row.seq == first && row.bounds.top() >= bounds.top() - px(0.5))
+                .any(|row| Some(row.seq) == first && row.bounds.top() >= bounds.top() - px(0.5))
         } else {
-            let last = (first + list.item_count() as u64).saturating_sub(1);
-            rows.iter()
-                .any(|row| row.seq == last && row.bounds.bottom() <= bounds.bottom() + px(0.5))
+            let last = order.last_seq();
+            rows.iter().any(|row| {
+                Some(row.seq) == last && row.bounds.bottom() <= bounds.bottom() + px(0.5)
+            })
         }
     }
 

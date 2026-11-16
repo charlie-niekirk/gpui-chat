@@ -9,6 +9,7 @@
 //!   owner of the tokens (refresh, validation, logout).
 //! * [`helix`]: [`HelixClient`], authenticated Helix GETs and JSON POSTs (refresh-and-retry on 401,
 //!   rate limits); [`HelixClient::send_chat_message`] sends chat (PR 3.2).
+//! * [`blocks`]: the Twitch block list (`GET` / `PUT` / `DELETE users/blocks`, PR 5.7).
 //! * [`moderation`]: the moderation commands as Helix requests ([`HelixClient::moderate`], PR 5.2).
 //! * [`streams`]: `Get Streams` / `Get Followed Streams` and the [`streams::StreamPoller`] behind
 //!   the live dot, the header stream info and the followed-live sidebar.
@@ -19,6 +20,7 @@
 //! * [`user_emotes`]: `Get User Emotes`, the Twitch emotes the logged-in user may use (PR 3.3).
 
 pub mod auth;
+pub mod blocks;
 mod chat_send;
 pub mod cheermotes;
 mod client;
@@ -33,6 +35,7 @@ pub mod user_emotes;
 pub mod users;
 
 pub use auth::Auth;
+pub use blocks::{BlockError, BlockedUser};
 pub use chat_send::{SEND_CHAT_PATH, SendError, SentMessage, echo_message};
 pub use client::{
     ClientConfig, Credentials, CredentialsProvider, TwitchClient, irc_login, settled_state,

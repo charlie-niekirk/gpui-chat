@@ -38,17 +38,19 @@ use gpui_kit::{
 
 use crate::account::AccountHub;
 use crate::actions::{
-    About, AddChannel, ClosePane, CloseWindow, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    OpenChannelSwitcher, OpenPalette, ReloadEmotes, RemoveChannel, SHELL_CONTEXT,
-    SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleDebugHud,
-    ToggleSidebar,
+    About, AddChannel, BlockOnTwitch, ClearFilter, ClosePane, CloseWindow, EnableBlockListSync,
+    Find, FindNext, FindPrevious, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp,
+    IgnoreUser, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp, OpenChannelSwitcher,
+    OpenPalette, ReloadEmotes, RemoveChannel, SHELL_CONTEXT, SelectNextChannel,
+    SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleBotsFilter, ToggleDebugHud,
+    ToggleLinksFilter, ToggleMentionsFilter, ToggleSidebar, UnignoreUser,
 };
 use crate::add_channel;
 use crate::attention::{Attention, AttentionEvent};
 use crate::bridge::BridgeSender;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
+use crate::chat::ChatView;
 use crate::composer::Composer;
 use crate::config;
 use crate::diagnostics::{Diagnostics, frame_probe};
@@ -847,6 +849,34 @@ impl AppShell {
         }
     }
 
+    /// The pane that has the keyboard focus (what Find, the filters and the ignore actions act on).
+    fn focused_pane(&self) -> Option<Entity<ChannelPane>> {
+        self.layout
+            .focused_channel()
+            .and_then(|channel| self.panes.get(channel))
+            .cloned()
+    }
+
+    /// Runs `f` on the focused pane's chat view; whether there was one.
+    fn with_chat(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut ChatView, &mut Context<ChatView>),
+    ) -> bool {
+        let Some(chat) = self.focused_pane().map(|pane| pane.read(cx).chat()) else {
+            return false;
+        };
+        chat.update(cx, f);
+        true
+    }
+
+    /// *Enable block list sync…*: a login that also asks for the block list scopes (PR 5.7).
+    fn enable_block_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(account) = self.account.clone() {
+            sign_in::open_for_block_list(account, window, cx);
+        }
+    }
+
     /// *Enable moderation tools…*: a login that also asks for the moderation scopes.
     fn enable_moderation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(account) = self.account.clone() {
@@ -878,6 +908,7 @@ impl AppShell {
                 let login = user.login.clone();
                 let needs_relogin = user.needs_relogin();
                 let can_enable_moderation = !user.moderation_enabled();
+                let can_enable_block_list = !user.block_list_enabled();
                 Button::new("account-menu")
                     .ghost()
                     .small()
@@ -890,8 +921,8 @@ impl AppShell {
                     .dropdown_caret(true)
                     .accessibility_label("Account")
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, _, _| {
-                        let (again, moderation, out) =
-                            (shell.clone(), shell.clone(), shell.clone());
+                        let (again, moderation, out, blocks) =
+                            (shell.clone(), shell.clone(), shell.clone(), shell.clone());
                         let menu = menu
                             .label(format!("Logged in to Twitch as {login}"))
                             .separator()
@@ -906,6 +937,18 @@ impl AppShell {
                                 move |_, window, cx| {
                                     moderation
                                         .update(cx, |shell, cx| shell.enable_moderation(window, cx))
+                                        .ok();
+                                },
+                            ))
+                        } else {
+                            menu
+                        };
+                        // The Twitch block list (PR 5.7): asked for only when wanted, too.
+                        let menu = if can_enable_block_list {
+                            menu.item(PopupMenuItem::new("Enable Block List Sync…").on_click(
+                                move |_, window, cx| {
+                                    blocks
+                                        .update(cx, |shell, cx| shell.enable_block_list(window, cx))
                                         .ok();
                                 },
                             ))
@@ -1631,6 +1674,62 @@ impl Render for AppShell {
             }))
             .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
                 this.focus_neighbour(Direction::Down, cx);
+            }))
+            // In-channel search, filters and ignoring (PR 5.7): all act on the focused pane.
+            .on_action(cx.listener(|this, _: &Find, window, cx| {
+                if let Some(pane) = this.focused_pane() {
+                    let chat = pane.read(cx).chat();
+                    chat.update(cx, |chat, cx| chat.open_find(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.find_step(true, cx));
+            }))
+            .on_action(cx.listener(|this, _: &FindPrevious, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.find_step(false, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ClearFilter, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.clear_filters(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMentionsFilter, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.toggle_mentions_filter(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLinksFilter, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.toggle_links_filter(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBotsFilter, _, cx| {
+                this.with_chat(cx, |chat, cx| chat.toggle_bots_filter(cx));
+            }))
+            .on_action(cx.listener(|this, _: &IgnoreUser, _, cx| {
+                this.with_chat(cx, |chat, cx| {
+                    if let Some((login, _)) = chat.selected_author(cx) {
+                        chat.ignore_user(&login, cx);
+                    }
+                });
+            }))
+            .on_action(cx.listener(|this, _: &UnignoreUser, _, cx| {
+                this.with_chat(cx, |chat, cx| {
+                    if let Some((login, _)) = chat.selected_author(cx) {
+                        chat.unignore_user(&login, cx);
+                    }
+                });
+            }))
+            .on_action(cx.listener(|this, _: &BlockOnTwitch, window, cx| {
+                let Some(pane) = this.focused_pane() else {
+                    return;
+                };
+                let author = pane
+                    .read(cx)
+                    .chat()
+                    .read_with(cx, |chat, cx| chat.selected_author(cx));
+                if let Some((login, user_id)) = author {
+                    pane.update(cx, |pane, cx| {
+                        pane.confirm_block(&login, user_id, window, cx)
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, _: &EnableBlockListSync, window, cx| {
+                this.enable_block_list(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ReloadEmotes, _, _| {
                 if let Some(live) = &this.live {

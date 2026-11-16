@@ -56,6 +56,8 @@ pub enum FailureKind {
     MissingScope,
     /// Twitch answered 403: the user is not (or no longer) a moderator here; the controls go away.
     Forbidden,
+    /// The login lacks the block list scopes (PR 5.7): offer to enable block list sync.
+    BlockListScope,
     Other,
 }
 

@@ -67,6 +67,13 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 | `ClosePane` | Close Pane | ⇧⌘W |
 | `FocusPaneLeft` `FocusPaneRight` `FocusPaneUp` `FocusPaneDown` | Focus Pane … | ⌃⌘←→↑↓ |
 | `OpenUserCard` | Open User Card for Selected Message (the author of the first selected chat message; no default key) | |
+| `Find` | Find in Chat… (opens the find bar of the focused pane, PR 5.7; context `AppShell`) | ⌘F |
+| `FindNext` / `FindPrevious` | Find Next / Previous (newer / older match, wrapping) | ⌘G / ⇧⌘G |
+| `ClearFilter` | Clear Chat Filter (the find bar's filters of the focused pane) | |
+| `ToggleMentionsFilter` `ToggleLinksFilter` `ToggleBotsFilter` | Show Only Mentions and Highlights / Messages with Links, Hide Bots | |
+| `IgnoreUser` / `UnignoreUser` | Ignore / Unignore Author of Selected Message | |
+| `BlockOnTwitch` | Block Author of Selected Message on Twitch… (asks first; needs block list sync) | |
+| `EnableBlockListSync` | Enable Block List Sync… (account) | |
 | `CopySelection` | Copy Selection (the selected chat text; context `ChatView`) | ⌘C |
 | `ToggleSidebar` | Toggle Sidebar | ⌘B, ⌘\ |
 | `ShowMentions` | Show Mentions (toggles the Mentions panel, PR 5.3) | ⌘⇧M |
@@ -79,7 +86,8 @@ Bindable but not in the palette (the input box and the emote picker; contexts
 `ComposerHistoryNext` (↓), `ComposerComplete` (Tab), `ComposerCompletePrevious` (⇧Tab),
 `ComposerCompletionDismiss` (Esc), `ComposerToggleEmotePicker` (⌘E), `EmotePickerLeft`
 `EmotePickerRight` `EmotePickerUp` `EmotePickerDown` `EmotePickerNextTab` `EmotePickerPreviousTab`
-`EmotePickerClose`; and in the chat (context `ChatView`, focused by a press in the messages)
+`EmotePickerClose`; in the find bar's text field (context `FindBar > Input`) `FindClose` (Esc: closes the bar and
+goes back to the input box), with ↑ / ↓ bound to `FindPrevious` / `FindNext` there (Enter and Shift-Enter step too); and in the chat (context `ChatView`, focused by a press in the messages)
 `ClearSelection` (Esc: closes the user card, or clears the selection, and goes back to the input box; with neither
 Esc goes on). `CopySelection` likewise goes on when nothing is selected; in the input box
 ⌘C is the box's own copy. They keep their defaults unless an entry names them.

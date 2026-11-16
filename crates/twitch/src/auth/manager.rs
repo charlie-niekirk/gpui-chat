@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, watch};
 use super::oauth::{AuthError, DeviceCode, OAuthClient, PollOutcome, TokenResponse, Validation};
 use super::store::{StoreError, TokenStore};
 use super::token::{StoredToken, missing_scopes};
-use super::{MODERATION_SCOPES, SCOPES, Secret, unix_now};
+use super::{BLOCK_LIST_SCOPES, MODERATION_SCOPES, SCOPES, Secret, unix_now};
 
 /// Refresh this long before the access token expires.
 const REFRESH_MARGIN_SECS: u64 = 5 * 60;
@@ -74,6 +74,13 @@ impl Account {
     /// Whether every moderation scope was granted (the tools are enabled).
     pub fn moderation_enabled(&self) -> bool {
         self.missing_moderation_scopes.is_empty()
+    }
+
+    /// Whether the login was granted both [`BLOCK_LIST_SCOPES`] (PR 5.7): the Twitch block list is
+    /// synced and *Block on Twitch…* works. Like moderation this is opt-in and never a reason to
+    /// log in again ([`Account::needs_relogin`]).
+    pub fn block_list_enabled(&self) -> bool {
+        BLOCK_LIST_SCOPES.iter().all(|scope| self.has_scope(scope))
     }
 }
 

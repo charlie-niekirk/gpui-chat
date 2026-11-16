@@ -198,6 +198,15 @@ impl Activity {
         })
     }
 
+    /// The user ignored someone (PR 5.7): their hits leave the log, and stop counting as unseen
+    /// mentions. Whether anything left.
+    pub fn drop_ignored(&mut self, ignores: &gpui_chat_core::Ignores) -> bool {
+        if ignores.is_empty() {
+            return false;
+        }
+        !self.retain(|e| !ignores.is_ignored(&e.message)).is_empty()
+    }
+
     /// The channel was closed: nothing of it is left to show.
     pub fn forget(&mut self, channel: &ChannelId) -> bool {
         let unread = self.unread.remove(channel).is_some();

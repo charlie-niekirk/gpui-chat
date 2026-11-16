@@ -10,7 +10,7 @@
 //! * Bump [`SCHEMA_VERSION`] only for changes a default cannot express
 //!   (renames, changed meaning). Adding a field is not such a change.
 
-use gpui_chat_core::HighlightConfig;
+use gpui_chat_core::{FilterConfig, HighlightConfig, IgnoreConfig};
 use serde::{Deserialize, Serialize};
 
 /// Version written to new files. Files without `schema_version` are treated as
@@ -50,6 +50,10 @@ pub struct Settings {
     pub streamlink: StreamlinkSettings,
     /// `[highlights]` and its `[[highlights.rules]]` / `[[highlights.users]]` tables (PR 5.3).
     pub highlights: HighlightConfig,
+    /// `[ignores]` and its `[[ignores.rules]]` table (PR 5.7).
+    pub ignores: IgnoreConfig,
+    /// `[filters]`: the bots *Hide bots* hides (PR 5.7).
+    pub filters: FilterConfig,
     // Later phases add sections here, each `#[serde(default)]`:
     // account (3.x: non-secret bits only; tokens live in the keychain).
 }
@@ -63,6 +67,8 @@ impl Default for Settings {
             emotes: EmoteSettings::default(),
             streamlink: StreamlinkSettings::default(),
             highlights: HighlightConfig::default(),
+            ignores: IgnoreConfig::default(),
+            filters: FilterConfig::default(),
         }
     }
 }
@@ -303,6 +309,16 @@ impl Settings {
             };
             return Err((field, problem.to_string()));
         }
+        if let Some(problem) = self.ignores.first_problem() {
+            let field = match problem.kind {
+                gpui_chat_core::ProblemKind::User(_) => "ignores.users",
+                _ => "ignores.rules",
+            };
+            return Err((field, problem.to_string()));
+        }
+        if let Some(reason) = self.filters.first_problem() {
+            return Err(("filters.bots", reason));
+        }
         Ok(())
     }
 }
@@ -367,6 +383,38 @@ mod tests {
             ..HighlightUser::default()
         }];
         assert_eq!(s.validate().unwrap_err().0, "highlights.users");
+    }
+
+    #[test]
+    fn ignores_and_filters_default_to_nothing_ignored_and_the_usual_bots() {
+        let s = Settings::default();
+        assert!(s.ignores.users.is_empty() && s.ignores.rules.is_empty());
+        assert!(!s.ignores.show_collapsed && s.ignores.sync_block_list);
+        assert!(s.filters.bots.iter().any(|bot| bot == "nightbot"));
+    }
+
+    #[test]
+    fn validate_names_the_bad_ignore_or_bot() {
+        use gpui_chat_core::{IgnoreRule, RuleKind};
+        let mut s = Settings::default();
+        s.ignores.rules = vec![IgnoreRule {
+            kind: RuleKind::Regex,
+            pattern: "(".into(),
+            ..IgnoreRule::default()
+        }];
+        let (field, reason) = s.validate().unwrap_err();
+        assert_eq!(field, "ignores.rules");
+        assert_eq!(reason, "rule 1: `(`: unclosed group");
+
+        let mut s = Settings::default();
+        s.ignores.users = vec!["fine".into(), "no spaces".into()];
+        let (field, reason) = s.validate().unwrap_err();
+        assert_eq!(field, "ignores.users");
+        assert!(reason.starts_with("user 2: "), "{reason}");
+
+        let mut s = Settings::default();
+        s.filters.bots = vec!["no spaces".into()];
+        assert_eq!(s.validate().unwrap_err().0, "filters.bots");
     }
 
     #[test]

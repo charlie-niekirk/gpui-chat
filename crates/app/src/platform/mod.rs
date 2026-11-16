@@ -5,11 +5,12 @@
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
-    About, AddChannel, ClosePane, CloseWindow, ComposerHistoryNext, ComposerHistoryPrevious,
-    FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow,
-    MoveChannelDown, MoveChannelUp, OpenChannelSwitcher, OpenPalette, OpenSettings, Quit,
-    ReloadEmotes, RemoveChannel, SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown,
-    SplitRight, ToggleDebugHud, ToggleSidebar,
+    About, AddChannel, ClearFilter, ClosePane, CloseWindow, ComposerHistoryNext,
+    ComposerHistoryPrevious, Find, FindNext, FindPrevious, FocusPaneDown, FocusPaneLeft,
+    FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
+    OpenChannelSwitcher, OpenPalette, OpenSettings, Quit, ReloadEmotes, RemoveChannel,
+    SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleDebugHud,
+    ToggleSidebar,
 };
 
 use crate::chat::selection_layer::ClearSelection;
@@ -38,6 +39,8 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     // Completion (Tab, Esc) and the emote picker: after the above, so the picker's ↑/↓ win in its
     // own search field.
     bindings.extend(crate::completion::bindings());
+    // The find bar's Esc / ↑ / ↓ (PR 5.7), scoped to its text field.
+    bindings.extend(crate::chat::view::find_bindings());
     // Esc in the chat clears its selection (⌘C / Ctrl-C to copy it is per platform).
     bindings.push(KeyBinding::new(
         "escape",
@@ -59,6 +62,11 @@ pub fn menus() -> Vec<Menu> {
 fn view_menu() -> Menu {
     Menu::new("View").items([
         MenuItem::action("Command Palette…", OpenPalette),
+        MenuItem::separator(),
+        MenuItem::action("Find in Chat…", Find),
+        MenuItem::action("Find Next", FindNext),
+        MenuItem::action("Find Previous", FindPrevious),
+        MenuItem::action("Clear Chat Filter", ClearFilter),
         MenuItem::separator(),
         MenuItem::action("Toggle Sidebar", ToggleSidebar),
         MenuItem::action("Show Mentions", ShowMentions),

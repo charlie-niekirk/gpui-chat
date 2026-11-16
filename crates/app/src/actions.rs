@@ -35,7 +35,31 @@ actions!(
         OpenChannelSwitcher,
         /// Opens the user card of the author of the selected chat message.
         OpenUserCard,
-        ShowMentions
+        ShowMentions,
+        /// Opens the find bar of the focused pane (PR 5.7).
+        Find,
+        /// Goes to the next (newer) match of the find bar.
+        FindNext,
+        /// Goes to the previous (older) match of the find bar.
+        FindPrevious,
+        /// Closes the find bar (Esc inside it).
+        FindClose,
+        /// Switches the focused pane's filters off.
+        ClearFilter,
+        /// Shows only mentions and highlights in the focused pane.
+        ToggleMentionsFilter,
+        /// Shows only messages with links in the focused pane.
+        ToggleLinksFilter,
+        /// Hides the messages of bots in the focused pane.
+        ToggleBotsFilter,
+        /// Ignores the author of the selected chat message.
+        IgnoreUser,
+        /// Stops ignoring the author of the selected chat message.
+        UnignoreUser,
+        /// Asks for the Twitch permissions that sync the block list.
+        EnableBlockListSync,
+        /// Blocks the author of the selected chat message on Twitch (asks first).
+        BlockOnTwitch
     ]
 );
 

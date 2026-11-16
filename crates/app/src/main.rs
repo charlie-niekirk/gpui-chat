@@ -27,6 +27,7 @@ mod firehose;
 mod fonts;
 mod history_service;
 mod hud;
+mod ignores;
 mod images;
 mod keymap;
 mod live;
@@ -137,9 +138,6 @@ fn start_chat(
         hub.set_auto_create(offline);
         hub
     });
-    // Highlights, unread dots and notifications: every batch passes through it before the stores.
-    let attention = attention::Attention::start(offline, cx);
-    hub.update(cx, |hub, _| hub.set_attention(attention.clone()));
     let (sender, receiver) = bridge::channel(INGEST_QUEUE, INGEST_BATCH);
     bridge::attach(
         &hub,
@@ -160,6 +158,13 @@ fn start_chat(
         let account = account.map(|(auth, helix)| AccountHub::start(auth, helix, cx));
         (ChannelList::from_saved(&saved), Some(live), account)
     };
+    // What is ignored (settings and, with a login that allows it, the Twitch block list): the chat
+    // views and the attention state ask it.
+    ignores::init(offline, cx);
+    // Highlights, unread dots and notifications: every batch passes through it before the stores
+    // (it asks what is ignored, so it starts after the ignore hub).
+    let attention = attention::Attention::start(offline, cx);
+    hub.update(cx, |hub, _| hub.set_attention(attention.clone()));
     if let Some(rate) = cli.firehose {
         let start_ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -538,6 +538,8 @@ pub struct LayoutKey {
     pub scale_bits: u32,
     /// The message is shown collapsed (`<message deleted>`, PR 5.2): another display text.
     pub collapsed: bool,
+    /// The message is an ignored one drawn as "1 ignored message" (PR 5.7).
+    pub ignored: bool,
 }
 
 impl LayoutKey {
@@ -546,12 +548,18 @@ impl LayoutKey {
             generation,
             scale_bits: scale_factor.to_bits(),
             collapsed: false,
+            ignored: false,
         }
     }
 
     #[must_use]
     pub fn collapsed(self, collapsed: bool) -> Self {
         Self { collapsed, ..self }
+    }
+
+    #[must_use]
+    pub fn ignored(self, ignored: bool) -> Self {
+        Self { ignored, ..self }
     }
 }
 

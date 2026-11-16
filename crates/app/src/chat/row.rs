@@ -20,8 +20,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    ChannelId, ChannelRole, DEFAULT_TIMEOUT_SECS, Message, MessageId, RowActions, TIMEOUT_PRESETS,
-    row_actions,
+    ChannelId, ChannelRole, DEFAULT_TIMEOUT_SECS, Ignores, Message, MessageId, RowActions,
+    TIMEOUT_PRESETS, row_actions,
 };
 use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -67,6 +67,8 @@ pub struct RowContext {
     pub revealed: Rc<RefCell<HashSet<MessageId>>>,
     /// The logged-in user's login: no moderation controls on their own messages.
     pub own_login: Option<Arc<str>>,
+    /// What is ignored, when ignored messages are shown as one collapsed line (PR 5.7).
+    pub ignored: Option<Arc<Ignores>>,
 }
 
 /// The row for `message`: the plain element, or with the hover buttons (Reply, and for a
@@ -79,12 +81,17 @@ pub fn message_row(
     cache: Rc<RefCell<LayoutCache>>,
     row: &RowContext,
 ) -> AnyElement {
-    let collapsed = is_collapsed(
-        message,
-        row.deleted,
-        row.revealed.borrow().contains(&message.id),
-    );
-    let element = MessageElement::new(seq, message.clone(), style, cache).collapsed(collapsed);
+    let revealed = row.revealed.borrow().contains(&message.id);
+    // An ignored message (PR 5.7) is one line "1 ignored message" until it is clicked open.
+    let ignored = !revealed
+        && row
+            .ignored
+            .as_ref()
+            .is_some_and(|ignores| ignores.is_ignored(message));
+    let collapsed = !ignored && is_collapsed(message, row.deleted, revealed);
+    let element = MessageElement::new(seq, message.clone(), style, cache)
+        .collapsed(collapsed)
+        .ignored(ignored);
     // Recent-messages history (PR 5.5) is shown dimmer than live chat.
     let element = if message.flags.history {
         div()
@@ -96,7 +103,7 @@ pub fn message_row(
         element.into_any_element()
     };
     // A collapsed line shows the message when clicked.
-    let element = if collapsed {
+    let element = if collapsed || ignored {
         let (view, id) = (row.view.clone(), message.id.clone());
         div()
             .id(row_id(row, "collapsed", seq))
@@ -304,6 +311,7 @@ pub fn row_menu(
                 )
                 .item(copy_item("Copy link", url.to_string()));
         }
+        menu = ignore_items(menu, &view, &message, cx);
         if can_reply && can_reply_to(&message) {
             let in_thread = in_thread(store, &message);
             let (reply_view, reply_message) = (view.clone(), message.clone());
@@ -377,6 +385,86 @@ pub fn row_menu(
         }
         menu
     }
+}
+
+/// *Show only …*, *Ignore user* / *Unignore user* and the Twitch block list items for the author of
+/// `message` (PR 5.7): none for the user's own messages or a line nobody wrote. *Block on Twitch…*
+/// needs a login; whether the login may use the block list is found out when it is chosen (a
+/// strip says to enable it).
+fn ignore_items(
+    menu: PopupMenu,
+    view: &WeakEntity<ChatView>,
+    message: &Message,
+    cx: &App,
+) -> PopupMenu {
+    let Some(author) = message
+        .author
+        .as_ref()
+        .filter(|a| gpui_chat_core::is_login(&a.login))
+    else {
+        return menu;
+    };
+    let own = crate::account::own_login(cx);
+    if own
+        .as_deref()
+        .is_some_and(|own| own.eq_ignore_ascii_case(&author.login))
+    {
+        return menu;
+    }
+    let Some(hub) = crate::ignores::current(cx) else {
+        return menu;
+    };
+    let (listed, blocked) = {
+        let hub = hub.read(cx);
+        (hub.is_listed(&author.login), hub.is_blocked(&author.login))
+    };
+    let login = author.login.clone();
+    let user_id = author.user_id.clone();
+    let mut menu = menu.separator();
+    let show_view = view.clone();
+    let shown = login.clone();
+    menu = menu.item(
+        PopupMenuItem::new(format!("Show only {}", author.display_name)).on_click(
+            move |_, _, cx| {
+                show_view
+                    .update(cx, |view, cx| view.filter_from(Some(&shown), cx))
+                    .ok();
+            },
+        ),
+    );
+    let ignore_view = view.clone();
+    let ignored_login = login.clone();
+    menu = if listed {
+        menu.item(
+            PopupMenuItem::new("Unignore user").on_click(move |_, _, cx| {
+                ignore_view
+                    .update(cx, |view, cx| view.unignore_user(&ignored_login, cx))
+                    .ok();
+            }),
+        )
+    } else {
+        menu.item(PopupMenuItem::new("Ignore user").on_click(move |_, _, cx| {
+            ignore_view
+                .update(cx, |view, cx| view.ignore_user(&ignored_login, cx))
+                .ok();
+        }))
+    };
+    if own.is_some() {
+        let block_view = view.clone();
+        let label = if blocked {
+            "Unblock on Twitch"
+        } else {
+            "Block on Twitch…"
+        };
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            block_view
+                .update(cx, |view, cx| {
+                    view.request_block(login.clone(), user_id.clone(), !blocked, cx)
+                })
+                .ok();
+        }));
+    }
+    menu
 }
 
 /// A menu item that puts `text` on the clipboard.

@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_chat_twitch::auth::{
-    AuthError, AuthState, DeviceCode, DevicePolling, MODERATION_SCOPES, OAuthClient, client_id,
+    AuthError, AuthState, BLOCK_LIST_SCOPES, DeviceCode, DevicePolling, MODERATION_SCOPES,
+    OAuthClient, client_id,
 };
 use gpui_chat_twitch::{Auth, HelixClient};
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
@@ -46,6 +47,54 @@ pub enum SignIn {
 impl SignIn {
     fn is_finished(&self) -> bool {
         matches!(self, Self::Done | Self::Failed(_))
+    }
+}
+
+/// The optional permission sets a sign-in can ask for on top of the normal ones: each is enabled by
+/// its own *Enable …* step and kept by later logins (least privilege: a normal login asks for
+/// none of them).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    /// The moderation tools (PR 5.2).
+    pub moderation: bool,
+    /// Block list sync and *Block on Twitch…* (PR 5.7).
+    pub block_list: bool,
+}
+
+impl Features {
+    pub const NONE: Self = Self {
+        moderation: false,
+        block_list: false,
+    };
+    pub const MODERATION: Self = Self {
+        moderation: true,
+        block_list: false,
+    };
+    pub const BLOCK_LIST: Self = Self {
+        moderation: false,
+        block_list: true,
+    };
+
+    /// The scopes to ask for besides the normal ones.
+    pub fn scopes(self) -> Vec<&'static str> {
+        let mut scopes = Vec::new();
+        if self.moderation {
+            scopes.extend_from_slice(MODERATION_SCOPES);
+        }
+        if self.block_list {
+            scopes.extend_from_slice(BLOCK_LIST_SCOPES);
+        }
+        scopes
+    }
+
+    /// What the sheet is called.
+    pub fn title(self) -> &'static str {
+        match (self.moderation, self.block_list) {
+            (true, true) => "Enable moderation tools and block list sync",
+            (true, false) => "Enable moderation tools",
+            (false, true) => "Enable block list sync",
+            (false, false) => "Log in to Twitch",
+        }
     }
 }
 
@@ -87,8 +136,8 @@ pub struct AccountHub {
     /// The notice of the current logged-out state was dismissed.
     notice_dismissed: bool,
     sign_in: Option<SignIn>,
-    /// The sign-in in progress (or just finished) also asks for the moderation scopes.
-    sign_in_moderation: bool,
+    /// The optional permissions the sign-in in progress (or just finished) asks for.
+    sign_in_features: Features,
     /// Numbers sign-in attempts so a stale one cannot overwrite a newer one's progress.
     attempt: u64,
     sign_in_abort: Option<AbortHandle>,
@@ -146,7 +195,7 @@ impl AccountHub {
                 helix,
                 notice_dismissed: false,
                 sign_in: None,
-                sign_in_moderation: false,
+                sign_in_features: Features::NONE,
                 attempt: 0,
                 sign_in_abort: None,
                 _sign_in_task: None,
@@ -193,34 +242,36 @@ impl AccountHub {
         self.sign_in.as_ref()
     }
 
-    /// Whether the sign-in in progress asks for the moderation scopes (the sheet's wording, and
-    /// what "Try again" repeats).
-    pub fn sign_in_moderation(&self) -> bool {
-        self.sign_in_moderation
+    /// The optional permissions the sign-in in progress asks for (the sheet's wording, and what
+    /// "Try again" repeats).
+    pub fn sign_in_features(&self) -> Features {
+        self.sign_in_features
     }
 
-    /// Starts a device-code sign-in (cancelling one still running). `moderation` asks for the
-    /// moderation scopes too (**Enable moderation tools**: the extra permission is requested only
-    /// when the user wants it); a normal login keeps them if the user already enabled them, so
-    /// logging in again does not take the tools away.
-    pub fn begin_sign_in(&mut self, moderation: bool, cx: &mut Context<Self>) {
+    /// Starts a device-code sign-in (cancelling one still running). `features` asks for optional
+    /// permissions too (**Enable moderation tools…**, **Enable block list sync…**: an extra
+    /// permission is requested only when the user wants it); a normal login keeps the ones the
+    /// user already enabled, so logging in again does not take them away.
+    pub fn begin_sign_in(&mut self, features: Features, cx: &mut Context<Self>) {
         self.cancel_sign_in(cx);
-        let moderation = moderation
-            || self
-                .state
-                .account()
-                .is_some_and(gpui_chat_twitch::auth::Account::moderation_enabled);
-        self.sign_in_moderation = moderation;
-        let extra: &'static [&'static str] = if moderation { MODERATION_SCOPES } else { &[] };
+        let kept = self.state.account();
+        let features = Features {
+            moderation: features.moderation
+                || kept.is_some_and(gpui_chat_twitch::auth::Account::moderation_enabled),
+            block_list: features.block_list
+                || kept.is_some_and(gpui_chat_twitch::auth::Account::block_list_enabled),
+        };
+        self.sign_in_features = features;
+        let extra = features.scopes();
         self.attempt += 1;
         let attempt = self.attempt;
         let (progress, mut updates) = watch::channel(SignIn::Requesting);
         let auth = self.auth.clone();
         let flow = runtime::spawn_backend(cx, async move {
             let result = async {
-                let code = auth.request_device_code_with(extra).await?;
+                let code = auth.request_device_code_with(&extra).await?;
                 progress.send_replace(SignIn::Waiting(code.clone()));
-                auth.complete_device_login_with(&code, DevicePolling::default(), extra)
+                auth.complete_device_login_with(&code, DevicePolling::default(), &extra)
                     .await
             }
             .await;
