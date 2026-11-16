@@ -453,3 +453,140 @@ fn a_closed_channel_discards_its_running_fetch() {
     let again = tracker.observe(&joined("a")).unwrap();
     assert_eq!(again.request, HistoryRequest::on_join());
 }
+
+// ---- join and reconnect end to end: tracker → client (mock service) → store ---------------------
+
+/// A service that, like the real one, answers `after` with the messages after it and otherwise
+/// the newest `limit`, over a fixed log of `(id, tmi-sent-ts)`.
+async fn service_with_log(log: &[(&str, i64)]) -> MockServer {
+    use wiremock::{Request, Respond};
+    struct Log(Vec<(String, i64)>);
+    impl Respond for Log {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let param = |name: &str| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == name)
+                    .and_then(|(_, value)| value.parse::<i64>().ok())
+            };
+            let limit = param("limit").unwrap_or(100) as usize;
+            let after = param("after").unwrap_or(i64::MIN);
+            let mut lines: Vec<String> = self
+                .0
+                .iter()
+                .filter(|(_, ts)| *ts > after)
+                .map(|(id, ts)| {
+                    format!(
+                        "@id={id};historical=1;tmi-sent-ts={ts};rm-received-ts={ts} \
+                         :u!u@u.tmi.twitch.tv PRIVMSG #forsen :text of {id}"
+                    )
+                })
+                .collect();
+            let skip = lines.len().saturating_sub(limit);
+            lines.drain(..skip);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "messages": lines }))
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/recent-messages/forsen"))
+        .respond_with(Log(log
+            .iter()
+            .map(|(id, ts)| ((*id).to_owned(), *ts))
+            .collect()))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn shown(store: &gpui_chat_core::MessageStore) -> Vec<String> {
+    store.iter().map(|m| m.id.to_string()).collect()
+}
+
+#[tokio::test]
+async fn join_then_reconnect_shows_every_message_once_in_order() {
+    use gpui_chat_core::MessageStore;
+    // 25 messages, 1 s apart.
+    let log: Vec<(String, i64)> = (1..=25).map(|n| (format!("m{n:02}"), n * 1000)).collect();
+    let log_refs: Vec<(&str, i64)> = log.iter().map(|(id, ts)| (id.as_str(), *ts)).collect();
+    let server = service_with_log(&log_refs).await;
+    let client = HistoryClient::with_base(server.uri()).unwrap();
+    let mut tracker = HistoryTracker::new(true);
+    let mut store = MessageStore::new();
+    let channel = ChannelId::new("forsen");
+
+    // Join: the first 20 messages exist; one live message (m21) arrives while the fetch runs.
+    let join = tracker.observe(&joined("forsen")).unwrap();
+    let live_m21 = live("forsen", "m21", 21_000);
+    tracker.observe(&live_m21);
+    if let ChatEvent::Message { message, .. } = live_m21 {
+        store.push(message);
+    }
+    let fetched = client
+        .fetch(
+            &channel,
+            HistoryRequest {
+                limit: 10,
+                ..join.request
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.len(),
+        10,
+        "the newest ten of what the service had (m16..m25)"
+    );
+    assert!(tracker.complete(&channel, join.token, Some(&fetched)));
+    store.merge_history(fetched);
+    // m16..m20 from history, then the live m21 (also in the answer: dropped), then m22..m25 that
+    // history already knew about (it was fetched after they were said).
+    assert_eq!(
+        shown(&store),
+        [
+            "m16", "m17", "m18", "m19", "m20", "m21", "m22", "m23", "m24", "m25"
+        ]
+    );
+    assert!(
+        !store.get("m21").unwrap().flags.history,
+        "the live copy stays"
+    );
+
+    // Connection lost after m25; chat said m26..m30 meanwhile; the channel is joined again and
+    // live messages resume with m31.
+    let rejoin = tracker.observe(&joined("forsen")).unwrap();
+    assert_eq!(rejoin.request.after, Some(Timestamp(25_000 - 10_000)));
+    let live_m31 = live("forsen", "m31", 31_000);
+    tracker.observe(&live_m31);
+    if let ChatEvent::Message { message, .. } = live_m31 {
+        store.push(message);
+    }
+    let mut grown = log_refs.clone();
+    grown.extend((26..=31).map(|n| {
+        (
+            ["m26", "m27", "m28", "m29", "m30", "m31"][n - 26],
+            n as i64 * 1000,
+        )
+    }));
+    let server = service_with_log(&grown).await;
+    let client = HistoryClient::with_base(server.uri()).unwrap();
+    let gap = client.fetch(&channel, rejoin.request).await.unwrap();
+    // Only the gap (plus the overlap), not the whole backlog again.
+    assert_eq!(
+        gap.len(),
+        16,
+        "m16..m31 after the 10 s overlap: {:?}",
+        ids(&gap)
+    );
+    assert!(tracker.complete(&channel, rejoin.token, Some(&gap)));
+    let added = store.merge_history(gap);
+    assert_eq!(added, 5, "m26..m30 are the only new ones");
+    assert_eq!(
+        shown(&store),
+        [
+            "m16", "m17", "m18", "m19", "m20", "m21", "m22", "m23", "m24", "m25", "m26", "m27",
+            "m28", "m29", "m30", "m31"
+        ]
+    );
+}
