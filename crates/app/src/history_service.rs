@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use gpui_chat_core::{ChannelId, ChatEvent, Message, MessageKind};
+use gpui_chat_core::{ChannelId, ChatEvent, Message, MessageKind, Timestamp};
 use gpui_chat_twitch::{Fetch, HistoryClient, HistoryTracker};
 use gpui_kit::App;
 use tokio::runtime::Handle;
@@ -110,20 +110,41 @@ impl HistoryService {
             let wanted = inner.tracker().complete(
                 &channel,
                 token,
-                outcome.as_ref().ok().map(|messages| messages.as_slice()),
+                outcome
+                    .as_ref()
+                    .ok()
+                    .map(|history| history.messages.as_slice()),
             );
             if !wanted {
                 return;
             }
             let event = match outcome {
-                Ok(messages) if messages.is_empty() => return,
-                Ok(messages) => {
-                    tracing::debug!(%channel, count = messages.len(), "recent messages loaded");
+                Ok(history) => {
+                    let missing = history.may_be_missing_messages(&request);
+                    if history.messages.is_empty() && history.moderation.is_empty() {
+                        return;
+                    }
+                    tracing::debug!(
+                        %channel,
+                        count = history.messages.len(),
+                        moderation = history.moderation.len(),
+                        missing,
+                        "recent messages loaded"
+                    );
+                    let mut messages: Vec<Arc<Message>> = history
+                        .messages
+                        .into_iter()
+                        .map(|message| resolve(inner.emotes.as_ref(), &channel, message))
+                        .collect();
+                    if missing && let Some(oldest) = messages.first() {
+                        // Right before the oldest message the answer reached back to: where the
+                        // hole is.
+                        let notice = possibly_missing(token, oldest.timestamp);
+                        messages.insert(0, Arc::new(notice));
+                    }
                     ChatEvent::History {
-                        messages: messages
-                            .into_iter()
-                            .map(|message| resolve(inner.emotes.as_ref(), &channel, message))
-                            .collect(),
+                        messages,
+                        moderation: history.moderation,
                         channel,
                     }
                 }
@@ -176,6 +197,20 @@ fn unavailable(channel: ChannelId, token: u64, gap: bool) -> ChatEvent {
     }
 }
 
+/// The quiet line in a reconnect's history that marks a hole: the service had more messages for
+/// the time we were away than one answer can hold, so the earliest of them are not shown.
+/// Stamped just before the oldest message that was returned, so it lands where the hole is.
+fn possibly_missing(token: u64, oldest: Timestamp) -> Message {
+    let mut line = Message::plain(
+        format!("history-gap-{token}"),
+        Timestamp::from_unix_millis(oldest.unix_millis().saturating_sub(1)),
+        MessageKind::System,
+        "Some messages may be missing here.",
+    );
+    line.flags.history = true;
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +232,15 @@ mod tests {
         };
         assert!(gap.plain_text().contains("disconnected"));
         assert_ne!(gap.id, message.id, "one line per failure");
+    }
+
+    #[test]
+    fn the_hole_marker_sorts_just_before_the_oldest_returned_message() {
+        let line = possibly_missing(2, Timestamp(50_000));
+        assert_eq!(line.timestamp, Timestamp(49_999));
+        assert!(line.flags.history, "dimmed, and skipped by notifications");
+        assert_eq!(line.kind, MessageKind::System);
+        assert_eq!(line.id.as_str(), "history-gap-2");
     }
 
     #[test]

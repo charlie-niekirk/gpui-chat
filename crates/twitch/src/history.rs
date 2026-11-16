@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_chat_core::{
-    APP_NAME, ChannelId, ChatEvent, ClearTarget, ConnectionState, Message, MessageKind, Timestamp,
+    APP_NAME, ChannelId, ChatEvent, ConnectionState, Message, MessageKind, Moderation, Timestamp,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -58,7 +58,12 @@ pub enum HistoryError {
     /// A 2xx answer that is not the documented JSON.
     #[error("the recent-messages service sent an unreadable answer: {0}")]
     Malformed(String),
-    /// The service itself says no (`channel_not_joined`, a disabled channel, ...).
+    /// The channel name is not a Twitch login, so nothing is requested.
+    #[error("not a channel name: {0:?}")]
+    InvalidChannel(String),
+    /// The service itself says no (a disabled channel, ...). `channel_not_joined` is *not* one of
+    /// these: it is the service's normal answer for a channel it is not tracking yet, and
+    /// reads as an empty history.
     #[error("the recent-messages service says: {message} ({code})")]
     Service { code: String, message: String },
 }
@@ -142,12 +147,13 @@ impl HistoryClient {
     }
 
     /// Fetches and parses the recent messages of `channel`, oldest first, each flagged
-    /// `history`. The channel name is the only thing sent besides the request's own parameters.
+    /// `history`. The channel name is the only thing sent besides the request's own parameters;
+    /// a name that is not a Twitch login is refused without a request.
     pub async fn fetch(
         &self,
         channel: &ChannelId,
         request: HistoryRequest,
-    ) -> Result<Vec<Arc<Message>>, HistoryError> {
+    ) -> Result<History, HistoryError> {
         let url = self.url(channel, request)?;
         let response = self.http.get(url).send().await.map_err(|error| {
             if error.is_timeout() {
@@ -175,6 +181,9 @@ impl HistoryClient {
         channel: &ChannelId,
         request: HistoryRequest,
     ) -> Result<reqwest::Url, HistoryError> {
+        if !is_login(channel.login()) {
+            return Err(HistoryError::InvalidChannel(channel.login().to_owned()));
+        }
         let mut url = reqwest::Url::parse(&self.base)
             .map_err(|error| HistoryError::Malformed(format!("bad service address: {error}")))?;
         url.path_segments_mut()
@@ -207,56 +216,105 @@ struct Response {
     error_code: Option<String>,
 }
 
-/// Turns the service's JSON answer into messages, oldest first.
+/// A Twitch login: `[a-z0-9_]{1,25}`. Anything else (`..`, a slash, an empty name) never reaches
+/// the URL.
+fn is_login(name: &str) -> bool {
+    (1..=25).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// What one answer of the service held.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct History {
+    /// Chat lines, actions and user notices, oldest first, each flagged `history`.
+    pub messages: Vec<Arc<Message>>,
+    /// What moderators removed, in order (see [`Moderation`]); not yet applied to anything.
+    pub moderation: Vec<Moderation>,
+    /// How many raw lines the answer had (the service caps an answer at [`MAX_LIMIT`]).
+    pub lines: usize,
+}
+
+impl History {
+    /// Whether a reconnect's answer may have left a hole: it asked for everything after
+    /// [`gap_start`] and got a full answer (`limit` lines) whose oldest message is newer than the
+    /// newest one already seen, so the service had more than it could return and the earlier part
+    /// of the gap is missing. Never true for a join (no gap to speak of).
+    pub fn may_be_missing_messages(&self, request: &HistoryRequest) -> bool {
+        let Some(after) = request.after else {
+            return false;
+        };
+        // `after` is `newest_seen` less the overlap, see `gap_start`.
+        let newest_seen = after
+            .unix_millis()
+            .saturating_add(i64::try_from(GAP_OVERLAP.as_millis()).unwrap_or(i64::MAX));
+        self.lines >= request.limit as usize
+            && self
+                .messages
+                .first()
+                .is_some_and(|oldest| oldest.timestamp.unix_millis() > newest_seen)
+    }
+}
+
+/// Turns the service's JSON answer into a [`History`].
 ///
 /// * Chat lines, actions and `USERNOTICE`s become messages flagged `history` (also when the line
-///   lacks the service's `historical=1` tag).
-/// * `CLEARMSG` / `CLEARCHAT` lines mark the messages *before them* as deleted, as they would
-///   have been live; they are not returned themselves. `ROOMSTATE` and `NOTICE` lines are dropped:
-///   they describe the room as it was, and would overwrite what is true now.
+///   lacks the service's `historical=1` tag). A line with no timestamp at all is skipped: it
+///   could not be put in order.
+/// * `CLEARMSG` / `CLEARCHAT` lines become [`Moderation`]s carrying the time they happened; they
+///   are for the caller to apply to *everything* it shows, not only to this answer's messages.
+///   `ROOMSTATE` and `NOTICE` lines are dropped: they describe the room as it was, and would
+///   overwrite what is true now.
 /// * A line that does not parse is skipped (logged at debug level), never an error: one bad line
 ///   must not cost the other 99.
-/// * An `error` with no messages is an error ([`HistoryError::Service`]); with messages it is
-///   ignored.
-pub fn parse_history(body: &str) -> Result<Vec<Arc<Message>>, HistoryError> {
+/// * `channel_not_joined` (the service is not tracking the channel yet and starts doing so when
+///   asked: most small channels the first time, every channel after the service restarted) is an
+///   empty history. Any other `error` with no messages is an error ([`HistoryError::Service`]);
+///   with messages it is ignored.
+pub fn parse_history(body: &str) -> Result<History, HistoryError> {
     let response: Response =
         serde_json::from_str(body).map_err(|error| HistoryError::Malformed(error.to_string()))?;
     if response.messages.is_empty()
         && let Some(message) = response.error
     {
-        return Err(HistoryError::Service {
-            code: response.error_code.unwrap_or_default(),
-            message,
-        });
+        let code = response.error_code.unwrap_or_default();
+        if code == "channel_not_joined" {
+            tracing::debug!("the recent-messages service was not tracking this channel yet");
+            return Ok(History::default());
+        }
+        return Err(HistoryError::Service { code, message });
     }
-    let options = ParseOptions::default();
-    let mut messages: Vec<Arc<Message>> = Vec::with_capacity(response.messages.len());
+    // A line with neither timestamp tag gets this and is dropped.
+    const NO_TIME: Timestamp = Timestamp(i64::MIN);
+    let options = ParseOptions {
+        fallback_timestamp: NO_TIME,
+        ..ParseOptions::default()
+    };
+    let mut history = History {
+        lines: response.messages.len(),
+        ..History::default()
+    };
     let mut skipped = 0usize;
     for line in &response.messages {
         match parse_line_with(line, &options) {
             Ok(Some(ChatEvent::Message { mut message, .. })) => {
+                if message.timestamp == NO_TIME {
+                    skipped += 1;
+                    continue;
+                }
                 Arc::make_mut(&mut message).flags.history = true;
-                messages.push(message);
+                history.messages.push(message);
             }
             Ok(Some(ChatEvent::DeleteMessage { message_id, .. })) => {
-                if let Some(slot) = messages.iter_mut().find(|m| m.id == message_id) {
-                    *slot = Arc::new(slot.with_deleted());
-                }
+                history.moderation.push(Moderation::Delete { message_id });
             }
-            Ok(Some(ChatEvent::ClearChat { target, .. })) => {
-                for slot in &mut messages {
-                    let hit = match &target {
-                        ClearTarget::Channel => true,
-                        ClearTarget::User { login, .. } => slot
-                            .author
-                            .as_ref()
-                            .is_some_and(|a| a.login.eq_ignore_ascii_case(login)),
-                    };
-                    if hit && !slot.flags.deleted {
-                        *slot = Arc::new(slot.with_deleted());
-                    }
-                }
-            }
+            Ok(Some(ChatEvent::ClearChat {
+                target,
+                at: Some(at),
+                ..
+            })) => history.moderation.push(Moderation::Clear { target, at }),
+            Ok(Some(ChatEvent::ClearChat { at: None, .. })) => skipped += 1,
             Ok(_) => {}
             Err(error) => {
                 skipped += 1;
@@ -267,7 +325,7 @@ pub fn parse_history(body: &str) -> Result<Vec<Arc<Message>>, HistoryError> {
     if skipped > 0 {
         tracing::debug!(skipped, "recent messages: lines skipped");
     }
-    Ok(messages)
+    Ok(history)
 }
 
 /// One fetch the tracker wants made.

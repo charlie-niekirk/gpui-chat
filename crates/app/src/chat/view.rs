@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui_chat_core::{Message, MessageId};
+use gpui_chat_core::{Message, MessageId, Rebuild};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, Context, Entity, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
@@ -109,6 +109,9 @@ pub struct ChatView {
     /// How far into the store's log of replaced messages this view has applied
     /// ([`ChannelStore::replaced_since`]).
     replaced_seen: u64,
+    /// How many history merges that renumbered the store this view has applied
+    /// ([`gpui_chat_core::MessageStore::rebuilds_since`]).
+    rebuilds_seen: u64,
     /// Line height of the last render.
     line_height: Pixels,
     images: Rc<RefCell<FrameImages>>,
@@ -124,9 +127,12 @@ pub struct ChatView {
 
 impl ChatView {
     pub fn new(store: Entity<ChannelStore>, cx: &mut Context<Self>) -> Self {
-        let mirror = {
+        let (mirror, rebuilds_seen) = {
             let messages = store.read(cx).messages();
-            ListMirror::new(messages.first_seq(), messages.next_seq())
+            (
+                ListMirror::new(messages.first_seq(), messages.next_seq()),
+                messages.rebuild_serial(),
+            )
         };
         let list = ListState::new(mirror.len(), ListAlignment::Bottom, OVERDRAW);
         list.set_follow_mode(FollowMode::Tail);
@@ -153,6 +159,7 @@ impl ChatView {
             unseen_from: None,
             pill_shown: false,
             replaced_seen: 0,
+            rebuilds_seen,
             line_height: px(0.0),
             images: Rc::default(),
             hover: Rc::default(),
@@ -204,10 +211,42 @@ impl ChatView {
 
     /// Brings the list up to date with the store: splices, drops evicted layouts, counts unseen.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        // History merged *before* messages already shown renumbers the store's messages. Each such
+        // merge is replayed as the row insertions it was (`Rebuild`), so measured rows, the
+        // reader's scroll position (GPUI shifts its anchor for splices above it) and the
+        // "new messages" count all survive. More merges than the store remembers: the plain sync
+        // below sees numbers that all moved on and replaces every row.
+        let (rebuilds, serial) = self
+            .store
+            .read(cx)
+            .messages()
+            .rebuilds_since(self.rebuilds_seen);
+        self.rebuilds_seen = serial;
+        for rebuild in rebuilds.iter().flatten() {
+            self.apply_rebuild(rebuild);
+        }
         let (first, next) = {
             let messages = self.store.read(cx).messages();
             (messages.first_seq(), messages.next_seq())
         };
+        self.sync_range(first, next);
+        debug_assert_eq!(self.list.item_count(), self.mirror.len());
+        // A message replaced in place (the user's echo swapped for Twitch's copy, with its real
+        // emotes) can be a different height: measure those rows again.
+        let (replaced, serial) = self.store.read(cx).replaced_since(self.replaced_seen);
+        if serial != self.replaced_seen {
+            self.replaced_seen = serial;
+            match replaced {
+                Some(seqs) => self.remeasure_seqs(&seqs),
+                None => self.list.remeasure(),
+            }
+        }
+        // Also covers changes without new messages (deletions): rows re-render.
+        cx.notify();
+    }
+
+    /// Moves the list from the range it shows to `first..next` of the store's sequence numbers.
+    fn sync_range(&mut self, first: u64, next: u64) {
         let previous_next = self.mirror.next_seq();
         let change = self.mirror.sync(first, next);
         if !change.is_empty() {
@@ -225,19 +264,33 @@ impl ChatView {
                 self.unseen_from.get_or_insert(previous_next);
             }
         }
-        debug_assert_eq!(self.list.item_count(), self.mirror.len());
-        // A message replaced in place (the user's echo swapped for Twitch's copy, with its real
-        // emotes) can be a different height: measure those rows again.
-        let (replaced, serial) = self.store.read(cx).replaced_since(self.replaced_seen);
-        if serial != self.replaced_seen {
-            self.replaced_seen = serial;
-            match replaced {
-                Some(seqs) => self.remeasure_seqs(&seqs),
-                None => self.list.remeasure(),
-            }
+    }
+
+    /// Replays one history merge that renumbered the store: the list first catches up with the
+    /// state the merge started from, then the rows it dropped at the front go and the rows it
+    /// brought are inserted, and everything keyed by an old sequence number is moved to its new one.
+    fn apply_rebuild(&mut self, rebuild: &Rebuild) {
+        self.sync_range(rebuild.old_first, rebuild.old_next);
+        if rebuild.removed_front > 0 {
+            self.list.splice(0..rebuild.removed_front, 0);
         }
-        // Also covers changes without new messages (deletions): rows re-render.
-        cx.notify();
+        for &(at, count) in &rebuild.inserts {
+            self.list.splice(at..at, count);
+        }
+        self.mirror = ListMirror::new(rebuild.new_first, rebuild.new_next);
+        for cache in self.caches() {
+            cache.borrow_mut().remap(|seq| rebuild.map_seq(seq));
+        }
+        // The pill counts from the first message that arrived while scrolled away: still that
+        // message, under its new number (the oldest survivor if it was dropped).
+        self.unseen_from = self
+            .unseen_from
+            .map(|from| rebuild.map_seq(from).unwrap_or(rebuild.new_first));
+        // The row under the pointer is found again by the next mouse move.
+        self.hovered.set(None);
+        if let Some(panel) = &self.thread {
+            panel.hovered.set(None);
+        }
     }
 
     fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
@@ -848,6 +901,129 @@ mod tests {
         assert!(h.following(cx));
         assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
         assert!(!h.view.read_with(cx, |v, _| v.pill_shown()));
+    }
+
+    fn history_before(count: i64, cx: &mut VisualTestContext, h: &Harness) {
+        // Older than every live message (`chat` stamps them 0).
+        let messages = (0..count)
+            .map(|n| {
+                let mut message = Message::chat(
+                    format!("h{n}"),
+                    Timestamp(n - count - 10),
+                    Author::new("old", "Old"),
+                    vec![Fragment::Text("earlier".into())],
+                );
+                message.flags.history = true;
+                Arc::new(message)
+            })
+            .collect();
+        h.store.update(cx, |store, cx| {
+            store.apply(ChatEvent::History {
+                channel: ChannelId::new("test"),
+                messages,
+                moderation: Vec::new(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    /// The id of the message at the top of the list.
+    fn top_id(h: &Harness, cx: &mut VisualTestContext) -> (usize, String) {
+        let top = h
+            .view
+            .read_with(cx, |v, _| v.list_state().logical_scroll_top());
+        let id = h.view.read_with(cx, |v, cx| {
+            let seq = v.mirror.first_seq() + top.item_ix as u64;
+            let id = v
+                .store
+                .read(cx)
+                .messages()
+                .get_by_seq(seq)
+                .map(|m| m.id.to_string());
+            id.expect("the top row is a message")
+        });
+        (top.item_ix, id)
+    }
+
+    #[gpui_kit::test]
+    fn history_inserted_above_a_scrolled_up_reader_does_not_move_them(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        h.scroll(400.0, cx);
+        assert!(!h.following(cx));
+        h.push(7, "hello", cx);
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 7);
+        let (top_ix, top_message) = top_id(&h, cx);
+        let cached = h.view.read_with(cx, |v, _| v.cache.borrow().len());
+        assert!(cached > 0);
+
+        history_before(25, cx, &h);
+
+        assert_eq!(h.items(cx), 232, "25 rows inserted, none replaced");
+        assert!(!h.following(cx), "still paused");
+        let (new_ix, still) = top_id(&h, cx);
+        assert_eq!(still, top_message, "the reader still sees the same message");
+        assert_eq!(
+            new_ix,
+            top_ix + 25,
+            "…which moved down by what was inserted above it"
+        );
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.unseen()),
+            7,
+            "the pill still counts only the 7"
+        );
+        assert!(h.view.read_with(cx, |v, _| v.pill_shown()));
+        // Layouts moved with their messages instead of being thrown away.
+        let after = h.view.read_with(cx, |v, _| v.cache.borrow().len());
+        assert!(after >= cached, "{after} layouts vs {cached} before");
+        let seq_of_top = h.view.read_with(cx, |v, cx| {
+            v.store.read(cx).messages().seq_of(&top_message).unwrap()
+        });
+        assert!(
+            h.view
+                .read_with(cx, |v, _| v.cache.borrow().flow_of(seq_of_top).is_some())
+        );
+    }
+
+    #[gpui_kit::test]
+    fn history_on_join_while_following_keeps_following(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(5, "hello", cx);
+        assert!(h.following(cx));
+        history_before(40, cx, &h);
+        assert_eq!(h.items(cx), 45);
+        assert!(h.following(cx), "history above does not unfollow");
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
+        h.push(3, "live", cx);
+        assert_eq!(h.items(cx), 48);
+        assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
+    }
+
+    #[gpui_kit::test]
+    fn history_that_overflows_the_cap_drops_the_oldest_rows_in_step(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 50);
+        h.push(40, "hello", cx);
+        history_before(30, cx, &h);
+        // 70 merged, 50 kept: the 20 oldest history rows fall off.
+        assert_eq!(h.items(cx), 50);
+        let (items, store_len) = h.view.read_with(cx, |v, cx| {
+            (
+                v.list_state().item_count(),
+                v.store.read(cx).messages().len(),
+            )
+        });
+        assert_eq!(items, store_len);
+        let oldest = h.view.read_with(cx, |v, cx| {
+            v.store
+                .read(cx)
+                .messages()
+                .get_index(0)
+                .map(|m| m.id.to_string())
+        });
+        assert_eq!(oldest.as_deref(), Some("h20"));
+        assert!(h.following(cx));
     }
 
     #[gpui_kit::test]

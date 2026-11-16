@@ -205,15 +205,27 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (live or fetched, minus a 10 s overlap; the whole history again if no earlier fetch ever succeeded), only the latest
   fetch of a channel is still wanted when it finishes, and `chat.history = false` plans nothing so the channel name is
   never sent. `HistoryClient` (`crates/twitch/src/history.rs`) calls `recent-messages.robotty.de/api/v2/recent-messages/<login>`
-  (`limit`, `after`; 8 s timeout, no account or token sent) and `parse_history` maps the raw IRC lines with the live
-  parser (`parse_line_with`), flags them `history`, applies the `CLEARMSG` / `CLEARCHAT` lines in the answer to the messages before
-  them and drops `ROOMSTATE` / `NOTICE` lines (they describe the room as it was). The answer is one `ChatEvent::History`; third-party emotes
-  are resolved as for live messages. A failure is a `warn` plus one quiet system line in the channel. `ChannelStore::apply`
-  merges the batch with `MessageStore::merge_history`: by timestamp, de-duplicated by message id (the live copy wins), and
-  when it has to go *before* retained messages the buffer is rebuilt with fresh sequence numbers (so every view sees "all
-  replaced" through the ordinary list sync, never a reused number). History rows are drawn at 60 % opacity (`chat/row.rs`),
-  and `flags.history` stays on the message for notifications (PR 5.3) to skip. The setting is read when a channel is joined, so
-  a change applies to the next join or reconnect.
+  (`limit`, `after`; 8 s timeout, no account or token sent; the name must be a login, `[a-z0-9_]{1,25}`, or nothing is
+  requested) and `parse_history` maps the raw IRC lines with the live parser (`parse_line_with`), flags them `history`,
+  skips lines with no timestamp, returns `CLEARMSG` / `CLEARCHAT` lines as `Moderation`s with their time (not applied to the
+  answer alone) and drops `ROOMSTATE` / `NOTICE` lines (they describe the room as it was). `channel_not_joined`
+  (the service's normal answer for a channel it does not record yet; it starts when asked) is an empty history, not a failure.
+  The answer is one `ChatEvent::History { messages, moderation }`; third-party emotes are resolved as for live messages. A
+  failure is a `warn` plus one quiet system line in the channel; a full gap answer that starts after what was seen
+  (`History::may_be_missing_messages`) adds a "Some messages may be missing here." line, stamped to land in the hole.
+  `ChannelStore::apply` merges the batch with `MessageStore::merge_history` (by timestamp, de-duplicated by message id, the
+  live copy wins; nothing at all happens when nothing is new), then applies the answer's moderation *and* the store's short
+  memory of live `CLEARMSG` / `CLEARCHAT` (`live_moderation`) to everything shown: a clear reaches only messages sent at or
+  before its time, so what a timed-out user said afterwards survives. Any live message with an id already shown (chat, action
+  or user notice) is dropped. When history has to go *before* retained messages the store is renumbered and records a `Rebuild`
+  (rows dropped at the front, runs of inserted rows, `map_seq` old to new): `ChatView::sync` replays it as list splices
+  (`apply_rebuild`), so measured rows, the reader's scroll position (GPUI moves its anchor for splices above it) and the
+  "new messages" count survive, and the layout caches are re-keyed (`LayoutCache::remap`). More merges than the store
+  remembers (8) fall back to replacing every row. Anything else keyed by a sequence number must be remapped there too (the
+  hovered row is cleared). The renumbering itself is O(scrollback) in the store, once per merge that adds messages before
+  others. History rows are drawn at `Tokens::history_opacity` (`chat/row.rs`), derived per theme from how far its muted text
+  sits between background and text, and `flags.history` stays on the message for notifications (PR 5.3) to skip. The
+  setting is read when a channel is joined, so a change applies to the next join or reconnect.
 - `account.rs` / `sign_in.rs` / `platform/keychain.rs` (PR 3.1) — the Twitch account. `AccountHub` (GPUI
   entity, live source only: offline runs never touch the keychain) mirrors `gpui_chat_twitch::Auth`'s
   `AuthState` (a `watch` channel) into the UI: on start the backend restores the stored login and then

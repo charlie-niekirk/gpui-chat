@@ -170,8 +170,11 @@ it has been asked about. They are shown dimmed so they are not mistaken for live
 raise a notification.
 
 **Privacy:** to get them the app sends *the name of the channel you joined* (and your IP address, as
-any web request does) to that service. It sends no account, token or message of yours. Set
-`chat.history = false` (or switch off *Chat → Load recent messages*) to never contact it; chat then
+any web request does) to that service. It sends no account, token or message of yours. The service
+only has history for channels it records, and it starts recording a channel the first time anyone asks
+for it: joining a small channel with this on can make that third-party bot start logging the
+channel's chat from then on (its first answer is "not tracked yet", so that first join shows no
+history). Set `chat.history = false` (or switch off *Chat → Load recent messages*) to never contact it; chat then
 starts empty at the moment you join, as on twitch.tv. The setting is read when a channel is joined or
 re-joined, so changing it affects the next join or reconnect, not channels already open. If the service
 is slow, down or refuses (it is a volunteer-run service), joining is not delayed and the channel shows a

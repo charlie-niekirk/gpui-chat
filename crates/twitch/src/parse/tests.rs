@@ -441,7 +441,9 @@ fn clearchat_timeout_ban_and_channel() {
     let targets: Vec<_> = evs
         .iter()
         .map(|e| match e {
-            ChatEvent::ClearChat { channel, target } => {
+            ChatEvent::ClearChat {
+                channel, target, ..
+            } => {
                 assert_eq!(channel.login(), "testchan");
                 target.clone()
             }
@@ -728,4 +730,18 @@ fn a_replayed_conversation_forms_one_thread_in_a_store() {
     let orphan = store.thread("33333333-0000-4000-8000-0000000000f0");
     assert!(orphan.root.is_none());
     assert_eq!(orphan.replies.len(), 1);
+}
+
+#[test]
+fn clearchat_carries_its_time_when_the_line_has_one() {
+    let at = |line: &str| match parse_line(line).unwrap() {
+        Some(ChatEvent::ClearChat { at, .. }) => at,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        at("@ban-duration=600;tmi-sent-ts=1794826007000 :tmi.twitch.tv CLEARCHAT #c :someone"),
+        Some(Timestamp(1_794_826_007_000))
+    );
+    assert_eq!(at(":tmi.twitch.tv CLEARCHAT #c"), None);
+    assert_eq!(at("@tmi-sent-ts=oops :tmi.twitch.tv CLEARCHAT #c"), None);
 }

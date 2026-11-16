@@ -32,7 +32,9 @@ fn ids(messages: &[Arc<Message>]) -> Vec<String> {
 
 #[test]
 fn a_recorded_response_parses_like_live_chat() {
-    let messages = parse_history(&fixture("recent-messages.json")).unwrap();
+    let history = parse_history(&fixture("recent-messages.json")).unwrap();
+    assert_eq!(history.lines, 13);
+    let messages = history.messages;
     // The line with no id and the malformed one are skipped; ROOMSTATE, NOTICE and the
     // moderation lines are not messages. Order is the service's (oldest first).
     assert_eq!(ids(&messages), ["1", "2", "3", "4", "5", "6", "7"]);
@@ -67,15 +69,86 @@ fn a_recorded_response_parses_like_live_chat() {
 }
 
 #[test]
-fn moderation_since_is_applied_to_the_messages_before_it() {
-    let messages = parse_history(&fixture("recent-messages.json")).unwrap();
-    let deleted: Vec<bool> = messages.iter().map(|m| m.flags.deleted).collect();
-    // m5 by CLEARMSG, m6 by the CLEARCHAT of its author; nothing else.
+fn moderation_comes_back_with_its_time_and_is_not_applied_to_the_answer_alone() {
+    let history = parse_history(&fixture("recent-messages.json")).unwrap();
+    assert!(history.messages.iter().all(|m| !m.flags.deleted));
+    let id = |n: u32| gpui_chat_core::MessageId::from(format!("11111111-0000-4000-8000-{n:012}"));
+    assert_eq!(
+        history.moderation,
+        [
+            Moderation::Delete { message_id: id(5) },
+            Moderation::Clear {
+                target: gpui_chat_core::ClearTarget::User {
+                    login: "trouble".into(),
+                    duration: Some(Duration::from_secs(600)),
+                },
+                at: Timestamp(1_794_826_007_000),
+            },
+        ]
+    );
+}
+
+fn store_with(history: &History, live: &[(&str, &str, i64)]) -> gpui_chat_core::MessageStore {
+    let mut store = gpui_chat_core::MessageStore::new();
+    for (id, login, ts) in live {
+        store.push(Arc::new(Message::chat(
+            *id,
+            Timestamp(*ts),
+            gpui_chat_core::Author::new(*login, *login),
+            vec![],
+        )));
+    }
+    store.merge_history(history.messages.clone());
+    for moderation in &history.moderation {
+        store.apply_moderation(moderation);
+    }
+    store
+}
+
+#[test]
+fn applied_to_the_merged_store_the_fixtures_moderation_strikes_the_right_messages() {
+    let history = parse_history(&fixture("recent-messages.json")).unwrap();
+    let store = store_with(&history, &[]);
+    let deleted: Vec<bool> = store.iter().map(|m| m.flags.deleted).collect();
+    // m5 by CLEARMSG, m6 by the timeout of its author; nothing else.
     assert_eq!(deleted, [false, false, false, false, true, true, false]);
 }
 
 #[test]
-fn a_clear_of_the_whole_chat_deletes_what_came_before_only() {
+fn a_gap_answer_can_delete_a_message_that_was_already_shown() {
+    // Shown live before the drop; the CLEARMSG that removed it happened while disconnected.
+    let body = serde_json::json!({ "messages": [
+        "@id=a;tmi-sent-ts=1000 :u!u@u.tmi.twitch.tv PRIVMSG #c :spam",
+        "@login=u;target-msg-id=live1;tmi-sent-ts=2000 :tmi.twitch.tv CLEARMSG #c :spam",
+        "@ban-duration=60;tmi-sent-ts=3000 :tmi.twitch.tv CLEARCHAT #c :spammer",
+    ]})
+    .to_string();
+    let history = parse_history(&body).unwrap();
+    let store = store_with(
+        &history,
+        &[
+            ("live1", "u", 900),
+            ("live2", "spammer", 2500),
+            ("live3", "spammer", 4000),
+        ],
+    );
+    let deleted: Vec<(String, bool)> = store
+        .iter()
+        .map(|m| (m.id.to_string(), m.flags.deleted))
+        .collect();
+    assert_eq!(
+        deleted,
+        [
+            ("live1".to_owned(), true),
+            ("a".to_owned(), false),
+            ("live2".to_owned(), true),
+            ("live3".to_owned(), false), // sent after the timeout: survives
+        ]
+    );
+}
+
+#[test]
+fn a_clear_of_the_whole_chat_reaches_what_came_before_it_only() {
     let body = serde_json::json!({
         "messages": [
             "@id=a;tmi-sent-ts=1 :u!u@u.tmi.twitch.tv PRIVMSG #c :one",
@@ -84,33 +157,95 @@ fn a_clear_of_the_whole_chat_deletes_what_came_before_only() {
         ]
     })
     .to_string();
-    let messages = parse_history(&body).unwrap();
+    let store = store_with(&parse_history(&body).unwrap(), &[]);
     assert_eq!(
-        messages.iter().map(|m| m.flags.deleted).collect::<Vec<_>>(),
+        store.iter().map(|m| m.flags.deleted).collect::<Vec<_>>(),
         [true, false]
     );
 }
 
 #[test]
-fn a_line_without_the_historical_tag_is_still_marked() {
-    let body = r##"{"messages":["@id=a;tmi-sent-ts=1 :u!u@u.tmi.twitch.tv PRIVMSG #c :hi"]}"##;
-    assert!(parse_history(body).unwrap()[0].flags.history);
+fn a_clear_without_a_time_is_dropped_rather_than_guessed() {
+    let body = r##"{"messages":["@id=a;tmi-sent-ts=1 :u!u@u.tmi.twitch.tv PRIVMSG #c :one","@ban-duration=5 :tmi.twitch.tv CLEARCHAT #c :u"]}"##;
+    assert!(parse_history(body).unwrap().moderation.is_empty());
 }
 
 #[test]
-fn the_services_own_refusal_is_an_error_but_only_without_messages() {
-    let error = parse_history(&fixture("channel-not-joined.json")).unwrap_err();
+fn a_line_with_no_timestamp_cannot_be_placed_so_it_is_skipped() {
+    let body = serde_json::json!({ "messages": [
+        "@id=a :u!u@u.tmi.twitch.tv PRIVMSG #c :no time at all",
+        "@id=b;rm-received-ts=7 :u!u@u.tmi.twitch.tv PRIVMSG #c :only the service's time",
+        "@id=c;tmi-sent-ts=9 :u!u@u.tmi.twitch.tv PRIVMSG #c :fine",
+    ]})
+    .to_string();
+    let history = parse_history(&body).unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "c"]
+    );
+    assert!(history.messages.iter().all(|m| m.timestamp > Timestamp(0)));
+}
+
+#[test]
+fn a_line_without_the_historical_tag_is_still_marked() {
+    let body = r##"{"messages":["@id=a;tmi-sent-ts=1 :u!u@u.tmi.twitch.tv PRIVMSG #c :hi"]}"##;
+    assert!(parse_history(body).unwrap().messages[0].flags.history);
+}
+
+#[test]
+fn channel_not_joined_is_an_empty_history_not_an_error() {
+    // The service's normal answer for a channel it has not tracked yet (it starts doing so now).
+    let history = parse_history(&fixture("channel-not-joined.json")).unwrap();
+    assert_eq!(history, History::default());
+}
+
+#[test]
+fn any_other_refusal_is_an_error_but_only_without_messages() {
+    let refused =
+        r##"{"messages":[],"error":"This channel opted out","error_code":"channel_ignored"}"##;
+    let error = parse_history(refused).unwrap_err();
     assert!(
-        matches!(&error, HistoryError::Service { code, .. } if code == "channel_not_joined"),
+        matches!(&error, HistoryError::Service { code, .. } if code == "channel_ignored"),
         "{error:?}"
     );
     let partial = r##"{"messages":["@id=a;tmi-sent-ts=1 :u!u@u.tmi.twitch.tv PRIVMSG #c :hi"],"error":"half","error_code":"x"}"##;
-    assert_eq!(parse_history(partial).unwrap().len(), 1);
+    assert_eq!(parse_history(partial).unwrap().messages.len(), 1);
     // An empty channel is fine too.
     assert_eq!(
         parse_history(r#"{"messages":[],"error":null,"error_code":null}"#).unwrap(),
-        []
+        History::default()
     );
+}
+
+#[test]
+fn a_full_gap_answer_that_starts_after_what_was_seen_may_be_missing_messages() {
+    let request = HistoryRequest {
+        limit: 3,
+        ..HistoryRequest::gap_after(Timestamp(100_000))
+    };
+    let answer = |lines: usize, first_ts: i64| History {
+        messages: vec![Arc::new(Message::chat(
+            "m",
+            Timestamp(first_ts),
+            gpui_chat_core::Author::new("u", "u"),
+            vec![],
+        ))],
+        lines,
+        ..History::default()
+    };
+    // Full, and its oldest message is newer than the newest one seen: a hole.
+    assert!(answer(3, 100_500).may_be_missing_messages(&request));
+    // Full, but it reaches back to (or before) what was seen: contiguous.
+    assert!(!answer(3, 99_000).may_be_missing_messages(&request));
+    assert!(!answer(3, 100_000).may_be_missing_messages(&request));
+    // Not full: the service had no more.
+    assert!(!answer(2, 100_500).may_be_missing_messages(&request));
+    // A join has no gap.
+    assert!(!answer(3, 100_500).may_be_missing_messages(&HistoryRequest::on_join()));
 }
 
 #[test]
@@ -159,7 +294,7 @@ async fn fetch_asks_for_the_channel_with_a_limit_and_parses_the_answer() {
         .fetch(&ChannelId::new("#Forsen"), HistoryRequest::on_join())
         .await
         .unwrap();
-    assert_eq!(messages.len(), 7);
+    assert_eq!(messages.messages.len(), 7);
     // No account, token or cookie is sent: only the request line and the user agent.
     let received = &server.received_requests().await.unwrap()[0];
     assert!(received.headers.get("authorization").is_none());
@@ -186,7 +321,7 @@ async fn a_gap_request_carries_after_and_a_large_limit() {
         )
         .await
         .unwrap();
-    assert!(messages.is_empty());
+    assert!(messages.messages.is_empty());
 }
 
 #[tokio::test]
@@ -257,14 +392,53 @@ async fn an_unreachable_service_is_a_network_error_without_the_channel_in_it() {
 }
 
 #[tokio::test]
-async fn the_services_refusal_comes_back_as_an_error() {
+async fn an_untracked_channel_is_an_empty_answer_and_a_refusal_is_an_error() {
     let server = server_with(&fixture("channel-not-joined.json")).await;
+    let client = HistoryClient::with_base(server.uri()).unwrap();
+    let history = client
+        .fetch(&ChannelId::new("forsen"), HistoryRequest::on_join())
+        .await
+        .unwrap();
+    assert_eq!(history, History::default());
+
+    let server =
+        server_with(r#"{"messages":[],"error":"nope","error_code":"channel_ignored"}"#).await;
     let client = HistoryClient::with_base(server.uri()).unwrap();
     let error = client
         .fetch(&ChannelId::new("forsen"), HistoryRequest::on_join())
         .await
         .unwrap_err();
     assert!(matches!(error, HistoryError::Service { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_name_that_is_not_a_login_is_refused_before_any_request() {
+    let server = MockServer::start().await;
+    let client = HistoryClient::with_base(server.uri()).unwrap();
+    for name in [
+        "..",
+        "a/b",
+        "",
+        "UPPER?",
+        "has space",
+        "twenty_six_characters_long_",
+        "ünï",
+    ] {
+        let channel = ChannelId::new(name);
+        let result = client.fetch(&channel, HistoryRequest::on_join()).await;
+        assert!(
+            matches!(result, Err(HistoryError::InvalidChannel(_))),
+            "{name:?}: {result:?}"
+        );
+    }
+    // Valid ones pass (and would be requested).
+    assert!(
+        is_login("a")
+            && is_login("forsen")
+            && is_login("some_user_99")
+            && is_login(&"a".repeat(25))
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 // ---- the tracker: when to fetch, and what to ask for ---------------------------------------
@@ -532,7 +706,8 @@ async fn join_then_reconnect_shows_every_message_once_in_order() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .messages;
     assert_eq!(
         fetched.len(),
         10,
@@ -571,7 +746,11 @@ async fn join_then_reconnect_shows_every_message_once_in_order() {
     }));
     let server = service_with_log(&grown).await;
     let client = HistoryClient::with_base(server.uri()).unwrap();
-    let gap = client.fetch(&channel, rejoin.request).await.unwrap();
+    let gap = client
+        .fetch(&channel, rejoin.request)
+        .await
+        .unwrap()
+        .messages;
     // Only the gap (plus the overlap), not the whole backlog again.
     assert_eq!(
         gap.len(),

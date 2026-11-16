@@ -584,8 +584,9 @@ fn chat_page(this: &WeakEntity<SettingsView>) -> SettingPage {
             .description(
                 "Show a channel's recent messages when you join it and fill in what you missed \
                  after a reconnect, dimmed. Privacy: this sends the channel's name (and your IP \
-                 address) to the third-party recent-messages service, recent-messages.robotty.de; \
-                 off, nothing is sent. Applies the next time a channel is joined.",
+                 address) to the third-party recent-messages service, recent-messages.robotty.de, \
+                 and if it was not recording that channel yet, asking makes it start. Off: \
+                 nothing is sent. Applies the next time a channel is joined.",
             ),
             SettingItem::new(
                 "Scrollback",

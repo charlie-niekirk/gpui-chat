@@ -32,7 +32,8 @@ pub use client::{
 };
 pub use helix::{HelixClient, HelixError, HelixListError, HelixResponse};
 pub use history::{
-    Fetch, HistoryClient, HistoryError, HistoryRequest, HistoryTracker, gap_start, parse_history,
+    Fetch, History, HistoryClient, HistoryError, HistoryRequest, HistoryTracker, gap_start,
+    parse_history,
 };
 pub use limits::{Backoff, JoinRateLimit};
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};

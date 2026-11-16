@@ -27,9 +27,6 @@ use crate::channels::ChannelStore;
 use crate::reply::can_reply_to;
 use crate::theme::Tokens;
 
-/// How opaque a history row is drawn: subtle, still easily readable in every bundled theme.
-const HISTORY_OPACITY: f32 = 0.6;
-
 /// What a row needs besides its message.
 pub struct RowContext {
     /// Element-id prefix, so the list's buttons and the thread popover's (same message, same
@@ -56,7 +53,7 @@ pub fn message_row(
     let element = if message.flags.history {
         div()
             .w_full()
-            .opacity(HISTORY_OPACITY)
+            .opacity(row.tokens.history_opacity)
             .child(element)
             .into_any_element()
     } else {
