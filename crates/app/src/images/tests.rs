@@ -517,6 +517,49 @@ fn only_permanent_failures_become_text() {
 }
 
 #[gpui_kit::test]
+fn an_avatar_that_failed_for_good_is_told_apart_from_one_that_loads_or_may_yet(
+    cx: &mut TestAppContext,
+) {
+    use crate::chat::user_card::{AvatarShow, avatar_show};
+    let h = Harness::new(&[("https://cdn/jpeg", "static.jpg")], 1 << 30, cx);
+    h.route("https://cdn/missing", Err(FetchError::NotFound(404)));
+    h.route("https://cdn/flaky", Err(FetchError::Status(503)));
+    h.route(
+        "https://cdn/garbage",
+        Ok(b"definitely not an image".to_vec()),
+    );
+    let ask = |url: &'static str, cx: &mut TestAppContext| {
+        // What the card's avatar box does: ask for the image, then see what became of it.
+        let cache = h.cache(cx);
+        drop(cache.request(url));
+        h.load(url, cx);
+        let key = ImageKey::new(url);
+        cx.read(|cx| Images::failed_for_good(&key, cx))
+    };
+    // Not asked for yet: nothing failed.
+    assert!(!cx.read(|cx| Images::failed_for_good(&ImageKey::new("https://cdn/none"), cx)));
+    // A JPEG (the common avatar format) decodes.
+    assert!(!ask("https://cdn/jpeg", cx));
+    assert!(matches!(
+        h.cache(cx).status("https://cdn/jpeg"),
+        ImageStatus::Ready(_)
+    ));
+    // Not found and undecodable are final: the card draws the initial instead.
+    assert!(ask("https://cdn/missing", cx));
+    assert!(ask("https://cdn/garbage", cx));
+    // A transient error is retried: the placeholder stays.
+    assert!(!ask("https://cdn/flaky", cx));
+    assert_eq!(
+        avatar_show(Some("https://cdn/missing"), true),
+        AvatarShow::Initial
+    );
+    assert_eq!(
+        avatar_show(Some("https://cdn/flaky"), false),
+        AvatarShow::Image
+    );
+}
+
+#[gpui_kit::test]
 fn a_transient_failure_keeps_the_placeholder_and_is_retried(cx: &mut TestAppContext) {
     let h = Harness::new(&[], 1 << 30, cx);
     h.route("flaky", Err(FetchError::Status(503)));

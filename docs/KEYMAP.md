@@ -69,6 +69,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 | `OpenUserCard` | Open User Card for Selected Message (the author of the first selected chat message; no default key) | |
 | `CopySelection` | Copy Selection (the selected chat text; context `ChatView`) | ⌘C |
 | `ToggleSidebar` | Toggle Sidebar | ⌘B, ⌘\ |
+| `ShowMentions` | Show Mentions (toggles the Mentions panel, PR 5.3) | ⌘⇧M |
 | `ToggleDebugHud` | Toggle Debug HUD | ⌘⇧D |
 | `LogIn` / `LogOut` | Log In to Twitch… / Log Out | |
 | `About` `MinimizeWindow` `CloseWindow` `Quit` | | ⌘M ⌘W ⌘Q |

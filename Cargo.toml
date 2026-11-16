@@ -37,7 +37,7 @@ twitch_api = { version = "=0.8.0", features = ["helix", "reqwest"] }
 twitch_oauth2 = { version = "=0.17.1", features = ["reqwest"] }
 
 # Media (WebP preferred, GIF/PNG fallback; no AVIF)
-image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 sha2 = "0.10"
 
 # Platform services, settings and paths
@@ -58,6 +58,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 
 # Text
 unicode-segmentation = "1.13"
+# Highlight rules (PR 5.3): user-written regexes run on the `regex` crate, which matches in time
+# linear in the message (no backtracking), so a pathological pattern cannot stall chat.
+regex = "1.13"
 
 # Errors and logging
 thiserror = "2.0"

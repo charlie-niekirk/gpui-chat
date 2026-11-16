@@ -43,6 +43,25 @@ seventv = true                             # 7TV emotes (channel + global, zero-
 bttv = true                                # BetterTTV emotes (channel + global)
 ffz = true                                 # FrankerFaceZ emotes (channel + global)
 
+[highlights]                               # PR 5.3, see "Highlights and notifications" below
+mentions = true                            # highlight messages that say your login / display name
+mention_color = "accent"                   # accent | red | green | yellow (theme colours)
+mention_notify = true                      # system notification for a mention
+notifications = true                       # master switch for system notifications
+notification_previews = true               # false: "New highlight in #channel", no name or text
+
+[[highlights.rules]]                       # any number; phrases and regular expressions
+kind = "phrase"                            # phrase (plain text, any case) | regex
+pattern = "nice play"
+whole_word = true                          # phrases only: whole words (default) or anywhere
+color = "green"
+notify = false
+
+[[highlights.users]]                       # everything they say is highlighted
+login = "streamer"
+color = "yellow"
+notify = true
+
 [streamlink]
 # path = "/opt/homebrew/bin/streamlink"   # unset: found automatically (see below)
 # player = "mpv"                          # --player; unset: streamlink's default player
@@ -197,6 +216,72 @@ Moderation tools (buttons, menu items, the room-mode menu, `/timeout` and the ot
 broadcaster of the channel. They need Twitch permissions a normal login does not ask for (least privilege, and nobody who only
 watches chat is asked to log in again): choose **Enable moderation tools…** (account menu, *Settings → Account*, or the button on
 the strip that appears when you first use a tool) and approve the extra permissions. Logging in again later keeps them.
+
+## Highlights and notifications (PR 5.3)
+
+`[highlights]` says which messages to notice. The matching is `gpui_chat_core::highlight` (pure code, tested
+there); the app stamps the verdict on each message **as it arrives** (`MessageFlags::highlight`, and `mention`
+for your own name), so editing the rules recolours what comes next, not what is already on screen.
+
+- **Mentions** (`mentions`, on by default): your login, and your display name once the app has seen one of your
+  own messages (the login is all the account says), as a whole word in any case, with or without `@`. History
+  lines are checked too (their parser does not know you), so a mention in recent messages is drawn as one, but
+  history never counts or notifies.
+- **Rules** (`[[highlights.rules]]`): `kind = "phrase"` is plain text compared ignoring Unicode case (`É` = `é`);
+  with `whole_word = true` (the default) a letter, digit or `_` may not touch either end, except where the phrase
+  itself starts or ends with a symbol (`c++`, `!hype`). `kind = "regex"` is the Rust `regex` syntax, searched
+  unanchored and ignoring case (write `(?-i)` to match case). **A regular expression cannot stall chat:** the
+  engine's search time is linear in the message however the pattern is written (no backtracking), patterns are
+  compiled with a size limit, and one that matches the empty text (so every message, e.g. `.*`) is refused. Text is
+  matched as typed: an emote is its name, so `pog` as a whole word does not match the emote `PogChamp`.
+  **Limits:** a pattern is at most 500 characters *as typed* (phrases and regexes alike); one rule's compiled size is capped
+  (256 KiB) and all regular expressions together share a 4 MiB budget (they are searched in one pass with a `RegexSet`), so
+  200 rules cannot take hundreds of megabytes; over the budget none of the regular expressions is used and the problem says
+  so.
+- **Unicode:** case is ignored by *simple* Unicode case folding, exactly what the `regex` crate does: `É` = `é`, `Σ` = `ς`,
+  `ß` = `ẞ`. It is not full folding: `STRASSE` does **not** match `straße`, and the Turkish letters are their own: `istanbul`
+  does not match `İSTANBUL` or `ıstanbul`, while `İstanbul` matches `İSTANBUL`. Write a second rule if you need both.
+- **Users** (`[[highlights.users]]`): the login, case and a leading `@` ignored.
+- **Colours** are the theme's own (`accent`, `red` = `danger`, `green` = `success`, `yellow` = `warning`), so every
+  theme and variant gets a suitable tint; a value this build does not know reads as `accent`. A hit draws a tint and
+  a left bar in that colour (a removed message is not tinted).
+- **Priority:** your name, then rules in file order, then users. The first match picks the colour; the message
+  notifies if *any* matching rule says `notify`. Your own messages never match.
+- **Validation:** a rule that cannot be used makes the file invalid like any other bad value (the previous settings
+  stay, the banner says `rule 2: `(`: unclosed group`). At most 200 rules and 500 users. The settings window's
+  Highlights page edits these through `update_file` (`EditValue::Tables` writes the `[[...]]` blocks; replacing a list
+  replaces all its blocks, so comments inside them are lost).
+
+**What counts:** only events for a channel that is open. A line that arrives for a channel just closed (the part is still on
+its way) or never opened is ignored, and in shared chat (PR 5.1) the *copy* of a line that another open channel shows too is
+drawn but not counted, so one line is one dot, one Mentions row and one notification, not one per channel. A line a moderator
+removes (a delete, a timeout, a ban, a clear) leaves the Mentions log, is taken out of a held summary and its banner in
+Notification Center is dismissed.
+
+**Unread and mention dots** (sidebar): a channel is *watched* while a pane shows it and the window is in front. A live
+message (not history, not yours, not removed) in any other channel makes its dot; a highlight hit among them becomes a
+count pill (`9+` above nine). Showing the channel in the **focused** pane while the window is in front clears both
+(switching to it, focusing its pane, coming back to the window); a channel in an unfocused pane stops counting new
+messages but keeps its backlog until focused. **Show Mentions** (View menu, ⇧⌘M, ⌘K) opens a panel beside the chat with
+the last 500 hits of every channel, newest first (the 200 newest are listed; the list is virtualised and rebuilt only when the
+log changes); clicking a row shows the message in its channel: the list pauses on it (new messages wait behind the "new
+messages" pill until you scroll or use it), the row flashes briefly, and a message that has left the scrollback says so.
+
+**Notifications** go through GPUI (`App::show_system_notification`, `UNUserNotificationCenter` on macOS) and are raised
+for a hit whose rule says `notify` (mentions: `mention_notify`) when the window is in the background *or* the channel is
+not on screen, unless `notifications = false`. At most one every 5 s: hits in between are counted and arrive as one
+"N more highlights in #a, #b" (nothing held fires after `notifications` is switched off). `notification_previews = false`
+leaves the author and the text out: the notification only says "New highlight in #channel", for a locked screen. Clicking one brings the app forward and shows the channel and message (the summary opens
+the Mentions panel). macOS is asked for permission the first time a notification is shown, never at startup. macOS only
+delivers notifications to an app **inside a `.app` bundle**: from `cargo run` GPUI logs
+`system notifications disabled: not running from an app bundle` (it shows in the log, below) and does nothing; highlights, dots and the Mentions
+panel work either way. Offline runs (`--firehose`, `--replay`) act as the login `viewer`.
+
+## Logging
+
+The app logs to stderr: `tracing` events and, because `tracing-subscriber` bridges the `log` crate, GPUI's own `log` records
+(why a notification could not be shown, a denied authorisation). Default filter `warn,gpui_chat=info,gpui_macos=info`;
+`RUST_LOG` overrides it (`RUST_LOG=gpui_macos=debug,gpui_chat=debug cargo run`).
 
 ## Twitch account (PR 3.1)
 

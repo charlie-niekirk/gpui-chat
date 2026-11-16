@@ -101,6 +101,7 @@ catalog![
         false "Chat" ClearSelection "Clear Selection",
         true "Chat" OpenUserCard "Open User Card for Selected Message",
         true "View" ToggleSidebar "Toggle Sidebar",
+        true "View" ShowMentions "Show Mentions",
         true "View" ToggleDebugHud "Toggle Debug HUD",
         true "Account" LogIn "Log In to Twitch…",
         true "Account" LogOut "Log Out",

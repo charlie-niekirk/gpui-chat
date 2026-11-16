@@ -13,6 +13,7 @@ cargo run -p gpui-chat-media --example gen_fixtures   # needs img2webp (brew ins
 | `animated.gif` | 28×28, 4 frames, delays 100/50/**0**/30 ms, right half transparent | `image` |
 | `animated.webp` | same frames, delays 100/50/**10**/30 ms, sub-rectangle frames | `img2webp -lossless -min_size` |
 | `animated-112.gif`, `animated-112.webp` | 112×112 (4x emote), 24 frames at 40 ms | `image`, `img2webp -lossless` |
+| `static.jpg` | 28×28 solid RGB(200,100,50) JPEG (quality 95), for the JPEG avatar decode test; `gen_fixtures jpeg` rewrites only this one | `image` |
 | `corrupt.png` | first half of `static.png` | — |
 | `oversized.png` | 4096×16, over the default 2048 px decode limit | `image` |
 

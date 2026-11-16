@@ -54,11 +54,29 @@ pub fn image(
     frame: Rc<RefCell<FrameImages>>,
     owner: EntityId,
 ) -> impl IntoElement {
+    image_with(key, side, radius, placeholder, frame, owner, false)
+}
+
+/// [`image`], and with `notify_failed` the owner is told to redraw once the image has failed for
+/// good, so it can draw something else in its place (the user card's initial). Only for a view
+/// that stops asking for the image then: an owner that keeps painting it would redraw forever.
+pub fn image_with(
+    key: Option<ImageKey>,
+    side: f32,
+    radius: f32,
+    placeholder: Hsla,
+    frame: Rc<RefCell<FrameImages>>,
+    owner: EntityId,
+    notify_failed: bool,
+) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, (), window, cx| {
             if let Some(key) = &key {
                 paint(key, bounds, radius, placeholder, &frame, owner, window, cx);
+                if notify_failed && Images::failed_for_good(key, cx) {
+                    cx.notify(owner);
+                }
             }
         },
     )

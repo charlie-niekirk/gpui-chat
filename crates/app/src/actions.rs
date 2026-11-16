@@ -34,7 +34,8 @@ actions!(
         OpenPalette,
         OpenChannelSwitcher,
         /// Opens the user card of the author of the selected chat message.
-        OpenUserCard
+        OpenUserCard,
+        ShowMentions
     ]
 );
 

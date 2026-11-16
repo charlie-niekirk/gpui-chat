@@ -159,6 +159,24 @@ pub fn detail_lines(profile: &UserProfile, follow: Option<Follow>, now: i64) -> 
     lines
 }
 
+/// What the avatar box shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvatarShow {
+    /// Their image (a placeholder while it loads).
+    Image,
+    /// A circle with the name's initial: logged out (no URL), no avatar, or the image failed for
+    /// good (not found, not an image, undecodable).
+    Initial,
+}
+
+/// Maps what is known about the avatar to what is drawn.
+pub fn avatar_show(url: Option<&str>, failed_for_good: bool) -> AvatarShow {
+    match url {
+        Some(_) if !failed_for_good => AvatarShow::Image,
+        _ => AvatarShow::Initial,
+    }
+}
+
 /// The first character of `name`, uppercased, for the avatar placeholder.
 pub fn initial(name: &str) -> String {
     name.chars()
@@ -309,17 +327,25 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
 
     // --- header: avatar, names, close ---
     // The avatar once Helix gave its URL; before that (and logged out) a circle with the initial.
-    let avatar = match model.avatar.as_ref() {
-        Some(url) => emote_thumb::image(
-            Some(gpui_chat_media::ImageKey::new(url.as_str())),
+    let avatar_key = model
+        .avatar
+        .as_ref()
+        .map(|url| gpui_chat_media::ImageKey::new(url.as_str()));
+    let failed = avatar_key
+        .as_ref()
+        .is_some_and(|key| Images::failed_for_good(key, cx));
+    let avatar = match (avatar_show(model.avatar.as_deref(), failed), avatar_key) {
+        (AvatarShow::Image, Some(key)) => emote_thumb::image_with(
+            Some(key),
             AVATAR,
             AVATAR / 2.0,
             tokens.border,
             images.clone(),
             owner,
+            true,
         )
         .into_any_element(),
-        None => div()
+        _ => div()
             .size(px(AVATAR))
             .rounded_full()
             .bg(tokens.border)
@@ -952,6 +978,16 @@ mod tests {
             ..profile()
         };
         assert!(detail_lines(&undated, None, now()).is_empty());
+    }
+
+    #[test]
+    fn the_avatar_is_its_image_unless_there_is_none_or_it_failed_for_good() {
+        let url = Some("https://static-cdn.jtvnw.net/x-profile_image-600x600.jpeg");
+        assert_eq!(avatar_show(url, false), AvatarShow::Image);
+        // Not found, not an image, undecodable: the same initial as the logged-out card.
+        assert_eq!(avatar_show(url, true), AvatarShow::Initial);
+        assert_eq!(avatar_show(None, false), AvatarShow::Initial);
+        assert_eq!(avatar_show(None, true), AvatarShow::Initial);
     }
 
     #[test]
