@@ -5,7 +5,8 @@
 //! The message element itself paints everything (and stays a single custom element). Rows
 //! report the pointer through [`MessageStyle::hovered_row`]; only the hovered row is wrapped and
 //! carries a button, so the other rows cost nothing extra, and the menu is a single element
-//! around all of them ([`row_menu`] reads the hovered row when it opens).
+//! around all of them ([`row_menu`] asks the selection surface what the right-click was over:
+//! the message, and a link under the pointer, PR 5.6).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,12 +17,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::{
-    AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement as _, MouseButton,
-    ParentElement as _, Styled as _, WeakEntity, Window, div, px,
+    AnyElement, App, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement as _,
+    MouseButton, ParentElement as _, Styled as _, WeakEntity, Window, div, px,
 };
 
-use super::element::{HoveredRow, MessageElement, MessageStyle};
+use super::element::{MessageElement, MessageStyle};
 use super::layout::LayoutCache;
+use super::selection::{self, one_line};
+use super::selection_layer::Surface;
 use super::view::ChatView;
 use crate::channels::ChannelStore;
 use crate::reply::can_reply_to;
@@ -37,6 +40,8 @@ pub struct RowContext {
     /// The row the pointer is over, if rows can be replied to (there is a composer): only that
     /// one gets a button.
     pub hovered: Option<u64>,
+    /// Rows can be replied to (there is a composer).
+    pub can_reply: bool,
 }
 
 /// The row for `message`: the plain element, or with the Reply button when the pointer is over it
@@ -85,44 +90,75 @@ pub fn message_row(
         .into_any_element()
 }
 
-/// The right-click menu for the row under the pointer when it opens (Reply, View thread), or an
-/// empty menu (which Kit does not show) when the pointer is over no row that can be replied to.
-/// `hovered` is the cell the rows keep current; `store` is where its message is looked up.
+/// The right-click menu for the row the right-click was over (resolved by `surface` at the click):
+/// Copy (when there is a selection), Copy message, Copy username, Open / Copy link (over a link),
+/// then Reply and View thread when `can_reply`. Empty (which Kit does not show) over no row.
+/// `store` is where the message is looked up. *Copy message* is the message's text alone; ⌘C on a
+/// selected whole message copies the chat line (`HH:MM name: text`).
 pub fn row_menu(
     view: WeakEntity<ChatView>,
     store: Entity<ChannelStore>,
-    hovered: HoveredRow,
+    surface: Rc<Surface>,
+    can_reply: bool,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, _, cx| {
-        let Some(seq) = hovered.get() else {
+        let Some(target) = surface.take_menu_target() else {
             return menu;
         };
         let store = store.read(cx);
-        let Some(message) = store
-            .messages()
-            .get_by_seq(seq)
-            .filter(|message| can_reply_to(message))
-            .cloned()
-        else {
+        let Some(message) = store.messages().get_by_seq(target.seq).cloned() else {
             return menu;
         };
+        // The text is taken now: a press on the menu clears the selection before the item runs.
+        let mut menu = match surface.selected_text(store.messages()) {
+            Some(text) => menu.item(copy_item("Copy", text)).separator(),
+            None => menu,
+        };
+        menu = menu.item(copy_item("Copy message", one_line(&message.plain_text())));
+        if let Some(author) = &message.author {
+            menu = menu.item(copy_item(
+                "Copy username",
+                selection::username(author).to_owned(),
+            ));
+        }
+        if let Some(url) = target.link {
+            let open = url.clone();
+            menu = menu
+                .separator()
+                .item(
+                    PopupMenuItem::new("Open link")
+                        .disabled(!selection::openable(&url))
+                        .on_click(move |_, _, cx| cx.open_url(&open)),
+                )
+                .item(copy_item("Copy link", url.to_string()));
+        }
+        if !can_reply || !can_reply_to(&message) {
+            return menu;
+        }
         let in_thread = in_thread(store, &message);
         let (reply_view, reply_message) = (view.clone(), message.clone());
         let (thread_view, root) = (view.clone(), message.thread_root().clone());
-        menu.item(
-            PopupMenuItem::new("Reply")
-                .on_click(move |_, _, cx| request_reply(&reply_view, &reply_message, cx)),
-        )
-        .item(
-            PopupMenuItem::new("View thread")
-                .disabled(!in_thread)
-                .on_click(move |_, window, cx| {
-                    thread_view
-                        .update(cx, |view, cx| view.open_thread(root.clone(), window, cx))
-                        .ok();
-                }),
-        )
+        menu.separator()
+            .item(
+                PopupMenuItem::new("Reply")
+                    .on_click(move |_, _, cx| request_reply(&reply_view, &reply_message, cx)),
+            )
+            .item(
+                PopupMenuItem::new("View thread")
+                    .disabled(!in_thread)
+                    .on_click(move |_, window, cx| {
+                        thread_view
+                            .update(cx, |view, cx| view.open_thread(root.clone(), window, cx))
+                            .ok();
+                    }),
+            )
     }
+}
+
+/// A menu item that puts `text` on the clipboard.
+fn copy_item(label: &'static str, text: String) -> PopupMenuItem {
+    PopupMenuItem::new(label)
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
 }
 
 fn request_reply(view: &WeakEntity<ChatView>, message: &Arc<Message>, cx: &mut App) {

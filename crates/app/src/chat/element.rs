@@ -37,6 +37,7 @@ use super::colors;
 use super::display::{self, BadgeSlot, DisplayEmote, DisplayOptions, Role};
 use super::flow::{AtomKind, Flow};
 use super::layout::{LayoutCache, LayoutKey, MessageLayout, ReplyFit, ReplyLine, ShapedMessage};
+use super::selection_layer::Surface;
 use super::tooltip::{EmoteHover, Target};
 use crate::badges::Badges;
 use crate::images::{EmoteBox, FrameImages, Images, Lookup};
@@ -150,6 +151,9 @@ pub struct MessageStyle {
     /// Where each row reports whether the pointer is over it; `None` when nothing needs to know
     /// (a chat without a composer).
     pub hovered_row: Option<HoveredRow>,
+    /// Where rows report their geometry and find their part of the selection (PR 5.6); all
+    /// selection and link handling lives there ([`super::selection_layer`]).
+    pub selection: Option<Rc<Surface>>,
 }
 
 /// One message in the chat list.
@@ -328,6 +332,8 @@ pub struct Prepainted {
     /// The reply context line as laid out for this width, with its hit area when it can be
     /// clicked.
     reply: Option<PreparedReply>,
+    /// Hit areas of the links (for their cursor).
+    links: Vec<Hitbox>,
 }
 
 /// The reply context line for one frame.
@@ -639,17 +645,25 @@ impl Element for MessageElement {
             .reply
             .as_ref()
             .map(|line| self.prepare_reply(line, bounds, window));
+        let origin = self.content_origin(bounds, &layout);
+        let links = self
+            .style
+            .selection
+            .as_ref()
+            .map_or_else(Vec::new, |surface| {
+                surface.prepaint_row(self.seq, bounds, origin, &layout, window)
+            });
         if layout.shaped.inlines.is_empty() && self.style.hovered_row.is_none() {
             return Prepainted {
                 layout,
                 hitbox: None,
                 reply,
+                links,
             };
         }
         // Normal behaviour: it only answers "is the pointer over this message"; wheel events
         // still reach the list.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let origin = self.content_origin(bounds, &layout);
         for inline in &layout.shaped.inlines {
             let target = Target {
                 seq: self.seq,
@@ -665,6 +679,7 @@ impl Element for MessageElement {
             layout,
             hitbox: Some(hitbox),
             reply,
+            links,
         }
     }
 
@@ -705,6 +720,16 @@ impl Element for MessageElement {
                 self.paint_reply(line, prepared, window);
             }
             let origin = self.content_origin(bounds, &prepainted.layout);
+            // The selection goes behind the text.
+            if let Some(surface) = &style.selection {
+                surface.paint_row(
+                    self.seq,
+                    origin,
+                    &prepainted.layout,
+                    &prepainted.links,
+                    window,
+                );
+            }
             let line_height = style.line_height;
             let baseline = (line_height - shaped.ascent - shaped.descent) / 2.0 + shaped.ascent;
             // Top of the text in `line`: the line-height box centred in the (maybe taller) line.

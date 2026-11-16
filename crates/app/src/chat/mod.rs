@@ -8,6 +8,8 @@
 //! * [`element`] — the custom GPUI `Element` that measures and paints one message.
 //! * [`list_sync`] — incremental list splices from store sequence numbers (pure).
 //! * [`row`] — a row with its reply button and context menu; [`thread`] — the thread popover.
+//! * [`selection`] — selecting text across messages, and what copying it gives (pure);
+//!   [`selection_layer`] — the mouse, the highlight, links and autoscroll in the window.
 //! * [`tooltip`] — emote hover tooltips (preview, name, provider).
 //! * [`view`] — the `ChatView` entity: list, follow-bottom, "new messages" pill, live settings.
 
@@ -18,6 +20,8 @@ pub mod flow;
 pub mod layout;
 pub mod list_sync;
 pub mod row;
+pub mod selection;
+pub mod selection_layer;
 pub mod thread;
 pub mod tooltip;
 pub mod view;

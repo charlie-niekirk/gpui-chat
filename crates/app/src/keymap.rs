@@ -36,6 +36,7 @@ use gpui_kit::{
 
 use crate::actions::*;
 use crate::bridge::{self, BridgeReceiver};
+use crate::chat::selection_layer::{ClearSelection, CopySelection};
 use crate::completion::{
     ComposerComplete, ComposerCompletePrevious, ComposerCompletionDismiss,
     ComposerToggleEmotePicker,
@@ -96,6 +97,8 @@ catalog![
         true "Pane" FocusPaneRight "Focus Pane Right",
         true "Pane" FocusPaneUp "Focus Pane Above",
         true "Pane" FocusPaneDown "Focus Pane Below",
+        true "Chat" CopySelection "Copy Selection",
+        false "Chat" ClearSelection "Clear Selection",
         true "View" ToggleSidebar "Toggle Sidebar",
         true "View" ToggleDebugHud "Toggle Debug HUD",
         true "Account" LogIn "Log In to Twitch…",
@@ -690,6 +693,63 @@ mod tests {
             let held = cx.key_bindings().borrow().bindings().count();
             assert_eq!(held, kit + platform::default_bindings().len() - 1);
         });
+    }
+
+    /// A composer-like box: the input inside the composer's key context, as in a pane.
+    struct ComposerBox {
+        input: Entity<gpui_kit::component::input::InputState>,
+    }
+
+    impl gpui_kit::Render for ComposerBox {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{InteractiveElement as _, ParentElement as _};
+            gpui_kit::div()
+                .key_context(crate::actions::COMPOSER_CONTEXT)
+                .child(gpui_kit::component::input::Input::new(&self.input))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn copy_in_the_input_box_copies_its_own_text_not_the_chat_selection(cx: &mut TestAppContext) {
+        setup(cx);
+        let chat_copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = chat_copies.clone();
+        cx.update(|cx| {
+            crate::theme::apply_settings(
+                &gpui_chat_settings::AppearanceSettings::default(),
+                None,
+                cx,
+            );
+            cx.on_action(move |_: &CopySelection, _| counter.set(counter.get() + 1));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| ComposerBox {
+            input: cx.new(|cx| {
+                gpui_kit::component::input::InputState::new(window, cx).default_value("typed text")
+            }),
+        });
+        cx.update(|window, cx| {
+            let input = view.read(cx).input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.run_until_parked();
+        let (all, copy) = if cfg!(target_os = "macos") {
+            ("cmd-a", "cmd-c")
+        } else {
+            ("ctrl-a", "ctrl-c")
+        };
+        cx.simulate_keystrokes(all);
+        cx.simulate_keystrokes(copy);
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("typed text")
+        );
+        assert_eq!(chat_copies.get(), 0, "the chat's Copy is not what ⌘C ran");
     }
 
     fn keys_of_default<A: Action>(action: A, cx: &mut TestAppContext) -> Vec<String> {

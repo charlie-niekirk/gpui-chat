@@ -37,7 +37,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
   `alt-e` would fire before text input and the input box could no longer type them (and on macOS
   `alt-` makes accents). Keys that type nothing (`escape`, arrows, `f1`…, `tab`, `enter`) may stand
   alone.
-- **`context`** is a GPUI key-context expression (`AppShell`, `ChatComposer > Input`,
+- **`context`** is a GPUI key-context expression (`AppShell`, `ChatView`, `ChatComposer > Input`,
   `EmotePicker > Input`). Left out, it is the context the action's own default shortcut has, so
   rebinding keeps working where the default did. A shortcut in a narrower context beats one in a
   wider context (the input box's Tab beats a global Tab).
@@ -66,6 +66,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 | `SplitRight` / `SplitDown` | Split Right / Down | ⌘D / ⌥⇧⌘D |
 | `ClosePane` | Close Pane | ⇧⌘W |
 | `FocusPaneLeft` `FocusPaneRight` `FocusPaneUp` `FocusPaneDown` | Focus Pane … | ⌃⌘←→↑↓ |
+| `CopySelection` | Copy Selection (the selected chat text; context `ChatView`) | ⌘C |
 | `ToggleSidebar` | Toggle Sidebar | ⌘B, ⌘\ |
 | `ToggleDebugHud` | Toggle Debug HUD | ⌘⇧D |
 | `LogIn` / `LogOut` | Log In to Twitch… / Log Out | |
@@ -76,7 +77,10 @@ Bindable but not in the palette (the input box and the emote picker; contexts
 `ComposerHistoryNext` (↓), `ComposerComplete` (Tab), `ComposerCompletePrevious` (⇧Tab),
 `ComposerCompletionDismiss` (Esc), `ComposerToggleEmotePicker` (⌘E), `EmotePickerLeft`
 `EmotePickerRight` `EmotePickerUp` `EmotePickerDown` `EmotePickerNextTab` `EmotePickerPreviousTab`
-`EmotePickerClose`. They keep their defaults unless an entry names them.
+`EmotePickerClose`; and in the chat (context `ChatView`, focused by a press in the messages)
+`ClearSelection` (Esc: clears the selection and goes back to the input box; with nothing
+selected Esc goes on). `CopySelection` likewise goes on when nothing is selected; in the input box
+⌘C is the box's own copy. They keep their defaults unless an entry names them.
 
 The list lives in `crates/app/src/keymap.rs` (`catalog`); a test fails if an action is defined and
 missing from it.
