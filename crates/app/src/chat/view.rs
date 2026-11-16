@@ -274,8 +274,17 @@ impl ChatView {
             .messages()
             .rebuilds_since(self.rebuilds_seen);
         self.rebuilds_seen = serial;
-        for rebuild in rebuilds.iter().flatten() {
-            self.apply_rebuild(rebuild);
+        match &rebuilds {
+            Some(rebuilds) => rebuilds
+                .iter()
+                .for_each(|rebuild| self.apply_rebuild(rebuild)),
+            // The list replaces every row below: nothing keyed by an old number means anything.
+            None => {
+                self.surface.reset();
+                if let Some(panel) = &self.thread {
+                    panel.surface.reset();
+                }
+            }
         }
         let (first, next) = {
             let messages = self.store.read(cx).messages();
@@ -338,6 +347,12 @@ impl ChatView {
         self.unseen_from = self
             .unseen_from
             .map(|from| rebuild.map_seq(from).unwrap_or(rebuild.new_first));
+        // The selection (and the right-click target, the press in progress) follow their messages.
+        let map = |seq| rebuild.map_seq(seq);
+        self.surface.remap(&map);
+        if let Some(panel) = &self.thread {
+            panel.surface.remap(&map);
+        }
         // The row under the pointer is found again by the next mouse move.
         self.hovered.set(None);
         if let Some(panel) = &self.thread {
@@ -1620,6 +1635,79 @@ mod tests {
         });
         assert_eq!(oldest.as_deref(), Some("h20"));
         assert!(h.following(cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_selection_follows_its_messages_when_history_is_inserted_before_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(4, "hello world", cx);
+        // From inside message 1 to inside message 2: a partial first line, a partial second.
+        press(point_of(&h, 1, 3, cx), point_of(&h, 2, 8, cx), 1, cx);
+        let before = selected(&h, cx).expect("a selection");
+        assert!(before.contains('\n'), "{before:?}");
+        let ids = ("m1", "m2");
+        let seq_of = |h: &Harness, id: &str, cx: &mut VisualTestContext| {
+            h.store
+                .read_with(cx, |s, _| s.messages().seq_of(id).expect("the message"))
+        };
+        let old = (seq_of(&h, ids.0, cx), seq_of(&h, ids.1, cx));
+
+        history_before(6, cx, &h);
+
+        let new = (seq_of(&h, ids.0, cx), seq_of(&h, ids.1, cx));
+        assert_ne!(new, old, "the messages were renumbered");
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.surface.selection_seqs()),
+            Some(new.0..=new.1),
+            "the selection moved with them"
+        );
+        assert_eq!(
+            selected(&h, cx),
+            Some(before.clone()),
+            "…and still copies the same text"
+        );
+        // ⌘C's action.
+        assert!(h.view.update(cx, |v, cx| v.copy_selection(cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(before)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_selection_is_dropped_when_the_list_replaces_every_row(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(4, "hello world", cx);
+        press(point_of(&h, 1, 3, cx), point_of(&h, 2, 8, cx), 1, cx);
+        assert!(selected(&h, cx).is_some());
+        // More renumbering merges in one batch than the store remembers: the view cannot replay
+        // them, so it replaces every row and nothing keyed by an old number can be trusted.
+        h.store.update(cx, |store, cx| {
+            for n in 0..10i64 {
+                let mut message = Message::chat(
+                    format!("x{n}"),
+                    Timestamp(-100 - n),
+                    Author::new("old", "Old"),
+                    vec![Fragment::Text("earlier".into())],
+                );
+                message.flags.history = true;
+                store.apply(ChatEvent::History {
+                    channel: ChannelId::new("test"),
+                    messages: vec![Arc::new(message)],
+                    moderation: Vec::new(),
+                });
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(selected(&h, cx), None);
+        assert_eq!(
+            h.view.read_with(cx, |v, _| v.surface.selection_seqs()),
+            None
+        );
+        assert_eq!(h.items(cx), 14, "every row is there, replaced");
     }
 
     #[gpui_kit::test]

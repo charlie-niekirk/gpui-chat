@@ -224,8 +224,10 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   (rows dropped at the front, runs of inserted rows, `map_seq` old to new): `ChatView::sync` replays it as list splices
   (`apply_rebuild`), so measured rows, the reader's scroll position (GPUI moves its anchor for splices above it) and the
   "new messages" count survive, and the layout caches are re-keyed (`LayoutCache::remap`). More merges than the store
-  remembers (8) fall back to replacing every row. Anything else keyed by a sequence number must be remapped there too (the
-  hovered row is cleared). The renumbering itself is O(scrollback) in the store, once per merge that adds messages before
+  remembers (8) fall back to replacing every row. `apply_rebuild` also moves everything of PR 5.6 that is keyed by a sequence number through `Rebuild::map_seq`
+  (`Surface::remap`: the selection and its two end texts, the press's link, the context-menu target, the popover's rows;
+  a selection whose end message is gone is cleared) and clears the hovered row; when the view falls back to replacing every row
+  `Surface::reset` drops the selection and the target. Any new state keyed by a sequence number must be remapped there too. The renumbering itself is O(scrollback) in the store, once per merge that adds messages before
   others. History rows are drawn at `Tokens::history_opacity` (`chat/row.rs`), derived per theme from how far its muted text
   sits between background and text, and `flags.history` stays on the message for notifications (PR 5.3) to skip. The
   setting is read when a channel is joined, so a change applies to the next join or reconnect.
