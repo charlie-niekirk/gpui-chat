@@ -279,10 +279,16 @@ pub fn row_menu(
                 _ => "View user".to_owned(),
             };
             let (card_view, position) = (view.clone(), target.position);
+            // The author's own name: the card is about the account that sent this message.
+            let origin = message
+                .author
+                .as_ref()
+                .filter(|author| author.login.eq_ignore_ascii_case(&login))
+                .and_then(|author| author.user_id.clone());
             menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
                 card_view
                     .update(cx, |view, cx| {
-                        view.open_user_card(&login, position, window, cx)
+                        view.open_user_card(&login, origin.as_deref(), position, window, cx)
                     })
                     .ok();
             }));

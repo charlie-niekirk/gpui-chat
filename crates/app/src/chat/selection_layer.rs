@@ -95,6 +95,8 @@ struct RowGeometry {
 pub struct UserTarget {
     /// Lowercase login.
     pub login: Arc<str>,
+    /// The message the click was in; `None` for the parent's name on a reply line.
+    pub seq: Option<u64>,
     pub position: Point<Pixels>,
 }
 
@@ -234,6 +236,9 @@ pub struct Surface {
     /// The rows this surface shows, when it shows only some of the store (the thread popover).
     members: RefCell<Option<Vec<u64>>>,
     menu_target: RefCell<Option<MenuTarget>>,
+    /// Where a card drawn over this surface is: a press inside it is not "elsewhere" (it must not
+    /// clear the selection).
+    overlay: Cell<Option<Bounds<Pixels>>>,
     /// Who hears about a click on a name or mention.
     on_user: RefCell<Option<Rc<OnUser>>>,
     #[cfg(test)]
@@ -264,6 +269,7 @@ impl Surface {
             members: RefCell::default(),
             menu_target: RefCell::default(),
             on_user: RefCell::default(),
+            overlay: Cell::default(),
             #[cfg(test)]
             last_aimed: RefCell::default(),
             color: Cell::new(Hsla::default()),
@@ -435,6 +441,29 @@ impl Surface {
         (!text.is_empty()).then_some(text)
     }
 
+    /// Opens `login`'s card at `position`, as a click on their name in a row would (the reply
+    /// line's parent name does this).
+    pub fn open_user(
+        &self,
+        login: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let on_user = self.on_user.borrow().clone();
+        if let Some(on_user) = on_user {
+            on_user(
+                UserTarget {
+                    login: Arc::from(login.to_ascii_lowercase()),
+                    seq: None,
+                    position,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
     /// The sequence number of the first message the selection touches.
     pub fn selection_start(&self) -> Option<u64> {
         self.selection
@@ -457,6 +486,23 @@ impl Surface {
         self.bounds
             .get()
             .map(|bounds| bounds.origin + point(px(24.0), px(24.0)))
+    }
+
+    /// Tells the surface where the card over it is (`None`: there is none).
+    pub fn set_overlay(&self, bounds: Option<Bounds<Pixels>>) {
+        self.overlay.set(bounds);
+    }
+
+    /// Where the card over this surface is (tests).
+    #[cfg(test)]
+    pub fn overlay_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.overlay.get()
+    }
+
+    fn in_overlay(&self, position: Point<Pixels>) -> bool {
+        self.overlay
+            .get()
+            .is_some_and(|bounds| bounds.contains(&position))
     }
 
     /// Installs what happens when a name or mention is clicked (the view does it every render,
@@ -778,7 +824,11 @@ impl Surface {
                 self.hit(position)
                     .is_some_and(|hit| hit.seq == *seq && hit.user().as_deref() == Some(&**login))
             })
-            .map(|(_, login)| UserTarget { login, position });
+            .map(|(seq, login)| UserTarget {
+                login,
+                seq: Some(seq),
+                position,
+            });
         let id = self.clicks.get() + 1;
         self.clicks.set(id);
         *self.pending.borrow_mut() = Some(PendingClick { id, link });
@@ -889,6 +939,7 @@ impl Surface {
             if phase == DispatchPhase::Capture
                 && event.button == MouseButton::Left
                 && !outside.is_hovered(window)
+                && !surface.in_overlay(event.position)
                 && surface.clear()
             {
                 cx.notify(view);

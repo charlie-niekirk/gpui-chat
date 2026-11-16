@@ -51,8 +51,9 @@ pub use tokenizer::{
     WordResolver, parse_emotes_tag, resolve_fragments, twitch_emote_ranges,
 };
 pub use user_card::{
-    CardActions, KnownUser, MAX_CARD_MESSAGES, card_actions, format_age, format_date, is_login,
-    is_shared_copy, known_user, parse_rfc3339, profile_url, user_messages,
+    CardActions, CardMessages, KnownUser, MAX_CARD_MESSAGES, card_actions, duration_words,
+    format_age, format_date, is_login, is_shared_copy, known_user, parse_rfc3339, profile_url,
+    same_account, user_messages,
 };
 
 /// Name of this crate, used by the placeholder test below.

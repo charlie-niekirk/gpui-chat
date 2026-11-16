@@ -46,8 +46,69 @@ pub fn user_messages(store: &MessageStore, login: &str, limit: usize) -> Vec<(u6
         .collect()
 }
 
+/// One user's messages in a store, kept up to date without scanning it again: the card asks for
+/// them every frame it is open, and a busy channel holds up to 100 000 messages.
+///
+/// It remembers which sequence numbers were theirs and how far into the store it has looked; each
+/// [`CardMessages::update`] only looks at what arrived since, forgets what was evicted, and starts
+/// over when the store renumbered its messages (a history merge, [`MessageStore::rebuild_serial`]).
+/// The messages themselves are read from the store each time, so a removal or any other
+/// replacement shows at once.
+#[derive(Debug, Clone)]
+pub struct CardMessages {
+    login: String,
+    /// Their sequence numbers, oldest first, at most [`MAX_CARD_MESSAGES`].
+    seqs: Vec<u64>,
+    /// The sequence number the next scan starts at.
+    scanned_to: u64,
+    /// The store's rebuild serial at the last scan; `None` before the first.
+    rebuilds: Option<u64>,
+}
+
+impl CardMessages {
+    pub fn new(login: &str) -> Self {
+        Self {
+            login: login.to_owned(),
+            seqs: Vec::new(),
+            scanned_to: 0,
+            rebuilds: None,
+        }
+    }
+
+    /// Their messages in `store`, newest first, at most [`MAX_CARD_MESSAGES`], with their
+    /// sequence numbers; the same as [`user_messages`] would give.
+    pub fn update(&mut self, store: &MessageStore) -> Vec<(u64, Arc<Message>)> {
+        let serial = store.rebuild_serial();
+        if self.rebuilds != Some(serial) || store.next_seq() < self.scanned_to {
+            self.seqs.clear();
+            self.scanned_to = store.first_seq();
+            self.rebuilds = Some(serial);
+        }
+        self.seqs.extend(
+            store
+                .iter_since(self.scanned_to)
+                .filter(|(_, message)| is_by(message, &self.login))
+                .map(|(seq, _)| seq),
+        );
+        self.scanned_to = store.next_seq();
+        let evicted = self.seqs.partition_point(|seq| *seq < store.first_seq());
+        self.seqs.drain(..evicted);
+        if self.seqs.len() > MAX_CARD_MESSAGES {
+            self.seqs.drain(..self.seqs.len() - MAX_CARD_MESSAGES);
+        }
+        self.seqs
+            .iter()
+            .rev()
+            .filter_map(|seq| {
+                let message = store.get_by_seq(*seq)?;
+                is_by(message, &self.login).then(|| (*seq, Arc::clone(message)))
+            })
+            .collect()
+    }
+}
+
 /// Whether `message` is something `login` said (case-insensitively).
-fn is_by(message: &Message, login: &str) -> bool {
+pub fn is_by(message: &Message, login: &str) -> bool {
     let wrote = match message.kind {
         MessageKind::Chat | MessageKind::Action => true,
         MessageKind::UserNotice => !message.fragments.is_empty(),
@@ -65,6 +126,9 @@ fn is_by(message: &Message, login: &str) -> bool {
 /// only known from another room of a shared chat.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KnownUser {
+    /// The store holds at least one message of theirs: their badges (and so whether they are a
+    /// moderator) are known. A user only named by a mention is not seen.
+    pub seen: bool,
     pub display_name: Option<String>,
     pub user_id: Option<String>,
     pub badges: Vec<BadgeId>,
@@ -81,6 +145,7 @@ pub fn known_user(messages: &[(u64, Arc<Message>)]) -> KnownUser {
     let Some((_, newest)) = messages.first() else {
         return known;
     };
+    known.seen = true;
     if let Some(author) = &newest.author {
         known.display_name =
             Some(author.display_name.clone()).filter(|name| !name.trim().is_empty());
@@ -120,7 +185,9 @@ impl CardActions {
 
 /// The moderation controls the card offers for `login` in `channel`, for a user who is `role`
 /// there and whose own login is `own_login` (when known). None for viewers, for the user
-/// themself, for the broadcaster, for someone known only from another room of a shared chat, and
+/// themself, for the broadcaster, for someone known only from another room of a shared chat, for
+/// someone not [seen](KnownUser::seen) (named by a mention: their badges, and so whether they are
+/// a moderator or the broadcaster, are unknown, and Twitch refuses to punish those), and
 /// (as for a message, [`crate::row_actions`]) none against another moderator or staff unless the
 /// user is the broadcaster. Unban is always offered to someone who may moderate: the card has no
 /// ban to read it off (the user's messages may have left the store), and Twitch answers
@@ -134,6 +201,7 @@ pub fn card_actions(
 ) -> CardActions {
     if !role.can_moderate()
         || !is_login(login)
+        || !known.seen
         || known.only_shared_copies
         || login.eq_ignore_ascii_case(channel.login())
         || own_login.is_some_and(|own| login.eq_ignore_ascii_case(own))
@@ -146,6 +214,31 @@ pub fn card_actions(
         ban: may_punish,
         unban: may_punish,
     }
+}
+
+/// Whether the account Helix found for a login (`helix_id`) is the one that sent the messages
+/// the card is about (`known_id`, the `user-id` of their message). After a rename another account
+/// may own the old login; moderating "by login" would then hit a stranger. Unknown ids agree.
+pub fn same_account(known_id: Option<&str>, helix_id: &str) -> bool {
+    known_id.is_none_or(|known| known == helix_id)
+}
+
+/// A timeout length in words for a screen reader: `10 minutes`, `1 hour`, `2 weeks`.
+pub fn duration_words(seconds: u64) -> String {
+    const UNITS: [(u64, &str); 5] = [
+        (604_800, "week"),
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    for (size, name) in UNITS {
+        if seconds >= size && seconds.is_multiple_of(size) {
+            let count = seconds / size;
+            return format!("{count} {name}{}", if count == 1 { "" } else { "s" });
+        }
+    }
+    format!("{seconds} seconds")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -222,7 +315,8 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// `14 Mar 2015` (UTC) for Unix seconds.
+/// `14 Mar 2015` for Unix seconds, in UTC like the chat's clock (`display::clock`, `HH:MM` UTC):
+/// the workspace has no time-zone data, and the card's dates are days, not times.
 pub fn format_date(unix_seconds: i64) -> String {
     let (year, month, day) = civil_from_days(unix_seconds.div_euclid(86_400));
     let month = usize::try_from(month - 1)
@@ -329,6 +423,101 @@ mod tests {
         assert!(user_messages(&store, "nobody", 10).is_empty());
     }
 
+    fn same(a: &[(u64, Arc<Message>)], b: &[(u64, Arc<Message>)]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.0 == y.0 && Arc::ptr_eq(&x.1, &y.1))
+    }
+
+    #[test]
+    fn the_cached_messages_follow_the_store_as_it_grows_evicts_and_changes() {
+        let mut store = MessageStore::with_capacity(6);
+        let mut cache = CardMessages::new("Bob");
+        let check = |store: &MessageStore, cache: &mut CardMessages| {
+            let fresh = user_messages(store, "bob", MAX_CARD_MESSAGES);
+            assert!(same(&cache.update(store), &fresh));
+            fresh.len()
+        };
+        assert_eq!(check(&store, &mut cache), 0);
+        store.push(chat("1", "bob", "a"));
+        store.push(chat("2", "alice", "b"));
+        assert_eq!(check(&store, &mut cache), 1);
+        // Nothing new: the same answer without a scan.
+        assert_eq!(check(&store, &mut cache), 1);
+        store.push(chat("3", "bob", "c"));
+        store.push(chat("4", "bob", "d"));
+        assert_eq!(check(&store, &mut cache), 3);
+        // A message changing (a removal replaces it) shows without being found again.
+        store.mark_deleted("3");
+        let shown = cache.update(&store);
+        assert!(
+            shown
+                .iter()
+                .any(|(_, m)| m.id.as_str() == "3" && m.flags.deleted)
+        );
+        // Eviction forgets the oldest.
+        for n in 5..12 {
+            store.push(chat(
+                &n.to_string(),
+                if n % 2 == 0 { "bob" } else { "alice" },
+                "x",
+            ));
+        }
+        assert_eq!(check(&store, &mut cache), 3);
+        assert!(
+            user_messages(&store, "bob", 10)
+                .iter()
+                .all(|(seq, _)| *seq >= store.first_seq())
+        );
+    }
+
+    #[test]
+    fn the_cache_starts_over_when_history_renumbers_the_store() {
+        let stamped = |id: &str, who: &str, ts: i64| {
+            Arc::new(Message::chat(
+                id,
+                Timestamp::from_unix_millis(ts),
+                author(who, &[]),
+                vec![Fragment::Text(id.to_owned())],
+            ))
+        };
+        let mut store = MessageStore::new();
+        store.push(stamped("live1", "bob", 100));
+        store.push(stamped("live2", "alice", 110));
+        let mut cache = CardMessages::new("bob");
+        assert_eq!(cache.update(&store).len(), 1);
+        let before = store.rebuild_serial();
+        store.merge_history(vec![stamped("old1", "bob", 10), stamped("old2", "bob", 20)]);
+        assert_ne!(store.rebuild_serial(), before, "history went before live");
+        let fresh = user_messages(&store, "bob", MAX_CARD_MESSAGES);
+        assert_eq!(fresh.len(), 3);
+        assert!(same(&cache.update(&store), &fresh));
+        // A store that was emptied and refilled is not mistaken for the old one.
+        let mut other = MessageStore::new();
+        other.push(stamped("n1", "bob", 1));
+        assert!(same(
+            &cache.update(&other),
+            &user_messages(&other, "bob", MAX_CARD_MESSAGES)
+        ));
+    }
+
+    #[test]
+    fn the_cache_keeps_the_newest_two_hundred() {
+        let mut store = MessageStore::new();
+        for n in 0..MAX_CARD_MESSAGES + 30 {
+            store.push(chat(&n.to_string(), "bob", "x"));
+        }
+        let mut cache = CardMessages::new("bob");
+        let shown = cache.update(&store);
+        assert_eq!(shown.len(), MAX_CARD_MESSAGES);
+        assert_eq!(shown[0].1.id.as_str(), (MAX_CARD_MESSAGES + 29).to_string());
+        assert!(same(
+            &shown,
+            &user_messages(&store, "bob", MAX_CARD_MESSAGES)
+        ));
+    }
+
     #[test]
     fn system_lines_and_textless_events_are_not_something_the_user_said() {
         let mut store = MessageStore::new();
@@ -425,6 +614,39 @@ mod tests {
     }
 
     #[test]
+    fn a_user_only_named_by_a_mention_gets_no_moderation() {
+        // Nothing of theirs is in the store: their badges are unknown, they may be a moderator
+        // or the broadcaster of another name.
+        let unseen = known_user(&[]);
+        assert!(!unseen.seen);
+        assert!(!actions(ChannelRole::Moderator, Some("me"), "bob", &unseen).any());
+        assert!(!actions(ChannelRole::Broadcaster, Some("streamer"), "bob", &unseen).any());
+        // Once a message shows them, the badges decide.
+        let seen = known_user(&[(0, chat("1", "bob", "hi"))]);
+        assert!(seen.seen);
+        assert!(actions(ChannelRole::Moderator, Some("me"), "bob", &seen).any());
+    }
+
+    #[test]
+    fn an_id_that_differs_from_the_messages_is_another_account() {
+        assert!(same_account(Some("77"), "77"));
+        assert!(!same_account(Some("77"), "78"));
+        assert!(same_account(None, "78"));
+    }
+
+    #[test]
+    fn timeouts_are_spoken_in_words() {
+        assert_eq!(duration_words(1), "1 second");
+        assert_eq!(duration_words(60), "1 minute");
+        assert_eq!(duration_words(600), "10 minutes");
+        assert_eq!(duration_words(3_600), "1 hour");
+        assert_eq!(duration_words(86_400), "1 day");
+        assert_eq!(duration_words(604_800), "1 week");
+        assert_eq!(duration_words(1_209_600), "2 weeks");
+        assert_eq!(duration_words(90), "90 seconds");
+    }
+
+    #[test]
     fn viewers_get_no_moderation() {
         let known = KnownUser::default();
         assert_eq!(
@@ -435,7 +657,10 @@ mod tests {
 
     #[test]
     fn a_moderator_may_act_on_an_ordinary_chatter() {
-        let known = KnownUser::default();
+        let known = KnownUser {
+            seen: true,
+            ..KnownUser::default()
+        };
         let offered = actions(ChannelRole::Moderator, Some("me"), "bob", &known);
         assert_eq!(
             offered,
@@ -450,7 +675,10 @@ mod tests {
 
     #[test]
     fn nobody_moderates_themselves_or_the_broadcaster() {
-        let known = KnownUser::default();
+        let known = KnownUser {
+            seen: true,
+            ..KnownUser::default()
+        };
         assert!(!actions(ChannelRole::Moderator, Some("Me"), "me", &known).any());
         assert!(!actions(ChannelRole::Moderator, Some("me"), "Streamer", &known).any());
         assert!(
@@ -467,12 +695,14 @@ mod tests {
     #[test]
     fn another_moderator_is_off_limits_except_to_the_broadcaster() {
         let known = KnownUser {
+            seen: true,
             badges: vec![BadgeId::new("moderator", "1")],
             ..KnownUser::default()
         };
         assert!(!actions(ChannelRole::Moderator, Some("me"), "bob", &known).any());
         assert!(actions(ChannelRole::Broadcaster, Some("streamer"), "bob", &known).any());
         let staff = KnownUser {
+            seen: true,
             badges: vec![BadgeId::new("staff", "1")],
             ..KnownUser::default()
         };
@@ -540,6 +770,17 @@ mod tests {
 
     fn at(text: &str) -> i64 {
         parse_rfc3339(text).unwrap()
+    }
+
+    #[test]
+    fn a_leap_day_account_turns_a_year_on_the_first_of_march() {
+        let created = at("2020-02-29T12:00:00Z");
+        assert_eq!(format_date(created), "29 Feb 2020");
+        let age = |now: &str| format_age(created, at(now));
+        assert_eq!(age("2021-02-28T12:00:00Z"), "11 months");
+        assert_eq!(age("2021-03-01T12:00:00Z"), "1 year");
+        assert_eq!(age("2024-02-29T12:00:00Z"), "4 years");
+        assert_eq!(age("2024-02-28T23:59:59Z"), "3 years");
     }
 
     #[test]

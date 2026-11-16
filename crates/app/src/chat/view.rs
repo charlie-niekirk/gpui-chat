@@ -332,6 +332,7 @@ impl ChatView {
     pub fn open_user_card(
         &mut self,
         login: &str,
+        origin_id: Option<&str>,
         anchor: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -343,12 +344,21 @@ impl ChatView {
         if let Some(directory) = user_directory::current(cx) {
             directory.update(cx, |directory, cx| directory.retry(&login, cx));
         }
-        self.user_card = Some(UserCard {
-            login: Arc::from(login),
-            anchor,
-        });
+        self.user_card = Some(UserCard::new(&login, origin_id, anchor));
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// The Twitch id of the author of message `seq` when `login` is that author's login: who the
+    /// card moderates when it is opened from their name or message.
+    pub fn sender_id(&self, seq: u64, login: &str, cx: &App) -> Option<String> {
+        let store = self.store.read(cx);
+        let author = store.messages().get_by_seq(seq)?.author.as_ref()?;
+        author
+            .login
+            .eq_ignore_ascii_case(login)
+            .then(|| author.user_id.clone())
+            .flatten()
     }
 
     /// Opens the card of the author of the first selected message (the `OpenUserCard` action);
@@ -376,15 +386,16 @@ impl ChatView {
             return false;
         };
         let anchor = surface.anchor_of(seq);
-        let login = self
+        let author = self
             .store
             .read(cx)
             .messages()
             .get_by_seq(seq)
-            .and_then(|message| message.author.as_ref().map(|author| author.login.clone()));
-        match (login, anchor) {
-            (Some(login), Some(anchor)) => {
-                self.open_user_card(&login, anchor, window, cx);
+            .and_then(|message| message.author.as_ref())
+            .map(|author| (author.login.clone(), author.user_id.clone()));
+        match (author, anchor) {
+            (Some((login, id)), Some(anchor)) => {
+                self.open_user_card(&login, id.as_deref(), anchor, window, cx);
                 self.user_card.is_some()
             }
             _ => false,
@@ -864,7 +875,18 @@ impl Render for ChatView {
             Rc::new(
                 move |target: UserTarget, window: &mut Window, cx: &mut App| {
                     view.update(cx, |view, cx| {
-                        view.open_user_card(&target.login, target.position, window, cx);
+                        // The id of the account that sent the message the name or mention is
+                        // in, when it is that account's own name.
+                        let origin = target
+                            .seq
+                            .and_then(|seq| view.sender_id(seq, &target.login, cx));
+                        view.open_user_card(
+                            &target.login,
+                            origin.as_deref(),
+                            target.position,
+                            window,
+                            cx,
+                        );
                     })
                     .ok();
                 },
@@ -993,8 +1015,8 @@ impl Render for ChatView {
                 }
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
-                // The card first: it is the thing on top, and Esc closes the top thing.
-                if this.close_user_card(cx) | this.clear_selection(cx) {
+                // The card first: it is the thing on top, and one Esc closes one thing.
+                if this.close_user_card(cx) || this.clear_selection(cx) {
                     cx.emit(ChatViewEvent::SelectionDismissed);
                 } else {
                     cx.propagate();
@@ -1029,24 +1051,40 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::AnyElement> {
-        let card = self.user_card.clone()?;
         let directory = user_directory::current(cx);
+        // The account changed (log out, log in as someone else): what was looked up belonged to
+        // the old one. Deferred, since this is a render and the directory notifies.
+        if let Some(directory) = directory.clone() {
+            cx.defer(move |cx| directory.update(cx, |directory, cx| directory.sync_account(cx)));
+        }
+        let Some(card) = self.user_card.as_mut() else {
+            self.surface.set_overlay(None);
+            if let Some(panel) = &self.thread {
+                panel.surface.set_overlay(None);
+            }
+            return None;
+        };
+        let (login, origin_id, anchor) = (card.login.clone(), card.origin_id.clone(), card.anchor);
         let logged_in = user_directory::available(cx);
         let own_login = crate::account::own_login(cx);
         let now = crate::live::now().unix_millis().div_euclid(1000);
         let (model, role, room_id, channel) = {
             let store = self.store.read(cx);
+            // Only what arrived since the last frame is looked at, not the scrollback.
+            let messages = card.messages.update(store.messages());
             let profile = directory
                 .as_ref()
-                .and_then(|directory| directory.read(cx).profile(&card.login).cloned());
+                .and_then(|directory| directory.read(cx).profile(&login).cloned());
             let room_id = store.room().room_id.clone();
             let follow = |user_id: &str| -> Option<Follow> {
                 let (directory, room_id) = (directory.as_ref()?, room_id.as_deref()?);
                 directory.read(cx).follow(room_id, user_id)
             };
             let model = CardModel::build(
-                &card.login,
-                store,
+                &login,
+                origin_id.as_deref(),
+                messages,
+                store.channel(),
                 profile.as_ref(),
                 &follow,
                 CardInputs {
@@ -1063,7 +1101,7 @@ impl ChatView {
         // Account details are asked for once per user and session (idempotent, off the UI thread).
         if logged_in {
             let wants_follow = model.wants_follow(role, room_id.as_deref());
-            let login = card.login.to_string();
+            let login = login.to_string();
             if let Some(directory) = directory {
                 cx.defer(move |cx| {
                     directory.update(cx, |directory, cx| {
@@ -1075,6 +1113,10 @@ impl ChatView {
                 });
             }
         }
+        let mut surfaces = vec![self.surface.clone()];
+        if let Some(panel) = &self.thread {
+            surfaces.push(panel.surface.clone());
+        }
         Some(user_card::render(
             user_card::Env {
                 tokens: *tokens,
@@ -1084,8 +1126,9 @@ impl ChatView {
                 deleted,
                 model: &model,
                 channel,
-                anchor: card.anchor,
+                anchor,
                 can_login: crate::account::current(cx).is_some(),
+                surfaces,
             },
             window,
             cx,
@@ -2647,6 +2690,8 @@ mod tests {
         });
         let name = at_text(&h, 0, "al", cx);
         press(name, name, 1, cx);
+        // The click is over (the double-click interval passed): the list is not held for it.
+        settle(cx);
         assert_eq!(card_login(&h, cx).as_deref(), Some("al"));
         // Opening the card gave the chat the focus, so Esc reaches it: it closes the card, the
         // owner is asked to focus the input box, and the key does not go on.
@@ -2735,13 +2780,13 @@ mod tests {
         // "@" and an `@`-prefixed login are accepted; nonsense is not.
         cx.update(|window, cx| {
             h.view.update(cx, |v, cx| {
-                v.open_user_card("@Dee", point(px(10.0), px(10.0)), window, cx);
+                v.open_user_card("@Dee", None, point(px(10.0), px(10.0)), window, cx);
             });
         });
         assert_eq!(card_login(&h, cx).as_deref(), Some("dee"));
         cx.update(|window, cx| {
             h.view.update(cx, |v, cx| {
-                v.open_user_card("not a login!", point(px(10.0), px(10.0)), window, cx);
+                v.open_user_card("not a login!", None, point(px(10.0), px(10.0)), window, cx);
             });
         });
         assert_eq!(card_login(&h, cx).as_deref(), Some("dee"));
@@ -2808,5 +2853,98 @@ mod tests {
                 .read_with(cx, |v, _| v.list.logical_scroll_top().item_ix),
             7
         );
+    }
+
+    #[gpui_kit::test]
+    fn a_double_click_on_a_bottom_row_name_selects_the_word_the_card_opens_above(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        push_events(&mut h, vec![said(0, "al", "hello there")], cx);
+        let name = at_text(&h, 0, "al", cx);
+        // The newest lines are at the bottom of the window: the card opens above the pointer, so
+        // it is not under it for the second press.
+        press(name, name, 1, cx);
+        assert_eq!(card_login(&h, cx).as_deref(), Some("al"));
+        press(name, name, 2, cx);
+        assert_eq!(selected(&h, cx).as_deref(), Some("al"));
+        assert_eq!(
+            card_login(&h, cx),
+            None,
+            "the second press is outside the card"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_press_inside_the_card_keeps_the_chat_selection(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "hello there"),
+                said(1, "cy", "general kenobi"),
+            ],
+            cx,
+        );
+        // Select something in the chat, then open a card (a name click replaces the selection,
+        // so open it from the menu path instead) and press inside it.
+        let from = at_text(&h, 1, "general", cx);
+        let to = at_text(&h, 1, "kenobi", cx);
+        press(from, to, 1, cx);
+        assert!(selected(&h, cx).is_some());
+        cx.update(|window, cx| {
+            h.view.update(cx, |v, cx| {
+                v.open_user_card("al", None, point(px(100.0), px(500.0)), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let card = h.view.read_with(cx, |v, _| v.surface.overlay_bounds());
+        let card = card.expect("the card told the surface where it is");
+        let inside = point(card.origin.x + px(20.0), card.origin.y + px(10.0));
+        press(inside, inside, 1, cx);
+        assert_eq!(
+            card_login(&h, cx).as_deref(),
+            Some("al"),
+            "a press on the card keeps it"
+        );
+        assert!(selected(&h, cx).is_some(), "and the selection");
+        // A press outside both clears the selection and closes the card.
+        let outside = point(px(2.0), px(20.0));
+        press(outside, outside, 1, cx);
+        assert_eq!(card_login(&h, cx), None);
+        assert_eq!(selected(&h, cx), None);
+    }
+
+    #[gpui_kit::test]
+    fn a_name_click_gives_the_card_the_id_of_the_account_that_sent_the_message(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        let mut message = Message::chat(
+            "m0",
+            Timestamp(0),
+            {
+                let mut author = Author::new("al", "Al");
+                author.user_id = Some("55".into());
+                author
+            },
+            vec![Fragment::Text("hello".into())],
+        );
+        message.flags.echo = false;
+        push_events(
+            &mut h,
+            vec![ChatEvent::Message {
+                channel: ChannelId::new("test"),
+                message: Arc::new(message),
+            }],
+            cx,
+        );
+        let name = at_text(&h, 0, "Al", cx);
+        press(name, name, 1, cx);
+        // The card knows whose message it was opened from: 55, from the message.
+        let origin = h.view.read_with(cx, |v, _| {
+            v.user_card.as_ref().and_then(|c| c.origin_id.clone())
+        });
+        assert_eq!(origin.as_deref(), Some("55"));
     }
 }

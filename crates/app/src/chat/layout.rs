@@ -357,6 +357,9 @@ pub struct ReplyLine {
     pub descent: Pixels,
     /// The room the line takes at the top of the row, gap to the text included.
     pub height: f32,
+    /// The parent's name (byte range of the text) and login: a click on it opens their card
+    /// (PR 5.4) instead of the thread.
+    pub user: Option<(std::ops::Range<usize>, Arc<str>)>,
 }
 
 impl ReplyLine {
@@ -387,7 +390,32 @@ impl ReplyLine {
             ascent: layout.ascent,
             descent: layout.descent,
             height,
+            user: None,
         }
+    }
+
+    /// The same line with the parent's name at `range` opening `login`'s card.
+    pub fn with_user(mut self, range: std::ops::Range<usize>, login: &str) -> Self {
+        self.user = Some((range, Arc::from(login.to_ascii_lowercase())));
+        self
+    }
+
+    /// Where the parent's name is drawn in `fit` (x from the line's left, and width), when it is
+    /// drawn whole: a name the ellipsis cut is not offered.
+    pub fn user_span(&self, fit: &ReplyFit) -> Option<(f32, f32)> {
+        let (range, _) = self.user.as_ref()?;
+        let drawn = &self.atoms[..fit.atoms.min(self.atoms.len())];
+        let first = drawn
+            .iter()
+            .position(|atom| atom.range.start >= range.start)?;
+        let last = drawn.iter().rposition(|atom| atom.range.end <= range.end)?;
+        (first <= last
+            && drawn[last].range.end == range.end
+            && drawn[first].range.start == range.start)
+            .then(|| {
+                let x = self.offsets[first];
+                (x, self.offsets[last] + drawn[last].width - x)
+            })
     }
 
     /// `text` with the `…` the line is cut with.

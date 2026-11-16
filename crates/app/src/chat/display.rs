@@ -227,8 +227,13 @@ impl DisplayText {
 
     /// Appends `name` as the [`Role::Name`] span of `author`, which opens their card.
     fn push_name(&mut self, author: &Author) {
+        self.push_name_as(author, Role::Name);
+    }
+
+    /// [`Self::push_name`] with another role (a collapsed removed line draws the name muted).
+    fn push_name_as(&mut self, author: &Author, role: Role) {
         let start = self.text.len();
-        self.push(author_name(author), Role::Name);
+        self.push(author_name(author), role);
         self.mark_user(start, &author.login);
     }
 
@@ -261,6 +266,16 @@ pub fn reply_text(reply: &ReplyRef) -> String {
     } else {
         format!("↳ Replying to {name}: {body}")
     }
+}
+
+/// The byte range of the parent's name in [`reply_text`], when it is a login's name that can open
+/// the card (the line's click on it opens that card instead of the thread).
+pub fn reply_name_range(reply: &ReplyRef) -> Option<Range<usize>> {
+    if !gpui_chat_core::is_login(&reply.parent_login) {
+        return None;
+    }
+    let start = "↳ Replying to ".len();
+    Some(start..start + reply.parent_name().len())
 }
 
 /// `HH:MM` (UTC) of a Unix millisecond timestamp.
@@ -382,7 +397,8 @@ pub fn build_collapsed(message: &Message, options: DisplayOptions) -> DisplayTex
         out.push(" ", Role::Separator);
     }
     if let Some(author) = &message.author {
-        out.push(author_name(author), Role::System);
+        // Still the user's card: a moderator unbans from a removed line.
+        out.push_name_as(author, Role::System);
         out.push(": ", Role::System);
     }
     out.push("<message deleted>", Role::System);
@@ -504,6 +520,23 @@ mod tests {
             parent_body: body.into(),
             thread_parent_id: None,
         }
+    }
+
+    #[test]
+    fn a_collapsed_line_and_a_reply_line_name_a_user_that_opens_a_card() {
+        let message = chat(vec![Fragment::Text("secret".into())]);
+        let collapsed = build_collapsed(&message, DisplayOptions::default());
+        let user = collapsed.user_at(1).expect("the name is clickable");
+        assert_eq!(&collapsed.text[user.range.clone()], "Alice");
+        assert_eq!(&*user.login, "alice");
+        assert!(collapsed.user_at("Alice: <".len()).is_none());
+        let reply = reply("hello there");
+        let text = reply_text(&reply);
+        let range = reply_name_range(&reply).unwrap();
+        assert_eq!(&text[range], "Bob");
+        let mut odd = reply.clone();
+        odd.parent_login = "not a login!".into();
+        assert_eq!(reply_name_range(&odd), None);
     }
 
     #[test]

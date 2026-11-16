@@ -1001,6 +1001,9 @@ async fn enabling_moderation_asks_for_the_extra_scopes_and_the_login_has_them() 
         .unwrap();
     assert!(account.moderation_enabled());
     assert!(account.has_moderation_scope("moderator:manage:banned_users"));
+    // Granted scopes are kept as they came, including ones no list of ours names.
+    assert!(account.has_scope("moderator:manage:banned_users"));
+    assert!(!account.has_scope(crate::users::FOLLOWERS_SCOPE));
     assert!(!account.needs_relogin());
 }
 

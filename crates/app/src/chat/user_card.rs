@@ -23,9 +23,9 @@
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    BadgeId, CardActions, ChannelRole, KnownUser, MAX_CARD_MESSAGES, Message, MessageKind,
-    TIMEOUT_PRESETS, card_actions, format_age, format_date, format_seconds, known_user,
-    profile_url, user_messages,
+    BadgeId, CardActions, CardMessages, ChannelId, ChannelRole, KnownUser, MAX_CARD_MESSAGES,
+    Message, MessageKind, TIMEOUT_PRESETS, card_actions, duration_words, format_age, format_date,
+    format_seconds, known_user, profile_url, same_account,
 };
 use gpui_chat_settings::DeletedMessages;
 use gpui_chat_twitch::UserProfile;
@@ -34,13 +34,13 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::{
     Anchor, AnyElement, ClipboardItem, Context, EntityId, InteractiveElement as _,
     IntoElement as _, MouseButton, ParentElement as _, Pixels, Point, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored, deferred, div,
-    point, px,
+    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored, canvas, deferred,
+    div, point, px, uniform_list,
 };
 
 use super::display;
+use super::selection_layer::Surface;
 use super::view::ChatView;
-use crate::channels::ChannelStore;
 use crate::emote_thumb;
 use crate::images::{FrameImages, Images};
 use crate::moderation::{RowAction, is_collapsed};
@@ -54,8 +54,10 @@ use std::rc::Rc;
 const WIDTH: f32 = 340.0;
 const AVATAR: f32 = 56.0;
 const BADGE: f32 = 18.0;
-/// The message list scrolls beyond this height.
+/// The message list scrolls beyond this height. Its rows have one fixed height (two lines of
+/// text), so only the visible ones are built however long the list is.
 const LIST_HEIGHT: f32 = 190.0;
+const ROW_HEIGHT: f32 = 46.0;
 /// Where the card sits relative to the pointer that opened it.
 const OFFSET: (f32, f32) = (6.0, 10.0);
 
@@ -64,8 +66,25 @@ const OFFSET: (f32, f32) = (6.0, 10.0);
 pub struct UserCard {
     /// Lowercase login.
     pub login: Arc<str>,
+    /// The Twitch id of the account whose message (name) the card was opened from: that, and not
+    /// whoever owns the login now, is who moderation is aimed at. `None` for a mention, a
+    /// reply line or a user with no message.
+    pub origin_id: Option<Arc<str>>,
     /// Window coordinates.
     pub anchor: Point<Pixels>,
+    /// Their messages in the store, kept up to date without scanning it each frame.
+    pub messages: CardMessages,
+}
+
+impl UserCard {
+    pub fn new(login: &str, origin_id: Option<&str>, anchor: Point<Pixels>) -> Self {
+        Self {
+            login: Arc::from(login),
+            origin_id: origin_id.filter(|id| !id.is_empty()).map(Arc::from),
+            anchor,
+            messages: CardMessages::new(login),
+        }
+    }
 }
 
 /// What the account part of the card says.
@@ -74,7 +93,7 @@ pub enum Details {
     /// Nobody is logged in: Helix cannot be asked.
     LoggedOut,
     Loading,
-    /// Twitch has no account with this login.
+    /// Twitch has no account with this login (it was renamed, suspended or deleted).
     Missing,
     Failed(String),
     /// One line each: when the account was created, how long they have followed.
@@ -92,12 +111,16 @@ pub struct CardModel {
     pub avatar: Option<String>,
     pub badges: Vec<BadgeId>,
     /// Their messages in this channel, newest first.
-    pub messages: Vec<(u64, Arc<Message>)>,
+    pub messages: Rc<Vec<(u64, Arc<Message>)>>,
     pub details: Details,
+    /// The account that owns this login now is not the one that sent the messages (a rename: the
+    /// old name went to someone else). The card says so, and offers no moderation.
+    pub conflict: bool,
     pub actions: CardActions,
     /// The newest message that can be replied to, when replying is possible.
     pub reply_to: Option<Arc<Message>>,
-    /// The id the moderation request can use (saves a lookup): Twitch's, else the one on a message.
+    /// The id moderation is aimed at (and the follow lookup uses): the sender's, from the message
+    /// the card was opened from or their newest one, else Helix's for the login.
     pub user_id: Option<String>,
 }
 
@@ -155,27 +178,32 @@ pub fn messages_title(count: usize) -> String {
 }
 
 impl CardModel {
-    /// Builds the card for `login` from `store`, the directory's answer for it (`profile`,
-    /// `follow`) and the login state.
+    /// Builds the card for `login`: `messages` are theirs (newest first,
+    /// [`CardMessages::update`]), `origin_id` the id of the sender of the message the card was
+    /// opened from, `profile` / `follow` the directory's answers and `inputs` the rest.
     pub fn build(
         login: &str,
-        store: &ChannelStore,
+        origin_id: Option<&str>,
+        messages: Vec<(u64, Arc<Message>)>,
+        channel: &ChannelId,
         profile: Option<&Profile>,
         follow: &dyn Fn(&str) -> Option<Follow>,
         inputs: CardInputs<'_>,
     ) -> Self {
-        let messages = user_messages(store.messages(), login, MAX_CARD_MESSAGES);
         let known = known_user(&messages);
         let found = match profile {
             Some(Profile::Found(profile)) => Some(profile),
             _ => None,
         };
-        let user_id = found
-            .map(|profile| profile.id.clone())
-            .or_else(|| known.user_id.clone());
+        // Who sent the messages: the message the card was opened from, else their newest.
+        let sender_id = origin_id.or(known.user_id.as_deref());
+        let conflict = found.is_some_and(|profile| !same_account(sender_id, &profile.id));
+        let user_id = sender_id
+            .map(str::to_owned)
+            .or_else(|| found.map(|profile| profile.id.clone()));
         let details = match profile {
             Some(Profile::Found(profile)) => {
-                let follow = user_id.as_deref().and_then(follow);
+                let follow = user_id.as_deref().filter(|_| !conflict).and_then(follow);
                 Details::Found(detail_lines(profile, follow, inputs.now))
             }
             Some(Profile::Missing) => Details::Missing,
@@ -185,14 +213,8 @@ impl CardModel {
             None if inputs.logged_in => Details::Loading,
             None => Details::LoggedOut,
         };
-        let actions = if inputs.moderation {
-            card_actions(
-                inputs.role,
-                store.channel(),
-                inputs.own_login,
-                login,
-                &known,
-            )
+        let actions = if inputs.moderation && !conflict {
+            card_actions(inputs.role, channel, inputs.own_login, login, &known)
         } else {
             CardActions::default()
         };
@@ -211,8 +233,9 @@ impl CardModel {
                         .cloned()
                 })
                 .flatten(),
-            messages,
+            messages: Rc::new(messages),
             details,
+            conflict,
             actions,
             user_id,
         }
@@ -225,7 +248,7 @@ impl CardModel {
         role: ChannelRole,
         room_id: Option<&str>,
     ) -> Option<(String, String)> {
-        if !role.can_moderate() || !matches!(self.details, Details::Found(_)) {
+        if !role.can_moderate() || self.conflict || !matches!(self.details, Details::Found(_)) {
             return None;
         }
         Some((room_id?.to_owned(), self.user_id.clone()?))
@@ -260,9 +283,12 @@ pub struct Env<'a> {
     pub images: Rc<RefCell<FrameImages>>,
     pub deleted: DeletedMessages,
     pub model: &'a CardModel,
-    pub channel: gpui_chat_core::ChannelId,
+    pub channel: ChannelId,
     pub anchor: Point<Pixels>,
     pub can_login: bool,
+    /// The selection surfaces the card sits over: a press inside the card must not clear their
+    /// selection, so they are told where the card is.
+    pub surfaces: Vec<Rc<Surface>>,
 }
 
 /// The card, positioned at its anchor (and kept inside the window).
@@ -277,6 +303,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
         channel,
         anchor,
         can_login,
+        surfaces,
     } = env;
     let muted = tokens.text_muted;
 
@@ -305,6 +332,11 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
             .child(initial(&model.title))
             .into_any_element(),
     };
+    let avatar = div()
+        .id("user-card-avatar")
+        .flex_none()
+        .aria_label(format!("Avatar of {}", model.title))
+        .child(avatar);
     let login_line = if model.title.eq_ignore_ascii_case(&model.login) {
         None
     } else {
@@ -314,7 +346,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     let header = h_flex()
         .gap_3()
         .items_center()
-        .child(div().flex_none().child(avatar))
+        .child(avatar)
         .child(
             v_flex()
                 .flex_1()
@@ -355,7 +387,7 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
             .children(lines.iter().map(|line| div().text_sm().child(line.clone())))
             .into_any_element(),
         Details::Loading => muted_line("Loading account details…", muted),
-        Details::Missing => muted_line("No Twitch account has this name.", muted),
+        Details::Missing => muted_line("No such account (renamed or suspended?)", muted),
         Details::Failed(why) => {
             let retry_view = view.clone();
             let login = model.login.clone();
@@ -398,6 +430,14 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
             .into_any_element(),
     };
 
+    // After a rename the login can belong to someone else: say so, and moderation is off.
+    let conflict = model.conflict.then(|| {
+        div()
+            .text_sm()
+            .text_color(tokens.danger_text)
+            .child("This name now belongs to a different account than the one who sent these messages (renamed?). Moderation is off.")
+    });
+
     // --- actions ---
     let actions = actions_row(model, &view);
     let moderation = moderation_rows(model, &view, &tokens);
@@ -406,8 +446,24 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     let list = message_list(model, deleted, &tokens, &view);
 
     let close_on_outside = view.clone();
+    // Where the card is, for the surfaces under it: a press inside it keeps their selection.
+    let place = canvas(
+        move |bounds, _, _| {
+            for surface in &surfaces {
+                surface.set_overlay(Some(bounds));
+            }
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .size_full();
+    // Below the middle of the window the card opens upward from the pointer: the newest lines
+    // (the ones people click) are at the bottom, and a card over the pointer would take the second
+    // press of a double-click.
+    let upward = anchor.y > window.viewport_size().height / 2.0;
     let card = v_flex()
         .id("user-card")
+        .relative()
         .occlude()
         .w(px(WIDTH))
         .max_w_full()
@@ -430,16 +486,24 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
         .child(header)
         .children(badges)
         .child(details)
+        .children(conflict)
         .child(actions)
         .children(moderation)
-        .child(list);
+        .child(list)
+        .child(place);
 
     deferred(
         anchored()
-            .anchor(Anchor::TopLeft)
+            .anchor(if upward {
+                Anchor::BottomLeft
+            } else {
+                Anchor::TopLeft
+            })
             .position(anchor)
-            .offset(point(px(OFFSET.0), px(OFFSET.1)))
-            .snap_to_window_with_margin(px(8.0))
+            .offset(point(
+                px(OFFSET.0),
+                px(if upward { -OFFSET.1 } else { OFFSET.1 }),
+            ))
             .child(card),
     )
     .with_priority(2)
@@ -457,7 +521,7 @@ fn muted_line(text: &str, color: gpui_kit::Hsla) -> AnyElement {
 /// The badges the user has in this channel, each its image and title.
 fn badge_chips(
     model: &CardModel,
-    channel: &gpui_chat_core::ChannelId,
+    channel: &ChannelId,
     tokens: &Tokens,
     images: &Rc<RefCell<FrameImages>>,
     owner: EntityId,
@@ -619,6 +683,7 @@ fn moderation_rows(
                 .xsmall()
                 .label(format_seconds(seconds))
                 .tooltip(RowAction::Timeout(seconds).label())
+                .accessibility_label(format!("Time out for {}", duration_words(seconds)))
                 .disabled(!actions.timeout)
                 .on_click(move |_, _, cx| run(RowAction::Timeout(seconds), cx)),
         );
@@ -667,56 +732,95 @@ fn moderation_rows(
     )
 }
 
-/// The user's messages, newest first, each one a click that jumps to it in the chat.
+/// The user's messages, newest first, each one a click that jumps to it in the chat. A list of
+/// fixed-height rows: only the visible ones are built.
 fn message_list(
     model: &CardModel,
     deleted: DeletedMessages,
     tokens: &Tokens,
     view: &WeakEntity<ChatView>,
 ) -> AnyElement {
-    let mut rows = v_flex().w_full();
-    for (seq, message) in &model.messages {
-        let seq = *seq;
-        let jump_view = view.clone();
-        let removed = message.flags.deleted;
-        let collapsed = is_collapsed(message, deleted, false);
-        let text = row_text(message, deleted);
-        let mut body = div().flex_1().min_w_0().text_sm().line_clamp(3);
-        if removed || collapsed {
-            body = body.text_color(tokens.text_muted);
-            // A struck-through message keeps its text; a collapsed one has none to strike.
-            if !collapsed {
-                body = body.line_through();
-            }
-        }
-        let body = body.child(text);
-        let mut row = h_flex()
-            .id(SharedString::from(format!("user-card-row-{seq}")))
-            .w_full()
-            .gap_2()
-            .items_start()
-            .px_1()
-            .py_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|row| row.bg(tokens.border.opacity(0.5)))
-            .tooltip(|window, cx| {
-                gpui_kit::component::tooltip::Tooltip::new("Jump to this message").build(window, cx)
-            })
-            .on_click(move |_, _, cx| {
-                jump_view
-                    .update(cx, |view, cx| view.jump_from_card(seq, cx))
-                    .ok();
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(tokens.text_muted)
-                    .child(display::clock(message.timestamp.unix_millis())),
-            );
+    let messages = model.messages.clone();
+    let count = messages.len();
+    let (tokens_for_rows, view) = (*tokens, view.clone());
+    let list = uniform_list("user-card-messages", count, move |range, _, _| {
+        range
+            .filter_map(|ix| messages.get(ix))
+            .map(|(seq, message)| message_row(*seq, message, deleted, &tokens_for_rows, &view))
+            .collect::<Vec<_>>()
+    })
+    .w_full()
+    .h(px((count as f32 * ROW_HEIGHT).min(LIST_HEIGHT)));
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(tokens.text_muted)
+                .child(messages_title(count)),
+        )
+        .child(list)
+        .into_any_element()
+}
+
+/// One row of the list: time, text (two lines at most), a "history" mark for a message from
+/// recent-messages history; struck through (or collapsed) when it was removed.
+fn message_row(
+    seq: u64,
+    message: &Arc<Message>,
+    deleted: DeletedMessages,
+    tokens: &Tokens,
+    view: &WeakEntity<ChatView>,
+) -> AnyElement {
+    let jump_view = view.clone();
+    let removed = message.flags.deleted;
+    let collapsed = is_collapsed(message, deleted, false);
+    let text = row_text(message, deleted);
+    let time = display::clock(message.timestamp.unix_millis());
+    let label = format!(
+        "{time}{}: {text}. Jump to this message",
         if message.flags.history {
-            row = row.child(
+            ", from history"
+        } else {
+            ""
+        }
+    );
+    let mut body = div().flex_1().min_w_0().text_sm().line_clamp(2);
+    if removed || collapsed {
+        body = body.text_color(tokens.text_muted);
+        // A struck-through message keeps its text; a collapsed one has none to strike.
+        if !collapsed {
+            body = body.line_through();
+        }
+    }
+    let body = body.child(text);
+    let mut row = h_flex()
+        .id(SharedString::from(format!("user-card-row-{seq}")))
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .gap_2()
+        .items_start()
+        .px_1()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|row| row.bg(tokens.border.opacity(0.5)))
+        .aria_label(label)
+        .on_click(move |_, _, cx| {
+            jump_view
+                .update(cx, |view, cx| view.jump_from_card(seq, cx))
+                .ok();
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(tokens.text_muted)
+                .child(time),
+        );
+    if message.flags.history {
+        row = row
+            .child(
                 div()
                     .flex_none()
                     .px_1()
@@ -726,40 +830,25 @@ fn message_list(
                     .text_xs()
                     .text_color(tokens.text_muted)
                     .child("history"),
-            );
-            row = row.child(
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .opacity(tokens.history_opacity)
                     .child(body),
             );
-        } else {
-            row = row.child(body);
-        }
-        rows = rows.child(row);
+    } else {
+        row = row.child(body);
     }
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(tokens.text_muted)
-                .child(messages_title(model.messages.len())),
-        )
-        .child(
-            div()
-                .id("user-card-messages")
-                .max_h(px(LIST_HEIGHT))
-                .overflow_y_scroll()
-                .child(rows),
-        )
-        .into_any_element()
+    row.into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use gpui_chat_core::{Author, ChannelId, ChatEvent, Fragment, Removal, Timestamp};
+
+    use crate::channels::ChannelStore;
 
     use super::*;
 
@@ -791,6 +880,37 @@ mod tests {
                 vec![Fragment::Text(text.to_owned())],
             )),
         }
+    }
+
+    /// The card for `login` from `store`, opened from nothing in particular.
+    fn build_for(
+        login: &str,
+        store: &ChannelStore,
+        profile: Option<&Profile>,
+        follow: &dyn Fn(&str) -> Option<Follow>,
+        inputs: CardInputs<'_>,
+    ) -> CardModel {
+        build_from(login, None, store, profile, follow, inputs)
+    }
+
+    fn build_from(
+        login: &str,
+        origin_id: Option<&str>,
+        store: &ChannelStore,
+        profile: Option<&Profile>,
+        follow: &dyn Fn(&str) -> Option<Follow>,
+        inputs: CardInputs<'_>,
+    ) -> CardModel {
+        let messages = CardMessages::new(login).update(store.messages());
+        CardModel::build(
+            login,
+            origin_id,
+            messages,
+            store.channel(),
+            profile,
+            follow,
+            inputs,
+        )
     }
 
     fn store(events: impl IntoIterator<Item = ChatEvent>) -> ChannelStore {
@@ -860,7 +980,7 @@ mod tests {
             chat("2", "alice", "hi", 2_000),
             chat("3", "Bob", "again", 3_000),
         ]);
-        let model = CardModel::build(
+        let model = build_for(
             "Bob",
             &store,
             None,
@@ -883,7 +1003,7 @@ mod tests {
     fn a_found_profile_gives_the_avatar_the_name_and_the_account_lines() {
         let store = store([chat("1", "bob", "hello", 1_000)]);
         let found = Profile::Found(Arc::new(profile()));
-        let model = CardModel::build(
+        let model = build_for(
             "bob",
             &store,
             Some(&found),
@@ -902,7 +1022,7 @@ mod tests {
     fn each_lookup_state_has_its_own_text() {
         let store = store([]);
         let build = |profile: Option<&Profile>, logged_in| {
-            CardModel::build(
+            build_for(
                 "bob",
                 &store,
                 profile,
@@ -924,7 +1044,7 @@ mod tests {
     #[test]
     fn a_user_with_no_messages_still_gets_a_card_and_nothing_to_reply_to() {
         let store = store([chat("1", "alice", "hi", 1_000)]);
-        let model = CardModel::build(
+        let model = build_for(
             "bob",
             &store,
             None,
@@ -947,7 +1067,7 @@ mod tests {
             message_id: "2".into(),
             login: None,
         });
-        let model = CardModel::build(
+        let model = build_for(
             "bob",
             &store,
             None,
@@ -962,7 +1082,7 @@ mod tests {
             ..inputs(false, ChannelRole::Viewer)
         };
         assert!(
-            CardModel::build("bob", &store, None, &|_| None, no_box)
+            build_for("bob", &store, None, &|_| None, no_box)
                 .reply_to
                 .is_none()
         );
@@ -976,7 +1096,7 @@ mod tests {
                 moderation,
                 ..inputs(true, role)
             };
-            CardModel::build(login, &store, None, &|_| None, inputs).actions
+            build_for(login, &store, None, &|_| None, inputs).actions
         };
         assert!(build("bob", ChannelRole::Moderator, true).any());
         assert!(!build("bob", ChannelRole::Viewer, true).any());
@@ -988,11 +1108,65 @@ mod tests {
     }
 
     #[test]
+    fn a_user_named_only_by_a_mention_gets_no_moderation_until_a_message_shows_them() {
+        let none = store([chat("1", "alice", "hi", 1_000)]);
+        let inputs = inputs(true, ChannelRole::Moderator);
+        assert!(
+            !build_for("bob", &none, None, &|_| None, inputs)
+                .actions
+                .any()
+        );
+        let some = store([chat("1", "bob", "hi", 1_000)]);
+        assert!(
+            build_for("bob", &some, None, &|_| None, inputs)
+                .actions
+                .any()
+        );
+    }
+
+    #[test]
+    fn an_account_that_is_not_the_sender_is_a_conflict_and_gets_no_moderation() {
+        // The messages are from account 77 (see `chat`); Helix says the login is account 99 now.
+        let store = store([chat("1", "bob", "hi", 1_000)]);
+        let inputs = inputs(true, ChannelRole::Moderator);
+        let other = Profile::Found(Arc::new(UserProfile {
+            id: "99".into(),
+            ..profile()
+        }));
+        let model = build_for("bob", &store, Some(&other), &|_| None, inputs);
+        assert!(model.conflict);
+        assert!(!model.actions.any());
+        assert_eq!(
+            model.user_id.as_deref(),
+            Some("77"),
+            "still aimed at the sender"
+        );
+        assert_eq!(
+            model.wants_follow(ChannelRole::Moderator, Some("1000")),
+            None
+        );
+        // The same account: no conflict, moderation as usual.
+        let same = Profile::Found(Arc::new(profile()));
+        let model = build_for("bob", &store, Some(&same), &|_| None, inputs);
+        assert!(!model.conflict);
+        assert!(model.actions.any());
+        // Opened from a message by another id than the newest one: that message's sender counts.
+        let model = build_from("bob", Some("55"), &store, Some(&same), &|_| None, inputs);
+        assert!(model.conflict, "77 is not who sent the clicked message");
+        assert_eq!(model.user_id.as_deref(), Some("55"));
+        assert!(!model.actions.any());
+        // With nothing to compare against, Helix's id is used and nothing conflicts.
+        let empty = self::store([]);
+        let model = build_for("bob", &empty, Some(&same), &|_| None, inputs);
+        assert!(!model.conflict);
+        assert_eq!(model.user_id.as_deref(), Some("77"));
+    }
+
+    #[test]
     fn the_follow_lookup_is_for_a_moderator_who_has_both_ids() {
         let store = store([chat("1", "bob", "hello", 1_000)]);
         let found = Profile::Found(Arc::new(profile()));
-        let model =
-            |role| CardModel::build("bob", &store, Some(&found), &|_| None, inputs(true, role));
+        let model = |role| build_for("bob", &store, Some(&found), &|_| None, inputs(true, role));
         assert_eq!(
             model(ChannelRole::Moderator).wants_follow(ChannelRole::Moderator, Some("1000")),
             Some(("1000".to_owned(), "77".to_owned()))
@@ -1006,7 +1180,7 @@ mod tests {
             None
         );
         // Nothing to ask while the account is not known.
-        let loading = CardModel::build(
+        let loading = build_for(
             "bob",
             &store,
             None,
