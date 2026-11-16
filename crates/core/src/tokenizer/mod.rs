@@ -318,24 +318,16 @@ impl<'a> Tokenizer<'a> {
         if self.cheermote_prefixes.is_empty() {
             return None;
         }
-        // The amount is the trailing run of digits; prefixes may themselves contain
-        // digits (`4Head100` is prefix `4Head`, 100 bits), so try each split of the run.
-        let run_start = word
-            .rfind(|c: char| !c.is_ascii_digit())
-            .map(|i| i + word[i..].chars().next().map_or(1, char::len_utf8))?;
-        (run_start..word.len())
-            .filter(|&i| i > 0 && !word[i..].starts_with('0'))
-            .find_map(|i| {
-                let (prefix, digits) = word.split_at(i);
-                let bits: u32 = digits.parse().ok()?;
-                self.cheermote_prefixes
-                    .iter()
-                    .any(|p| p.eq_ignore_ascii_case(prefix))
-                    .then(|| Fragment::Cheer {
-                        prefix: prefix.to_owned(),
-                        bits,
-                    })
-            })
+        let (prefix, bits) = split_cheer(word, |prefix| {
+            self.cheermote_prefixes
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(prefix))
+        })?;
+        Some(Fragment::Cheer {
+            prefix: prefix.to_owned(),
+            bits,
+            image: None,
+        })
     }
 
     /// A piece of a word that contains no emoji: look for a mention or link between
@@ -451,9 +443,26 @@ pub fn resolve_fragments(
     Some(b.finish().fragments)
 }
 
+/// Splits a word such as `Cheer100` into its prefix and bit amount, when `is_prefix` knows the
+/// prefix. The amount is the trailing run of digits; prefixes may themselves contain digits
+/// (`4Head100` is prefix `4Head`, 100 bits), so each split of the run is tried. An amount has no
+/// leading zero.
+pub(crate) fn split_cheer(word: &str, is_prefix: impl Fn(&str) -> bool) -> Option<(&str, u32)> {
+    let run_start = word
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + word[i..].chars().next().map_or(1, char::len_utf8))?;
+    (run_start..word.len())
+        .filter(|&i| i > 0 && !word[i..].starts_with('0'))
+        .find_map(|i| {
+            let (prefix, digits) = word.split_at(i);
+            let bits: u32 = digits.parse().ok()?;
+            is_prefix(prefix).then_some((prefix, bits))
+        })
+}
+
 /// Fragments whose text can be one piece of a larger word: the tokenizer splits `abc👍`,
 /// `@bob,` and `(x.com)` into several fragments without any whitespace between.
-fn joins_word(fragment: &Fragment) -> bool {
+pub(crate) fn joins_word(fragment: &Fragment) -> bool {
     matches!(
         fragment,
         Fragment::Emoji { .. } | Fragment::Mention { .. } | Fragment::Link { .. }
@@ -461,7 +470,7 @@ fn joins_word(fragment: &Fragment) -> bool {
 }
 
 /// Calls `f` with the byte range of every whitespace-delimited word of `text`, in order.
-fn for_each_word(text: &str, mut f: impl FnMut(std::ops::Range<usize>)) {
+pub(crate) fn for_each_word(text: &str, mut f: impl FnMut(std::ops::Range<usize>)) {
     let mut start: Option<usize> = None;
     for (i, c) in text.char_indices() {
         if c.is_whitespace() {

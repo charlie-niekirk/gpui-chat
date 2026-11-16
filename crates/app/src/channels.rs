@@ -11,11 +11,12 @@
 //! unit-tested without a window.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageKind,
-    MessageStore, Moderation, RoomState,
+    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, EventKind, Message,
+    MessageId, MessageKind, MessageStore, Moderation, RoomState,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
 
@@ -37,7 +38,13 @@ pub struct ChannelStore {
     /// them (a fetch that was in flight, a gap answer) is struck through too, see
     /// [`ChannelStore::apply`].
     live_moderation: VecDeque<Moderation>,
+    /// The latest mystery (gift bomb) rows as `(origin id, message id)`: the per-recipient lines
+    /// that follow are folded into them (PR 5.1), see [`ChannelStore::fold_gift`].
+    gift_rows: VecDeque<(String, MessageId)>,
 }
+
+/// How many gift bombs [`ChannelStore`] folds lines into at a time.
+const GIFT_ROWS: usize = 16;
 
 /// How many live moderation actions [`ChannelStore`] remembers for history that arrives later.
 const MODERATION_LOG: usize = 128;
@@ -56,6 +63,7 @@ impl ChannelStore {
             replaced: VecDeque::new(),
             replaced_serial: 0,
             live_moderation: VecDeque::new(),
+            gift_rows: VecDeque::new(),
         }
     }
 
@@ -120,19 +128,16 @@ impl ChannelStore {
                     MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
                 ) && let Some(shown) = self.messages.get(message.id.as_str())
                 {
-                    if shown.flags.echo
-                        && !message.flags.echo
-                        && let Some(seq) = self.messages.replace(message)
-                    {
-                        self.replaced_serial += 1;
-                        if self.replaced.len() >= REPLACED_LOG {
-                            self.replaced.pop_front();
-                        }
-                        self.replaced.push_back((self.replaced_serial, seq));
+                    if shown.flags.echo && !message.flags.echo && self.replace_logged(message) {
                         return true;
                     }
                     return false;
                 }
+                // One line of a gift bomb whose row is here: it joins the row (PR 5.1).
+                if let Some(changed) = self.fold_gift(&message) {
+                    return changed;
+                }
+                self.note_gift_row(&message);
                 self.messages.push(message);
                 true
             }
@@ -144,6 +149,10 @@ impl ChannelStore {
                 moderation,
                 ..
             } => {
+                let messages = fold_gifts(messages);
+                for message in &messages {
+                    self.note_gift_row(message);
+                }
                 let rebuilds = self.messages.rebuild_serial();
                 let mut changed = self.messages.merge_history(messages) > 0;
                 if self.messages.rebuild_serial() != rebuilds {
@@ -191,6 +200,65 @@ impl ChannelStore {
         }
     }
 
+    /// Replaces the retained message with `message`'s id by it and logs the replacement for the
+    /// views; `false` when no retained message has that id.
+    fn replace_logged(&mut self, message: Arc<Message>) -> bool {
+        let Some(seq) = self.messages.replace(message) else {
+            return false;
+        };
+        self.replaced_serial += 1;
+        if self.replaced.len() >= REPLACED_LOG {
+            self.replaced.pop_front();
+        }
+        self.replaced.push_back((self.replaced_serial, seq));
+        true
+    }
+
+    /// Remembers `message` as a gift bomb row that later lines can be folded into.
+    fn note_gift_row(&mut self, message: &Message) {
+        let Some(EventKind::MysteryGift {
+            origin_id: Some(origin),
+            ..
+        }) = &message.event
+        else {
+            return;
+        };
+        if self.gift_rows.len() >= GIFT_ROWS {
+            self.gift_rows.pop_front();
+        }
+        self.gift_rows
+            .push_back((origin.clone(), message.id.clone()));
+    }
+
+    /// One per-recipient line of a gift bomb (`message`) whose row is shown: the recipient is
+    /// added to the row (the row is replaced in place) and the line is not shown on its own.
+    /// `None` when `message` is not such a line or its row is not here (then it is shown, quietly);
+    /// `Some(changed)` when it was folded (`false`: the recipient was there already).
+    fn fold_gift(&mut self, message: &Message) -> Option<bool> {
+        let Some(EventKind::Gift {
+            recipient,
+            community_gift_id: Some(origin),
+            ..
+        }) = &message.event
+        else {
+            return None;
+        };
+        let row_id = self
+            .gift_rows
+            .iter()
+            .rev()
+            .find(|(known, _)| known == origin)?
+            .1
+            .clone();
+        let row = self.messages.get(row_id.as_str())?.clone();
+        let Some(event) = row.event.as_ref()?.with_recipient(recipient.name()) else {
+            return Some(false);
+        };
+        let mut updated = (*row).clone();
+        updated.event = Some(event);
+        Some(self.replace_logged(Arc::new(updated)))
+    }
+
     fn remember(&mut self, moderation: Moderation) {
         if self.live_moderation.len() >= MODERATION_LOG {
             self.live_moderation.pop_front();
@@ -206,6 +274,46 @@ impl ChannelStore {
         }
         changed
     }
+}
+
+/// `messages` (recent history, oldest first) with the per-recipient lines of each gift bomb folded
+/// into its row when the row is among them; lines whose row is not stay.
+fn fold_gifts(messages: Vec<Arc<Message>>) -> Vec<Arc<Message>> {
+    let mut out: Vec<Arc<Message>> = Vec::with_capacity(messages.len());
+    let mut rows: HashMap<String, usize> = HashMap::new();
+    for message in messages {
+        if let Some(EventKind::MysteryGift {
+            origin_id: Some(origin),
+            ..
+        }) = &message.event
+        {
+            rows.insert(origin.clone(), out.len());
+        }
+        let folded = match &message.event {
+            Some(EventKind::Gift {
+                recipient,
+                community_gift_id: Some(origin),
+                ..
+            }) => rows.get(origin).copied().map(|at| {
+                let event = out[at]
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.with_recipient(recipient.name()));
+                (at, event)
+            }),
+            _ => None,
+        };
+        match folded {
+            Some((at, Some(event))) => {
+                let mut row = (*out[at]).clone();
+                row.event = Some(event);
+                out[at] = Arc::new(row);
+            }
+            Some((_, None)) => {}
+            None => out.push(message),
+        }
+    }
+    out
 }
 
 /// Splits a batch into per-channel runs, keeping each channel's events in arrival order and
@@ -347,6 +455,19 @@ impl ChannelHub {
         let started = Instant::now();
         let count = events.len();
         let (groups, unrouted) = split_by_channel(events);
+        // Rooms that the batch itself announces, for the shared-chat check below: a replay (or a
+        // join burst) can deliver a channel's `ROOMSTATE` and the first shared messages together.
+        let announced: Vec<(ChannelId, String)> = groups
+            .iter()
+            .flat_map(|(channel, events)| {
+                events.iter().filter_map(move |event| match event {
+                    ChatEvent::RoomState { update, .. } => {
+                        update.room_id.clone().map(|id| (channel.clone(), id))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
         let mut changed = false;
         for event in unrouted {
             match event {
@@ -361,6 +482,7 @@ impl ChannelHub {
             }
         }
         for (channel, events) in groups {
+            let events = self.name_shared_sources(&channel, events, &announced, cx);
             let store = match self.stores.get(&channel) {
                 Some(store) => store.clone(),
                 None if self.auto_create && !self.closed.contains(&channel) => {
@@ -379,6 +501,83 @@ impl ChannelHub {
         self.diagnostics
             .record_batch(started, count, started.elapsed());
         changed
+    }
+
+    /// Names the source channel of shared-chat messages (PR 5.1) that came from a channel this
+    /// hub has open, by its login: Twitch only says which *room* a message was sent in. Every
+    /// channel of a session keeps its own copy of each message (ids, replies and mentions
+    /// resolve inside one channel), so nothing is dropped; a source that is not open keeps
+    /// whatever `SpecialService` looked up (or the generic label). History batches are named too.
+    fn name_shared_sources(
+        &self,
+        channel: &ChannelId,
+        events: Vec<ChatEvent>,
+        announced: &[(ChannelId, String)],
+        cx: &App,
+    ) -> Vec<ChatEvent> {
+        let is_shared = |message: &Message| {
+            message
+                .shared
+                .as_ref()
+                .is_some_and(|shared| shared.source_login.is_none())
+        };
+        let any = events.iter().any(|event| match event {
+            ChatEvent::Message { message, .. } => is_shared(message),
+            ChatEvent::History { messages, .. } => messages.iter().any(|m| is_shared(m)),
+            _ => false,
+        });
+        if !any {
+            return events;
+        }
+        // Room id -> login of the other open channels, as far as their `ROOMSTATE`s told (and
+        // this batch's).
+        let rooms: HashMap<&str, &ChannelId> = self
+            .stores
+            .iter()
+            .filter(|(other, _)| *other != channel)
+            .filter_map(|(other, store)| Some((store.read(cx).room().room_id.as_deref()?, other)))
+            .chain(
+                announced
+                    .iter()
+                    .filter(|(other, _)| other != channel)
+                    .map(|(other, id)| (id.as_str(), other)),
+            )
+            .collect();
+        let named = |message: Arc<Message>| -> Arc<Message> {
+            let Some(shared) = message.shared.as_ref().filter(|s| s.source_login.is_none()) else {
+                return message;
+            };
+            let Some(source) = rooms.get(shared.source_room_id.as_str()) else {
+                return message;
+            };
+            let mut message = (*message).clone();
+            if let Some(shared) = message.shared.as_mut() {
+                shared.source_login = Some(source.login().to_owned());
+                shared
+                    .source_name
+                    .get_or_insert_with(|| source.login().to_owned());
+            }
+            Arc::new(message)
+        };
+        events
+            .into_iter()
+            .map(|event| match event {
+                ChatEvent::Message { channel, message } => ChatEvent::Message {
+                    channel,
+                    message: named(message),
+                },
+                ChatEvent::History {
+                    channel,
+                    messages,
+                    moderation,
+                } => ChatEvent::History {
+                    channel,
+                    messages: messages.into_iter().map(named).collect(),
+                    moderation,
+                },
+                other => other,
+            })
+            .collect()
     }
 
     fn ensure_quiet(
@@ -992,6 +1191,262 @@ mod tests {
         assert_eq!(busy.read_with(cx, |s, _| s.messages().len()), 1000);
         assert_eq!(busy_notifies.get(), 2);
         drop(task);
+    }
+
+    fn room(channel: &str, room_id: &str) -> ChatEvent {
+        ChatEvent::RoomState {
+            channel: ChannelId::new(channel),
+            update: RoomStateUpdate {
+                room_id: Some(room_id.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A message of `channel` (whose room is `room_id`) that was sent in `source`.
+    fn shared(channel: &str, room_id: &str, id: &str, source: &str, source_id: &str) -> ChatEvent {
+        use gpui_chat_core::{SharedChat, message::RawTags};
+        let ChatEvent::Message { channel, message } = chat(channel, id, "guest") else {
+            unreachable!()
+        };
+        let mut message = (*message).clone();
+        message.raw_tags = RawTags::new([("room-id".to_owned(), room_id.to_owned())]);
+        message.shared = Some(SharedChat {
+            source_room_id: source.into(),
+            source_id: Some(MessageId::from(source_id)),
+            source_badges: Vec::new(),
+            source_login: None,
+            source_name: None,
+        });
+        ChatEvent::Message {
+            channel,
+            message: Arc::new(message),
+        }
+    }
+
+    fn ids_and_sources(
+        hub: &Entity<ChannelHub>,
+        channel: &str,
+        cx: &mut TestAppContext,
+    ) -> Vec<(String, Option<String>)> {
+        hub.read_with(cx, |hub, cx| {
+            hub.store(&ChannelId::new(channel))
+                .unwrap()
+                .read(cx)
+                .messages()
+                .iter()
+                .map(|m| {
+                    (
+                        m.id.as_str().to_owned(),
+                        m.shared.as_ref().and_then(|s| s.source_login.clone()),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn every_channel_keeps_its_copy_of_a_shared_chat_message_named_by_its_source(
+        cx: &mut TestAppContext,
+    ) {
+        let hub = cx.new(|_| ChannelHub::new(100, Diagnostics::new()));
+        // One batch, as `--replay-speed 0` and a join burst deliver it: the rooms are announced
+        // together with the messages.
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(
+                vec![
+                    room("main", "1000"),
+                    room("other", "2000"),
+                    // Sent in #other: its own copy there, and the copy delivered to #main.
+                    shared("other", "2000", "o1", "2000", "o1"),
+                    shared("main", "1000", "m1", "2000", "o1"),
+                    // Sent in a channel that is not open.
+                    shared("main", "1000", "m2", "3000", "x1"),
+                    // Sent in #main itself, and its copy in #other.
+                    shared("main", "1000", "m3", "1000", "m3"),
+                    shared("other", "2000", "o2", "1000", "m3"),
+                    chat("main", "m4", "plain"),
+                ],
+                cx,
+            );
+        });
+        let name = |s: &str| Some(s.to_owned());
+        // Nothing is dropped: replies to `m1` and mentions in it resolve in #main. A message sent
+        // in the channel itself needs no source.
+        assert_eq!(
+            ids_and_sources(&hub, "main", cx),
+            [
+                ("m1".into(), name("other")),
+                ("m2".into(), None),
+                ("m3".into(), None),
+                ("m4".into(), None)
+            ]
+        );
+        assert_eq!(
+            ids_and_sources(&hub, "other", cx),
+            [("o1".into(), None), ("o2".into(), name("main"))]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_shared_message_whose_source_is_not_open_is_left_for_the_lookup(cx: &mut TestAppContext) {
+        let hub = cx.new(|_| ChannelHub::new(100, Diagnostics::new()));
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(
+                vec![
+                    room("main", "1000"),
+                    shared("main", "1000", "m1", "2000", "o1"),
+                ],
+                cx,
+            );
+            // The source channel is opened later: its messages are named from then on.
+            hub.apply_batch(
+                vec![
+                    room("other", "2000"),
+                    shared("main", "1000", "m2", "2000", "o2"),
+                ],
+                cx,
+            );
+            hub.apply_batch(vec![shared("main", "1000", "m3", "2000", "o3")], cx);
+        });
+        assert_eq!(
+            ids_and_sources(&hub, "main", cx),
+            [
+                ("m1".into(), None),
+                ("m2".into(), Some("other".to_owned())),
+                ("m3".into(), Some("other".to_owned()))
+            ]
+        );
+    }
+
+    // ---- gift bombs ---------------------------------------------------------------------------
+
+    use gpui_chat_core::{EventKind, Recipient, SubPlan};
+
+    fn user_notice(id: &str, event: EventKind) -> Arc<Message> {
+        let mut message = Message::chat(id, Timestamp(0), Author::new("bomber", "Bomber"), vec![]);
+        message.kind = MessageKind::UserNotice;
+        message.event = Some(event);
+        Arc::new(message)
+    }
+
+    fn bomb(id: &str, count: u32) -> Arc<Message> {
+        user_notice(
+            id,
+            EventKind::MysteryGift {
+                plan: SubPlan::Tier1,
+                count,
+                gifter_total: Some(100),
+                anonymous: false,
+                origin_id: Some("origin".into()),
+                recipients: Vec::new(),
+            },
+        )
+    }
+
+    fn gift(id: &str, to: &str, origin: Option<&str>) -> Arc<Message> {
+        user_notice(
+            id,
+            EventKind::Gift {
+                plan: SubPlan::Tier1,
+                recipient: Recipient {
+                    login: to.to_lowercase(),
+                    display_name: to.into(),
+                    user_id: None,
+                },
+                months: 1,
+                gifter_total: None,
+                anonymous: false,
+                community_gift_id: origin.map(str::to_owned),
+            },
+        )
+    }
+
+    fn recipients(store: &ChannelStore, id: &str) -> Vec<String> {
+        match &store.messages().get(id).unwrap().event {
+            Some(EventKind::MysteryGift { recipients, .. }) => recipients.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn message_event(message: Arc<Message>) -> ChatEvent {
+        ChatEvent::Message {
+            channel: ChannelId::new("c"),
+            message,
+        }
+    }
+
+    #[test]
+    fn the_lines_of_a_gift_bomb_join_its_row_instead_of_adding_rows() {
+        let mut store = ChannelStore::new(ChannelId::new("c"), 100);
+        store.apply(message_event(bomb("b1", 3)));
+        let seq = store.messages().seq_of("b1").unwrap();
+        let (_, serial) = store.replaced_since(0);
+        assert!(store.apply(message_event(gift("g1", "Ann", Some("origin")))));
+        assert!(store.apply(message_event(gift("g2", "Ben", Some("origin")))));
+        assert_eq!(store.messages().len(), 1, "no row per recipient");
+        assert_eq!(recipients(&store, "b1"), ["Ann", "Ben"]);
+        // The view is told the row changed (same sequence number).
+        let (replaced, _) = store.replaced_since(serial);
+        assert_eq!(replaced, Some(vec![seq]));
+        // The same line again (live and in history): nothing changes, nothing shows.
+        assert!(!store.apply(message_event(gift("g1b", "Ann", Some("origin")))));
+        assert_eq!(store.messages().len(), 1);
+        // Another bomb's line, or a plain gift, is a row of its own.
+        store.apply(message_event(gift("g3", "Cleo", Some("other-origin"))));
+        store.apply(message_event(gift("g4", "Dan", None)));
+        assert_eq!(store.messages().len(), 3);
+        assert_eq!(recipients(&store, "b1"), ["Ann", "Ben"]);
+    }
+
+    #[test]
+    fn a_line_whose_row_is_gone_is_shown_on_its_own() {
+        let mut store = ChannelStore::new(ChannelId::new("c"), 2);
+        store.apply(message_event(bomb("b1", 3)));
+        store.apply(message_event(chat_message("x1")));
+        store.apply(message_event(chat_message("x2")));
+        assert!(store.messages().get("b1").is_none(), "evicted");
+        assert!(store.apply(message_event(gift("g1", "Ann", Some("origin")))));
+        assert_eq!(store.messages().len(), 2);
+    }
+
+    fn chat_message(id: &str) -> Arc<Message> {
+        Arc::new(Message::chat(
+            id,
+            Timestamp(0),
+            Author::new("u", "U"),
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn history_folds_a_bomb_the_same_way() {
+        let mut store = ChannelStore::new(ChannelId::new("c"), 100);
+        let mut history = vec![
+            chat_message("a"),
+            bomb("b1", 12),
+            gift("g1", "Ann", Some("origin")),
+            gift("g2", "Ben", Some("origin")),
+            gift("g3", "Cleo", Some("elsewhere")),
+        ];
+        for (n, message) in history.iter_mut().enumerate() {
+            let mut m = (**message).clone();
+            m.timestamp = Timestamp(n as i64 + 1);
+            m.flags.history = true;
+            *message = Arc::new(m);
+        }
+        store.apply(ChatEvent::History {
+            channel: ChannelId::new("c"),
+            messages: history,
+            moderation: Vec::new(),
+        });
+        // a, the bomb with two recipients, and the line of a bomb that is not here.
+        assert_eq!(store.messages().len(), 3);
+        assert_eq!(recipients(&store, "b1"), ["Ann", "Ben"]);
+        // A live line that follows is folded into the history row.
+        assert!(store.apply(message_event(gift("g9", "Dan", Some("origin")))));
+        assert_eq!(recipients(&store, "b1"), ["Ann", "Ben", "Dan"]);
+        assert_eq!(store.messages().len(), 3);
     }
 
     #[gpui_kit::test]

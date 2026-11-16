@@ -8,15 +8,18 @@
 //! * [`ChatEvent`]: what network backends send to the UI.
 //! * [`APP_NAME`] / [`APP_ID`]: the one place the application identity lives.
 
+pub mod cheer;
 pub mod complete;
 pub mod compose;
 pub mod emote;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod special;
 pub mod store;
 pub mod tokenizer;
 
+pub use cheer::{CheerTier, Cheermote, CheermoteSet};
 pub use complete::{
     COMMANDS, Chatter, CommandInfo, Edit, MIN_COLON_QUERY, RECENT_EMOTES, Recents, Tier, Trigger,
     TriggerKind, apply, find_trigger, match_tier, rank, recent_chatters, word_insertion,
@@ -31,6 +34,7 @@ pub use event::{
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
 pub use message::{Author, Fragment, Message, MessageFlags, MessageKind, ReplyRef, Rgb, Timestamp};
+pub use special::{AnnouncementColor, EventKind, Recipient, SharedChat, SubPlan};
 pub use store::{DEFAULT_CAPACITY, MessageStore, Rebuild, Thread};
 pub use tokenizer::{
     DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,

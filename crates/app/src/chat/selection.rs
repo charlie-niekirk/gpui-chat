@@ -292,19 +292,22 @@ pub fn one_line(text: &str) -> String {
 }
 
 /// A message as one copied line: `HH:MM name: text` (`HH:MM name text` for `/me`, `HH:MM text` for
-/// notices), with the original text of the message.
+/// notices), with the original text of the message. What a row shows besides that is part of the
+/// line, as in a partial selection of it: the shared-chat label (`[OtherChan]`) and the marker of
+/// a chat line (`First message`) go after the time, a notice's own line (PR 5.1) takes the place
+/// of Twitch's.
 pub fn message_line(message: &Message) -> String {
     let time = display::clock(message.timestamp.unix_millis());
     let body = one_line(&message.plain_text());
     let name = message.author.as_ref().map(display::author_name);
-    let rest = match (message.kind, name) {
+    let label = super::events::source_label(message);
+    let mut rest = match (message.kind, name) {
         (MessageKind::Chat, Some(name)) => format!("{name}: {body}"),
         (MessageKind::Action, Some(name)) => format!("{name} {body}"),
         (MessageKind::UserNotice, name) => {
-            let mut rest = message
-                .system_text
-                .as_deref()
-                .map(one_line)
+            // Our own wording of the event (PR 5.1) where we have one, else Twitch's.
+            let mut rest = super::events::notice_line(message)
+                .or_else(|| message.system_text.as_deref().map(one_line))
                 .unwrap_or_default();
             if !message.fragments.is_empty() {
                 if !rest.is_empty() {
@@ -319,6 +322,18 @@ pub fn message_line(message: &Message) -> String {
         }
         _ => body,
     };
+    if message.kind != MessageKind::UserNotice
+        && let Some(header) = super::events::header(message)
+    {
+        rest = format!("{} {rest}", header.text);
+    }
+    if let Some(label) = label {
+        rest = if rest.is_empty() {
+            label
+        } else {
+            format!("{label} {rest}")
+        };
+    }
     if rest.is_empty() {
         time
     } else {
@@ -661,6 +676,32 @@ mod tests {
         assert_eq!(message_line(&sub), "01:01 Alice subscribed! Alice: hype");
         sub.fragments.clear();
         assert_eq!(message_line(&sub), "01:01 Alice subscribed!");
+    }
+
+    #[test]
+    fn a_whole_row_copy_keeps_the_label_and_the_marker_like_a_partial_one() {
+        use gpui_chat_core::SharedChat;
+        use gpui_chat_core::message::RawTags;
+        let mut message = chat("hi there");
+        message.flags.first_message = true;
+        message.raw_tags = RawTags::new([("room-id".to_owned(), "1000".to_owned())]);
+        message.shared = Some(SharedChat {
+            source_room_id: "2000".into(),
+            source_id: None,
+            source_badges: Vec::new(),
+            source_login: Some("other".into()),
+            source_name: Some("OtherChan".into()),
+        });
+        assert_eq!(
+            message_line(&message),
+            "01:01 [OtherChan] First message Alice: hi there"
+        );
+        // The same text a partial selection of the whole display text gives (marker, then time).
+        let display = display::build(&message, DisplayOptions { timestamps: true }, &[]);
+        assert_eq!(
+            selected_text(&display, 0..display.text.len()),
+            "First message 01:01 [OtherChan] Alice: hi there"
+        );
     }
 
     fn badge_slot(title: &str) -> BadgeSlot {

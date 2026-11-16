@@ -22,8 +22,9 @@ use gpui_kit::{
 };
 
 use super::element::{MessageElement, MessageStyle};
+use super::events;
 use super::layout::LayoutCache;
-use super::selection::{self, one_line};
+use super::selection::{self};
 use super::selection_layer::Surface;
 use super::view::ChatView;
 use crate::channels::ChannelStore;
@@ -124,7 +125,7 @@ pub fn row_menu(
             Some(text) => menu.item(copy_item("Copy", text)).separator(),
             None => menu,
         };
-        menu = menu.item(copy_item("Copy message", one_line(&message.plain_text())));
+        menu = menu.item(copy_item("Copy message", events::copy_text(&message)));
         if let Some(author) = &message.author {
             menu = menu.item(copy_item(
                 "Copy username",
