@@ -252,6 +252,31 @@ fn emote_boxes(
         .collect()
 }
 
+/// A name paint and where its box is (x of the name's start in the unwrapped line, its width).
+struct NamePaint {
+    paint: std::sync::Arc<gpui_chat_emotes::Paint>,
+    x0: f32,
+    width: f32,
+}
+
+/// The paint the author's name is drawn with, if it has one that can be drawn and stays readable
+/// on `background`. A read lock and a hash probe per message painted; nothing is allocated.
+fn name_paint(
+    message: &Message,
+    extent: Option<(f32, f32)>,
+    background: Hsla,
+    cx: &App,
+) -> Option<NamePaint> {
+    let (x0, x1) = extent?;
+    let user_id = message.author.as_ref()?.user_id.as_deref()?;
+    let paint = cx.try_global::<Badges>()?.cosmetics().paint(user_id)?;
+    colors::paint_readable(&paint, background).then(|| NamePaint {
+        paint,
+        x0,
+        width: (x1 - x0).max(1.0),
+    })
+}
+
 /// The badges of `message` that can be drawn: each one that has a definition (this channel's, then
 /// the global one) and an image that has not failed for good, in message order. Starts the image
 /// loads. Without a badge registry or image store there are none.
@@ -981,6 +1006,15 @@ impl Element for MessageElement {
                     .unwrap_or_else(|| colors::fallback_color(&author.login));
                 colors::readable(color, palette.background)
             });
+            // A 7TV paint on the author's name (PR 6.2): glyph by glyph, each in the paint's colour
+            // where it stands in the name (GPUI draws glyphs in one colour each, so a gradient is
+            // sampled per glyph). Not on a removed or ignored line, and only when the paint stays
+            // readable on this theme; otherwise the name keeps its plain colour.
+            let name_paint = if flags.deleted || self.collapsed || self.ignored {
+                None
+            } else {
+                name_paint(message, shaped.name_extent, palette.background, cx)
+            };
             if let (Some(line), Some(prepared)) = (&shaped.reply, &prepainted.reply) {
                 self.paint_reply(line, prepared, window);
             }
@@ -1027,11 +1061,38 @@ impl Element for MessageElement {
                 let result = if glyph.is_emoji {
                     window.paint_emoji(position, glyph.font_id, glyph.id, style.font_size)
                 } else {
-                    let color = if flags.deleted {
+                    let mut color = if flags.deleted {
                         palette.muted
                     } else {
                         palette.role(role, name, header_color)
                     };
+                    if role == Role::Name
+                        && let Some(paint) = &name_paint
+                    {
+                        // The glyph's middle, in the name's own box.
+                        let x = glyph.x - paint.x0 + atom.width / 2.0;
+                        if let Some(sampled) = paint.paint.color_at(
+                            x,
+                            line_height.as_f32() / 2.0,
+                            paint.width,
+                            line_height.as_f32(),
+                        ) {
+                            color = colors::paint_hsla(sampled);
+                        }
+                        for shadow in &paint.paint.shadows {
+                            // A glow (no offset) has nothing to be drawn behind the glyph with.
+                            if shadow.x != 0.0 || shadow.y != 0.0 {
+                                let at = position + point(px(shadow.x), px(shadow.y));
+                                let _ = window.paint_glyph(
+                                    at,
+                                    glyph.font_id,
+                                    glyph.id,
+                                    style.font_size,
+                                    colors::paint_hsla(shadow.color),
+                                );
+                            }
+                        }
+                    }
                     window.paint_glyph(position, glyph.font_id, glyph.id, style.font_size, color)
                 };
                 if let Err(error) = result {

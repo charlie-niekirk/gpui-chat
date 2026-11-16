@@ -183,6 +183,9 @@ pub struct ShapedMessage {
     pub reply: Option<ReplyLine>,
     /// How an event row is dressed (PR 5.1), decided once here rather than at every paint.
     pub look: Option<super::events::Look>,
+    /// Where the author's name starts and ends in the unwrapped line (x of its first atom, x of
+    /// its end): the box a name paint's gradient spans. `None` without a name.
+    pub name_extent: Option<(f32, f32)>,
 }
 
 /// Cuts the shaped `text` into one atom per extended grapheme cluster, each with its advance.
@@ -291,11 +294,24 @@ impl ShapedMessage {
             }
         }
         let (atoms, inlines) = inline_emotes(atoms, &display, boxes);
-        let atom_spans = atoms
+        let atom_spans: Vec<u32> = atoms
             .iter()
             .map(|atom| display.span_at(atom.range.start).unwrap_or(0) as u32)
             .collect();
         let glyphs = glyph_refs(layout, &atoms);
+        let name_extent = atoms
+            .iter()
+            .zip(&atom_spans)
+            .filter(|(atom, span)| {
+                atom.kind == AtomKind::Glyphs
+                    && display.spans[**span as usize].role == super::display::Role::Name
+            })
+            .fold(None, |extent: Option<(f32, f32)>, (atom, _)| {
+                let end = atom.src_x + atom.width;
+                Some(extent.map_or((atom.src_x, end), |(from, to)| {
+                    (from.min(atom.src_x), to.max(end))
+                }))
+            });
         Self {
             display,
             atoms,
@@ -306,6 +322,7 @@ impl ShapedMessage {
             descent: layout.descent,
             reply: None,
             look: None,
+            name_extent,
         }
     }
 
@@ -1494,6 +1511,33 @@ mod tests {
         let flow = flow::flow(&s.atoms, 1000.0, 20.0);
         assert_eq!(flow.placements[4].x, 56.0);
         assert_eq!(flow.height(), 20.0, "an 18 px box fits the 20 px line");
+    }
+
+    #[test]
+    fn the_names_extent_is_where_its_glyphs_are_after_the_badges() {
+        let s = shaped_badges(&[slot("Mod", "m", 18.0), slot("Sub", "s", 18.0)]);
+        // Both badges are 18 wide + a 10 px space each; the name "Al" is two 10 px glyphs (the
+        // test layout's advance): from x 56 (see above) to 76 in the unwrapped line.
+        let (from, to) = s.name_extent.expect("a name");
+        let al: Vec<_> = s
+            .atoms
+            .iter()
+            .filter(|a| {
+                &s.display.text[a.range.clone()] == "A" || &s.display.text[a.range.clone()] == "l"
+            })
+            .collect();
+        assert_eq!(al.len(), 2);
+        assert_eq!(from, al[0].src_x);
+        assert_eq!(to, al[1].src_x + al[1].width);
+        assert!(to > from);
+        // A message with no author has no name box.
+        let notice = Message::plain("2", Timestamp(0), gpui_chat_core::MessageKind::System, "hi");
+        let display = display::build(&notice, DisplayOptions::default(), &[]);
+        let layout = fake_layout(&display.text);
+        assert_eq!(
+            ShapedMessage::from_layout(display, &layout, &[]).name_extent,
+            None
+        );
     }
 
     #[test]

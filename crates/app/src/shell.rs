@@ -243,11 +243,14 @@ impl AppShell {
                 let settings = store.read(cx).settings();
                 let (appearance, emotes) = (settings.appearance.clone(), settings.emotes.clone());
                 let history = settings.chat.history;
+                let badges = settings.badges.clone();
+                crate::badges::Badges::apply_settings(&badges, cx);
                 theme::apply_settings_if_changed(&appearance, Some(window), cx);
                 // The provider switches are idempotent: nothing happens unless one changed.
                 if let Some(live) = &this.live {
                     live.set_emote_providers(emote_service::providers(&emotes));
                     live.set_history(history);
+                    live.set_badges(&badges);
                 }
                 cx.notify();
             }),

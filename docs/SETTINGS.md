@@ -43,6 +43,12 @@ seventv = true                             # 7TV emotes (channel + global, zero-
 bttv = true                                # BetterTTV emotes (channel + global)
 ffz = true                                 # FrankerFaceZ emotes (channel + global)
 
+[badges]                                   # PR 6.2: besides Twitch's own badges
+seventv = true                             # 7TV badges
+ffz = true                                 # FrankerFaceZ badges (bot, supporter, ...)
+chatterino = true                          # Chatterino badges
+paints = true                              # 7TV name paints (gradient / shadow usernames)
+
 [highlights]                               # PR 5.3, see "Highlights and notifications" below
 mentions = true                            # highlight messages that say your login / display name
 mention_color = "accent"                   # accent | red | green | yellow (theme colours)
@@ -189,6 +195,14 @@ without a restart: a provider that is off is not requested, and its emotes are n
 messages that arrive afterwards (messages already on screen keep what they were resolved with).
 Turning a provider on reloads the emote sets, since it may never have been fetched; Twitch's
 own emotes are always on. Files without these keys read as all on.
+
+`badges.seventv`, `badges.ffz`, `badges.chatterino` and `badges.paints` (PR 6.2) apply live too: a
+provider that is off hides its badges at once (on messages already on screen as well), `paints`
+draws every name in its plain colour. BetterTTV's badges are not offered: they are SVG images and
+the image pipeline draws bitmaps only. A paint that would be hard to read on the current theme is
+drawn in the plain colour as well. With `emotes.seventv` (live emote updates) and the 7TV
+cosmetics both off, no connection to 7TV's EventAPI is made; likewise none to BTTV's socket with
+`emotes.bttv` off.
 
 `appearance.line_height` and `chat.timestamps` also apply live (the chat view re-lays out its
 messages). `chat.scrollback` is read once at startup.

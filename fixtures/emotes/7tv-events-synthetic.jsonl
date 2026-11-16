@@ -1,0 +1,9 @@
+{"op":0,"d":{"type":"emote_set.update","body":{"id":"SET1","kind":3,"pulled":[{"key":"emotes","index":3,"type":"object","old_value":{"id":"EMOTE_OLD","name":"OldOne","flags":0,"data":{"id":"EMOTE_OLD","name":"OldOne"}}},{"key":"other","index":0,"type":"object","old_value":{"id":"X","name":"Ignored"}}]}}}
+{"op":0,"d":{"type":"emote_set.update","body":{"id":"SET1","kind":3,"updated":[{"key":"emotes","index":1,"type":"object","old_value":{"id":"EMOTE_A","name":"Alpha","flags":0},"value":{"id":"EMOTE_A","name":"Beta","flags":0}},{"key":"emotes","index":2,"type":"object","old_value":{"id":"EMOTE_B","name":"Same","flags":0},"value":{"id":"EMOTE_B","name":"Same","flags":1}}]}}}
+{"op":0,"d":{"type":"user.update","body":{"id":"USER1","kind":1,"updated":[{"key":"connections","index":1,"type":"array","value":[{"key":"emote_set_id","type":"string","old_value":"SET1","value":"SET2"}]}]}}}
+{"op":0,"d":{"type":"user.update","body":{"id":"USER1","kind":1,"updated":[{"key":"connections","index":0,"type":"array","value":[{"key":"emote_set_id","type":"string","old_value":"SET2","value":null}]}]}}}
+{"op":0,"d":{"type":"user.update","body":{"id":"USER1","kind":1,"updated":[{"key":"username","type":"string","old_value":"a","value":"b"}]}}}
+{"op":0,"d":{"type":"entitlement.delete","body":{"id":"0","kind":10,"object":{"id":"0","kind":"PAINT","ref_id":"PAINT1","user":{"id":"U","connections":[{"id":"98712408","platform":"TWITCH"}]}}}}}
+{"op":4,"d":{"reason":"restart"}}
+{"op":7,"d":{"code":4000,"message":"Server Error"}}
+{"op":6,"d":{"message":"bad subscription"}}

@@ -14,7 +14,7 @@ crates/
   app/         bin `gpui-chat` — the only crate that depends on GPUI. Views, actions, keymap, theme, platform/
   core/        domain types, message store, tokenizer. No I/O
   twitch/      IRC transport, Helix client, auth (device flow), later EventSub
-  emotes/      providers: Twitch, BTTV, FFZ, 7TV; emote sets; resolution order; live updates; badges (`BadgeSource`, registry)
+  emotes/      providers: Twitch, BTTV, FFZ, 7TV; emote sets; resolution order; live updates (7TV EventAPI, BTTV socket); badges (`BadgeSource`, registry); cosmetics (third-party badges, 7TV paints)
   media/       image fetch, disk cache, decode (static + animated), memory budget
   settings/    typed settings, load/save/watch, paths
   streamlink/  locate binary, launch, track child processes
@@ -734,6 +734,40 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   (PR 3.1) implements the same trait; in the app, `AccountBadgeSource` asks Helix while logged in (falling back
   to the anonymous source when a Helix request fails), and `BadgeService::follow_login` reloads the global and
   every open channel's set when the user logs in or out.
+- **Live emote updates (`emotes` crate, `live` module, PR 6.2):** `LiveEmotes` keeps at most two websocket
+  connections, one per provider, shared by every open channel, and only while something is subscribed
+  (`live::socket::run`: connect, run the provider's `Session`, on any failure back off 1 s → 60 s with jitter and
+  resubscribe from scratch; a connection that stays up resets the backoff). 7TV (`wss://events.7tv.io/v3`,
+  `live::seventv`): per channel `emote_set.update` of its active set and `user.update` of the owning 7TV user
+  (a switch of the active set fetches the new set, `SevenTvClient::set`, and re-subscribes), plus — when paints
+  or 7TV badges are on — `cosmetic.create` / `entitlement.create` / `entitlement.delete` with the channel as
+  context. BTTV (`wss://sockets.betterttv.net/ws`, `live::bttv`): `join_channel twitch:<room id>`, then
+  `emote_create` / `emote_update` / `emote_delete`. Frames are parsed by pure functions (fixtures
+  `fixtures/emotes/7tv-events-*.jsonl`, `bttv-events.jsonl`: the 7TV ones were recorded, except the pulled /
+  updated / `user.update` ones, written from the documented shape; the BTTV ones are written from the protocol),
+  applied to the channel's set in the `EmoteRegistry` (`EmoteSet::with_changes`: add, rename, remove by emote id; the
+  next message resolves against the new set, messages already shown keep what they had) and reported as one
+  coalesced quiet system line per channel and provider (`live::notices`: "7TV: added PogU, KEKW · removed Old",
+  written out 1.5 s after the first change). A provider switched off in the settings holds no connection; a channel
+  that closes unsubscribes. `EmoteService` opens a channel once its sets loaded (the load records the 7TV ids in
+  `EmoteSet::origin`), `GPUI_CHAT_7TV_EVENTS_URL` / `GPUI_CHAT_BTTV_SOCKET_URL` point the connections elsewhere and
+  `cargo run -p gpui-chat-emotes --example live_replay -- fixtures/emotes/live-demo.jsonl` is a local server that
+  replays a script of frames, to watch an add / rename / remove in the app. Not recovered: changes made while a
+  connection was down (see BACKLOG).
+- **Cosmetics (`emotes` crate, `cosmetics` module, PR 6.2):** `Cosmetics` holds what is worn next to and on a
+  name. *7TV*: `StyleLookup` asks for chatters it does not know (`userByConnection(platform: TWITCH)`, up to 50 per
+  GraphQL `GET`, then `cosmetics(list: ...)` for the definitions that are missing; the query complexity limit rules
+  out one request), the EventAPI keeps styles current; a style is trusted for 30 minutes. *FFZ*
+  (`api.frankerfacez.com/v1/badges/ids`) and *Chatterino* (`api.chatterino.com/badges`) publish their holders once
+  (`cosmetics::bulk`). BTTV's badges are SVG, which the image pipeline cannot draw, so there are none. Badge
+  definitions live in the `BadgeRegistry`'s third-party layer (sets `seventv` / `ffz` / `chatterino`; a switched-off
+  provider hides its set without forgetting it, and the registry version moves so views lay out again), and a badge
+  reaches a message as one more `BadgeId` after Twitch's own, added where emotes are resolved
+  (`EmoteService::with_cosmetics`, live and history alike), so rendering, tooltips (title "7TV: …", line "7TV
+  badge") and copy are the ones every badge has. A chatter's *first* message may precede the answer of the lookup
+  and then has none (BACKLOG). *Paints* (`cosmetics::paint`): `Paint` is gradient / flat colour / image data plus
+  `color_at(x, y, w, h)` (CSS linear and radial gradient maths, `repeat`) and the luminance of every stop and
+  midpoint for readability; paints are looked up by Twitch user id at paint time.
 - Async I/O runs on a `tokio` runtime on background threads. GPUI has its own
   executor; backends talk to the UI over channels.
 
@@ -754,6 +788,16 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   stream — flow already treats them as unbreakable boxes and the painter skips their glyphs;
   PR 5.6 hit-tests with `Flow::line_at` / `index_at` / `atom_at` (point ↔ byte offset in the
   display text).
+- **Name paints** (PR 6.2, `MessageElement::paint`). GPUI paints a glyph in one `Hsla` (`Window::paint_glyph`; a
+  gradient `Background` exists for quads only), so a paint is drawn glyph by glyph: each glyph of the author's name
+  gets `Paint::color_at` at its middle within the name's box (`ShapedMessage::name_extent`, worked out when the
+  message is shaped; the paint itself is looked up per painted row, a read lock and a hash probe, with no
+  allocation), and a shadow with an offset is the glyph again behind it in the shadow's colour (glows, which have
+  no offset, and image paints are not drawn: the plain colour is used). `colors::paint_readable` falls back to the
+  plain colour whenever any colour of the paint (stops and their midpoints) has under 3:1 contrast against the
+  theme's background, so a paint is judged per theme. Removed, collapsed and ignored lines, event headers, reply
+  lines and the user card keep plain colours; selection, copy, search and highlights work on the display text,
+  which paints do not touch.
 - **Selection and links** (PR 5.6, `chat/selection.rs` pure, `chat/selection_layer.rs` GPUI). A
   selection is two units (anchor, head) of `(store seq, byte offset in the display text)`, so it
   spans messages; a click picks a caret, a double-click a word (a run of non-spaces inside one

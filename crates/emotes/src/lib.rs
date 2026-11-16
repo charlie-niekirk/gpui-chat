@@ -24,10 +24,12 @@
 pub mod badges;
 pub mod bttv;
 pub mod catalog;
+pub mod cosmetics;
 mod error;
 pub mod ffz;
 mod http;
 mod lenient;
+pub mod live;
 mod loader;
 mod resolver;
 mod set;
@@ -41,14 +43,16 @@ pub use badges::{
 };
 pub use bttv::BttvClient;
 pub use catalog::EmoteCatalog;
+pub use cosmetics::{CosmeticOptions, Cosmetics, Paint, PaintColor, PaintFill, Shadow, Stop};
 pub use error::EmoteError;
 pub use ffz::FfzClient;
 pub use http::{
     HttpClient, HttpConfig, HttpError, HttpFuture, HttpResponse, ReqwestHttp, user_agent,
 };
+pub use live::{Backoff, Endpoints, LiveEmotes, LiveSink};
 pub use loader::{EmoteLoader, ProviderResults};
 pub use resolver::{EmoteRegistry, EmoteResolver, Providers};
-pub use set::{EmoteScope, EmoteSet, SetEmote};
+pub use set::{EmoteChange, EmoteScope, EmoteSet, SetEmote, SetOrigin};
 pub use seventv::SevenTvClient;
 
 /// Checks that `id` is a plain Twitch user id (ASCII digits), so it can be put in a URL

@@ -28,6 +28,9 @@ Options:
   --replay-speed <x>           Replay speed: 1 follows the log's tmi-sent-ts spacing (or a fixed
                                100 msgs/s without timestamps), 2 is twice as fast, 0 is as fast
                                as possible (default: 1)
+  --cosmetics                  Give the synthetic users 7TV paints and third-party badges, to look
+                               at and time the painting (with --firehose; the badge images load
+                               from their CDNs)
   --hud                        Start with the debug HUD visible (toggle: View > Toggle Debug HUD)
   -h, --help                   Print this help
 ";
@@ -45,6 +48,8 @@ pub struct Cli {
     pub replay_speed: f64,
     /// Open with the debug HUD visible.
     pub hud: bool,
+    /// Give the synthetic users paints and third-party badges.
+    pub cosmetics: bool,
 }
 
 impl Default for Cli {
@@ -56,6 +61,7 @@ impl Default for Cli {
             replay: None,
             replay_speed: 1.0,
             hud: false,
+            cosmetics: false,
         }
     }
 }
@@ -103,6 +109,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError>
         match flag.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--hud" => cli.hud = true,
+            "--cosmetics" => cli.cosmetics = true,
             "--firehose" => {
                 let raw = value("--firehose")?;
                 let rate: f64 = raw
@@ -153,6 +160,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError>
     if cli.replay.is_some() && cli.firehose.is_some() {
         return Err(error("--replay and --firehose are two sources; pick one"));
     }
+    if cli.cosmetics && cli.firehose.is_none() {
+        return Err(error("--cosmetics needs --firehose"));
+    }
     if speed_given && cli.replay.is_none() {
         return Err(error("--replay-speed needs --replay"));
     }
@@ -181,6 +191,7 @@ mod tests {
             replay: None,
             replay_speed: 1.0,
             hud: true,
+            cosmetics: false,
         });
         assert_eq!(
             parse_args(&[
@@ -193,6 +204,19 @@ mod tests {
             ]),
             Ok(expected)
         );
+    }
+
+    #[test]
+    fn cosmetics_go_with_the_firehose() {
+        assert_eq!(
+            parse_args(&["--firehose", "10", "--cosmetics"]),
+            Ok(Parsed::Run(Cli {
+                firehose: Some(10.0),
+                cosmetics: true,
+                ..Cli::default()
+            }))
+        );
+        assert!(parse_args(&["--cosmetics"]).is_err());
     }
 
     #[test]

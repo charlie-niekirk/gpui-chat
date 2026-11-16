@@ -209,6 +209,7 @@ impl SettingsView {
             appearance_page(&this, cx),
             chat_page(&this),
             emotes_page(&this),
+            badges_page(&this),
             highlights::page(&this),
             ignores::page(&this),
             streamlink_page(),
@@ -693,6 +694,57 @@ fn emotes_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                     provider("FrankerFaceZ", "Channel and global sets.", "emotes.ffz"),
                 ]),
         )
+}
+
+fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
+    let switch = |title: &'static str, description: &'static str, field: &'static str| {
+        let read: fn(&Settings) -> bool = match field {
+            "badges.seventv" => |s| s.badges.seventv,
+            "badges.ffz" => |s| s.badges.ffz,
+            "badges.chatterino" => |s| s.badges.chatterino,
+            _ => |s| s.badges.paints,
+        };
+        SettingItem::new(
+            title,
+            SettingField::switch(move |cx| read(current(cx)), bool_writer(this, field))
+                .default_value(true),
+        )
+        .description(description)
+    };
+    SettingPage::new("Badges and paints")
+        .icon(IconName::Star)
+        .groups([
+            SettingGroup::new()
+                .title("Third-party badges")
+                .description(
+                    "Shown after Twitch's own badges; a tooltip names the provider. Turning one \
+                     off hides its badges everywhere at once. BetterTTV's badges are SVG images \
+                     and are not supported.",
+                )
+                .items([
+                    switch(
+                        "7TV",
+                        "7TV's badges (subscriber, event and other cosmetics).",
+                        "badges.seventv",
+                    ),
+                    switch(
+                        "FrankerFaceZ",
+                        "Bot, supporter and developer badges.",
+                        "badges.ffz",
+                    ),
+                    switch(
+                        "Chatterino",
+                        "Supporter, contributor and developer badges.",
+                        "badges.chatterino",
+                    ),
+                ]),
+            SettingGroup::new().title("Name paints").items([switch(
+                "7TV paints",
+                "Draw usernames in their 7TV gradient and shadow. A paint that would be hard to \
+                 read on the current theme is drawn in the plain colour instead.",
+                "badges.paints",
+            )]),
+        ])
 }
 
 fn streamlink_page() -> SettingPage {

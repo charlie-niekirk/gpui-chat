@@ -14,7 +14,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use gpui_chat_core::{ChannelId, Emote, EmoteProvider, WordResolver};
 
 use crate::loader::ProviderResults;
-use crate::set::EmoteSet;
+use crate::set::{EmoteChange, EmoteSet};
 
 /// Which third-party providers are in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +128,50 @@ impl EmoteRegistry {
             self.write().channels.entry(channel.clone()).or_default(),
             results,
         );
+    }
+
+    /// `channel`'s set of `provider`, if one loaded.
+    pub fn channel_set(
+        &self,
+        channel: &ChannelId,
+        provider: EmoteProvider,
+    ) -> Option<Arc<EmoteSet>> {
+        let i = slot(provider)?;
+        self.read().channels.get(channel)?[i].clone()
+    }
+
+    /// Replaces `channel`'s set of `set.provider` (a live switch to another set).
+    pub fn replace_channel_set(&self, channel: &ChannelId, set: EmoteSet) {
+        if let Some(i) = slot(set.provider) {
+            self.write().channels.entry(channel.clone()).or_default()[i] = Some(Arc::new(set));
+        }
+    }
+
+    /// Applies live `changes` to `channel`'s set of `provider` and returns the ones that took
+    /// effect (none if that set never loaded). Messages shaped afterwards resolve against the new
+    /// set; nothing already in a store is rewritten.
+    pub fn apply_changes(
+        &self,
+        channel: &ChannelId,
+        provider: EmoteProvider,
+        changes: &[EmoteChange],
+    ) -> Vec<EmoteChange> {
+        let Some(i) = slot(provider) else {
+            return Vec::new();
+        };
+        let mut state = self.write();
+        let Some(current) = state
+            .channels
+            .get_mut(channel)
+            .and_then(|slots| slots[i].as_mut())
+        else {
+            return Vec::new();
+        };
+        let (updated, applied) = current.with_changes(changes);
+        if !applied.is_empty() {
+            *current = Arc::new(updated);
+        }
+        applied
     }
 
     /// Forgets a channel's sets (the channel was closed).

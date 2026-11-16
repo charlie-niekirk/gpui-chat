@@ -1,0 +1,80 @@
+{
+ "ids": [
+  "98712408",
+  "11148817",
+  "1",
+  "270252923",
+  "84180052",
+  "45052775",
+  "46803479",
+  "477204920",
+  "32636311"
+ ],
+ "response": {
+  "data": {
+   "u0": {
+    "id": "01GZS49CF8000B0QFDSJA7E0VS",
+    "style": {
+     "paint_id": "01KG85VVBYG9KRKFME5E6GACB0",
+     "badge_id": "01M506MW5EVSVT0Q5C5TVRHN0A"
+    }
+   },
+   "u1": {
+    "id": "01F7GF1ZV8000EFV6JZ29CKEDB",
+    "style": {
+     "paint_id": null,
+     "badge_id": "01GAF95ZTG000E8VNG1S1RMTBB"
+    }
+   },
+   "u2": {
+    "id": "00000000000000000000000000",
+    "style": {
+     "paint_id": null,
+     "badge_id": null
+    }
+   },
+   "u3": {
+    "id": "01KBZK3MK9S43GFW1YFTNVDZ3Y",
+    "style": {
+     "paint_id": "01KG85VVBYG9KRKFME5E6GACB0",
+     "badge_id": null
+    }
+   },
+   "u4": {
+    "id": "01F6RA600R000ATZXMPM5X7AC2",
+    "style": {
+     "paint_id": "01FV8PCSG0000BRBEDNCDBP3DJ",
+     "badge_id": "01GXP5DNHR000CV9HPMT8GM9JZ"
+    }
+   },
+   "u5": {
+    "id": "01FEHKCBCG0008560AZ8HK26JJ",
+    "style": {
+     "paint_id": null,
+     "badge_id": null
+    }
+   },
+   "u6": {
+    "id": "01FBKN1C8R0007FZM48WK4941F",
+    "style": {
+     "paint_id": "01M76WERH4C0CN7CY7M8SX2HFV",
+     "badge_id": "01GAFA46M0000E8VNG1S1RMTBG"
+    }
+   },
+   "u7": {
+    "id": "01G7SW2MKG0007FDF709WWFX14",
+    "style": {
+     "paint_id": null,
+     "badge_id": null
+    }
+   },
+   "u8": {
+    "id": "01F012D3200009D0SFZ9W6ZZK0",
+    "style": {
+     "paint_id": null,
+     "badge_id": null
+    }
+   }
+  }
+ }
+}

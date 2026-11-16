@@ -30,7 +30,7 @@ use serde_json::Value;
 use crate::error::EmoteError;
 use crate::http::{HttpClient, get_ok};
 use crate::lenient::{null_default, parse_entries};
-use crate::set::{EmoteScope, EmoteSet, SetEmote};
+use crate::set::{EmoteScope, EmoteSet, SetEmote, SetOrigin};
 use crate::{absolute_url, validate_user_id};
 
 pub const DEFAULT_BASE_URL: &str = "https://7tv.io/v3";
@@ -64,6 +64,22 @@ impl SevenTvClient {
         parse_global(&body)
     }
 
+    /// One emote set by its id (`GET /emote-sets/{id}`) as a channel set, and its name: what a
+    /// channel switched to. `owner_id` is recorded in the set's origin.
+    pub async fn set(
+        &self,
+        set_id: &str,
+        owner_id: Option<&str>,
+        connection: Option<usize>,
+    ) -> Result<(EmoteSet, String), EmoteError> {
+        if set_id.is_empty() || !set_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(EmoteError::InvalidUserId(set_id.to_owned()));
+        }
+        let url = format!("{}/emote-sets/{set_id}", self.base_url);
+        let body = get_ok(&*self.http, &url).await?;
+        parse_set(&body, owner_id, connection)
+    }
+
     /// The active emote set of a Twitch user id. No 7TV account → empty set.
     pub async fn channel(&self, twitch_user_id: &str) -> Result<EmoteSet, EmoteError> {
         let id = validate_user_id(twitch_user_id)?;
@@ -80,13 +96,27 @@ impl SevenTvClient {
 
 #[derive(Deserialize)]
 struct RawSet {
+    id: Option<String>,
     #[serde(default, deserialize_with = "null_default")]
     emotes: Vec<Value>,
 }
 
 #[derive(Deserialize)]
+struct RawConnection {
+    platform: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawUserInfo {
+    id: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    connections: Vec<RawConnection>,
+}
+
+#[derive(Deserialize)]
 struct RawUser {
     emote_set: Option<RawSet>,
+    user: Option<RawUserInfo>,
 }
 
 #[derive(Deserialize)]
@@ -140,12 +170,71 @@ pub(crate) fn parse_global(body: &[u8]) -> Result<EmoteSet, EmoteError> {
     Ok(convert_set(raw, EmoteScope::Global))
 }
 
+pub(crate) fn parse_set(
+    body: &[u8],
+    owner_id: Option<&str>,
+    connection: Option<usize>,
+) -> Result<(EmoteSet, String), EmoteError> {
+    #[derive(Deserialize)]
+    struct Named {
+        #[serde(default, deserialize_with = "null_default")]
+        name: String,
+    }
+    let raw: RawSet = serde_json::from_slice(body).map_err(EmoteError::parse)?;
+    let name = serde_json::from_slice::<Named>(body)
+        .map_err(EmoteError::parse)?
+        .name;
+    let set_id = raw.id.clone();
+    let set = convert_set(raw, EmoteScope::Channel);
+    let set = match set_id.filter(|id| !id.is_empty()) {
+        Some(set_id) => set.with_origin(SetOrigin {
+            set_id: set_id.into(),
+            owner_id: owner_id.map(Into::into),
+            connection,
+        }),
+        None => set,
+    };
+    Ok((set, name))
+}
+
 pub(crate) fn parse_channel(body: &[u8]) -> Result<EmoteSet, EmoteError> {
     let raw: RawUser = serde_json::from_slice(body).map_err(EmoteError::parse)?;
+    let (owner_id, connection) = match raw.user {
+        Some(user) => (
+            user.id.filter(|id| !id.is_empty()),
+            user.connections
+                .iter()
+                .position(|c| c.platform.as_deref() == Some("TWITCH")),
+        ),
+        None => (None, None),
+    };
     Ok(match raw.emote_set {
-        Some(set) => convert_set(set, EmoteScope::Channel),
+        Some(set) => {
+            let set_id = set.id.clone().filter(|id| !id.is_empty());
+            let converted = convert_set(set, EmoteScope::Channel);
+            match set_id {
+                Some(set_id) => converted.with_origin(SetOrigin {
+                    set_id: set_id.into(),
+                    owner_id: owner_id.map(Into::into),
+                    connection,
+                }),
+                None => converted,
+            }
+        }
         None => EmoteSet::empty(EmoteProvider::SevenTv, EmoteScope::Channel),
     })
+}
+
+/// One emote-set entry as the REST API and the EventAPI both send it (`id`, `name`, `flags`,
+/// `data`): `None` for an entry without usable images or one that is malformed.
+pub(crate) fn parse_active_emote(value: &Value) -> Option<SetEmote> {
+    match serde_json::from_value::<RawActive>(value.clone()) {
+        Ok(raw) => convert(raw),
+        Err(error) => {
+            tracing::warn!(%error, "skipping malformed 7TV emote");
+            None
+        }
+    }
 }
 
 fn convert_set(raw: RawSet, scope: EmoteScope) -> EmoteSet {
@@ -209,7 +298,7 @@ fn convert(raw: RawActive) -> Option<SetEmote> {
 }
 
 /// `3x.webp` → [`ImageScale::X3`].
-fn file_scale(name: &str) -> Option<ImageScale> {
+pub(crate) fn file_scale(name: &str) -> Option<ImageScale> {
     let stem = name.split('.').next()?;
     match stem.strip_suffix('x')?.parse::<u8>().ok()? {
         1 => Some(ImageScale::X1),
@@ -221,7 +310,7 @@ fn file_scale(name: &str) -> Option<ImageScale> {
 }
 
 /// Lower is better. `None` for formats we cannot decode.
-fn format_rank(format: &str) -> Option<u8> {
+pub(crate) fn format_rank(format: &str) -> Option<u8> {
     match format {
         "WEBP" => Some(0),
         "GIF" => Some(1),

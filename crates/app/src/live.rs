@@ -103,7 +103,7 @@ impl LiveSource {
             ));
         }
         let enabled = emote_service::providers(&config::current(cx).emotes);
-        let emotes = EmoteService::start(enabled, cx);
+        let emotes = EmoteService::start(enabled, sender.clone(), cx);
         let badges = BadgeService::start(account.clone(), cx);
         let special = SpecialService::start(account.clone(), cx);
         let history = HistoryService::start(
@@ -264,6 +264,13 @@ impl LiveSource {
     pub fn reload_emotes(&self) {
         if let Some(emotes) = &self.emotes {
             emotes.reload();
+        }
+    }
+
+    /// Applies the `[badges]` switches to the live connections and the holder-list loads.
+    pub fn set_badges(&self, settings: &gpui_chat_settings::BadgeSettings) {
+        if let Some(emotes) = &self.emotes {
+            emotes.set_cosmetic_options(crate::badges::cosmetic_options(settings));
         }
     }
 

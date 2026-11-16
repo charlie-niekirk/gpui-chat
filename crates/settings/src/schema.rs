@@ -47,6 +47,8 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub chat: ChatSettings,
     pub emotes: EmoteSettings,
+    /// `[badges]`: third-party badges and 7TV name paints (PR 6.2).
+    pub badges: BadgeSettings,
     pub streamlink: StreamlinkSettings,
     /// `[highlights]` and its `[[highlights.rules]]` / `[[highlights.users]]` tables (PR 5.3).
     pub highlights: HighlightConfig,
@@ -65,6 +67,7 @@ impl Default for Settings {
             appearance: AppearanceSettings::default(),
             chat: ChatSettings::default(),
             emotes: EmoteSettings::default(),
+            badges: BadgeSettings::default(),
             streamlink: StreamlinkSettings::default(),
             highlights: HighlightConfig::default(),
             ignores: IgnoreConfig::default(),
@@ -205,6 +208,31 @@ impl Default for EmoteSettings {
             seventv: true,
             bttv: true,
             ffz: true,
+        }
+    }
+}
+
+/// `[badges]`: what is drawn next to and on a name besides Twitch's own badges.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BadgeSettings {
+    /// Show 7TV's badges.
+    pub seventv: bool,
+    /// Show FrankerFaceZ's badges (bot, supporter, ...).
+    pub ffz: bool,
+    /// Show Chatterino's badges (supporter, contributor, ...).
+    pub chatterino: bool,
+    /// Draw 7TV name paints (gradients and shadows) on usernames.
+    pub paints: bool,
+}
+
+impl Default for BadgeSettings {
+    fn default() -> Self {
+        Self {
+            seventv: true,
+            ffz: true,
+            chatterino: true,
+            paints: true,
         }
     }
 }
