@@ -19,6 +19,7 @@ pub mod moderation;
 pub mod special;
 pub mod store;
 pub mod tokenizer;
+pub mod user_card;
 
 pub use cheer::{CheerTier, Cheermote, CheermoteSet};
 pub use complete::{
@@ -48,6 +49,10 @@ pub use store::{DEFAULT_CAPACITY, MessageStore, Rebuild, Thread};
 pub use tokenizer::{
     DEFAULT_CHEERMOTE_PREFIXES, EmoteRange, NoResolver, RawEmoteRange, Tokenized, Tokenizer,
     WordResolver, parse_emotes_tag, resolve_fragments, twitch_emote_ranges,
+};
+pub use user_card::{
+    CardActions, KnownUser, MAX_CARD_MESSAGES, card_actions, format_age, format_date, is_login,
+    is_shared_copy, known_user, parse_rfc3339, profile_url, user_messages,
 };
 
 /// Name of this crate, used by the placeholder test below.

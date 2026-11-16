@@ -473,6 +473,38 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   invalidations together (`ChatView::caches`). A root that left the store is introduced by the reply tags (author and,
   for a direct reply, the text).
 
+### User card (PR 5.4)
+
+A card over the chat with a user's avatar, names, badges, account age, this session's messages and actions
+(`crates/app/src/chat/user_card.rs`; pure parts in `core::user_card`, Helix in `twitch::users`).
+
+- **Opening.** Click an author's name or an `@mention` (`DisplayText::users`, hit-tested by `selection_layer::Surface` like links:
+  pointing hand, opens on release, not after a drag; the surface calls the callback the view installs with `set_on_user`), *View user*
+  in the right-click menu (the name/mention under the pointer, else the author; `MenuTarget::user`), or the `OpenUserCard` action
+  (palette, bindable: the first selected message's author). `ChatView::open_user_card` takes focus, so Esc reaches `ClearSelection`
+  there first: it closes the card, then (as for a selection) asks the pane to refocus the input box. With no card open Esc is exactly
+  what it was (selection, else the composer chain: completion list, reply, propagate). A press outside the card (`on_mouse_down_out`)
+  closes it. It is a `deferred(anchored())` element at the pointer, kept inside the window; Kit's `Popover` needs a trigger element and
+  has no point anchor, which a click on painted text does not have.
+- **Content** (`CardModel`, built from the store each render): the user's messages (`user_messages`, newest first, 200 at most;
+  history marked, removed ones struck through or collapsed per `chat.deleted_messages`, each a click that scrolls the chat to it and
+  closes the card), the badges and name of their newest message, and the account part: avatar (`profile_image_url` through the image
+  store like an emote), display name + login, `Account created 14 Mar 2021 (5 years old)`, `Following since …`. Logged out (or an
+  offline run) there is no Helix: the card says "Log in to see account details" (with a Log in button when there is a login owner)
+  and the rest still shows.
+- **Account lookups** (`user_directory::UserDirectory`, one entity, a per-session cache): `GET users?login=` on the backend runtime
+  through a oneshot, once per login (loading / found / missing are kept; a failure is retried by the card's Retry or by opening the
+  card again). `GET channels/followers` needs `moderator:read:followers` (not requested at login) and a moderator token, so it is only
+  tried for a moderator, and any refusal is "unavailable": the line is left out. Nothing blocks the UI thread.
+- **Actions.** Copy username, Mention (`ChatViewEvent::Mention`: `Composer::insert_mention` puts `@login ` at the caret and focuses
+  the box), Reply to their newest replyable message (`ReplyRequested`, the existing path), Profile (`core::profile_url`: always
+  `https://www.twitch.tv/<login>`). For a moderator: Timeout presets, Ban… (asks first) and Unban, as `ChatViewEvent::ModerateUser`
+  → `ChannelPane::user_action` → the same `confirm_and_run` / `run_command` as the buttons on a message, so Helix, the live
+  moderator and the replay loopback, the missing-scope "Enable moderation tools" strip and the 403 handling are shared. `core::card_actions`
+  decides what is offered: nothing to viewers, to oneself, to the broadcaster, to another moderator unless the user is the broadcaster,
+  or to a user known only from shared-chat copies of another room; Unban is always offered to a moderator (the card has no ban to
+  read it off). Every action closes the card.
+
 ### Domain model (`crates/core`)
 
 Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowercase login,

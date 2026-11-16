@@ -12,6 +12,7 @@
 
 use std::fmt;
 
+use crate::emote::BadgeId;
 use crate::event::{ChannelRole, ClearTarget, FollowersOnly, RoomState};
 use crate::ids::ChannelId;
 use crate::message::{Message, MessageKind, Timestamp};
@@ -714,6 +715,17 @@ impl RowActions {
     }
 }
 
+/// Whether `badges` are those of a moderator, the broadcaster or Twitch staff: someone a
+/// moderator may not time out or ban (Twitch refuses it).
+pub fn author_is_staff(badges: &[BadgeId]) -> bool {
+    badges.iter().any(|badge| {
+        matches!(
+            &*badge.set,
+            "moderator" | "broadcaster" | "staff" | "admin" | "global_mod"
+        )
+    })
+}
+
 /// The moderation controls `message` gets in `channel` for a user who is `role` there and whose
 /// own login is `own_login` (when known): none for viewers, for lines nobody wrote, for
 /// events (a `USERNOTICE` card is not a chat line, whatever user text it carries: Twitch does
@@ -749,13 +761,7 @@ pub fn row_actions(
     {
         return RowActions::default();
     }
-    let author_is_staff = author.badges.iter().any(|badge| {
-        matches!(
-            &*badge.set,
-            "moderator" | "broadcaster" | "staff" | "admin" | "global_mod"
-        )
-    });
-    let may_punish = role.is_broadcaster() || !author_is_staff;
+    let may_punish = role.is_broadcaster() || !author_is_staff(&author.badges);
     RowActions {
         delete: may_punish && !message.flags.deleted,
         timeout: may_punish,

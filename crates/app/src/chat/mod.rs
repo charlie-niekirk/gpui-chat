@@ -27,6 +27,7 @@ pub mod selection;
 pub mod selection_layer;
 pub mod thread;
 pub mod tooltip;
+pub mod user_card;
 pub mod view;
 
 pub use view::ChatView;

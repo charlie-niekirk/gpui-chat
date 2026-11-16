@@ -232,6 +232,26 @@ impl RowAction {
         })
     }
 
+    /// The command for the user `login` (the user card, PR 5.4: the user may have no message
+    /// left to act on); `None` for Delete, which needs a message.
+    pub fn command_for_user(self, login: &str) -> Option<ModCommand> {
+        Some(match self {
+            Self::Delete => return None,
+            Self::Timeout(seconds) => ModCommand::Timeout {
+                user: login.to_owned(),
+                seconds,
+                reason: None,
+            },
+            Self::Ban => ModCommand::Ban {
+                user: login.to_owned(),
+                reason: None,
+            },
+            Self::Unban => ModCommand::Unban {
+                user: login.to_owned(),
+            },
+        })
+    }
+
     /// The menu item / tooltip text.
     pub fn label(self) -> String {
         match self {

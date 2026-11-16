@@ -24,6 +24,11 @@
 //!   their links a pointing-hand cursor. A click that starts and ends on the same link opens it in
 //!   the browser once the double-click interval has passed without another press, so a
 //!   double-click on a link selects it instead.
+//! * **Users** (PR 5.4): an author's name or an `@mention` opens that user's card. Like a link it
+//!   gets the pointing hand, and a click that starts and ends on it (no drag) reports a
+//!   [`UserTarget`] to the callback the view installed ([`Surface::set_on_user`]) the moment the
+//!   button is released: a double-click on a name opens the card at its first click and the second
+//!   press, which is outside the card, closes it again and selects the word.
 //! * **Copying** uses the display text of the selection's two end messages as it was when the
 //!   pointer was on them (the offsets were measured on it), even if their layouts were dropped or
 //!   rebuilt since; the messages in between are copied whole from the store.
@@ -84,6 +89,15 @@ struct RowGeometry {
     layout: MessageLayout,
 }
 
+/// A name or mention that was clicked: whose card to open, and where (window coordinates, the
+/// pointer's position) to anchor it.
+#[derive(Clone, Debug)]
+pub struct UserTarget {
+    /// Lowercase login.
+    pub login: Arc<str>,
+    pub position: Point<Pixels>,
+}
+
 /// What a point on the surface is over.
 #[derive(Clone)]
 pub struct Hit {
@@ -106,6 +120,16 @@ impl Hit {
             .map(|link| link.url.clone())
     }
 
+    /// The author name or mention drawn under the point: its lowercase login.
+    pub fn user(&self) -> Option<Arc<str>> {
+        let atom = self.atom?;
+        self.layout
+            .shaped
+            .display
+            .user_at(atom)
+            .map(|user| user.login.clone())
+    }
+
     /// The selection unit at the point: a word or a message around it, or a caret. Off the text
     /// (above or below every row) there is no word, so a caret.
     fn unit(&self, granularity: Granularity) -> Range<TextPos> {
@@ -125,6 +149,15 @@ struct Drag {
     moved: bool,
     /// The link it started on, which a release on the same link opens.
     link: Option<(u64, Arc<str>)>,
+    /// The name or mention it started on, whose card a release on it opens.
+    user: Option<(u64, Arc<str>)>,
+}
+
+/// A click that ended: the double-click timer to start, and the user (if a name or mention was
+/// clicked) to open now.
+struct Released {
+    id: u64,
+    user: Option<UserTarget>,
 }
 
 /// An end of the selection: its message's sequence number and display text as the pointer saw it.
@@ -160,7 +193,15 @@ impl Shown {
 pub struct MenuTarget {
     pub seq: u64,
     pub link: Option<Arc<str>>,
+    /// The name or mention under the pointer (lowercase login): "View user" opens this one
+    /// instead of the message's author.
+    pub user: Option<Arc<str>>,
+    /// Where the pointer was (window coordinates): the card opens there.
+    pub position: Point<Pixels>,
 }
+
+/// What the view does with a click on a name or mention.
+pub type OnUser = dyn Fn(UserTarget, &mut Window, &mut App);
 
 /// One place messages are selected in. Shared (`Rc`) by its view, its layer and its rows.
 pub struct Surface {
@@ -193,6 +234,8 @@ pub struct Surface {
     /// The rows this surface shows, when it shows only some of the store (the thread popover).
     members: RefCell<Option<Vec<u64>>>,
     menu_target: RefCell<Option<MenuTarget>>,
+    /// Who hears about a click on a name or mention.
+    on_user: RefCell<Option<Rc<OnUser>>>,
     #[cfg(test)]
     last_aimed: RefCell<Option<MenuTarget>>,
     /// The selection background.
@@ -220,6 +263,7 @@ impl Surface {
             cache,
             members: RefCell::default(),
             menu_target: RefCell::default(),
+            on_user: RefCell::default(),
             #[cfg(test)]
             last_aimed: RefCell::default(),
             color: Cell::new(Hsla::default()),
@@ -279,6 +323,10 @@ impl Surface {
                 .link
                 .take()
                 .and_then(|(seq, url)| Some((map(seq)?, url)));
+            drag.user = drag
+                .user
+                .take()
+                .and_then(|(seq, login)| Some((map(seq)?, login)));
         }
         let moved = |target: &mut Option<MenuTarget>| {
             *target = target.take().and_then(|target| {
@@ -387,6 +435,36 @@ impl Surface {
         (!text.is_empty()).then_some(text)
     }
 
+    /// The sequence number of the first message the selection touches.
+    pub fn selection_start(&self) -> Option<u64> {
+        self.selection
+            .borrow()
+            .as_ref()
+            .filter(|selection| !selection.is_empty())
+            .map(|selection| selection.start().seq)
+    }
+
+    /// Where a card about message `seq` hangs (window coordinates): under the row when it was
+    /// drawn this frame, else near the surface's top-left corner.
+    pub fn anchor_of(&self, seq: u64) -> Option<Point<Pixels>> {
+        let rows = self.rows.borrow();
+        if let Some(row) = rows.iter().find(|row| row.seq == seq) {
+            return Some(point(
+                row.bounds.left() + px(24.0),
+                row.bounds.bottom() - px(4.0),
+            ));
+        }
+        self.bounds
+            .get()
+            .map(|bounds| bounds.origin + point(px(24.0), px(24.0)))
+    }
+
+    /// Installs what happens when a name or mention is clicked (the view does it every render,
+    /// so the callback always belongs to the live view).
+    pub fn set_on_user(&self, on_user: Rc<OnUser>) {
+        *self.on_user.borrow_mut() = Some(on_user);
+    }
+
     /// What the right-click (or long press) that is opening a menu was over; taken, so a menu
     /// opened some other way finds nothing stale.
     pub fn take_menu_target(&self) -> Option<MenuTarget> {
@@ -461,8 +539,14 @@ impl Surface {
         drop(rows);
         let MessageLayout { shaped, flow } = layout;
         let mut hitboxes = Vec::new();
-        for link in &shaped.display.links {
-            for rect in highlight(flow, &shaped.atoms, link.range.clone()) {
+        let clickable = shaped
+            .display
+            .links
+            .iter()
+            .map(|link| &link.range)
+            .chain(shaped.display.users.iter().map(|user| &user.range));
+        for range in clickable {
+            for rect in highlight(flow, &shaped.atoms, range.clone()) {
                 let line = &flow.lines[rect.line];
                 let bounds = Bounds::new(
                     origin + point(px(rect.x), px(line.top)),
@@ -598,6 +682,9 @@ impl Surface {
         let link = (event.click_count <= 1)
             .then(|| hit.link().map(|url| (hit.seq, url)))
             .flatten();
+        let user = (event.click_count <= 1)
+            .then(|| hit.user().map(|login| (hit.seq, login)))
+            .flatten();
         match selection.as_mut() {
             Some(current) if event.modifiers.shift => {
                 current.extend_to(hit.unit(current.granularity));
@@ -614,6 +701,7 @@ impl Surface {
             origin: event.position,
             moved: event.modifiers.shift,
             link,
+            user,
         });
         self.pointer.set(event.position);
         true
@@ -663,8 +751,8 @@ impl Surface {
 
     /// Ends a press. A click (no drag, one click) leaves nothing selected and becomes a
     /// [`PendingClick`] with the link it started and ended on; returns its id, for the timer that
-    /// settles it after [`DOUBLE_CLICK`].
-    fn release(&self, position: Point<Pixels>) -> Option<u64> {
+    /// settles it after [`DOUBLE_CLICK`], and the name or mention it started and ended on.
+    fn release(&self, position: Point<Pixels>) -> Option<Released> {
         let drag = self.drag.borrow_mut().take()?;
         let click = !drag.moved
             && self
@@ -684,10 +772,17 @@ impl Surface {
                     .is_some_and(|hit| hit.seq == *seq && hit.link().as_deref() == Some(&**url))
             })
             .map(|(_, url)| url);
+        let user = drag
+            .user
+            .filter(|(seq, login)| {
+                self.hit(position)
+                    .is_some_and(|hit| hit.seq == *seq && hit.user().as_deref() == Some(&**login))
+            })
+            .map(|(_, login)| UserTarget { login, position });
         let id = self.clicks.get() + 1;
         self.clicks.set(id);
         *self.pending.borrow_mut() = Some(PendingClick { id, link });
-        Some(id)
+        Some(Released { id, user })
     }
 
     /// The double-click interval after click `id` passed: if no press came since, the list may
@@ -844,12 +939,18 @@ impl Surface {
         });
 
         let surface = self.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
-            if let Some(id) = surface.release(event.position) {
+            if let Some(Released { id, user }) = surface.release(event.position) {
                 surface.settle_later(id, view, cx);
+                // Cloned out of the cell: the callback may re-render and install it again.
+                let on_user = surface.on_user.borrow().clone();
+                if let (Some(user), Some(on_user)) = (user, on_user) {
+                    on_user(user, window, cx);
+                    cx.notify(view);
+                }
             }
         });
     }
@@ -887,6 +988,8 @@ impl Surface {
             .map(|hit| MenuTarget {
                 seq: hit.seq,
                 link: hit.link(),
+                user: hit.user(),
+                position,
             });
         #[cfg(test)]
         {
@@ -917,6 +1020,8 @@ mod remap_tests {
         *surface.menu_target.borrow_mut() = Some(MenuTarget {
             seq,
             link: Some("https://example.com".into()),
+            user: None,
+            position: Point::default(),
         });
     }
 

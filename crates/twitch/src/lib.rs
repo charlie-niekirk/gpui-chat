@@ -15,6 +15,7 @@
 //! * [`history`]: [`HistoryClient`], the recent-messages service behind the history shown on join
 //!   and after a reconnect (PR 5.5).
 //! * [`cheermotes`]: `Get Cheermotes`, a channel's cheermote set, for bits messages (PR 5.1).
+//! * [`users`]: `Get Users` and `Get Channel Followers`, behind the user card (PR 5.4).
 //! * [`user_emotes`]: `Get User Emotes`, the Twitch emotes the logged-in user may use (PR 3.3).
 
 pub mod auth;
@@ -29,6 +30,7 @@ mod parse;
 pub mod room_names;
 pub mod streams;
 pub mod user_emotes;
+pub mod users;
 
 pub use auth::Auth;
 pub use chat_send::{SEND_CHAT_PATH, SendError, SentMessage, echo_message};
@@ -45,6 +47,7 @@ pub use moderation::ModError;
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
 pub use room_names::{RoomName, RoomNames};
 pub use user_emotes::UserEmote;
+pub use users::{UserProfile, UserQuery};
 
 #[cfg(test)]
 mod chat_tests;

@@ -1040,6 +1040,7 @@ mod tests {
             emotes: Vec::new(),
             badges: Vec::new(),
             links: Vec::new(),
+            users: Vec::new(),
             breaks: Vec::new(),
         };
         assert_eq!(visual.len(), text.chars().count());
@@ -1080,6 +1081,7 @@ mod tests {
                 emotes: Vec::new(),
                 badges: Vec::new(),
                 links: Vec::new(),
+                users: Vec::new(),
                 breaks: vec![2],
             };
             let glyphs = (0..text.len())
@@ -1217,6 +1219,7 @@ mod tests {
             emotes: Vec::new(),
             badges: Vec::new(),
             links: Vec::new(),
+            users: Vec::new(),
             breaks: Vec::new(),
         };
         let xs = [0.0, 8.7, 16.1, 25.3, 33.9];

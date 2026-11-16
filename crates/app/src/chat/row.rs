@@ -12,7 +12,7 @@
 //! report the pointer through [`MessageStyle::hovered_row`]; only the hovered row is wrapped and
 //! carries a button, so the other rows cost nothing extra, and the menu is a single element
 //! around all of them ([`row_menu`] asks the selection surface what the right-click was over:
-//! the message, and a link under the pointer, PR 5.6).
+//! the message, a link under the pointer, PR 5.6, and the name or mention for *View user*, PR 5.4).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -265,6 +265,27 @@ pub fn row_menu(
                 "Copy username",
                 selection::username(author).to_owned(),
             ));
+        }
+        // The user card (PR 5.4): of the name or mention under the pointer, else the author.
+        let mentioned = target.user.clone();
+        let viewed = mentioned
+            .clone()
+            .or_else(|| message.author.as_ref().map(|a| Arc::from(a.login.as_str())));
+        if let Some(login) = viewed.filter(|login| gpui_chat_core::is_login(login)) {
+            let label = match (&mentioned, &message.author) {
+                (Some(login), Some(author)) if !login.eq_ignore_ascii_case(&author.login) => {
+                    format!("View @{login}")
+                }
+                _ => "View user".to_owned(),
+            };
+            let (card_view, position) = (view.clone(), target.position);
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                card_view
+                    .update(cx, |view, cx| {
+                        view.open_user_card(&login, position, window, cx)
+                    })
+                    .ok();
+            }));
         }
         if let Some(url) = target.link {
             let open = url.clone();

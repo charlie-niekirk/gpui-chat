@@ -105,6 +105,15 @@ pub struct DisplayLink {
     pub url: Arc<str>,
 }
 
+/// A clickable user in the text (PR 5.4): an author's name or an `@mention`, where it is and
+/// whose card it opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayUser {
+    pub range: Range<usize>,
+    /// Lowercase login.
+    pub login: Arc<str>,
+}
+
 /// The display text and its spans. Spans are contiguous, in order, and cover the whole text.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayText {
@@ -116,6 +125,8 @@ pub struct DisplayText {
     pub badges: Vec<DisplayBadge>,
     /// Every link, in text order.
     pub links: Vec<DisplayLink>,
+    /// Every author name and mention that opens a user card, in text order.
+    pub users: Vec<DisplayUser>,
     /// Byte offsets of the hard line breaks (each is one space character in `text`, so copying
     /// and hit-testing see a space), in text order.
     pub breaks: Vec<usize>,
@@ -208,6 +219,30 @@ impl DisplayText {
         self.links.get(i).filter(|link| link.range.start <= index)
     }
 
+    /// The user whose name or mention contains byte `index`.
+    pub fn user_at(&self, index: usize) -> Option<&DisplayUser> {
+        let i = self.users.partition_point(|user| user.range.end <= index);
+        self.users.get(i).filter(|user| user.range.start <= index)
+    }
+
+    /// Appends `name` as the [`Role::Name`] span of `author`, which opens their card.
+    fn push_name(&mut self, author: &Author) {
+        let start = self.text.len();
+        self.push(author_name(author), Role::Name);
+        self.mark_user(start, &author.login);
+    }
+
+    /// Makes the text from byte `start` to the end open `login`'s card (when it is a login).
+    fn mark_user(&mut self, start: usize, login: &str) {
+        let end = self.text.len();
+        if end > start && gpui_chat_core::is_login(login) {
+            self.users.push(DisplayUser {
+                range: start..end,
+                login: Arc::from(login.to_ascii_lowercase()),
+            });
+        }
+    }
+
     /// Index of the span containing byte `index`.
     pub fn span_at(&self, index: usize) -> Option<usize> {
         let i = self.spans.partition_point(|span| span.range.end <= index);
@@ -260,14 +295,22 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                 }
             }
             Fragment::Emoji { text } => out.push(text, Role::Emoji),
-            Fragment::Mention { text, is_self, .. } => out.push(
+            Fragment::Mention {
                 text,
-                if *is_self {
-                    Role::SelfMention
-                } else {
-                    Role::Mention
-                },
-            ),
+                login,
+                is_self,
+            } => {
+                let start = out.text.len();
+                out.push(
+                    text,
+                    if *is_self {
+                        Role::SelfMention
+                    } else {
+                        Role::Mention
+                    },
+                );
+                out.mark_user(start, login);
+            }
             Fragment::Link { text, url } => {
                 let start = out.text.len();
                 out.push(text, Role::Link);
@@ -396,7 +439,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
             let chat = message.kind == MessageKind::Chat;
             if let Some(author) = author {
                 out.push_badges(badges);
-                out.push(author_name(author), Role::Name);
+                out.push_name(author);
                 out.push(if chat { ": " } else { " " }, Role::Separator);
             }
             let role = if chat { Role::Text } else { Role::ActionText };
@@ -415,7 +458,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                 }
                 if let Some(author) = author {
                     out.push_badges(badges);
-                    out.push(author_name(author), Role::Name);
+                    out.push_name(author);
                     out.push(": ", Role::Separator);
                 }
                 push_body(&mut out, &body_fragments(message), Role::Text);
