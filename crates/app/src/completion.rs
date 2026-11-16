@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_chat_core::{
-    COMMANDS, Chatter, CommandInfo, Edit, Emote, Recents, Trigger, TriggerKind, apply,
+    COMMANDS, ChannelRole, Chatter, CommandInfo, Edit, Emote, Recents, Trigger, TriggerKind, apply,
     find_trigger, rank,
 };
 use gpui_chat_emotes::EmoteCatalog;
@@ -110,6 +110,15 @@ pub fn remember_emote(name: &str, cx: &mut App) {
     drop(recents);
 }
 
+/// What candidates are drawn from besides the text itself: the emotes available here, the ones
+/// used recently and the user's role (it decides which `/commands` are offered, PR 5.2).
+#[derive(Clone, Copy)]
+pub struct Sources<'a> {
+    pub catalog: &'a EmoteCatalog,
+    pub recents: &'a Recents,
+    pub role: ChannelRole,
+}
+
 /// One candidate.
 #[derive(Debug, Clone)]
 pub enum Item {
@@ -130,13 +139,18 @@ impl Item {
 }
 
 /// The candidates for `trigger`, best first. `chatters` (newest speaker first) is only asked for
-/// by an `@` trigger.
+/// by an `@` trigger. `role` decides which `/commands` are offered: the moderation ones only to
+/// someone who may use them (PR 5.2).
 pub fn candidates(
     trigger: &Trigger,
-    catalog: &EmoteCatalog,
-    recents: &Recents,
+    sources: Sources<'_>,
     chatters: impl FnOnce() -> Vec<Chatter>,
 ) -> Vec<Item> {
+    let Sources {
+        catalog,
+        recents,
+        role,
+    } = sources;
     let query = trigger.query.as_str();
     match trigger.kind {
         TriggerKind::Emote => {
@@ -173,10 +187,16 @@ pub fn candidates(
             .map(|i| Item::User(chatters[i].clone()))
             .collect()
         }
-        TriggerKind::Command => rank(query, COMMANDS, |command| command.name, |_| None, LIMIT)
-            .into_iter()
-            .map(|i| Item::Command(&COMMANDS[i]))
-            .collect(),
+        TriggerKind::Command => {
+            let allowed: Vec<&'static CommandInfo> = COMMANDS
+                .iter()
+                .filter(|command| command.role.allows(role))
+                .collect();
+            rank(query, &allowed, |command| command.name, |_| None, LIMIT)
+                .into_iter()
+                .map(|i| Item::Command(allowed[i]))
+                .collect()
+        }
     }
 }
 
@@ -320,8 +340,7 @@ impl Autocomplete {
         text: &str,
         caret: usize,
         explicit: bool,
-        catalog: &EmoteCatalog,
-        recents: &Recents,
+        sources: Sources<'_>,
         chatters: impl FnOnce() -> Vec<Chatter>,
     ) -> Outcome {
         // A list Tab opened keeps treating the plain word as emotes while it is typed on.
@@ -340,7 +359,7 @@ impl Autocomplete {
             self.popup = None;
             return Outcome::Closed;
         }
-        let items = candidates(&trigger, catalog, recents, chatters);
+        let items = candidates(&trigger, sources, chatters);
         if items.is_empty() {
             self.popup = None;
             return Outcome::Closed;
@@ -550,8 +569,11 @@ mod tests {
             text,
             text.len(),
             explicit,
-            catalog,
-            &Recents::default(),
+            Sources {
+                catalog,
+                recents: &Recents::default(),
+                role: ChannelRole::Viewer,
+            },
             || chatters(&["Zed", "Zoe", "Bob"]),
         )
     }
@@ -605,8 +627,11 @@ mod tests {
             "@ほ",
             "@ほ".len(),
             false,
-            &catalog,
-            &Recents::default(),
+            Sources {
+                catalog: &catalog,
+                recents: &Recents::default(),
+                role: ChannelRole::Viewer,
+            },
             || {
                 vec![Chatter {
                     login: "hoge".into(),
@@ -622,7 +647,11 @@ mod tests {
         let catalog = catalog(&[]);
         let mut auto = Autocomplete::default();
         assert_eq!(refresh(&mut auto, "/", false, &catalog), Outcome::Open);
-        assert_eq!(texts(&auto), ["me"]);
+        assert_eq!(
+            texts(&auto),
+            ["me"],
+            "a viewer is offered no moderation command"
+        );
         let edit = auto.popup().unwrap().edit_for(0, "").unwrap();
         assert_eq!(edit.applied_to("/").0, "/me ");
         assert_eq!(refresh(&mut auto, "/x", false, &catalog), Outcome::Closed);
@@ -631,6 +660,40 @@ mod tests {
             refresh(&mut auto, "hi /me", false, &catalog),
             Outcome::Closed
         );
+    }
+
+    #[test]
+    fn moderation_commands_are_offered_to_the_roles_that_may_use_them() {
+        let catalog = catalog(&[]);
+        let commands = |role, text: &str| {
+            let mut auto = Autocomplete::default();
+            auto.refresh(
+                text,
+                text.len(),
+                false,
+                Sources {
+                    catalog: &catalog,
+                    recents: &Recents::default(),
+                    role,
+                },
+                Vec::new,
+            );
+            texts(&auto)
+        };
+        assert_eq!(commands(ChannelRole::Viewer, "/ti"), Vec::<String>::new());
+        assert_eq!(commands(ChannelRole::Moderator, "/ti"), ["timeout"]);
+        assert_eq!(
+            commands(ChannelRole::Moderator, "/ra"),
+            Vec::<String>::new()
+        );
+        let broadcaster = commands(ChannelRole::Broadcaster, "/ra");
+        assert!(broadcaster.contains(&"raid".to_owned()), "{broadcaster:?}");
+        let unlifts = commands(ChannelRole::Moderator, "/un");
+        assert!(unlifts.contains(&"unban".to_owned()), "{unlifts:?}");
+        assert!(!unlifts.contains(&"unmod".to_owned()), "{unlifts:?}");
+        let moderator = commands(ChannelRole::Moderator, "/");
+        assert!(moderator.contains(&"ban".to_owned()) && moderator.contains(&"me".to_owned()));
+        assert!(!moderator.contains(&"mod".to_owned()), "broadcaster only");
     }
 
     #[test]
@@ -733,7 +796,17 @@ mod tests {
         let mut recents = Recents::default();
         recents.push("KappaHD");
         let mut auto = Autocomplete::default();
-        auto.refresh(":kap", 4, false, &catalog, &recents, Vec::new);
+        auto.refresh(
+            ":kap",
+            4,
+            false,
+            Sources {
+                catalog: &catalog,
+                recents: &recents,
+                role: ChannelRole::Viewer,
+            },
+            Vec::new,
+        );
         assert_eq!(texts(&auto), ["KappaHD", "Kappa", "KappaPride"]);
     }
 }

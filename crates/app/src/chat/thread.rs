@@ -237,6 +237,7 @@ pub fn render(
                     store,
                     panel.surface.clone(),
                     rows.can_reply,
+                    rows.role.can_moderate(),
                 )),
         )
         .into_any_element()

@@ -1,0 +1,28 @@
+# Moderation replay (PR 5.2): a channel where the logged-in user is a moderator, with messages that
+# are then deleted, timed out and banned.
+#
+#   cargo run -p gpui-chat --release -- --replay fixtures/irc/moderation.irc --replay-speed 0
+#
+# Offline there is no Helix: the moderation buttons, the right-click menu, the room-mode menu and
+# the slash commands all work, and the effect each one would have is fed back into the chat.
+# Change `mod=1;...badges=moderator/1` of the USERSTATE line to `mod=0;...badges=` to see the viewer
+# side (no controls at all).
+@badge-info=;badges=moderator/1;color=#00FF7F;display-name=Viewer;emote-sets=0;mod=1;subscriber=0;user-type=mod :tmi.twitch.tv USERSTATE #testchan
+@emote-only=0;followers-only=10;r9k=0;room-id=1000;slow=0;subs-only=0 :tmi.twitch.tv ROOMSTATE #testchan
+@badge-info=;badges=broadcaster/1;color=#FF4500;display-name=testchan;id=40000000-0000-4000-8000-000000000001;room-id=1000;tmi-sent-ts=1700000010000;user-id=1000 :testchan!testchan@testchan.tmi.twitch.tv PRIVMSG #testchan :welcome to the stream everyone
+@badge-info=;badges=moderator/1;color=#00FF7F;display-name=ModGuy;id=40000000-0000-4000-8000-000000000002;room-id=1000;tmi-sent-ts=1700000011000;user-id=2001 :modguy!modguy@modguy.tmi.twitch.tv PRIVMSG #testchan :be nice in chat please
+@badge-info=subscriber/3;badges=subscriber/3;color=#1E90FF;display-name=Alice;id=40000000-0000-4000-8000-000000000003;room-id=1000;tmi-sent-ts=1700000012000;user-id=3001 :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchan :that last round was great, what is the game called again?
+@badge-info=;badges=;color=#FF69B4;display-name=Spammer;id=40000000-0000-4000-8000-000000000004;room-id=1000;tmi-sent-ts=1700000013000;user-id=3002 :spammer!spammer@spammer.tmi.twitch.tv PRIVMSG #testchan :BUY FOLLOWERS at cheap-followers.example now now now
+@badge-info=;badges=;color=#FF69B4;display-name=Spammer;id=40000000-0000-4000-8000-000000000005;room-id=1000;tmi-sent-ts=1700000013500;user-id=3002 :spammer!spammer@spammer.tmi.twitch.tv PRIVMSG #testchan :BUY FOLLOWERS at cheap-followers.example now now now
+@badge-info=;badges=;color=#9ACD32;display-name=Bob;id=40000000-0000-4000-8000-000000000006;room-id=1000;tmi-sent-ts=1700000014000;user-id=3003 :bob!bob@bob.tmi.twitch.tv PRIVMSG #testchan :first time here, hi all
+@badge-info=;badges=;color=#DAA520;display-name=Troll;id=40000000-0000-4000-8000-000000000007;room-id=1000;tmi-sent-ts=1700000015000;user-id=3004 :troll!troll@troll.tmi.twitch.tv PRIVMSG #testchan :this stream is garbage and so are all of you
+@badge-info=;badges=;color=#DAA520;display-name=Troll;id=40000000-0000-4000-8000-000000000008;room-id=1000;tmi-sent-ts=1700000015500;user-id=3004 :troll!troll@troll.tmi.twitch.tv PRIVMSG #testchan :nobody can even play
+@badge-info=;badges=;color=#8A2BE2;display-name=Carol;id=40000000-0000-4000-8000-000000000009;room-id=1000;tmi-sent-ts=1700000016000;user-id=3005 :carol!carol@carol.tmi.twitch.tv PRIVMSG #testchan :does anyone know the song that is playing?
+# the spammer is timed out for 10 minutes: both messages are struck out, then one line says so
+@ban-duration=600;room-id=1000;target-user-id=3002;tmi-sent-ts=1700000017000 :tmi.twitch.tv CLEARCHAT #testchan :spammer
+# one message deleted by a moderator
+@login=bob;room-id=1000;target-msg-id=40000000-0000-4000-8000-000000000006;tmi-sent-ts=1700000018000 :tmi.twitch.tv CLEARMSG #testchan :first time here, hi all
+# the troll is banned
+@room-id=1000;target-user-id=3004;tmi-sent-ts=1700000019000 :tmi.twitch.tv CLEARCHAT #testchan :troll
+@badge-info=;badges=;color=#1E90FF;display-name=Dave;id=40000000-0000-4000-8000-000000000010;room-id=1000;tmi-sent-ts=1700000020000;user-id=3006 :dave!dave@dave.tmi.twitch.tv PRIVMSG #testchan :what did I miss?
+@badge-info=;badges=;color=#FF7F50;display-name=Erin;id=40000000-0000-4000-8000-000000000011;room-id=1000;tmi-sent-ts=1700000021000;user-id=3007 :erin!erin@erin.tmi.twitch.tv PRIVMSG #testchan :just a spammer, already handled

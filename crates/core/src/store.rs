@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::event::{ClearTarget, Moderation};
 use crate::ids::MessageId;
-use crate::message::Message;
+use crate::message::{Message, MessageKind};
 
 /// Default number of messages kept per channel.
 pub const DEFAULT_CAPACITY: usize = 1_000;
@@ -22,6 +22,14 @@ pub struct Thread<'a> {
     pub root: Option<&'a Arc<Message>>,
     /// The replies still retained, oldest first.
     pub replies: Vec<&'a Arc<Message>>,
+}
+
+/// Whether `message` is something a moderator can remove: what a person wrote.
+fn is_chat_line(message: &Message) -> bool {
+    matches!(
+        message.kind,
+        MessageKind::Chat | MessageKind::Action | MessageKind::UserNotice
+    )
 }
 
 /// A bounded, ordered buffer of the most recent messages of one channel.
@@ -300,7 +308,9 @@ impl MessageStore {
             Moderation::Clear { target, at } => {
                 let at = *at;
                 match target {
-                    ClearTarget::Channel => self.mark_where(|m| m.timestamp <= at),
+                    ClearTarget::Channel => {
+                        self.mark_where(|m| is_chat_line(m) && m.timestamp <= at)
+                    }
                     ClearTarget::User { login, .. } => self.mark_where(|m| {
                         m.timestamp <= at
                             && m.author
@@ -458,9 +468,11 @@ impl MessageStore {
         })
     }
 
-    /// Marks every retained message as deleted; returns how many changed.
+    /// Marks every retained chat line as deleted; returns how many changed. System lines and
+    /// notices stay as they are (a "chat was cleared" line must not be struck through by the
+    /// clear it reports).
     pub fn mark_all_deleted(&mut self) -> usize {
-        self.mark_where(|_| true)
+        self.mark_where(is_chat_line)
     }
 
     fn mark_where(&mut self, mut pred: impl FnMut(&Message) -> bool) -> usize {
@@ -705,8 +717,13 @@ mod tests {
         assert_eq!(store.mark_user_deleted("Alice"), 2);
         assert!(store.get("1").unwrap().flags.deleted);
         assert!(!store.get("2").unwrap().flags.deleted);
-        assert_eq!(store.mark_all_deleted(), 2, "already-deleted are skipped");
-        assert!(store.iter().all(|m| m.flags.deleted));
+        assert_eq!(store.mark_all_deleted(), 1, "already-deleted are skipped");
+        assert!(
+            store
+                .iter()
+                .all(|m| m.flags.deleted == (m.kind == MessageKind::Chat)),
+            "chat lines are deleted, the system line is not"
+        );
     }
 
     #[test]

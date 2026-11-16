@@ -273,22 +273,6 @@ pub fn rank<T>(
     hits.into_iter().map(|hit| hit.index).collect()
 }
 
-/// A slash command the input box understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandInfo {
-    /// Without the slash.
-    pub name: &'static str,
-    pub usage: &'static str,
-    pub summary: &'static str,
-}
-
-/// The commands [`crate::parse_input`] accepts (a test keeps the two in step).
-pub const COMMANDS: &[CommandInfo] = &[CommandInfo {
-    name: "me",
-    usage: "/me <message>",
-    summary: "Send a message as an action",
-}];
-
 /// Someone who spoke in a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chatter {
@@ -384,6 +368,7 @@ mod tests {
     use super::*;
     use crate::compose::{Input, InputError, parse_input};
     use crate::message::{Author, Message, Timestamp};
+    use crate::moderation::COMMANDS;
 
     fn trigger(text: &str, explicit: bool) -> Option<Trigger> {
         find_trigger(text, text.len(), explicit)

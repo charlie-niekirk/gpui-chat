@@ -14,8 +14,8 @@ mod fields;
 use std::rc::Rc;
 
 use gpui_chat_settings::{
-    EMOTE_SCALE_RANGE, EditValue, FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, SCROLLBACK_RANGE,
-    SettingEdit, Settings, SettingsError, ThemeMode,
+    DeletedMessages, EMOTE_SCALE_RANGE, EditValue, FONT_SIZE_RANGE, LINE_HEIGHT_RANGE,
+    SCROLLBACK_RANGE, SettingEdit, Settings, SettingsError, ThemeMode,
 };
 use gpui_chat_twitch::auth::AuthState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -571,7 +571,44 @@ fn bool_writer(
 }
 
 fn chat_page(this: &WeakEntity<SettingsView>) -> SettingPage {
-    SettingPage::new("Chat").icon(IconName::Inbox).group(
+    let removed = SettingGroup::new()
+        .title("Moderation")
+        .items([SettingItem::new(
+            "Removed messages",
+            SettingField::dropdown(
+                vec![
+                    ("strikethrough".into(), "Struck through".into()),
+                    ("collapse".into(), "Collapsed".into()),
+                ],
+                |cx| {
+                    match current(cx).chat.deleted_messages {
+                        DeletedMessages::Strikethrough => "strikethrough",
+                        DeletedMessages::Collapse => "collapse",
+                    }
+                    .into()
+                },
+                {
+                    let this = this.clone();
+                    move |value: SharedString, cx| {
+                        SettingsView::write(
+                            &this,
+                            vec![SettingEdit::set(
+                                "chat.deleted_messages",
+                                EditValue::Str(value.to_string()),
+                            )],
+                            cx,
+                        );
+                    }
+                },
+            )
+            .default_value("strikethrough"),
+        )
+        .description(
+            "How a message a moderator deleted (or whose author was timed out or banned) is shown: \
+         dimmed and struck through where it is, or collapsed to “<message deleted>” until you \
+         click it.",
+        )]);
+    SettingPage::new("Chat").icon(IconName::Inbox).groups([
         SettingGroup::new().title("History").items([
             SettingItem::new(
                 "Load recent messages",
@@ -615,7 +652,8 @@ fn chat_page(this: &WeakEntity<SettingsView>) -> SettingPage {
             )
             .description("Messages kept per channel. Takes effect the next time the app starts."),
         ]),
-    )
+        removed,
+    ])
 }
 
 fn emotes_page(this: &WeakEntity<SettingsView>) -> SettingPage {

@@ -46,6 +46,7 @@ pub const CLIENT_ID_ENV: &str = "GPUI_CHAT_TWITCH_CLIENT_ID";
 /// * `user:read:chat`, `user:write:chat`: Helix chat, Send Chat Message (PR 3.2).
 /// * `user:read:emotes`: the user's own Twitch emotes (PR 3.3).
 /// * `user:read:follows`: the followed-live sidebar (PR 3.5).
+/// * [`MODERATION_SCOPES`]: the moderation tools (PR 5.2).
 pub const SCOPES: &[&str] = &[
     "chat:read",
     "chat:edit",
@@ -53,6 +54,28 @@ pub const SCOPES: &[&str] = &[
     "user:write:chat",
     "user:read:emotes",
     "user:read:follows",
+    "moderator:manage:banned_users",
+    "moderator:manage:chat_messages",
+    "moderator:manage:chat_settings",
+    "moderator:manage:announcements",
+    "moderator:manage:shoutouts",
+    "channel:manage:moderators",
+    "channel:manage:vips",
+    "channel:manage:raids",
+];
+
+/// The part of [`SCOPES`] only the moderation tools use (PR 5.2). A login that predates them keeps
+/// working for chat: the tools say which scope to log in again for when one is used, and the
+/// account banner does not ask every viewer to log in again for them.
+pub const MODERATION_SCOPES: &[&str] = &[
+    "moderator:manage:banned_users",
+    "moderator:manage:chat_messages",
+    "moderator:manage:chat_settings",
+    "moderator:manage:announcements",
+    "moderator:manage:shoutouts",
+    "channel:manage:moderators",
+    "channel:manage:vips",
+    "channel:manage:raids",
 ];
 
 /// The client id to use: `$GPUI_CHAT_TWITCH_CLIENT_ID` when set and not blank, else

@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui_chat_core::{APP_ID, APP_NAME, ChannelId};
+use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent};
 use gpui_chat_settings::SettingsError;
-use gpui_chat_twitch::auth::AuthState;
+use gpui_chat_twitch::auth::{AuthState, MODERATION_SCOPES};
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -42,6 +42,7 @@ use crate::actions::{
     SelectNextChannel, SelectPreviousChannel, SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::add_channel;
+use crate::bridge::BridgeSender;
 use crate::channel_list::{ChannelList, Move};
 use crate::channels::ChannelHub;
 use crate::composer::Composer;
@@ -52,8 +53,9 @@ use crate::fonts::FontConfig;
 use crate::hud::DebugHud;
 use crate::keymap::{self, KeymapState};
 use crate::live::LiveSource;
+use crate::moderation::Moderator;
 use crate::palette;
-use crate::pane::ChannelPane;
+use crate::pane::{ChannelPane, PaneTools};
 use crate::sign_in;
 use crate::splits::view::{ChannelRows, Splits};
 use crate::splits::{Direction, DropZone, Layout, PaneId};
@@ -148,6 +150,9 @@ pub struct ShellParts {
     pub live: Option<LiveSource>,
     /// The Twitch account; `None` with the offline sources (they never touch the keychain).
     pub account: Option<Entity<AccountHub>>,
+    /// With `--replay`: where moderation commands go instead of Helix, so a recorded log that
+    /// says the user is a moderator can show (and try) the moderation controls offline.
+    pub loopback: Option<BridgeSender<ChatEvent>>,
     pub diagnostics: Diagnostics,
     pub hud_visible: bool,
 }
@@ -161,6 +166,7 @@ pub struct AppShell {
     list: ChannelList,
     live: Option<LiveSource>,
     account: Option<Entity<AccountHub>>,
+    loopback: Option<BridgeSender<ChatEvent>>,
     /// Live state of the open and the followed channels (PR 3.5); live source only, polls while
     /// logged in.
     stream_info: Option<Entity<StreamInfoHub>>,
@@ -183,6 +189,17 @@ pub struct AppShell {
     _subscriptions: Vec<Subscription>,
 }
 
+/// The missing scopes the account banner asks the user to log in again for: all but the
+/// moderation ones (PR 5.2), which only matter to moderators and are asked for when a moderation
+/// tool is used ("Log in again to grant …") instead of nagging every viewer.
+fn banner_scopes(missing: &[String]) -> Vec<&str> {
+    missing
+        .iter()
+        .map(String::as_str)
+        .filter(|scope| !MODERATION_SCOPES.contains(scope))
+        .collect()
+}
+
 impl AppShell {
     pub fn new(window: &mut Window, parts: ShellParts, cx: &mut Context<Self>) -> Self {
         let ShellParts {
@@ -190,6 +207,7 @@ impl AppShell {
             channels,
             live,
             account,
+            loopback,
             diagnostics,
             hud_visible,
         } = parts;
@@ -257,6 +275,7 @@ impl AppShell {
             list: channels,
             live,
             account,
+            loopback,
             stream_info,
             streams: StreamHub::start(window, cx),
             panes: HashMap::new(),
@@ -346,8 +365,19 @@ impl AppShell {
                 cx.new(|cx| Composer::new(store, live, account, cx))
             });
         let stream_info = self.stream_info.clone();
-        let pane =
-            cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, composer, cx));
+        // Moderation commands: Helix for the live source (with a login owner), the loopback for
+        // `--replay`.
+        let moderator = self
+            .live
+            .clone()
+            .filter(LiveSource::can_send)
+            .map(Moderator::Live)
+            .or_else(|| self.loopback.clone().map(Moderator::Loopback));
+        let tools = PaneTools {
+            composer,
+            moderator,
+        };
+        let pane = cx.new(|cx| ChannelPane::new(hub, store, streams, stream_info, live, tools, cx));
         self.panes.insert(channel, pane);
     }
 
@@ -762,12 +792,13 @@ impl AppShell {
         let (message, action, colour) = if let Some(notice) = account.notice() {
             (notice.to_owned(), "Log in", tokens.danger)
         } else if let AuthState::LoggedIn(user) = account.state()
-            && user.needs_relogin()
+            && let missing = banner_scopes(&user.missing_scopes)
+            && !missing.is_empty()
         {
             (
                 format!(
                     "Log in again to grant the new Twitch permissions ({}).",
-                    user.missing_scopes.join(", ")
+                    missing.join(", ")
                 ),
                 "Log in again",
                 tokens.accent,
@@ -1358,5 +1389,24 @@ impl Render for AppShell {
             );
         // Times the draw of everything above for the HUD.
         frame_probe(self.diagnostics.clone(), root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::banner_scopes;
+
+    #[test]
+    fn the_banner_does_not_ask_every_viewer_to_log_in_again_for_moderation_scopes() {
+        let missing: Vec<String> = [
+            "user:read:follows",
+            "moderator:manage:banned_users",
+            "channel:manage:raids",
+        ]
+        .map(str::to_owned)
+        .into();
+        assert_eq!(banner_scopes(&missing), ["user:read:follows"]);
+        let only_moderation: Vec<String> = vec!["moderator:manage:chat_settings".to_owned()];
+        assert!(banner_scopes(&only_moderation).is_empty());
     }
 }

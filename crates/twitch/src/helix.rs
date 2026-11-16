@@ -8,7 +8,8 @@
 //! bucket is empty, requests wait for the reset (up to [`HelixClient::max_wait`]); a 429 is retried
 //! once after that wait.
 //!
-//! [`HelixClient::post_json`] is the same for a JSON body (PR 3.2, Send Chat Message).
+//! [`HelixClient::post_json`] is the same for a JSON body (PR 3.2, Send Chat Message);
+//! [`HelixClient::request_json`] takes any method (PR 5.2, the moderation endpoints).
 //!
 //! Endpoint-specific parsing lives with the caller; this returns status and body. The base URL is
 //! injectable, so tests run against a local mock server.
@@ -212,24 +213,37 @@ impl HelixClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<HelixResponse, HelixError> {
-        let body = serde_json::to_vec(body)
+        self.request_json(Method::POST, path, Some(body)).await
+    }
+
+    /// Sends `method` to `path` (relative to the base) as the logged-in user, with `body` as JSON
+    /// when there is one (`PATCH` / `DELETE` / `POST` of the moderation endpoints, PR 5.2). Retries
+    /// like [`HelixClient::post_json`].
+    pub async fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<HelixResponse, HelixError> {
+        let body = body
+            .map(serde_json::to_vec)
+            .transpose()
             .map_err(|error| HelixError::Network(format!("cannot encode request: {error}")))?;
+        let body = body.as_deref();
         let auth = &self.inner.auth;
         let mut lease = auth.access_token().await?;
         let mut response = self
-            .send_request(Method::POST, path, Some(&body), &lease)
+            .send_request(method.clone(), path, body, &lease)
             .await?;
         if response.status == 401 && token_rejected(&response.body) {
             lease = auth.refresh_after_unauthorized(lease.generation).await?;
             response = self
-                .send_request(Method::POST, path, Some(&body), &lease)
+                .send_request(method.clone(), path, body, &lease)
                 .await?;
         }
         if response.status == 429 {
             let lease = auth.access_token().await?;
-            response = self
-                .send_request(Method::POST, path, Some(&body), &lease)
-                .await?;
+            response = self.send_request(method, path, body, &lease).await?;
         }
         Ok(response)
     }

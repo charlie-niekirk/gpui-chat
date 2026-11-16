@@ -57,8 +57,14 @@ impl Composer {
         let catalog = self.catalog(cx);
         let recents = completion::recent_emotes(cx);
         let store = self.store.clone();
+        let role = store.read(cx).role();
+        let sources = completion::Sources {
+            catalog: &catalog,
+            recents: &recents,
+            role,
+        };
         self.completion
-            .refresh(&text, caret, explicit, &catalog, &recents, || {
+            .refresh(&text, caret, explicit, sources, || {
                 recent_chatters(store.read(cx).messages().iter().map(|m| &**m), CHATTERS)
             })
     }

@@ -32,11 +32,13 @@
 //!   pane also handles Copy, so the command palette reaches it from the input box.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui_chat_core::{Message, MessageId, Rebuild};
+use gpui_chat_core::{ChannelRole, Message, MessageId, Rebuild};
+use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
@@ -59,6 +61,7 @@ use crate::channels::ChannelStore;
 use crate::config;
 use crate::fonts::FontConfig;
 use crate::images::{FrameImages, Images, LayoutChanges};
+use crate::moderation::RowAction;
 use crate::theme::Tokens;
 
 /// Rows rendered beyond the viewport, so short scrolls do not pop in.
@@ -76,6 +79,8 @@ struct TextConfig {
     emote_scale: f32,
     /// Light theme: Twitch emote URLs (picked when shaping) have light variants.
     light: bool,
+    /// How removed messages are drawn: collapsed rows have another height (PR 5.2).
+    deleted: DeletedMessages,
 }
 
 /// Badges are drawn as squares a bit taller than the text's x-height: 18 px at the default
@@ -91,6 +96,9 @@ pub enum ChatViewEvent {
     ReplyRequested(Arc<Message>),
     /// Esc cleared the selection: hand focus back to the input box.
     SelectionDismissed,
+    /// The user chose a moderation action (a row button or a menu item) on this message (PR 5.2);
+    /// the owner confirms it if need be and runs it.
+    Moderate(Arc<Message>, RowAction),
 }
 
 impl EventEmitter<ChatViewEvent> for ChatView {}
@@ -133,6 +141,13 @@ pub struct ChatView {
     can_reply: bool,
     /// The list's row the pointer is over (kept current by the rows when `can_reply`).
     hovered: HoveredRow,
+    /// Whether moderation controls can act (the pane has someone to run commands); they are
+    /// shown when the logged-in user is also a moderator here (PR 5.2).
+    moderation: bool,
+    /// Removed messages the user clicked open (`chat.deleted_messages = "collapse"`).
+    revealed: HashSet<MessageId>,
+    /// How far into the store's count of struck-out messages this view has applied.
+    deletions_seen: u64,
     /// The thread popover, while one is open.
     thread: Option<ThreadPanel>,
     /// Text selection and links in the list.
@@ -186,6 +201,9 @@ impl ChatView {
             hover: Rc::default(),
             can_reply: false,
             hovered: Rc::default(),
+            moderation: false,
+            revealed: HashSet::new(),
+            deletions_seen: 0,
             thread: None,
             _subscriptions: subscriptions,
         }
@@ -197,6 +215,37 @@ impl ChatView {
             self.can_reply = can_reply;
             cx.notify();
         }
+    }
+
+    /// Whether moderation controls can act: the pane can run commands (PR 5.2). What the user may
+    /// do is decided per channel by their role there.
+    pub fn set_moderation(&mut self, moderation: bool, cx: &mut Context<Self>) {
+        if self.moderation != moderation {
+            self.moderation = moderation;
+            cx.notify();
+        }
+    }
+
+    /// A moderation action was chosen on `message`: tell the owner.
+    pub fn request_moderation(
+        &mut self,
+        message: Arc<Message>,
+        action: RowAction,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(ChatViewEvent::Moderate(message, action));
+    }
+
+    /// Shows the text of a collapsed removed message.
+    pub fn reveal(&mut self, id: &MessageId, cx: &mut Context<Self>) {
+        if !self.revealed.insert(id.clone()) {
+            return;
+        }
+        let seq = self.store.read(cx).messages().seq_of(id.as_str());
+        if let Some(seq) = seq {
+            self.remeasure_seqs(&[seq]);
+        }
+        cx.notify();
     }
 
     /// Reply was chosen on `message`: tell the owner.
@@ -302,6 +351,14 @@ impl ChatView {
                 None => self.list.remeasure(),
             }
         }
+        // Messages struck out: when removed ones are drawn collapsed that is another row height.
+        let deletions = self.store.read(cx).deletions();
+        if deletions != self.deletions_seen {
+            self.deletions_seen = deletions;
+            if config::current(cx).chat.deleted_messages == DeletedMessages::Collapse {
+                self.list.remeasure();
+            }
+        }
         // Also covers changes without new messages (deletions): rows re-render.
         cx.notify();
     }
@@ -401,6 +458,7 @@ impl ChatView {
             },
             emote_scale: settings.emotes.scale,
             light: cx.global::<Tokens>().light,
+            deleted: settings.chat.deleted_messages,
         };
         if self.text_config.as_ref() != Some(&current) {
             if let Some(previous) = &self.text_config {
@@ -544,6 +602,18 @@ impl Render for ChatView {
             selection_color,
             None,
         );
+        // Moderation controls appear for a moderator of this channel, when the pane can run them.
+        let (channel, role) = {
+            let store = self.store.read(cx);
+            let role = if self.moderation {
+                store.role()
+            } else {
+                ChannelRole::Viewer
+            };
+            (store.channel().clone(), role)
+        };
+        let track_hover = self.can_reply || role.can_moderate();
+        let revealed = Rc::new(self.revealed.clone());
         let style = Rc::new(MessageStyle {
             bold_font: regular.clone().bold(),
             font: regular,
@@ -573,7 +643,7 @@ impl Render for ChatView {
                         .ok();
                 }) as OpenThread
             }),
-            hovered_row: self.can_reply.then(|| self.hovered.clone()),
+            hovered_row: track_hover.then(|| self.hovered.clone()),
             selection: Some(self.surface.clone()),
         });
         let handle = cx.entity().downgrade();
@@ -581,8 +651,12 @@ impl Render for ChatView {
             id,
             view: handle.clone(),
             tokens,
-            hovered: self.can_reply.then(|| hovered.get()).flatten(),
+            hovered: track_hover.then(|| hovered.get()).flatten(),
             can_reply: self.can_reply,
+            role,
+            channel: channel.clone(),
+            deleted: config.deleted,
+            revealed: revealed.clone(),
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -590,7 +664,7 @@ impl Render for ChatView {
                 reply_line: false,
                 on_open_thread: None,
                 hover: panel.hover.clone(),
-                hovered_row: self.can_reply.then(|| panel.hovered.clone()),
+                hovered_row: track_hover.then(|| panel.hovered.clone()),
                 selection: Some(panel.surface.clone()),
                 ..(*style).clone()
             });
@@ -676,6 +750,7 @@ impl Render for ChatView {
             self.store.clone(),
             self.surface.clone(),
             self.can_reply,
+            self.moderation,
         );
         div()
             .id("chat-view")
@@ -725,7 +800,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_chat_core::{Author, ChannelId, ChatEvent, Fragment, Message, Timestamp};
-    use gpui_chat_settings::{AppearanceSettings, Settings, SettingsEvent};
+    use gpui_chat_settings::{AppearanceSettings, DeletedMessages, Settings, SettingsEvent};
     use gpui_kit::{
         AppContext as _, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Point,
         ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, size,
@@ -988,6 +1063,117 @@ mod tests {
         h.view
             .update(cx, |view, cx| view.request_reply(message, cx));
         assert_eq!(*heard.borrow(), ["m0"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_moderator_gets_hover_tracking_and_others_do_not(cx: &mut TestAppContext) {
+        use gpui_chat_core::ChannelRole;
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(3, "hello", cx);
+        let over_newest = point(px(400.0), px(595.0));
+        let hovered =
+            |h: &Harness, cx: &mut VisualTestContext| h.view.read_with(cx, |v, _| v.hovered.get());
+        let become_ = |h: &Harness, role, cx: &mut VisualTestContext| {
+            h.store.update(cx, |store, cx| {
+                store.apply(ChatEvent::UserState {
+                    channel: ChannelId::new("test"),
+                    role,
+                });
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        // A moderator by USERSTATE, but nothing to run commands with: no controls, no tracking.
+        become_(&h, ChannelRole::Moderator, cx);
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(hovered(&h, cx), None);
+        // With a pane that can run them, the moderator's rows track the pointer (for the buttons).
+        h.view.update(cx, |view, cx| view.set_moderation(true, cx));
+        cx.run_until_parked();
+        cx.simulate_mouse_move(over_newest, None, Default::default());
+        cx.run_until_parked();
+        assert_eq!(hovered(&h, cx), Some(2));
+    }
+
+    #[gpui_kit::test]
+    fn choosing_a_moderation_action_tells_the_owner_which_message_and_action(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        h.push(1, "hello", cx);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let sink = heard.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                if let ChatViewEvent::Moderate(message, action) = event {
+                    sink.borrow_mut().push((message.id.to_string(), *action));
+                }
+            })
+        });
+        let message = h.store.read_with(cx, |store, _| {
+            store.messages().get_by_seq(0).unwrap().clone()
+        });
+        h.view.update(cx, |view, cx| {
+            view.request_moderation(message.clone(), RowAction::Timeout(600), cx);
+            view.request_moderation(message, RowAction::Ban, cx);
+        });
+        assert_eq!(
+            *heard.borrow(),
+            [
+                ("m0".to_owned(), RowAction::Timeout(600)),
+                ("m0".to_owned(), RowAction::Ban)
+            ]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_collapsed_message_is_one_line_until_revealed(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        // Messages long enough to wrap in the 800 px window, and enough of them to scroll.
+        let long = "word ".repeat(80);
+        h.push(30, &long, cx);
+        let (lines, _) = h.last_message_lines(cx);
+        assert!(lines > 1, "the messages wrap: {lines} lines");
+        // How far the content reaches past the window: the sum of the row heights, less 600 px.
+        let overflow = |h: &Harness, cx: &mut VisualTestContext| {
+            h.view
+                .read_with(cx, |view, _| view.list_state().max_offset_for_scrollbar().y)
+        };
+        let intact = overflow(&h, cx);
+        assert!(intact > px(200.0), "{intact:?}");
+
+        // Struck through, the messages keep their height.
+        h.store.update(cx, |store, cx| {
+            store.apply(ChatEvent::ClearChat {
+                channel: ChannelId::new("test"),
+                target: gpui_chat_core::ClearTarget::Channel,
+                at: None,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(h.store.read_with(cx, |s, _| s.deletions()), 1);
+        assert_eq!(overflow(&h, cx), intact);
+
+        // Collapsing is a setting; every removed message is laid out again as one line.
+        let mut settings = Settings::default();
+        settings.chat.deleted_messages = DeletedMessages::Collapse;
+        h.settings.update(cx, |store, cx| {
+            store.apply_events([SettingsEvent::Reloaded(settings)]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let collapsed = overflow(&h, cx);
+        assert!(collapsed < intact / 2.0, "{collapsed:?} < {intact:?}");
+
+        // Revealing one brings its text back, and only that one's.
+        let id = MessageId::from("m0");
+        h.view.update(cx, |view, cx| view.reveal(&id, cx));
+        cx.run_until_parked();
+        let revealed = overflow(&h, cx);
+        assert!(revealed > collapsed && revealed < intact, "{revealed:?}");
+        assert!(h.view.read_with(cx, |view, _| view.revealed.contains(&id)));
     }
 
     /// Presses (with `clicks`), optionally drags to `to`, and releases there.

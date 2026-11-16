@@ -139,6 +139,10 @@ pub struct ChatSettings {
     /// Load recent messages when a channel is joined and after a reconnect, from the public
     /// recent-messages service (the channel name is sent to it; see `docs/SETTINGS.md`).
     pub history: bool,
+    /// How a message a moderator removed (deleted, timed-out or banned user, cleared chat) is
+    /// drawn: struck through and dimmed in place, or collapsed to "<message deleted>" until
+    /// clicked.
+    pub deleted_messages: DeletedMessages,
 }
 
 impl Default for ChatSettings {
@@ -147,8 +151,22 @@ impl Default for ChatSettings {
             scrollback: 1000,
             timestamps: true,
             history: true,
+            deleted_messages: DeletedMessages::default(),
         }
     }
+}
+
+/// `chat.deleted_messages`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeletedMessages {
+    /// Collapsed to `<message deleted>`; a click shows the message.
+    Collapse,
+    /// Drawn in place, struck through and dimmed. Also the fallback for any value this build does
+    /// not know, so a file from a newer build still loads.
+    #[default]
+    #[serde(other)]
+    Strikethrough,
 }
 
 /// `[emotes]`

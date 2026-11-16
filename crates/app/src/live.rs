@@ -16,8 +16,8 @@ use gpui_chat_core::{Author, ChannelId, ChatEvent, Outgoing, ReplyRef, Timestamp
 use gpui_chat_emotes::{EmoteSet, Providers};
 use gpui_chat_twitch::auth::AuthState;
 use gpui_chat_twitch::{
-    Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, SendError, SentMessage,
-    TwitchClient, UserEmote, echo_message, irc_login, settled_state,
+    Auth, ClientConfig, Credentials, CredentialsProvider, HelixClient, ModError, SendError,
+    SentMessage, TwitchClient, UserEmote, echo_message, irc_login, settled_state,
 };
 use gpui_kit::App;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -27,6 +27,7 @@ use crate::bridge::BridgeSender;
 use crate::config;
 use crate::emote_service::{self, EmoteService};
 use crate::history_service::HistoryService;
+use crate::moderation::{ModRequest, local_line};
 use crate::runtime;
 
 /// Handle to the running client; the shell owns it.
@@ -149,6 +150,42 @@ impl LiveSource {
         drop(runtime::spawn_backend(cx, async move {
             let outcome = post(&helix, &sender, emotes.as_ref(), request).await;
             // The composer may be gone (pane closed): nobody to tell.
+            let _ = done.send(outcome);
+        }));
+        Some(result)
+    }
+
+    /// Runs a moderation command through Helix as the logged-in user (PR 5.2). The outcome arrives
+    /// on the returned channel; what the command did to the chat arrives over IRC like any
+    /// moderator action, except for the few commands chat does not report (making a moderator,
+    /// a raid), whose confirmation is added as a system line here. `None` without a login owner.
+    pub fn moderate(
+        &self,
+        request: ModRequest,
+        cx: &App,
+    ) -> Option<oneshot::Receiver<Result<(), ModError>>> {
+        let (_, helix) = self.account.clone()?;
+        let sender = self.sender.clone();
+        let (done, result) = oneshot::channel();
+        drop(runtime::spawn_backend(cx, async move {
+            let outcome = helix
+                .moderate(
+                    &request.room_id,
+                    &request.command,
+                    request.target_id.as_deref(),
+                )
+                .await;
+            match &outcome {
+                Ok(()) => {
+                    if let Some(text) = request.command.confirmation() {
+                        let _ = sender.send(local_line(&request.channel, now(), text)).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::info!(%error, command = ?request.command, "moderation command failed");
+                }
+            }
+            // The pane may be gone: nobody to tell.
             let _ = done.send(outcome);
         }));
         Some(result)

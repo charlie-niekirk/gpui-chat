@@ -13,9 +13,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, MessageKind,
-    MessageStore, Moderation, RoomState,
+    ChannelId, ChannelRole, ChatEvent, ClearTarget, ConnectionState, DEFAULT_CAPACITY, Message,
+    MessageKind, MessageStore, Moderation, RoomState, clear_line,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity};
 
@@ -37,6 +39,11 @@ pub struct ChannelStore {
     /// them (a fetch that was in flight, a gap answer) is struck through too, see
     /// [`ChannelStore::apply`].
     live_moderation: VecDeque<Moderation>,
+    /// What the logged-in user is in this channel (`USERSTATE`, PR 5.2).
+    role: ChannelRole,
+    /// Bumped whenever a message was struck out (deleted, timed out, banned, cleared): the chat
+    /// view lays its rows out again when removed messages draw at another height (PR 5.2).
+    deletions: u64,
 }
 
 /// How many live moderation actions [`ChannelStore`] remembers for history that arrives later.
@@ -56,7 +63,20 @@ impl ChannelStore {
             replaced: VecDeque::new(),
             replaced_serial: 0,
             live_moderation: VecDeque::new(),
+            role: ChannelRole::Viewer,
+            deletions: 0,
         }
+    }
+
+    /// What the logged-in user is in this channel (a viewer until `USERSTATE` says otherwise, and
+    /// whenever chat is anonymous).
+    pub fn role(&self) -> ChannelRole {
+        self.role
+    }
+
+    /// How many times messages were struck out so far (see [`ChannelStore`]).
+    pub fn deletions(&self) -> u64 {
+        self.deletions
     }
 
     /// The sequence numbers of the messages replaced since `seen` (a serial returned earlier; start
@@ -144,6 +164,7 @@ impl ChannelStore {
                 moderation,
                 ..
             } => {
+                let messages = self.with_clear_lines(messages, &moderation);
                 let rebuilds = self.messages.rebuild_serial();
                 let mut changed = self.messages.merge_history(messages) > 0;
                 if self.messages.rebuild_serial() != rebuilds {
@@ -151,11 +172,16 @@ impl ChannelStore {
                     self.replaced.clear();
                 }
                 for action in moderation.iter().chain(&self.live_moderation) {
-                    changed |= self.messages.apply_moderation(action) > 0;
+                    let struck = self.messages.apply_moderation(action);
+                    self.deletions += u64::from(struck > 0);
+                    changed |= struck > 0;
                 }
                 changed
             }
             ChatEvent::ClearChat { target, at, .. } => {
+                // Only an event that says when it happened gets a line: the line's id is made
+                // from the time, so that history shows the same event once.
+                let stamped = at;
                 let at = at.or_else(|| self.messages.iter().map(|m| m.timestamp).max());
                 if let Some(at) = at {
                     self.remember(Moderation::Clear {
@@ -163,16 +189,35 @@ impl ChannelStore {
                         at,
                     });
                 }
-                match target {
-                    ClearTarget::Channel => self.messages.mark_all_deleted() > 0,
-                    ClearTarget::User { login, .. } => self.messages.mark_user_deleted(&login) > 0,
-                }
+                let struck = match &target {
+                    ClearTarget::Channel => self.messages.mark_all_deleted(),
+                    ClearTarget::User { login, .. } => self.messages.mark_user_deleted(login),
+                };
+                self.deletions += u64::from(struck > 0);
+                // Chat says what happened ("alice was timed out for 10m"), once: the same event
+                // in recent-messages history has the same id.
+                let line = stamped.map(|at| clear_line(&target, at, false));
+                let shown = line.is_some_and(|line| {
+                    let new = !self.messages.contains(line.id.as_str());
+                    if new {
+                        self.messages.push(Arc::new(line));
+                    }
+                    new
+                });
+                struck > 0 || shown
             }
             ChatEvent::DeleteMessage { message_id, .. } => {
                 self.remember(Moderation::Delete {
                     message_id: message_id.clone(),
                 });
-                self.messages.mark_deleted(message_id.as_str())
+                let struck = self.messages.mark_deleted(message_id.as_str());
+                self.deletions += u64::from(struck);
+                struck
+            }
+            ChatEvent::UserState { role, .. } => {
+                let changed = self.role != role;
+                self.role = role;
+                changed
             }
             ChatEvent::RoomState { update, .. } => {
                 let before = self.room.clone();
@@ -184,11 +229,43 @@ impl ChannelStore {
                 true
             }
             ChatEvent::Connection { state, .. } => {
+                // The role belongs to the connection that reported it: a (re)join asks the server
+                // again, and an anonymous one never answers.
+                if !matches!(state, ConnectionState::Connected) {
+                    self.role = ChannelRole::Viewer;
+                }
                 let changed = self.connection.as_ref() != Some(&state);
                 self.connection = Some(state);
                 changed
             }
         }
+    }
+
+    /// `messages` (from recent-messages history) plus the system lines for the timeouts, bans and
+    /// clears the answer reports, so a message struck out in history has its "was timed out" line
+    /// as it would have live. Lines older than anything shown are left out: they would introduce
+    /// nothing.
+    fn with_clear_lines(
+        &self,
+        mut messages: Vec<Arc<Message>>,
+        moderation: &[Moderation],
+    ) -> Vec<Arc<Message>> {
+        let oldest = messages
+            .iter()
+            .map(|m| m.timestamp)
+            .chain(self.messages.iter().next().map(|m| m.timestamp))
+            .min();
+        let Some(oldest) = oldest else {
+            return messages;
+        };
+        for action in moderation {
+            if let Moderation::Clear { target, at } = action
+                && *at >= oldest
+            {
+                messages.push(Arc::new(clear_line(target, *at, true)));
+            }
+        }
+        messages
     }
 
     fn remember(&mut self, moderation: Moderation) {
@@ -548,7 +625,18 @@ mod tests {
         store
             .messages()
             .iter()
+            .filter(|m| m.kind == MessageKind::Chat)
             .map(|m| (m.id.to_string(), m.flags.deleted))
+            .collect()
+    }
+
+    /// The text of the system lines in the store, in order.
+    fn lines(store: &ChannelStore) -> Vec<String> {
+        store
+            .messages()
+            .iter()
+            .filter(|m| m.kind == MessageKind::System)
+            .map(|m| m.plain_text())
             .collect()
     }
 
@@ -574,6 +662,229 @@ mod tests {
                 ("l1".into(), false)
             ]
         );
+    }
+
+    fn timeout(login: &str, secs: u64, at: i64) -> ChatEvent {
+        ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::User {
+                login: login.into(),
+                duration: Some(std::time::Duration::from_secs(secs)),
+            },
+            at: Some(Timestamp(at)),
+        }
+    }
+
+    #[test]
+    fn a_timeout_ban_and_clear_each_leave_one_line_in_chat() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(by_login_live("a", "m1", "spam", 100));
+        assert!(store.apply(timeout("spam", 600, 200)));
+        assert!(store.apply(ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::User {
+                login: "spam".into(),
+                duration: None,
+            },
+            at: Some(Timestamp(300)),
+        }));
+        assert!(store.apply(ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::Channel,
+            at: Some(Timestamp(400)),
+        }));
+        assert_eq!(
+            lines(&store),
+            [
+                "spam was timed out for 10m.",
+                "spam was banned.",
+                "Chat was cleared by a moderator."
+            ]
+        );
+        // The lines are not struck through by the clear that made them, nor by a later one.
+        assert!(
+            store
+                .messages()
+                .iter()
+                .filter(|m| m.kind == MessageKind::System)
+                .all(|m| !m.flags.deleted)
+        );
+        // The same event again (a reconnect replaying it) is the same line.
+        assert!(!store.apply(timeout("spam", 600, 200)));
+        assert_eq!(lines(&store).len(), 3);
+        // Without a timestamp there is nothing to key the line on: none.
+        assert!(!store.apply(ChatEvent::ClearChat {
+            channel: ChannelId::new("a"),
+            target: ClearTarget::Channel,
+            at: None,
+        }));
+        assert_eq!(lines(&store).len(), 3);
+    }
+
+    #[test]
+    fn a_timeout_in_history_has_its_line_once_whether_or_not_it_was_seen_live() {
+        // Live first, then history repeating it: one line.
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(timeout("spam", 600, 500));
+        store.apply(history_with(
+            vec![by_login("s1", "spam", 400, true)],
+            vec![gpui_chat_core::Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "spam".into(),
+                    duration: Some(std::time::Duration::from_secs(600)),
+                },
+                at: Timestamp(500),
+            }],
+        ));
+        assert_eq!(lines(&store), ["spam was timed out for 10m."]);
+        assert_eq!(deleted(&store), [("s1".into(), true)]);
+        // History only (a join): the line lands after the message it struck.
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(history_with(
+            vec![
+                by_login("s1", "spam", 400, true),
+                by_login("o1", "other", 700, true),
+            ],
+            vec![gpui_chat_core::Moderation::Clear {
+                target: ClearTarget::User {
+                    login: "spam".into(),
+                    duration: None,
+                },
+                at: Timestamp(500),
+            }],
+        ));
+        let order: Vec<(String, bool)> = store
+            .messages()
+            .iter()
+            .map(|m| (m.plain_text(), m.flags.history))
+            .collect();
+        assert_eq!(order[1], ("spam was banned.".to_owned(), true));
+        assert_eq!(store.messages().len(), 3);
+        // Something that happened before everything shown introduces nothing.
+        let mut store = ChannelStore::new(ChannelId::new("a"), 50);
+        store.apply(history_with(
+            vec![by_login("o1", "other", 700, true)],
+            vec![gpui_chat_core::Moderation::Clear {
+                target: ClearTarget::Channel,
+                at: Timestamp(100),
+            }],
+        ));
+        assert!(lines(&store).is_empty());
+    }
+
+    #[test]
+    fn the_role_comes_from_userstate_and_ends_with_the_connection() {
+        use gpui_chat_core::ChannelRole;
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        assert_eq!(store.role(), ChannelRole::Viewer);
+        let state = |role| ChatEvent::UserState {
+            channel: ChannelId::new("a"),
+            role,
+        };
+        assert!(store.apply(state(ChannelRole::Moderator)));
+        assert!(!store.apply(state(ChannelRole::Moderator)));
+        assert_eq!(store.role(), ChannelRole::Moderator);
+        // A rejoin (or an anonymous reconnect) asks again; until the answer, a viewer.
+        store.apply(ChatEvent::Connection {
+            channel: Some(ChannelId::new("a")),
+            state: ConnectionState::Reconnecting { attempt: 1 },
+        });
+        assert_eq!(store.role(), ChannelRole::Viewer);
+        store.apply(state(ChannelRole::Broadcaster));
+        store.apply(ChatEvent::Connection {
+            channel: Some(ChannelId::new("a")),
+            state: ConnectionState::Connected,
+        });
+        assert_eq!(store.role(), ChannelRole::Broadcaster, "Connected keeps it");
+    }
+
+    #[test]
+    fn deletions_are_counted_so_views_can_lay_out_again() {
+        let mut store = ChannelStore::new(ChannelId::new("a"), 10);
+        store.apply(by_login_live("a", "m1", "spam", 100));
+        assert_eq!(store.deletions(), 0);
+        store.apply(ChatEvent::DeleteMessage {
+            channel: ChannelId::new("a"),
+            message_id: "m1".into(),
+            login: None,
+        });
+        assert_eq!(store.deletions(), 1);
+        // Nothing left to strike: no change.
+        store.apply(timeout("spam", 60, 200));
+        assert_eq!(store.deletions(), 1);
+    }
+
+    /// Applies every event of a recorded IRC log (a fixture of `fixtures/irc`) to a fresh store.
+    fn replayed(log: &str) -> ChannelStore {
+        let mut store = ChannelStore::new(ChannelId::new("testchan"), 100);
+        for line in log.lines() {
+            if let Some(event) = gpui_chat_twitch::parse_line(line).expect("a valid line") {
+                store.apply(event);
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn the_moderation_replay_makes_a_moderator_and_strikes_out_what_was_removed() {
+        use gpui_chat_core::{ChannelRole, FollowersOnly};
+        let store = replayed(include_str!("../../../fixtures/irc/moderation.irc"));
+        assert_eq!(store.role(), ChannelRole::Moderator);
+        assert_eq!(
+            store.room().followers_only,
+            FollowersOnly::Minutes(10),
+            "the room state of the log"
+        );
+        let removed: Vec<String> = store
+            .messages()
+            .iter()
+            .filter(|m| m.flags.deleted)
+            .map(|m| m.plain_text())
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "BUY FOLLOWERS at cheap-followers.example now now now",
+                "BUY FOLLOWERS at cheap-followers.example now now now",
+                "first time here, hi all",
+                "this stream is garbage and so are all of you",
+                "nobody can even play",
+            ]
+        );
+        assert_eq!(
+            lines(&store),
+            ["spammer was timed out for 10m.", "troll was banned."]
+        );
+        // Messages sent after the ban (and by others) are untouched.
+        assert!(
+            store
+                .messages()
+                .iter()
+                .filter(|m| m.kind == MessageKind::Chat && !m.flags.deleted)
+                .all(|m| !m.plain_text().contains("garbage"))
+        );
+    }
+
+    #[test]
+    fn the_viewer_replay_has_the_same_lines_and_no_role() {
+        use gpui_chat_core::ChannelRole;
+        let store = replayed(include_str!("../../../fixtures/irc/moderation-viewer.irc"));
+        assert_eq!(store.role(), ChannelRole::Viewer);
+        assert_eq!(
+            lines(&store),
+            [
+                "spammer was timed out for 10m.",
+                "Chat was cleared by a moderator."
+            ]
+        );
+        // The chat clear struck every message before it, and not the line it made.
+        let struck: Vec<bool> = store
+            .messages()
+            .iter()
+            .filter(|m| m.kind == MessageKind::Chat)
+            .map(|m| m.flags.deleted)
+            .collect();
+        assert_eq!(struck, [true, true, true, false]);
     }
 
     #[test]
@@ -807,7 +1118,12 @@ mod tests {
             },
             at: None,
         }));
-        assert!(store.messages().iter().all(|m| m.flags.deleted));
+        assert!(
+            store
+                .messages()
+                .iter()
+                .all(|m| m.flags.deleted == (m.kind == MessageKind::Chat))
+        );
         assert!(!store.apply(ChatEvent::ClearChat {
             channel: ch,
             target: ClearTarget::Channel,

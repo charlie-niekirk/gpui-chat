@@ -9,6 +9,7 @@
 //!   owner of the tokens (refresh, validation, logout).
 //! * [`helix`]: [`HelixClient`], authenticated Helix GETs and JSON POSTs (refresh-and-retry on 401,
 //!   rate limits); [`HelixClient::send_chat_message`] sends chat (PR 3.2).
+//! * [`moderation`]: the moderation commands as Helix requests ([`HelixClient::moderate`], PR 5.2).
 //! * [`streams`]: `Get Streams` / `Get Followed Streams` and the [`streams::StreamPoller`] behind
 //!   the live dot, the header stream info and the followed-live sidebar.
 //! * [`history`]: [`HistoryClient`], the recent-messages service behind the history shown on join
@@ -21,6 +22,7 @@ mod client;
 pub mod helix;
 pub mod history;
 mod limits;
+pub mod moderation;
 mod parse;
 pub mod streams;
 pub mod user_emotes;
@@ -36,6 +38,7 @@ pub use history::{
     parse_history,
 };
 pub use limits::{Backoff, JoinRateLimit};
+pub use moderation::ModError;
 pub use parse::{ParseError, ParseOptions, map_message, parse_line, parse_line_with};
 pub use user_emotes::UserEmote;
 

@@ -16,16 +16,17 @@
 //! * Optional tags that do not parse (`bits=-5`, `first-msg=true`) are treated as absent
 //!   (logged at debug level) instead of failing the message. Tags a message cannot be
 //!   built without (`id`) are errors.
-//! * Lines that are not chat (PING, JOIN, 001, CAP, USERSTATE, ...) map to `Ok(None)`.
+//! * Lines that are not chat (PING, JOIN, 001, CAP, GLOBALUSERSTATE, ...) map to `Ok(None)`.
+//! * `USERSTATE` maps to the local user's [`ChannelRole`] in the channel (PR 5.2).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_chat_core::message::RawTags;
 use gpui_chat_core::{
-    Author, BadgeId, ChannelId, ChatEvent, ClearTarget, DEFAULT_CHEERMOTE_PREFIXES, FollowersOnly,
-    Fragment, Message, MessageFlags, MessageId, MessageKind, ReplyRef, Rgb, RoomStateUpdate,
-    Timestamp, Tokenizer, twitch_emote_ranges,
+    Author, BadgeId, ChannelId, ChannelRole, ChatEvent, ClearTarget, DEFAULT_CHEERMOTE_PREFIXES,
+    FollowersOnly, Fragment, Message, MessageFlags, MessageId, MessageKind, ReplyRef, Rgb,
+    RoomStateUpdate, Timestamp, Tokenizer, twitch_emote_ranges,
 };
 use twitch_irc::message::{IRCMessage, IRCParseError, IRCPrefix};
 
@@ -102,6 +103,7 @@ pub fn map_message(
         "CLEARCHAT" => clearchat(msg).map(Some),
         "CLEARMSG" => clearmsg(msg).map(Some),
         "ROOMSTATE" => roomstate(msg).map(Some),
+        "USERSTATE" => userstate(msg).map(Some),
         "NOTICE" => notice(msg).map(Some),
         _ => Ok(None),
     }
@@ -361,6 +363,28 @@ fn roomstate(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
             slow_mode: number::<u64>(msg, "slow").map(Duration::from_secs),
             subscribers_only: flag(msg, "subs-only"),
         },
+    })
+}
+
+/// `USERSTATE`: the local user's role in the channel, from the `mod` tag and the badges (the
+/// broadcaster has neither `mod=1` nor a moderator badge, only `broadcaster/1`).
+fn userstate(msg: &IRCMessage) -> Result<ChatEvent, ParseError> {
+    let badges = badges(msg);
+    let has = |set: &str| badges.iter().any(|badge| &*badge.set == set);
+    let role = if has("broadcaster") {
+        ChannelRole::Broadcaster
+    } else if flag(msg, "mod") == Some(true)
+        || ["moderator", "staff", "admin", "global_mod"]
+            .iter()
+            .any(|set| has(set))
+    {
+        ChannelRole::Moderator
+    } else {
+        ChannelRole::Viewer
+    };
+    Ok(ChatEvent::UserState {
+        channel: channel(msg)?,
+        role,
     })
 }
 

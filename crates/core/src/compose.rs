@@ -13,6 +13,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use crate::moderation::{CommandError, ModCommand, parse_mod_command};
+
 /// Twitch's limit for one chat message, in characters (code points).
 pub const MAX_MESSAGE_CHARS: usize = 500;
 
@@ -48,6 +50,9 @@ pub enum InputError {
     MissingCommand,
     /// `/me` with nothing after it.
     MissingText { command: &'static str },
+    /// A moderation command (PR 5.2) with missing or invalid arguments: the sentence says what is
+    /// wrong and shows the usage.
+    BadCommand(CommandError),
     /// More than [`MAX_MESSAGE_CHARS`] characters.
     TooLong { chars: usize },
 }
@@ -63,6 +68,7 @@ impl fmt::Display for InputError {
                 "Type a command after the slash (try /me), or start with // to send a message that begins with a slash.",
             ),
             Self::MissingText { command } => write!(f, "Usage: /{command} <message>"),
+            Self::BadCommand(error) => error.fmt(f),
             Self::TooLong { chars } => write!(
                 f,
                 "Message is too long ({chars}/{MAX_MESSAGE_CHARS} characters)."
@@ -79,6 +85,9 @@ pub enum Input {
     /// Blank (or only whitespace): nothing to do.
     Empty,
     Send(Outgoing),
+    /// A moderation command (PR 5.2): goes to Helix, not to chat. Whether the user may run it
+    /// is up to the caller (it knows their role).
+    Command(ModCommand),
     Invalid(InputError),
 }
 
@@ -115,8 +124,9 @@ pub fn sanitize_line(text: &str) -> Cow<'_, str> {
 ///
 /// * `/me text` is an action; `/me` alone is a usage error.
 /// * `//text` sends `/text` (the escape for a message that starts with a slash).
-/// * any other `/command` is rejected: Helix does not run chat commands, and moderation commands
-///   arrive with PR 5.2.
+/// * the moderation commands (`/timeout`, `/ban`, `/slow`, ... see [`crate::moderation`]) are
+///   [`Input::Command`], or an error saying what is wrong with their arguments;
+/// * any other `/command` is rejected: Helix does not run chat commands.
 /// * more than [`MAX_MESSAGE_CHARS`] characters is rejected (an action counts its `/me `).
 ///
 /// Command names are case-insensitive. The text is [sanitised](sanitize_line) and trimmed first.
@@ -150,7 +160,11 @@ pub fn parse_input(raw: &str) -> Input {
                     action: true,
                 },
                 other => {
-                    return Input::Invalid(InputError::UnknownCommand(other.to_owned()));
+                    return match parse_mod_command(other, argument) {
+                        Some(Ok(command)) => Input::Command(command),
+                        Some(Err(error)) => Input::Invalid(InputError::BadCommand(error)),
+                        None => Input::Invalid(InputError::UnknownCommand(other.to_owned())),
+                    };
                 }
             }
         }
@@ -296,12 +310,12 @@ mod tests {
     #[test]
     fn other_commands_are_rejected_not_sent() {
         assert_eq!(
-            parse_input("/ban someone"),
-            Input::Invalid(InputError::UnknownCommand("ban".into()))
+            parse_input("/w someone hi"),
+            Input::Invalid(InputError::UnknownCommand("w".into()))
         );
         assert_eq!(
-            parse_input("/Timeout x 10"),
-            Input::Invalid(InputError::UnknownCommand("timeout".into()))
+            parse_input("/Marker x"),
+            Input::Invalid(InputError::UnknownCommand("marker".into()))
         );
         // A slash with no command name says so, not "Unknown command /".
         for line in ["/", "/ ", "/ hello", "  /   me hi"] {
@@ -317,9 +331,9 @@ mod tests {
                 .contains("Type a command")
         );
         assert!(
-            InputError::UnknownCommand("ban".into())
+            InputError::UnknownCommand("w".into())
                 .to_string()
-                .starts_with("Unknown command /ban")
+                .starts_with("Unknown command /w")
         );
     }
 
@@ -379,6 +393,24 @@ mod tests {
     }
 
     #[test]
+    fn moderation_commands_are_commands_not_messages() {
+        assert_eq!(
+            parse_input("/Timeout @Bob 10m spam"),
+            Input::Command(ModCommand::Timeout {
+                user: "bob".into(),
+                seconds: 600,
+                reason: Some("spam".into())
+            })
+        );
+        let Input::Invalid(error) = parse_input("/ban") else {
+            panic!("a ban needs a user")
+        };
+        assert_eq!(error.to_string(), "Usage: /ban <user> [reason]");
+        // The escape still sends a message that starts with a slash.
+        assert_eq!(parse_input("//ban bob"), send("/ban bob"));
+    }
+
+    #[test]
     fn a_multi_line_paste_is_one_message() {
         assert_eq!(
             parse_input("first line\nsecond line\nthird"),
@@ -387,6 +419,13 @@ mod tests {
         // A pasted command line is still a command, once.
         assert!(matches!(
             parse_input("/ban x\nhello"),
+            Input::Command(ModCommand::Ban {
+                reason: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_input("/w x\nhello"),
             Input::Invalid(InputError::UnknownCommand(_))
         ));
         assert_eq!(parse_input("\n\nhello\n"), send("hello"));

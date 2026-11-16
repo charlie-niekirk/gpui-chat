@@ -10,17 +10,25 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_chat_core::{ChannelId, ConnectionState, FollowersOnly, RoomState};
+use std::sync::Arc;
+
+use gpui_chat_core::{
+    ChannelId, ConnectionState, FOLLOWER_PRESETS, FollowersOnly, Message, ModCommand, RoomChange,
+    RoomMode, RoomState, SLOW_PRESETS, format_seconds,
+};
 use gpui_chat_streamlink::QUALITIES;
 use gpui_chat_twitch::streams::StreamInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
-use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::{
-    Action, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight,
-    Hsla, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
-    Styled, Subscription, Window, canvas, div, px,
+    Action, Anchor, App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Subscription, WeakEntity, Window, canvas, div, px,
 };
 
 use crate::actions::{ClosePane, SplitDown, SplitRight};
@@ -29,10 +37,18 @@ use crate::chat::ChatView;
 use crate::chat::selection_layer::CopySelection;
 use crate::chat::view::ChatViewEvent;
 use crate::composer::Composer;
+use crate::moderation::{ModRequest, Moderator, RowAction, confirmation};
 use crate::splits::view::{DragChip, DraggedPane};
 use crate::stream_info::{self, Liveness, StreamInfoHub};
 use crate::streams::{Phase, StreamHub, StreamState};
 use crate::theme::Tokens;
+
+/// What a pane can do besides showing chat: the input box (live source) and whoever runs moderation
+/// commands (PR 5.2). Either is `None` where there is nothing to do it with.
+pub struct PaneTools {
+    pub composer: Option<Entity<Composer>>,
+    pub moderator: Option<Moderator>,
+}
 
 /// What the header says about the connection to one channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +139,127 @@ pub fn room_chips(room: &RoomState) -> Vec<String> {
         chips.push("Unique".to_owned());
     }
     chips
+}
+
+/// The room-mode menu of a moderator (PR 5.2): a toggle per mode, with lengths for slow mode and
+/// followers-only. Each choice is a [`RoomChange`] through the pane's [`ChannelPane::run_command`],
+/// so it is the same Helix request as typing `/slow 30`.
+fn room_menu(
+    pane: WeakEntity<ChannelPane>,
+    room: RoomState,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |mut menu, window, cx| {
+        let apply = |pane: &WeakEntity<ChannelPane>, change: RoomChange| {
+            let pane = pane.clone();
+            move |_: &_, _: &mut Window, cx: &mut App| {
+                pane.update(cx, |pane, cx| {
+                    pane.run_command(ModCommand::Room(change), None, cx);
+                })
+                .ok();
+            }
+        };
+        for mode in RoomMode::ALL {
+            match mode {
+                RoomMode::Slow => {
+                    let (pane, room) = (pane.clone(), room.clone());
+                    menu = menu.submenu(mode.label(), window, cx, move |mut sub, _, _| {
+                        sub = sub.item(
+                            PopupMenuItem::new("Off")
+                                .checked(!RoomMode::Slow.is_on(&room))
+                                .on_click(apply(&pane, RoomChange::Slow(None))),
+                        );
+                        for seconds in SLOW_PRESETS {
+                            sub = sub.item(
+                                PopupMenuItem::new(format_seconds(u64::from(seconds)))
+                                    .checked(room.slow_mode.as_secs() == u64::from(seconds))
+                                    .on_click(apply(&pane, RoomChange::Slow(Some(seconds)))),
+                            );
+                        }
+                        sub
+                    });
+                }
+                RoomMode::Followers => {
+                    let (pane, room) = (pane.clone(), room.clone());
+                    menu = menu.submenu(mode.label(), window, cx, move |mut sub, _, _| {
+                        sub = sub.item(
+                            PopupMenuItem::new("Off")
+                                .checked(room.followers_only == FollowersOnly::Off)
+                                .on_click(apply(&pane, RoomChange::Followers(None))),
+                        );
+                        for minutes in FOLLOWER_PRESETS {
+                            let label = if minutes == 0 {
+                                "All followers".to_owned()
+                            } else {
+                                format_minutes(minutes)
+                            };
+                            let on = match room.followers_only {
+                                FollowersOnly::Off => false,
+                                FollowersOnly::All => minutes == 0,
+                                FollowersOnly::Minutes(m) => m == minutes,
+                            };
+                            sub = sub.item(
+                                PopupMenuItem::new(label)
+                                    .checked(on)
+                                    .on_click(apply(&pane, RoomChange::Followers(Some(minutes)))),
+                            );
+                        }
+                        sub
+                    });
+                }
+                _ => {
+                    menu = menu.item(
+                        PopupMenuItem::new(mode.label())
+                            .checked(mode.is_on(&room))
+                            .on_click(apply(&pane, mode.toggled(&room))),
+                    );
+                }
+            }
+        }
+        menu
+    }
+}
+
+/// A moderator's version of the header chips: every room mode that is on is a button opening the
+/// room-mode menu, and a "Chat modes" button (just its icon when compact) when none is on, so
+/// the menu is always within reach. The caret is what makes Kit's `Button` a menu trigger
+/// (`dropdown_menu_with_anchor` on a button without it never opens).
+fn room_buttons(
+    room: &RoomState,
+    compact: bool,
+    pane: &WeakEntity<ChannelPane>,
+) -> Vec<gpui_kit::AnyElement> {
+    let chips = if compact {
+        Vec::new()
+    } else {
+        room_chips(room)
+    };
+    let mut buttons = Vec::new();
+    let button = |id: String, label: Option<String>| {
+        let button = Button::new(SharedString::from(id))
+            .outline()
+            .xsmall()
+            .dropdown_caret(true)
+            .accessibility_label(label.clone().unwrap_or_else(|| "Chat modes".to_owned()));
+        match label {
+            Some(label) => button.label(label),
+            None => button.icon(Icon::new(gpui_kit::assets::IconName::Settings2)),
+        }
+    };
+    for (index, chip) in chips.iter().enumerate() {
+        buttons.push(
+            button(format!("room-chip-{index}"), Some(chip.clone()))
+                .dropdown_menu_with_anchor(Anchor::TopLeft, room_menu(pane.clone(), room.clone()))
+                .into_any_element(),
+        );
+    }
+    if chips.is_empty() {
+        buttons.push(
+            button("room-modes".to_owned(), None)
+                .dropdown_menu_with_anchor(Anchor::TopLeft, room_menu(pane.clone(), room.clone()))
+                .into_any_element(),
+        );
+    }
+    buttons
 }
 
 /// Below this header width (a narrow split) the header goes compact: no room-mode chips, the
@@ -254,6 +391,14 @@ pub struct ChannelPane {
     chat: Entity<ChatView>,
     /// The input box; `None` for the offline sources (and when there is no login owner).
     composer: Option<Entity<Composer>>,
+    /// Runs moderation commands (PR 5.2): Helix for the live source, a loopback for `--replay`;
+    /// `None` when there is nothing to run them with.
+    moderator: Option<Moderator>,
+    /// A moderation action chosen on a message, taken up by the next render (it may need a
+    /// dialog, which needs the window).
+    queued_action: Option<(Arc<Message>, RowAction)>,
+    /// Why the last moderation command failed, until dismissed.
+    mod_notice: Option<SharedString>,
     /// `false` for the offline sources, which have no connection to report.
     live: bool,
     /// Keyboard focus for a pane without an input box (the offline sources).
@@ -274,12 +419,18 @@ impl ChannelPane {
         streams: Entity<StreamHub>,
         stream_info: Option<Entity<StreamInfoHub>>,
         live: bool,
-        composer: Option<Entity<Composer>>,
+        tools: PaneTools,
         cx: &mut Context<Self>,
     ) -> Self {
+        let PaneTools {
+            composer,
+            moderator,
+        } = tools;
         let chat = cx.new(|cx| ChatView::new(store.clone(), cx));
         // Reply on a row puts this pane's composer (when it has one) in reply mode.
         chat.update(cx, |chat, cx| chat.set_can_reply(composer.is_some(), cx));
+        // Moderators get the moderation controls when there is something to run them with.
+        chat.update(cx, |chat, cx| chat.set_moderation(moderator.is_some(), cx));
         // Room and connection state arrive as store / hub changes; redraw the header with them.
         let mut subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
@@ -303,6 +454,10 @@ impl ChannelPane {
                     this.refocus = true;
                     cx.notify();
                 }
+                ChatViewEvent::Moderate(message, action) => {
+                    this.queued_action = Some((message.clone(), *action));
+                    cx.notify();
+                }
             }),
         );
         Self {
@@ -312,6 +467,9 @@ impl ChannelPane {
             store,
             chat,
             composer,
+            moderator,
+            queued_action: None,
+            mod_notice: None,
             live,
             focus_handle: cx.focus_handle(),
             in_split: false,
@@ -337,6 +495,150 @@ impl ChannelPane {
             self.in_split = in_split;
             cx.notify();
         }
+    }
+
+    /// Runs `command` in this pane's channel; a refusal shows in the strip under the header. What a
+    /// command does to the chat arrives as the events the server sends, not from here.
+    fn run_command(
+        &mut self,
+        command: ModCommand,
+        target_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(moderator) = self.moderator.clone() else {
+            return;
+        };
+        let (channel, room_id) = {
+            let store = self.store.read(cx);
+            (store.channel().clone(), store.room().room_id.clone())
+        };
+        let Some(room_id) = room_id else {
+            self.mod_notice = Some(
+                format!(
+                    "Not connected to #{} yet. Try again in a moment.",
+                    channel.login()
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let request = ModRequest {
+            channel,
+            room_id,
+            command,
+            target_id,
+        };
+        let Some(outcome) = moderator.run(request, cx) else {
+            return;
+        };
+        self.mod_notice = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // A closed channel means the runtime is stopping; nothing to show.
+            let Ok(Err(reason)) = outcome.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.mod_notice = Some(reason.into());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A button or menu item on `message` was chosen: run it, after asking when it is a ban.
+    fn row_action(
+        &mut self,
+        message: &Message,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(command) = action.command(message) else {
+            return;
+        };
+        let target_id = message
+            .author
+            .as_ref()
+            .and_then(|author| author.user_id.clone());
+        let Some((title, body)) = confirmation(&command) else {
+            self.run_command(command, target_id, cx);
+            return;
+        };
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let pane = cx.entity().downgrade();
+        let (title, body) = (SharedString::from(title), SharedString::from(body));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (pane, command, target_id) = (pane.clone(), command.clone(), target_id.clone());
+            dialog
+                .title(title.clone())
+                .child(body.clone())
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|button| button.label("Cancel")))
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("confirm-ban").danger().label("Ban")),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    pane.update(cx, |pane, cx| {
+                        pane.run_command(command.clone(), target_id.clone(), cx);
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// Whether the logged-in user is a moderator here and there is something to run commands.
+    fn can_moderate(&self, cx: &App) -> bool {
+        self.moderator.is_some() && self.store.read(cx).role().can_moderate()
+    }
+
+    /// The strip under the header with why the last moderation command failed.
+    fn mod_notice_strip(
+        &self,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let notice = self.mod_notice.clone()?;
+        Some(
+            h_flex()
+                .id("mod-notice")
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .bg(tokens.danger.opacity(0.14))
+                .border_b_1()
+                .border_color(tokens.danger)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(tokens.danger_text)
+                        .child(notice),
+                )
+                .child(
+                    Button::new("mod-notice-dismiss")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::Close))
+                        .accessibility_label("Dismiss")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mod_notice = None;
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 
     /// Split right / split down / close: they act on the focused pane, which a press in this
@@ -384,8 +686,17 @@ impl ChannelPane {
 
     /// `compact` is what the last measured width asked for; the measuring canvas asks for a
     /// redraw of `pane` when the width crosses [`COMPACT_BELOW`].
-    fn header(&self, tokens: &Tokens, compact: bool, pane: EntityId, cx: &App) -> impl IntoElement {
+    fn header(
+        &self,
+        tokens: &Tokens,
+        compact: bool,
+        pane: EntityId,
+        this: WeakEntity<Self>,
+        cx: &App,
+    ) -> impl IntoElement {
         let store = self.store.read(cx);
+        let moderating = self.can_moderate(cx);
+        let room = store.room().clone();
         let status = self
             .live
             .then(|| link_status(self.hub.read(cx).connection(), store.connection()));
@@ -481,26 +792,41 @@ impl ChannelPane {
             })
             .children(live_badge)
             .child(status_view)
-            .children((!compact).then(|| {
-                h_flex()
-                    .id("pane-chips")
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .gap_1p5()
-                    .children(chips.into_iter().map(|chip| {
-                        div()
-                            .flex_none()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(tokens.border)
-                            .text_xs()
-                            .text_color(tokens.text_muted)
-                            .child(chip)
-                    }))
-            }));
+            .children(if moderating {
+                // A moderator's chips are the room-mode menu (PR 5.2).
+                Some(
+                    h_flex()
+                        .id("pane-chips")
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
+                        .gap_1p5()
+                        .children(room_buttons(&room, compact, &this))
+                        .into_any_element(),
+                )
+            } else {
+                (!compact).then(|| {
+                    h_flex()
+                        .id("pane-chips")
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
+                        .gap_1p5()
+                        .children(chips.into_iter().map(|chip| {
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(tokens.border)
+                                .text_xs()
+                                .text_color(tokens.text_muted)
+                                .child(chip)
+                        }))
+                        .into_any_element()
+                })
+            });
         let right = h_flex()
             .id("pane-header-right")
             .flex_none()
@@ -642,6 +968,9 @@ impl Render for ChannelPane {
         if std::mem::take(&mut self.refocus) {
             cx.on_next_frame(window, |this, window, cx| this.focus(window, cx));
         }
+        if let Some((message, action)) = self.queued_action.take() {
+            self.row_action(&message, action, window, cx);
+        }
         v_flex()
             .id("channel-pane")
             .track_focus(&self.focus_handle)
@@ -657,8 +986,10 @@ impl Render for ChannelPane {
                 &tokens,
                 self.header_width.get() < COMPACT_BELOW,
                 cx.entity_id(),
+                cx.entity().downgrade(),
                 cx,
             ))
+            .children(self.mod_notice_strip(&tokens, cx))
             .child(div().flex_1().min_h_0().w_full().child(self.chat.clone()))
             .children(self.composer.clone())
     }

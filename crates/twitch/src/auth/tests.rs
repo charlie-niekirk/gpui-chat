@@ -897,6 +897,27 @@ fn missing_scopes_lists_what_the_constant_adds() {
 }
 
 #[test]
+fn the_login_asks_for_every_moderation_scope() {
+    assert_eq!(MODERATION_SCOPES.len(), 8);
+    for scope in [
+        "moderator:manage:banned_users",
+        "moderator:manage:chat_messages",
+        "moderator:manage:chat_settings",
+        "moderator:manage:announcements",
+        "channel:manage:moderators",
+        "channel:manage:vips",
+        "channel:manage:raids",
+        "moderator:manage:shoutouts",
+    ] {
+        assert!(MODERATION_SCOPES.contains(&scope), "{scope}");
+        assert!(SCOPES.contains(&scope), "{scope} is not requested at login");
+    }
+    // An older login lacks exactly those, and is told so.
+    let old = vec!["chat:read".to_owned(), "chat:edit".to_owned()];
+    assert!(missing_scopes(&old, SCOPES).contains(&"channel:manage:raids"));
+}
+
+#[test]
 fn expiry_margin() {
     let token = stored("a", "r", 1000);
     assert!(token.expires_within(1000, 0));
