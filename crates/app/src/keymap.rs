@@ -99,6 +99,7 @@ catalog![
         true "Pane" FocusPaneDown "Focus Pane Below",
         true "Chat" CopySelection "Copy Selection",
         false "Chat" ClearSelection "Clear Selection",
+        true "Chat" OpenUserCard "Open User Card for Selected Message",
         true "View" ToggleSidebar "Toggle Sidebar",
         true "View" ShowMentions "Show Mentions",
         true "View" ToggleDebugHud "Toggle Debug HUD",

@@ -29,7 +29,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled, Subscription, WeakEntity, Window, canvas, div, px,
 };
 
-use crate::actions::{ClosePane, SplitDown, SplitRight};
+use crate::actions::{ClosePane, OpenUserCard, SplitDown, SplitRight};
 use crate::channels::{ChannelHub, ChannelStore};
 use crate::chat::ChatView;
 use crate::chat::selection_layer::CopySelection;
@@ -560,6 +560,32 @@ impl ChannelPane {
             .author
             .as_ref()
             .and_then(|author| author.user_id.clone());
+        self.confirm_and_run(command, target_id, window, cx);
+    }
+
+    /// A moderation button on the user card (PR 5.4) was chosen for `login`: the same path as a
+    /// button on a message.
+    fn user_action(
+        &mut self,
+        login: &str,
+        user_id: Option<String>,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(command) = action.command_for_user(login) {
+            self.confirm_and_run(command, user_id, window, cx);
+        }
+    }
+
+    /// Runs `command` (after asking first when it is a ban, see [`confirmation`]).
+    fn confirm_and_run(
+        &mut self,
+        command: ModCommand,
+        target_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((title, body)) = confirmation(&command) else {
             self.run_command(command, target_id, cx);
             return;
@@ -998,6 +1024,19 @@ impl Render for ChannelPane {
                     ChatViewEvent::Moderate(message, action) => {
                         this.row_action(message, *action, window, cx);
                     }
+                    // The user card's Mention: `@login ` in the box, which takes focus.
+                    ChatViewEvent::Mention(login) => {
+                        if let Some(composer) = &this.composer {
+                            composer.update(cx, |composer, cx| {
+                                composer.insert_mention(login, window, cx);
+                            });
+                        }
+                    }
+                    ChatViewEvent::ModerateUser {
+                        login,
+                        user_id,
+                        action,
+                    } => this.user_action(login, user_id.clone(), *action, window, cx),
                 },
             ));
         }
@@ -1008,6 +1047,15 @@ impl Render for ChannelPane {
             // the chat focused, the chat view handles ⌘C itself; PR 5.6).
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 if !this.chat.update(cx, |chat, cx| chat.copy_selection(cx)) {
+                    cx.propagate();
+                }
+            }))
+            // The author of the selected message's card, from the palette or a key (PR 5.4).
+            .on_action(cx.listener(|this, _: &OpenUserCard, window, cx| {
+                let opened = this
+                    .chat
+                    .update(cx, |chat, cx| chat.open_user_card_for_selection(window, cx));
+                if !opened {
                     cx.propagate();
                 }
             }))

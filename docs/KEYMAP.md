@@ -66,6 +66,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 | `SplitRight` / `SplitDown` | Split Right / Down | ⌘D / ⌥⇧⌘D |
 | `ClosePane` | Close Pane | ⇧⌘W |
 | `FocusPaneLeft` `FocusPaneRight` `FocusPaneUp` `FocusPaneDown` | Focus Pane … | ⌃⌘←→↑↓ |
+| `OpenUserCard` | Open User Card for Selected Message (the author of the first selected chat message; no default key) | |
 | `CopySelection` | Copy Selection (the selected chat text; context `ChatView`) | ⌘C |
 | `ToggleSidebar` | Toggle Sidebar | ⌘B, ⌘\ |
 | `ShowMentions` | Show Mentions (toggles the Mentions panel, PR 5.3) | ⌘⇧M |
@@ -79,8 +80,8 @@ Bindable but not in the palette (the input box and the emote picker; contexts
 `ComposerCompletionDismiss` (Esc), `ComposerToggleEmotePicker` (⌘E), `EmotePickerLeft`
 `EmotePickerRight` `EmotePickerUp` `EmotePickerDown` `EmotePickerNextTab` `EmotePickerPreviousTab`
 `EmotePickerClose`; and in the chat (context `ChatView`, focused by a press in the messages)
-`ClearSelection` (Esc: clears the selection and goes back to the input box; with nothing
-selected Esc goes on). `CopySelection` likewise goes on when nothing is selected; in the input box
+`ClearSelection` (Esc: closes the user card, or clears the selection, and goes back to the input box; with neither
+Esc goes on). `CopySelection` likewise goes on when nothing is selected; in the input box
 ⌘C is the box's own copy. They keep their defaults unless an entry names them.
 
 The list lives in `crates/app/src/keymap.rs` (`catalog`); a test fails if an action is defined and

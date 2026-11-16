@@ -40,11 +40,43 @@ pub fn thumb(
     window: &Window,
 ) -> impl IntoElement {
     let key = key_for(emote, side, window.scale_factor(), light);
+    image(key, side, 0.0, placeholder, frame, owner)
+}
+
+/// A `side` × `side` box drawing the image at `key` (a badge, an avatar), with corners rounded by
+/// `radius` (`side / 2.0` is a circle); a placeholder while it loads, nothing if it failed.
+/// `owner` and `frame` as for [`thumb`].
+pub fn image(
+    key: Option<ImageKey>,
+    side: f32,
+    radius: f32,
+    placeholder: Hsla,
+    frame: Rc<RefCell<FrameImages>>,
+    owner: EntityId,
+) -> impl IntoElement {
+    image_with(key, side, radius, placeholder, frame, owner, false)
+}
+
+/// [`image`], and with `notify_failed` the owner is told to redraw once the image has failed for
+/// good, so it can draw something else in its place (the user card's initial). Only for a view
+/// that stops asking for the image then: an owner that keeps painting it would redraw forever.
+pub fn image_with(
+    key: Option<ImageKey>,
+    side: f32,
+    radius: f32,
+    placeholder: Hsla,
+    frame: Rc<RefCell<FrameImages>>,
+    owner: EntityId,
+    notify_failed: bool,
+) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, (), window, cx| {
             if let Some(key) = &key {
-                paint(key, bounds, placeholder, &frame, owner, window, cx);
+                paint(key, bounds, radius, placeholder, &frame, owner, window, cx);
+                if notify_failed && Images::failed_for_good(key, cx) {
+                    cx.notify(owner);
+                }
             }
         },
     )
@@ -52,9 +84,11 @@ pub fn thumb(
     .h(px(side))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     key: &ImageKey,
     bounds: Bounds<Pixels>,
+    radius: f32,
     placeholder: Hsla,
     frame: &RefCell<FrameImages>,
     owner: EntityId,
@@ -71,7 +105,7 @@ fn paint(
             if let Err(error) = window.paint_image(
                 target,
                 target,
-                Corners::default(),
+                Corners::all(px(radius)),
                 image.render_image().clone(),
                 0,
                 false,
@@ -80,7 +114,7 @@ fn paint(
             }
         }
         Lookup::Loading | Lookup::Retrying => {
-            window.paint_quad(fill(bounds, placeholder).corner_radii(px(4.0)));
+            window.paint_quad(fill(bounds, placeholder).corner_radii(px(radius.max(4.0))));
         }
         Lookup::Ready(_) | Lookup::Failed { .. } => {}
     }

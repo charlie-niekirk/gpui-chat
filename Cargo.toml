@@ -37,7 +37,7 @@ twitch_api = { version = "=0.8.0", features = ["helix", "reqwest"] }
 twitch_oauth2 = { version = "=0.17.1", features = ["reqwest"] }
 
 # Media (WebP preferred, GIF/PNG fallback; no AVIF)
-image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "jpeg"] }
 sha2 = "0.10"
 
 # Platform services, settings and paths

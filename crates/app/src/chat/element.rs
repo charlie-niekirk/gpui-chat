@@ -302,7 +302,11 @@ fn shape_reply(reply: &ReplyRef, style: &MessageStyle, window: &Window) -> Reply
         .text_system()
         .layout_line(&text, font_size, &[run], None);
     let height = (style.line_height.as_f32() * REPLY_SCALE).round() + REPLY_GAP;
-    ReplyLine::from_layout(reply.root_id().clone(), font_size, &text, &layout, height)
+    let line = ReplyLine::from_layout(reply.root_id().clone(), font_size, &text, &layout, height);
+    match display::reply_name_range(reply) {
+        Some(range) => line.with_user(range, &reply.parent_login),
+        None => line,
+    }
 }
 
 /// Shapes `message` as one line with the window text system.
@@ -425,6 +429,8 @@ struct PreparedReply {
     /// Where it is drawn.
     rect: Bounds<Pixels>,
     hitbox: Option<Hitbox>,
+    /// The parent's name in it, when it can open their card: where, and whose.
+    user: Option<(Hitbox, Arc<str>)>,
 }
 
 impl MessageElement {
@@ -588,7 +594,30 @@ impl MessageElement {
             .on_open_thread
             .is_some()
             .then(|| window.insert_hitbox(rect, HitboxBehavior::Normal));
-        PreparedReply { fit, rect, hitbox }
+        // The parent's name opens their card where the surface can (the list and the popover can,
+        // a bare element cannot).
+        let user = self
+            .style
+            .selection
+            .as_ref()
+            .and(line.user.as_ref())
+            .zip(line.user_span(&fit))
+            .map(|((_, login), (x, width))| {
+                let bounds = Bounds::new(
+                    rect.origin + point(px(x), px(0.0)),
+                    size(px(width), rect.size.height),
+                );
+                (
+                    window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    login.clone(),
+                )
+            });
+        PreparedReply {
+            fit,
+            rect,
+            hitbox,
+            user,
+        }
     }
 
     /// Draws the reply line (muted, the text colour under the pointer) and makes it open the
@@ -648,6 +677,18 @@ impl MessageElement {
                 cx.stop_propagation();
             }
         });
+        // Registered after the line's own handler, so it runs first (bubbling is in reverse
+        // order): a press on the name opens the card and not the thread.
+        if let (Some((name, login)), Some(surface)) = (&prepared.user, &style.selection) {
+            window.set_cursor_style(CursorStyle::PointingHand, name);
+            let (name, login, surface) = (name.clone(), login.clone(), surface.clone());
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase.bubble() && event.button == MouseButton::Left && name.is_hovered(window) {
+                    surface.open_user(&login, event.position, window, cx);
+                    cx.stop_propagation();
+                }
+            });
+        }
     }
 }
 

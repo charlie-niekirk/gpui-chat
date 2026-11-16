@@ -811,6 +811,7 @@ mod tests {
             user_id: "42".into(),
             missing_scopes: missing.iter().map(|s| (*s).to_owned()).collect(),
             missing_moderation_scopes: Vec::new(),
+            scopes: Vec::new(),
         })
     }
 

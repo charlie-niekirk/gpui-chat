@@ -1,4 +1,4 @@
-//! Decoding PNG (incl. APNG), GIF and WebP (static and animated) into BGRA frames.
+//! Decoding PNG (incl. APNG), GIF, WebP (static and animated) and JPEG into BGRA frames.
 //!
 //! Decoding is CPU-bound and synchronous; [`crate::ImageCache`] runs it on tokio's blocking
 //! pool behind a semaphore, never on the async workers. Call [`decode`] directly only from a
@@ -19,6 +19,7 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use image::codecs::gif::GifDecoder;
+use image::codecs::jpeg::JpegDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat};
@@ -62,6 +63,8 @@ pub enum SourceFormat {
     Png,
     Gif,
     WebP,
+    /// A still (user avatars are often JPEGs); opaque, orientation applied.
+    Jpeg,
 }
 
 /// One frame: BGRA8, straight alpha, `width * height * 4` bytes (see the module docs).
@@ -231,7 +234,7 @@ impl DecodedImage {
     }
 }
 
-/// Decodes PNG/APNG, GIF or WebP bytes into BGRA frames. Blocking and CPU-bound.
+/// Decodes PNG/APNG, GIF, WebP or JPEG bytes into BGRA frames. Blocking and CPU-bound.
 pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<DecodedImage, DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::Empty);
@@ -253,6 +256,11 @@ pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<DecodedImage, Decod
             let mut decoder = GifDecoder::new(cursor).map_err(malformed)?;
             let (w, h) = check_canvas(&mut decoder, limits)?;
             decode_frames(decoder.into_frames(), w, h, SourceFormat::Gif, limits)
+        }
+        ImageFormat::Jpeg => {
+            let mut decoder = JpegDecoder::new(cursor).map_err(malformed)?;
+            let (w, h) = check_canvas(&mut decoder, limits)?;
+            decode_still(decoder, w, h, SourceFormat::Jpeg)
         }
         ImageFormat::WebP => {
             let bytes = force_webp_animation_alpha(bytes);
@@ -481,6 +489,30 @@ mod tests {
         // (0,0) is RGBA (200, 100, 50, 128): BGRA, not premultiplied.
         assert_eq!(bgra_at(&img, 0, 0, 0), [50, 100, 200, 128]);
         assert_eq!(img.timeline().frame_at(ms(1234)), (0, None));
+    }
+
+    #[test]
+    fn a_jpeg_decodes_to_an_opaque_still() {
+        // Twitch avatars are very often JPEGs (`…-profile_image-600x600.jpeg`).
+        let img = decode(&fixture("static.jpg"), &DecodeLimits::default()).unwrap();
+        assert_eq!(img.format(), SourceFormat::Jpeg);
+        assert_eq!((img.width(), img.height()), (28, 28));
+        assert_eq!(img.frames().len(), 1);
+        assert!(!img.is_animated());
+        let [b, g, r, a] = bgra_at(&img, 0, 14, 14);
+        assert_eq!(a, 255, "JPEG has no alpha");
+        // Lossy: the colour is near RGB(200, 100, 50), not exact; the channels are BGRA.
+        let near = |got: u8, want: u8| got.abs_diff(want) <= 6;
+        assert!(near(r, 200) && near(g, 100) && near(b, 50), "{r} {g} {b}");
+        // Every pixel is there.
+        assert_eq!(img.frames()[0].pixels().len(), 28 * 28 * 4);
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_malformed_not_a_panic() {
+        let jpeg = fixture("static.jpg");
+        let err = decode(&jpeg[..jpeg.len() / 2], &DecodeLimits::default());
+        assert!(matches!(err, Err(DecodeError::Malformed(_))), "{err:?}");
     }
 
     #[test]

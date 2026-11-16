@@ -635,6 +635,17 @@ impl Images {
         Lookup::Ready(image)
     }
 
+    /// Whether the image at `key` failed in a way that will not mend (not found, not an image,
+    /// undecodable): a view may draw something else in its place. False while it loads, is being
+    /// retried after a transient error, or is ready.
+    pub fn failed_for_good(key: &ImageKey, cx: &App) -> bool {
+        cx.try_global::<Self>()
+            .and_then(|images| images.cache.as_ref())
+            .is_some_and(|cache| {
+                matches!(cache.status(key.url()), ImageStatus::Failed(error) if is_permanent(&error))
+            })
+    }
+
     /// Wakes the views that painted a transiently failed image after [`RETRY_POLL`], so they ask
     /// for it again. Call after painting; one timer serves every view.
     pub fn arm_retry(cx: &mut App) {

@@ -33,6 +33,8 @@ actions!(
         FocusPaneDown,
         OpenPalette,
         OpenChannelSwitcher,
+        /// Opens the user card of the author of the selected chat message.
+        OpenUserCard,
         ShowMentions
     ]
 );

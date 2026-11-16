@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use image::codecs::gif::{GifEncoder, Repeat};
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
-use image::{Delay, Frame, ImageFormat, Rgba, RgbaImage};
+use image::{Delay, Frame, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
 /// Frame `i` of the small animation: left half this colour, right half transparent.
 const FRAME_COLOURS: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
@@ -33,9 +34,25 @@ const GIF_DELAYS: [u32; 4] = [100, 50, 0, 30];
 /// WebP delays in ms. The 10 must be clamped to 100 by the decoder.
 const WEBP_DELAYS: [u32; 4] = [100, 50, 10, 30];
 
+/// static.jpg: 28x28, a solid RGB(200, 100, 50) (a JPEG avatar stand-in; lossy, so the decoder
+/// test allows a few levels of error).
+fn jpeg() -> Vec<u8> {
+    let rgb = RgbImage::from_pixel(28, 28, Rgb([200, 100, 50]));
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 95)
+        .encode(rgb.as_raw(), 28, 28, image::ExtendedColorType::Rgb8)
+        .expect("encode jpeg");
+    bytes
+}
+
 fn main() {
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/images");
     std::fs::create_dir_all(&out).expect("create fixtures/images");
+    // `gen_fixtures jpeg` rewrites only static.jpg (the rest needs `img2webp`).
+    save(&out, "static.jpg", &jpeg());
+    if std::env::args().nth(1).as_deref() == Some("jpeg") {
+        return;
+    }
     let tmp = tempfile::tempdir().expect("temp dir");
 
     // static.png / static.webp: 28x28 gradient, (0,0) = RGBA(200, 100, 50, 128).

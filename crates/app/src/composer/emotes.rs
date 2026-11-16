@@ -312,21 +312,40 @@ impl Composer {
 
     /// Inserts `emote` at the caret (or over the selection) with a space either side as needed.
     fn insert_emote(&mut self, emote: &Emote, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.input.clone() else {
+        if self.insert_word(&emote.name, window, cx) {
+            completion::remember_emote(&emote.name, cx);
+        }
+    }
+
+    /// Puts `@login ` at the caret (the user card's Mention): a space before it when the text
+    /// before the caret does not end in one, and the box gets the focus. Nothing while the box
+    /// cannot take text (logged out).
+    pub fn insert_mention(&mut self, login: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode(cx).can_send() {
             return;
+        }
+        self.input(window, cx);
+        self.insert_word(&format!("@{login}"), window, cx);
+    }
+
+    /// Replaces the selection with `word`, spaced from its neighbours, and focuses the box;
+    /// whether the box exists.
+    fn insert_word(&mut self, word: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(input) = self.input.clone() else {
+            return false;
         };
         let (text, selection) = {
             let input = input.read(cx);
             (input.value(), input.selected_range())
         };
-        let word = word_insertion(&text, selection, &emote.name);
+        let word = word_insertion(&text, selection, word);
         input.update(cx, |input, cx| {
             input.replace(word, window, cx);
             input.focus(window, cx);
         });
         self.history.reset();
-        completion::remember_emote(&emote.name, cx);
         cx.notify();
+        true
     }
 
     /// The list or the picker, positioned above the box. Empty when neither is open.

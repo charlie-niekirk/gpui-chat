@@ -48,6 +48,10 @@ pub struct Account {
     /// use a moderation tool ([`Auth::request_device_code_with`]), so this never counts as a reason
     /// to log in again ([`Account::needs_relogin`]).
     pub missing_moderation_scopes: Vec<String>,
+    /// Every scope the login was granted (what the token validated with). For scopes that are
+    /// in neither list above, such as `moderator:read:followers`, which the user card tries to
+    /// use when it is there but the app never asks for.
+    pub scopes: Vec<String>,
 }
 
 impl Account {
@@ -60,6 +64,11 @@ impl Account {
     /// Whether this login was granted `scope` of [`MODERATION_SCOPES`].
     pub fn has_moderation_scope(&self, scope: &str) -> bool {
         !self.missing_moderation_scopes.iter().any(|m| m == scope)
+    }
+
+    /// Whether the login was granted `scope`, whichever list it belongs to.
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|granted| granted == scope)
     }
 
     /// Whether every moderation scope was granted (the tools are enabled).
@@ -614,6 +623,7 @@ impl Auth {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            scopes: token.scopes.clone(),
         }
     }
 

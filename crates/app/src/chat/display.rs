@@ -105,6 +105,15 @@ pub struct DisplayLink {
     pub url: Arc<str>,
 }
 
+/// A clickable user in the text (PR 5.4): an author's name or an `@mention`, where it is and
+/// whose card it opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayUser {
+    pub range: Range<usize>,
+    /// Lowercase login.
+    pub login: Arc<str>,
+}
+
 /// The display text and its spans. Spans are contiguous, in order, and cover the whole text.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayText {
@@ -116,6 +125,8 @@ pub struct DisplayText {
     pub badges: Vec<DisplayBadge>,
     /// Every link, in text order.
     pub links: Vec<DisplayLink>,
+    /// Every author name and mention that opens a user card, in text order.
+    pub users: Vec<DisplayUser>,
     /// Byte offsets of the hard line breaks (each is one space character in `text`, so copying
     /// and hit-testing see a space), in text order.
     pub breaks: Vec<usize>,
@@ -208,6 +219,35 @@ impl DisplayText {
         self.links.get(i).filter(|link| link.range.start <= index)
     }
 
+    /// The user whose name or mention contains byte `index`.
+    pub fn user_at(&self, index: usize) -> Option<&DisplayUser> {
+        let i = self.users.partition_point(|user| user.range.end <= index);
+        self.users.get(i).filter(|user| user.range.start <= index)
+    }
+
+    /// Appends `name` as the [`Role::Name`] span of `author`, which opens their card.
+    fn push_name(&mut self, author: &Author) {
+        self.push_name_as(author, Role::Name);
+    }
+
+    /// [`Self::push_name`] with another role (a collapsed removed line draws the name muted).
+    fn push_name_as(&mut self, author: &Author, role: Role) {
+        let start = self.text.len();
+        self.push(author_name(author), role);
+        self.mark_user(start, &author.login);
+    }
+
+    /// Makes the text from byte `start` to the end open `login`'s card (when it is a login).
+    fn mark_user(&mut self, start: usize, login: &str) {
+        let end = self.text.len();
+        if end > start && gpui_chat_core::is_login(login) {
+            self.users.push(DisplayUser {
+                range: start..end,
+                login: Arc::from(login.to_ascii_lowercase()),
+            });
+        }
+    }
+
     /// Index of the span containing byte `index`.
     pub fn span_at(&self, index: usize) -> Option<usize> {
         let i = self.spans.partition_point(|span| span.range.end <= index);
@@ -226,6 +266,16 @@ pub fn reply_text(reply: &ReplyRef) -> String {
     } else {
         format!("↳ Replying to {name}: {body}")
     }
+}
+
+/// The byte range of the parent's name in [`reply_text`], when it is a login's name that can open
+/// the card (the line's click on it opens that card instead of the thread).
+pub fn reply_name_range(reply: &ReplyRef) -> Option<Range<usize>> {
+    if !gpui_chat_core::is_login(&reply.parent_login) {
+        return None;
+    }
+    let start = "↳ Replying to ".len();
+    Some(start..start + reply.parent_name().len())
 }
 
 /// `HH:MM` (UTC) of a Unix millisecond timestamp.
@@ -260,14 +310,22 @@ fn push_body(out: &mut DisplayText, fragments: &[Fragment], text_role: Role) {
                 }
             }
             Fragment::Emoji { text } => out.push(text, Role::Emoji),
-            Fragment::Mention { text, is_self, .. } => out.push(
+            Fragment::Mention {
                 text,
-                if *is_self {
-                    Role::SelfMention
-                } else {
-                    Role::Mention
-                },
-            ),
+                login,
+                is_self,
+            } => {
+                let start = out.text.len();
+                out.push(
+                    text,
+                    if *is_self {
+                        Role::SelfMention
+                    } else {
+                        Role::Mention
+                    },
+                );
+                out.mark_user(start, login);
+            }
             Fragment::Link { text, url } => {
                 let start = out.text.len();
                 out.push(text, Role::Link);
@@ -339,7 +397,8 @@ pub fn build_collapsed(message: &Message, options: DisplayOptions) -> DisplayTex
         out.push(" ", Role::Separator);
     }
     if let Some(author) = &message.author {
-        out.push(author_name(author), Role::System);
+        // Still the user's card: a moderator unbans from a removed line.
+        out.push_name_as(author, Role::System);
         out.push(": ", Role::System);
     }
     out.push("<message deleted>", Role::System);
@@ -396,7 +455,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
             let chat = message.kind == MessageKind::Chat;
             if let Some(author) = author {
                 out.push_badges(badges);
-                out.push(author_name(author), Role::Name);
+                out.push_name(author);
                 out.push(if chat { ": " } else { " " }, Role::Separator);
             }
             let role = if chat { Role::Text } else { Role::ActionText };
@@ -415,7 +474,7 @@ pub fn build(message: &Message, options: DisplayOptions, badges: &[BadgeSlot]) -
                 }
                 if let Some(author) = author {
                     out.push_badges(badges);
-                    out.push(author_name(author), Role::Name);
+                    out.push_name(author);
                     out.push(": ", Role::Separator);
                 }
                 push_body(&mut out, &body_fragments(message), Role::Text);
@@ -461,6 +520,23 @@ mod tests {
             parent_body: body.into(),
             thread_parent_id: None,
         }
+    }
+
+    #[test]
+    fn a_collapsed_line_and_a_reply_line_name_a_user_that_opens_a_card() {
+        let message = chat(vec![Fragment::Text("secret".into())]);
+        let collapsed = build_collapsed(&message, DisplayOptions::default());
+        let user = collapsed.user_at(1).expect("the name is clickable");
+        assert_eq!(&collapsed.text[user.range.clone()], "Alice");
+        assert_eq!(&*user.login, "alice");
+        assert!(collapsed.user_at("Alice: <".len()).is_none());
+        let reply = reply("hello there");
+        let text = reply_text(&reply);
+        let range = reply_name_range(&reply).unwrap();
+        assert_eq!(&text[range], "Bob");
+        let mut odd = reply.clone();
+        odd.parent_login = "not a login!".into();
+        assert_eq!(reply_name_range(&odd), None);
     }
 
     #[test]
