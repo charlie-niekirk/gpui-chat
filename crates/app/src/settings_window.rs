@@ -719,7 +719,9 @@ fn badges_page(this: &WeakEntity<SettingsView>) -> SettingPage {
                 .description(
                     "Shown after Twitch's own badges; a tooltip names the provider. Turning one \
                      off hides its badges everywhere at once. BetterTTV's badges are SVG images \
-                     and are not supported.",
+                     and are not supported. Privacy: 7TV's badges and paints are looked up by \
+                     asking 7tv.io about the Twitch ids of the chatters you see; with both off \
+                     nothing is sent to 7TV for them.",
                 )
                 .items([
                     switch(
