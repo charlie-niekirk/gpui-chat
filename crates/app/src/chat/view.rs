@@ -3570,4 +3570,97 @@ mod tests {
         });
         assert!(!h.view.update(cx, |v, cx| v.close_find(cx)));
     }
+
+    /// The keys of the find bar as the app binds them, with the shell's part (what ⌘F, ⌘G and ↑ / ↓
+    /// do) stood in for by global handlers that call the view.
+    fn bind_find_keys(h: &Harness, cx: &mut VisualTestContext) -> Rc<Cell<usize>> {
+        let finds = Rc::new(Cell::new(0));
+        let counted = finds.clone();
+        let view = h.view.clone();
+        cx.update(|window, cx| {
+            cx.bind_keys(find_bindings());
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "cmd-f",
+                crate::actions::Find,
+                None,
+            )]);
+            #[cfg(not(target_os = "macos"))]
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "ctrl-f",
+                crate::actions::Find,
+                None,
+            )]);
+            let window_handle = window.window_handle();
+            let find_view = view.clone();
+            cx.on_action(move |_: &crate::actions::Find, cx| {
+                counted.set(counted.get() + 1);
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        find_view.update(cx, |view, cx| view.open_find(window, cx));
+                    })
+                    .ok();
+            });
+            let next = view.clone();
+            cx.on_action(move |_: &crate::actions::FindNext, cx| {
+                next.update(cx, |view, cx| view.find_step(true, cx));
+            });
+            let previous = view;
+            cx.on_action(move |_: &crate::actions::FindPrevious, cx| {
+                previous.update(cx, |view, cx| view.find_step(false, cx));
+            });
+        });
+        finds
+    }
+
+    #[gpui_kit::test]
+    fn the_find_bars_keys_step_close_and_find_again_reaches_the_app_through_a_text_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        let events: Vec<_> = (0..60)
+            .map(|n| said(n, "al", &format!("line {n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        let finds = bind_find_keys(&h, cx);
+        open_find(&h, cx);
+        type_find(&h, "line 1", cx);
+        let position = |cx: &mut VisualTestContext| {
+            h.view
+                .read_with(cx, |v, _| v.find_status().and_then(|s| s.position))
+        };
+        // 1, 10 .. 19: 11 matches, on the newest to start with.
+        assert_eq!(position(cx), Some(11));
+        // Enter goes to the next (newer, wrapping to the first), Shift-Enter back, ↑ and ↓ too.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(position(cx), Some(1));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(position(cx), Some(11));
+        cx.simulate_keystrokes("up");
+        assert_eq!(position(cx), Some(10));
+        cx.simulate_keystrokes("down");
+        assert_eq!(position(cx), Some(11));
+        // ⌘F inside the bar's own text field (which binds it too, for searching its text) still
+        // reaches the app's Find.
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        assert_eq!(finds.get(), 1);
+        assert!(h.view.read_with(cx, |v, _| v.find_is_open()));
+        // Esc closes it (and tells the pane to give the input box focus back).
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                sink.borrow_mut().push(format!("{event:?}"));
+            })
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!h.view.read_with(cx, |v, _| v.find_is_open()));
+        assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+        // With the bar closed Esc in the chat does what it did: nothing to clear, so it goes on.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+    }
 }

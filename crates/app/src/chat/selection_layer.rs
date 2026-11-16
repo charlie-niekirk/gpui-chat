@@ -888,6 +888,19 @@ impl Surface {
         }
     }
 
+    /// Whether message `seq` was drawn this frame and is entirely inside the surface (nothing to
+    /// scroll to for the user to see it).
+    pub fn is_fully_visible(&self, seq: u64) -> bool {
+        let Some(bounds) = self.bounds.get() else {
+            return false;
+        };
+        self.rows.borrow().iter().any(|row| {
+            row.seq == seq
+                && row.bounds.top() >= bounds.top() - px(0.5)
+                && row.bounds.bottom() <= bounds.bottom() + px(0.5)
+        })
+    }
+
     /// Holds the list where it is every frame from now on (`true`) until told otherwise (`false`;
     /// following is not resumed here: the caller knows whether the list was following).
     pub fn keep_frozen(&self, on: bool) {

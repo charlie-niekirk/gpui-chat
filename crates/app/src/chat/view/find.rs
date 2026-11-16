@@ -268,11 +268,7 @@ impl ChatView {
         let Some(ix) = self.rows.borrow().index_of(seq) else {
             return;
         };
-        let on_screen = self.list.bounds_for_item(ix).is_some_and(|bounds| {
-            let viewport = self.list.viewport_bounds();
-            bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom()
-        });
-        if on_screen {
+        if self.surface.is_fully_visible(seq) {
             self.flash_row(seq, cx);
         } else {
             self.scroll_to_row(ix, seq, cx);

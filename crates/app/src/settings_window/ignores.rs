@@ -172,7 +172,7 @@ fn no_reset() -> Reset {
 
 pub fn page(this: &WeakEntity<SettingsView>) -> SettingPage {
     let users = SettingGroup::new()
-        .title("Ignored users and phrases")
+        .title("Users and phrases")
         .description(
             "Ignored messages are hidden everywhere: the chat, the Mentions view, the unread and \
              mention dots and notifications. Your own messages are never ignored. Ignoring takes \
