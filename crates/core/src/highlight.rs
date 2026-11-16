@@ -23,7 +23,10 @@
 //! stall the chat; a pattern that matches the empty string (so every message) is refused. They are
 //! case-insensitive unless they say `(?-i)`.
 
-use regex::{Regex, RegexBuilder};
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Message, MessageKind};
@@ -36,8 +39,10 @@ pub const MAX_USERS: usize = 500;
 pub const MAX_PATTERN_CHARS: usize = 500;
 /// Longest Twitch login.
 const MAX_LOGIN_CHARS: usize = 25;
-/// Memory a compiled regular expression may take.
-const REGEX_SIZE_LIMIT: usize = 1 << 20;
+/// Memory one compiled phrase or regular expression may take (and its lazy DFA cache).
+const REGEX_SIZE_LIMIT: usize = 256 << 10;
+/// The budget for all regular expressions together (the one set they are searched with).
+const REGEX_SET_SIZE_LIMIT: usize = 4 << 20;
 /// Nesting depth a regular expression may have.
 const REGEX_NEST_LIMIT: u32 = 50;
 
@@ -151,6 +156,9 @@ pub struct HighlightConfig {
     pub mention_notify: bool,
     /// Master switch for system notifications. Off: highlights still show, nothing is posted.
     pub notifications: bool,
+    /// Show who said what in a notification. Off: it only says there is a new highlight in the
+    /// channel, so nothing private reaches a locked screen.
+    pub notification_previews: bool,
     pub rules: Vec<HighlightRule>,
     pub users: Vec<HighlightUser>,
 }
@@ -162,6 +170,7 @@ impl Default for HighlightConfig {
             mention_color: HighlightColor::Accent,
             mention_notify: true,
             notifications: true,
+            notification_previews: true,
             rules: Vec::new(),
             users: Vec::new(),
         }
@@ -235,16 +244,52 @@ struct UserEntry {
     notify: bool,
 }
 
-/// A phrase or regular expression ready to run.
+/// A phrase, or the own-name pattern, ready to run.
 #[derive(Debug, Clone)]
 struct Matcher {
     regex: Regex,
-    /// Needs a word boundary at each end (phrases only).
+    /// Needs a word boundary at each end.
     whole_word: bool,
+}
+
+/// Checks the length the user typed (before anything is escaped), so the limit is the one the
+/// message names.
+fn check_length(pattern: &str) -> Result<(), String> {
+    if pattern.chars().count() > MAX_PATTERN_CHARS {
+        return Err(format!("longer than {MAX_PATTERN_CHARS} characters"));
+    }
+    Ok(())
+}
+
+fn builder(pattern: &str, size_limit: usize) -> RegexBuilder {
+    let mut builder = RegexBuilder::new(pattern);
+    builder
+        .case_insensitive(true)
+        .unicode(true)
+        .size_limit(size_limit)
+        .dfa_size_limit(size_limit)
+        .nest_limit(REGEX_NEST_LIMIT);
+    builder
+}
+
+/// A regular expression that compiles within the limits and does not match everything.
+fn check_regex(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("a regular expression is required".to_owned());
+    }
+    check_length(pattern)?;
+    let regex = builder(pattern, REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|error| short_error(&error))?;
+    if regex.is_match("") {
+        return Err("matches every message (it also matches nothing at all)".to_owned());
+    }
+    Ok(())
 }
 
 impl Matcher {
     fn phrase(phrase: &str, whole_word: bool) -> Result<Self, String> {
+        check_length(phrase)?;
         let phrase = phrase.trim();
         if phrase.is_empty() {
             return Err("a phrase is required".to_owned());
@@ -252,27 +297,8 @@ impl Matcher {
         Self::build(&regex::escape(phrase), whole_word)
     }
 
-    fn regex(pattern: &str) -> Result<Self, String> {
-        if pattern.trim().is_empty() {
-            return Err("a regular expression is required".to_owned());
-        }
-        let matcher = Self::build(pattern, false)?;
-        if matcher.regex.is_match("") {
-            return Err("matches every message (it also matches nothing at all)".to_owned());
-        }
-        Ok(matcher)
-    }
-
     fn build(pattern: &str, whole_word: bool) -> Result<Self, String> {
-        if pattern.chars().count() > MAX_PATTERN_CHARS * 2 {
-            return Err(format!("longer than {MAX_PATTERN_CHARS} characters"));
-        }
-        let regex = RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .unicode(true)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_SIZE_LIMIT)
-            .nest_limit(REGEX_NEST_LIMIT)
+        let regex = builder(pattern, REGEX_SIZE_LIMIT)
             .build()
             .map_err(|error| short_error(&error))?;
         Ok(Self { regex, whole_word })
@@ -301,6 +327,40 @@ impl Matcher {
             from = found.start() + step;
         }
         false
+    }
+}
+
+/// How one rule looks for its match.
+#[derive(Debug, Clone)]
+enum RuleMatcher {
+    Phrase(Matcher),
+    /// Position in [`Highlights::regex_set`].
+    Regex(usize),
+}
+
+/// Why `rule` cannot be used (`` `pattern`: reason ``), or `None` when it can. The same check
+/// [`Highlights::compile`] makes, for one entry on its own (a settings field numbers its own lines).
+pub fn rule_problem(rule: &HighlightRule) -> Option<String> {
+    let built = match rule.kind {
+        RuleKind::Phrase => Matcher::phrase(&rule.pattern, rule.whole_word).map(drop),
+        RuleKind::Regex => check_regex(&rule.pattern),
+    };
+    built
+        .err()
+        .map(|reason| format!("`{}`: {reason}", rule.pattern))
+}
+
+/// Why `user` cannot be used, or `None`.
+pub fn user_problem(user: &HighlightUser) -> Option<String> {
+    login_problem(&normalise_user(&user.login))
+}
+
+/// `text` in lowercase, without copying when it already is (Twitch logins are).
+fn lowercase(text: &str) -> Cow<'_, str> {
+    if text.chars().any(char::is_uppercase) {
+        Cow::Owned(text.to_lowercase())
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -384,10 +444,13 @@ pub struct Highlights {
     mentions: Option<(HighlightColor, bool)>,
     own: Option<Own>,
     own_matcher: Option<Matcher>,
-    /// `(index in the configuration, matcher, colour, notify)`.
-    rules: Vec<(usize, Matcher, HighlightColor, bool)>,
-    /// `(index in the configuration, login, entry)`.
-    users: Vec<(usize, String, UserEntry)>,
+    /// `(index in the configuration, matcher, colour, notify)`, in file order.
+    rules: Vec<(usize, RuleMatcher, HighlightColor, bool)>,
+    /// Every regular expression, searched together in one pass over the message.
+    regex_set: Option<RegexSet>,
+    /// By lowercase login: `(index of the first entry, entry)`; entries for one login are merged
+    /// (the first colour, a notification if any asks).
+    users: HashMap<String, (usize, UserEntry)>,
 }
 
 impl Highlights {
@@ -396,7 +459,8 @@ impl Highlights {
     pub fn compile(config: &HighlightConfig) -> (Self, Vec<RuleProblem>) {
         let mut problems = Vec::new();
         let mut rules = Vec::new();
-        let mut users = Vec::new();
+        let mut patterns: Vec<&str> = Vec::new();
+        let mut users: HashMap<String, (usize, UserEntry)> = HashMap::new();
         if config.rules.len() > MAX_RULES {
             problems.push(RuleProblem {
                 kind: ProblemKind::Lists,
@@ -411,8 +475,13 @@ impl Highlights {
         }
         for (index, rule) in config.rules.iter().enumerate().take(MAX_RULES) {
             let built = match rule.kind {
-                RuleKind::Phrase => Matcher::phrase(&rule.pattern, rule.whole_word),
-                RuleKind::Regex => Matcher::regex(&rule.pattern),
+                RuleKind::Phrase => {
+                    Matcher::phrase(&rule.pattern, rule.whole_word).map(RuleMatcher::Phrase)
+                }
+                RuleKind::Regex => check_regex(&rule.pattern).map(|()| {
+                    patterns.push(&rule.pattern);
+                    RuleMatcher::Regex(patterns.len() - 1)
+                }),
             };
             match built {
                 Ok(matcher) => rules.push((index, matcher, rule.color, rule.notify)),
@@ -422,17 +491,46 @@ impl Highlights {
                 }),
             }
         }
+        // One pass over the message for all regular expressions, within one memory budget: when
+        // they do not fit together none of them is used (and the problem says so).
+        let regex_set = if patterns.is_empty() {
+            None
+        } else {
+            match RegexSetBuilder::new(&patterns)
+                .case_insensitive(true)
+                .unicode(true)
+                .size_limit(REGEX_SET_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SET_SIZE_LIMIT)
+                .nest_limit(REGEX_NEST_LIMIT)
+                .build()
+            {
+                Ok(set) => Some(set),
+                Err(_) => {
+                    problems.push(RuleProblem {
+                        kind: ProblemKind::Lists,
+                        reason: "the regular expressions together are too large or complex"
+                            .to_owned(),
+                    });
+                    rules.retain(|(_, matcher, _, _)| !matches!(matcher, RuleMatcher::Regex(_)));
+                    None
+                }
+            }
+        };
         for (index, user) in config.users.iter().enumerate().take(MAX_USERS) {
             let login = normalise_user(&user.login);
             match login_problem(&login) {
-                None => users.push((
-                    index,
-                    login,
-                    UserEntry {
-                        color: user.color,
-                        notify: user.notify,
-                    },
-                )),
+                None => {
+                    users
+                        .entry(login)
+                        .and_modify(|(_, entry)| entry.notify |= user.notify)
+                        .or_insert((
+                            index,
+                            UserEntry {
+                                color: user.color,
+                                notify: user.notify,
+                            },
+                        ));
+                }
                 Some(reason) => problems.push(RuleProblem {
                     kind: ProblemKind::User(index),
                     reason,
@@ -446,6 +544,7 @@ impl Highlights {
             own: None,
             own_matcher: None,
             rules,
+            regex_set,
             users,
         };
         (engine, problems)
@@ -488,7 +587,7 @@ impl Highlights {
     /// Whether `message` is written by the local user.
     pub fn is_own(&self, message: &Message) -> bool {
         match (&self.own, &message.author) {
-            (Some(own), Some(author)) => own.login == author.login.to_lowercase(),
+            (Some(own), Some(author)) => own.login == *lowercase(&author.login),
             _ => false,
         }
     }
@@ -527,16 +626,19 @@ impl Highlights {
             mention = true;
             take(&mut hit, color, wants, HitReason::Mention);
         }
+        // Every regular expression in one pass, then the rules in file order.
+        let regexes = self.regex_set.as_ref().map(|set| set.matches(&text));
         for (index, matcher, color, wants) in &self.rules {
-            if matcher.is_match(&text) {
+            let matched = match matcher {
+                RuleMatcher::Phrase(phrase) => phrase.is_match(&text),
+                RuleMatcher::Regex(at) => regexes.as_ref().is_some_and(|m| m.matched(*at)),
+            };
+            if matched {
                 take(&mut hit, *color, *wants, HitReason::Rule(*index));
             }
         }
-        let login = author.login.to_lowercase();
-        for (index, user, entry) in &self.users {
-            if *user == login {
-                take(&mut hit, entry.color, entry.notify, HitReason::User(*index));
-            }
+        if let Some((index, entry)) = self.users.get(&*lowercase(&author.login)) {
+            take(&mut hit, entry.color, entry.notify, HitReason::User(*index));
         }
         hit.map(|hit| Hit {
             notify,
@@ -724,8 +826,26 @@ mod tests {
         // Final and medial sigma are one letter for case folding.
         assert!(hit(&e, "ΣΑΣ").is_some());
         assert!(hit(&e, "σας").is_some());
+        // Simple case folding only (what the `regex` crate does): ß and ẞ are one letter, but
+        // nothing folds ß to "ss", so STRASSE is not straße.
         let sharp = only(vec![rule("straße")]);
         assert!(hit(&sharp, "STRAßE").is_some());
+        assert!(hit(&sharp, "STRAẞE").is_some());
+        assert_eq!(hit(&sharp, "STRASSE"), None);
+        let ascii = only(vec![rule("strasse")]);
+        assert_eq!(hit(&ascii, "STRAßE"), None);
+        // Turkish dotted İ and dotless ı are letters of their own: a plain i does not match
+        // them (and they do not match it), but İ matches İ and ı matches ı.
+        let plain = only(vec![rule("istanbul")]);
+        assert!(hit(&plain, "ISTANBUL").is_some());
+        assert_eq!(hit(&plain, "İSTANBUL"), None);
+        assert_eq!(hit(&plain, "ıstanbul"), None);
+        let dotted = only(vec![rule("İstanbul")]);
+        assert!(hit(&dotted, "İSTANBUL").is_some());
+        assert_eq!(hit(&dotted, "ISTANBUL"), None);
+        let dotless = only(vec![rule("ısı")]);
+        assert!(hit(&dotless, "ISI").is_none(), "I is not ı");
+        assert!(hit(&dotless, "ısı").is_some());
         // Letters of other scripts are word characters too.
         let e = only(vec![rule("日本")]);
         assert_eq!(hit(&e, "日本語"), None);
@@ -825,7 +945,7 @@ mod tests {
                 regex_rule(".*"),
                 regex_rule("a{1000}{1000}"),
                 rule("   "),
-                regex_rule(&"x".repeat(MAX_PATTERN_CHARS * 2 + 1)),
+                regex_rule(&"x".repeat(MAX_PATTERN_CHARS + 1)),
             ],
             users: vec![
                 HighlightUser {
@@ -869,6 +989,128 @@ mod tests {
         assert!(e.evaluate(&say("good_1", "anything")).is_some());
         assert_eq!(config.first_problem().unwrap().kind, ProblemKind::Rule(0));
         assert!(HighlightConfig::default().problems().is_empty());
+    }
+
+    #[test]
+    fn the_length_limit_is_on_what_was_typed_for_phrases_and_regexes_alike() {
+        let long = |n: usize| "x".repeat(n);
+        let config = |rules| HighlightConfig {
+            rules,
+            ..HighlightConfig::default()
+        };
+        // Exactly at the limit is fine; one more is not, and the message names that number.
+        assert!(
+            config(vec![rule(&long(MAX_PATTERN_CHARS))])
+                .problems()
+                .is_empty()
+        );
+        assert!(
+            config(vec![regex_rule(&long(MAX_PATTERN_CHARS))])
+                .problems()
+                .is_empty()
+        );
+        for rules in [
+            vec![rule(&long(MAX_PATTERN_CHARS + 1))],
+            vec![regex_rule(&long(MAX_PATTERN_CHARS + 1))],
+            // Characters that escaping would double do not get a phrase past the limit either.
+            vec![rule(&"+".repeat(MAX_PATTERN_CHARS + 1))],
+        ] {
+            let problems = config(rules).problems();
+            assert_eq!(problems.len(), 1);
+            assert!(problems[0].reason.contains("longer than 500 characters"));
+        }
+        assert!(
+            config(vec![rule(&"+".repeat(MAX_PATTERN_CHARS))])
+                .problems()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_the_regexes_together_have_a_memory_budget() {
+        // Each of these fits on its own; 200 of them together do not fit the shared budget.
+        let heavy = r"[a-z]{200}";
+        let one = HighlightConfig {
+            rules: vec![regex_rule(heavy)],
+            ..HighlightConfig::default()
+        };
+        assert!(one.problems().is_empty(), "{:?}", one.problems());
+        let many = HighlightConfig {
+            rules: (0..MAX_RULES)
+                .map(|i| regex_rule(&format!("{heavy}{i}")))
+                .collect(),
+            ..HighlightConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let (e, problems) = Highlights::compile(&many);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, ProblemKind::Lists);
+        assert!(problems[0].reason.contains("together"));
+        assert!(e.rules.is_empty(), "none of them is used");
+    }
+
+    #[test]
+    fn regexes_are_searched_together_and_keep_their_order_among_phrases() {
+        let e = only(vec![
+            rule("alpha"),
+            HighlightRule {
+                color: HighlightColor::Red,
+                ..regex_rule(r"\bbeta\b")
+            },
+            HighlightRule {
+                color: HighlightColor::Green,
+                notify: true,
+                ..regex_rule("gam+a")
+            },
+        ]);
+        let found = hit(&e, "gamma then BETA").unwrap();
+        assert_eq!(
+            (found.color, found.reason, found.notify),
+            (HighlightColor::Red, HitReason::Rule(1), true)
+        );
+        let found = hit(&e, "alpha gamma").unwrap();
+        assert_eq!(found.reason, HitReason::Rule(0));
+        assert!(found.notify);
+        assert_eq!(hit(&e, "nothing"), None);
+    }
+
+    #[test]
+    fn duplicate_users_merge_and_a_rule_can_be_checked_alone() {
+        let e = engine(HighlightConfig {
+            mentions: false,
+            users: vec![
+                HighlightUser {
+                    login: "Bob".into(),
+                    color: HighlightColor::Green,
+                    notify: false,
+                },
+                HighlightUser {
+                    login: "@bob".into(),
+                    color: HighlightColor::Red,
+                    notify: true,
+                },
+            ],
+            ..HighlightConfig::default()
+        });
+        let found = e.evaluate(&say("bob", "x")).unwrap();
+        assert_eq!(
+            (found.color, found.notify, found.reason),
+            (HighlightColor::Green, true, HitReason::User(0))
+        );
+        assert_eq!(rule_problem(&rule("fine")), None);
+        assert_eq!(
+            rule_problem(&regex_rule("(")),
+            Some("`(`: unclosed group".to_owned())
+        );
+        assert!(user_problem(&HighlightUser::default()).is_some());
+        assert_eq!(
+            user_problem(&HighlightUser {
+                login: "ok_1".into(),
+                ..HighlightUser::default()
+            }),
+            None
+        );
     }
 
     #[test]

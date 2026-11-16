@@ -11,7 +11,9 @@
 //! name with a menu (log in again, log out) when logged in. A strip above the content says why the
 //! user was logged out, or that the login needs new permissions.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_chat_core::{APP_ID, APP_NAME, ChannelId, ChatEvent, MessageId};
@@ -30,8 +32,8 @@ use gpui_kit::component::{
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, WindowBounds, div,
-    px, size,
+    StatefulInteractiveElement, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    Window, WindowBounds, div, px, size,
 };
 
 use crate::account::AccountHub;
@@ -69,6 +71,8 @@ use crate::streams::StreamHub;
 use crate::theme::{self, Tokens};
 
 const SIDEBAR_WIDTH: Pixels = px(240.0);
+/// How long a one-line notice stays above the panes.
+const NOTICE_TIME: Duration = Duration::from_secs(4);
 /// Disk writes while dragging/resizing are coalesced into one write after this pause.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Channel list and layout edits are rare, so they are written almost at once (a divider drag
@@ -172,6 +176,12 @@ pub struct AppShell {
     attention: Entity<Attention>,
     /// The Mentions panel is open beside the panes.
     mentions_open: bool,
+    /// A line shown for a few seconds above the panes (a jump to a message that is gone).
+    notice: Option<&'static str>,
+    notice_task: Option<Task<()>>,
+    /// The panel's rows, with the log generation they were built from.
+    mentions_rows: RefCell<Option<(u64, Rc<Vec<mentions::Row>>)>>,
+    mentions_scroll: UniformListScrollHandle,
     /// Whether this window is the active one (a channel is only being watched while it is).
     window_active: bool,
     hud: Entity<DebugHud>,
@@ -287,6 +297,10 @@ impl AppShell {
             hub,
             attention,
             mentions_open: false,
+            notice: None,
+            notice_task: None,
+            mentions_rows: RefCell::new(None),
+            mentions_scroll: UniformListScrollHandle::new(),
             window_active: window.is_window_active(),
             hud,
             list: channels,
@@ -464,12 +478,31 @@ impl AppShell {
         self.show_channel(channel);
         self.list_changed(cx);
         self.focus_pending = true;
-        if let (Some(id), Some(pane)) = (message, self.panes.get(channel)) {
-            pane.update(cx, |pane, cx| pane.show_message(id, cx));
+        if let (Some(id), Some(pane)) = (message, self.panes.get(channel).cloned()) {
+            let found = pane.update(cx, |pane, cx| pane.show_message(id, cx));
+            if !found {
+                // It left the scrollback while the hit sat in the log: say so instead of showing
+                // the channel as if nothing had been asked.
+                self.show_notice("That message is no longer in the scrollback.", cx);
+            }
         }
         self.attention
             .update(cx, |attention, cx| attention.mark_seen(channel, cx));
         window.activate_window();
+        cx.notify();
+    }
+
+    /// Shows `text` above the panes for a few seconds.
+    fn show_notice(&mut self, text: &'static str, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        self.notice_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TIME).await;
+            this.update(cx, |this, cx| {
+                this.notice = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -1173,10 +1206,22 @@ impl AppShell {
         if !self.mentions_open {
             return None;
         }
-        let rows = mentions::rows(self.attention.read(cx).activity().mentions());
+        // Rebuilt only when the log changed, not on every frame or every sidebar change.
+        let rows = {
+            let activity = self.attention.read(cx).activity();
+            let mut cache = self.mentions_rows.borrow_mut();
+            match &*cache {
+                Some((generation, rows)) if *generation == activity.generation() => rows.clone(),
+                _ => {
+                    let rows = Rc::new(mentions::rows(activity.mentions()));
+                    *cache = Some((activity.generation(), rows.clone()));
+                    rows
+                }
+            }
+        };
         let shell = cx.entity().downgrade();
         let close = shell.clone();
-        let pick: mentions::Pick = std::rc::Rc::new(move |channel, id, window, cx| {
+        let pick: mentions::Pick = Rc::new(move |channel, id, window, cx| {
             let (channel, id) = (channel.clone(), id.clone());
             shell
                 .update(cx, |shell, cx| {
@@ -1184,14 +1229,20 @@ impl AppShell {
                 })
                 .ok();
         });
-        Some(mentions::panel(rows, tokens, pick, move |_, cx| {
-            close
-                .update(cx, |shell, cx| {
-                    shell.mentions_open = false;
-                    cx.notify();
-                })
-                .ok();
-        }))
+        Some(mentions::panel(
+            rows,
+            &self.mentions_scroll,
+            tokens,
+            pick,
+            move |_, cx| {
+                close
+                    .update(cx, |shell, cx| {
+                        shell.mentions_open = false;
+                        cx.notify();
+                    })
+                    .ok();
+            },
+        ))
     }
 
     fn main_area(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1615,6 +1666,11 @@ impl Render for AppShell {
                                     .then(|| Self::keymap_notice_banner(&keymap_notices, &tokens)),
                             )
                             .children(self.account_banner(&tokens, cx))
+                            .children(
+                                self.notice.map(|text| {
+                                    Self::notice_banner("jump-notice", text, &[], &tokens)
+                                }),
+                            )
                             .child(self.main_area(&tokens, cx))
                             .child(self.hud.clone()),
                     ),

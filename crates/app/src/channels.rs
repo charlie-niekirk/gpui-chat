@@ -584,12 +584,9 @@ impl ChannelHub {
     /// The `apply` of the bridge: one frame's events. Each touched store is updated and
     /// notified once. Returns `true` when the hub itself changed (a channel appeared or the
     /// connection state did), so its observers have something new to show.
-    pub fn apply_batch(&mut self, mut events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
+    pub fn apply_batch(&mut self, events: Vec<ChatEvent>, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let count = events.len();
-        if let Some(attention) = &self.attention {
-            attention.update(cx, |attention, cx| attention.process(&mut events, cx));
-        }
         let (groups, unrouted) = split_by_channel(events);
         // Rooms that the batch itself announces, for the shared-chat check below: a replay (or a
         // join burst) can deliver a channel's `ROOMSTATE` and the first shared messages together.
@@ -618,7 +615,7 @@ impl ChannelHub {
             }
         }
         for (channel, events) in groups {
-            let events = self.name_shared_sources(&channel, events, &announced, cx);
+            let mut events = self.name_shared_sources(&channel, events, &announced, cx);
             let store = match self.stores.get(&channel) {
                 Some(store) => store.clone(),
                 None if self.auto_create && !self.closed.contains(&channel) => {
@@ -627,6 +624,20 @@ impl ChannelHub {
                 }
                 None => continue,
             };
+            // Only now, with the event routed to a channel that is open: events for a channel the
+            // user just closed (the part is still on its way) count for nothing.
+            if let Some(attention) = self.attention.clone() {
+                let sources = self.open_rooms(&channel, &announced, cx);
+                let is_copy = |message: &Message| {
+                    message
+                        .shared
+                        .as_ref()
+                        .is_some_and(|shared| sources.contains(shared.source_room_id.as_str()))
+                };
+                attention.update(cx, |attention, cx| {
+                    attention.process(&mut events, &is_copy, cx);
+                });
+            }
             store.update(cx, |store, cx| {
                 if store.apply_all(events) {
                     cx.notify();
@@ -637,6 +648,28 @@ impl ChannelHub {
         self.diagnostics
             .record_batch(started, count, started.elapsed());
         changed
+    }
+
+    /// The room ids of the other open channels (as far as their `ROOMSTATE`s told, this batch's
+    /// included): a shared-chat message whose source room is one of them is the *copy* of a line
+    /// that channel shows too.
+    fn open_rooms(
+        &self,
+        channel: &ChannelId,
+        announced: &[(ChannelId, String)],
+        cx: &App,
+    ) -> HashSet<String> {
+        self.stores
+            .iter()
+            .filter(|(other, _)| *other != channel)
+            .filter_map(|(_, store)| store.read(cx).room().room_id.clone())
+            .chain(
+                announced
+                    .iter()
+                    .filter(|(other, _)| other != channel)
+                    .map(|(_, id)| id.clone()),
+            )
+            .collect()
     }
 
     /// Names the source channel of shared-chat messages (PR 5.1) that came from a channel this
@@ -2043,6 +2076,109 @@ mod tests {
             assert_eq!(activity.unread(&watched), 0, "the watched channel is seen");
             assert_eq!(activity.unread(&other), 2);
             assert_eq!(activity.unseen_mentions(&other), 1);
+        });
+    }
+
+    /// `event` (a message) saying `text`.
+    fn saying(event: ChatEvent, text: &str) -> ChatEvent {
+        let ChatEvent::Message { channel, message } = event else {
+            unreachable!()
+        };
+        let mut message = (*message).clone();
+        message.fragments = vec![gpui_chat_core::Fragment::Text(text.into())];
+        ChatEvent::Message {
+            channel,
+            message: Arc::new(message),
+        }
+    }
+
+    fn attended_hub(
+        auto_create: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ChannelHub>, Entity<Attention>) {
+        cx.update(|cx| {
+            crate::config::install_for_test(gpui_chat_settings::Settings::default(), cx);
+            let attention = Attention::start(true, cx);
+            let hub = cx.new(|_| {
+                let mut hub = ChannelHub::new(10, Diagnostics::new());
+                hub.set_auto_create(auto_create);
+                hub.set_attention(attention.clone());
+                hub
+            });
+            (hub, attention)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_channel_that_is_not_open_or_was_just_closed_counts_for_nothing(cx: &mut TestAppContext) {
+        let (hub, attention) = attended_hub(false, cx);
+        let (open, ghost) = (ChannelId::new("open"), ChannelId::new("ghost"));
+        hub.update(cx, |hub, cx| {
+            hub.ensure(&open, cx);
+            hub.apply_batch(
+                vec![
+                    saying(chat("open", "1", "alice"), "hi viewer"),
+                    // Nobody opened it.
+                    saying(chat("ghost", "2", "alice"), "hi viewer"),
+                ],
+                cx,
+            );
+            // Closed by the user, but the client still delivers what was in flight.
+            hub.remove(&open, cx);
+            hub.apply_batch(vec![saying(chat("open", "3", "alice"), "viewer again")], cx);
+        });
+        attention.read_with(cx, |attention, _| {
+            let activity = attention.activity();
+            // Only the one line that reached an open channel was counted (and it is forgotten
+            // with the channel by the shell; here we look at what the hub let through).
+            assert_eq!(activity.unread(&open), 1);
+            assert_eq!(activity.unseen_mentions(&open), 1);
+            assert_eq!(activity.unread(&ghost), 0);
+            assert_eq!(activity.unseen_mentions(&ghost), 0);
+        });
+        // The offline hub (auto-create) also leaves a closed channel alone.
+        let (hub, attention) = attended_hub(true, cx);
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(vec![saying(chat("busy", "1", "alice"), "viewer")], cx);
+            hub.remove(&ChannelId::new("busy"), cx);
+            hub.apply_batch(vec![saying(chat("busy", "2", "alice"), "viewer")], cx);
+        });
+        attention.read_with(cx, |attention, _| {
+            assert_eq!(attention.activity().unread(&ChannelId::new("busy")), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_shared_chat_line_is_one_hit_not_one_per_open_channel(cx: &mut TestAppContext) {
+        let (hub, attention) = attended_hub(true, cx);
+        let (main, other) = (ChannelId::new("main"), ChannelId::new("other"));
+        hub.update(cx, |hub, cx| {
+            hub.apply_batch(
+                vec![
+                    room("main", "1000"),
+                    room("other", "2000"),
+                    // Sent in #other: its own copy there, and the copy delivered to #main.
+                    saying(shared("other", "2000", "o1", "2000", "o1"), "hi @viewer"),
+                    saying(shared("main", "1000", "m1", "2000", "o1"), "hi @viewer"),
+                    // Sent in a channel that is not open: the only copy there is counts.
+                    saying(shared("main", "1000", "m2", "3000", "x1"), "viewer!"),
+                    // A plain line in #main.
+                    saying(chat("main", "m3", "alice"), "viewer"),
+                ],
+                cx,
+            );
+        });
+        attention.read_with(cx, |attention, _| {
+            let activity = attention.activity();
+            assert_eq!(activity.mention_count(), 3, "o1 once, m2, m3");
+            assert_eq!(activity.unseen_mentions(&other), 1);
+            assert_eq!(activity.unseen_mentions(&main), 2);
+            assert_eq!(activity.unread(&main), 2);
+        });
+        // The copy is still drawn like a mention in its channel.
+        hub.read_with(cx, |hub, cx| {
+            let store = hub.store(&main).unwrap().read(cx);
+            assert!(store.messages().get("m1").unwrap().flags.mention);
         });
     }
 }

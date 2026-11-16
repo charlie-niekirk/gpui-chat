@@ -29,6 +29,11 @@ pub fn show(notification: Notification, cx: &App) {
     });
 }
 
+/// Takes back the notification with this tag (delivered or pending), if it is still there.
+pub fn dismiss(tag: &str, cx: &App) {
+    cx.dismiss_system_notification(tag);
+}
+
 /// Runs `handler` with the tag of a notification the user clicked (on the main thread). One handler
 /// for the app; registering again replaces it.
 pub fn on_activate(cx: &App, mut handler: impl FnMut(&str, &mut App) + 'static) {

@@ -283,15 +283,20 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   `notify` if any match says so; never the user's own messages). `MessageFlags::highlight` carries the colour,
   `flags.mention` is set from the own-name rule (so it also covers history, whose parser did not know the login).
   `attention.rs`: `Core` (no GPUI: engine + `activity::Activity` + `notifications::Coalescer`, all tested) and the
-  `Attention` entity, which `ChannelHub::apply_batch` calls with the whole batch **before** the stores see it: it stamps
-  messages (cloning only the ones a rule hit), counts unread / unseen mentions for channels that are not *watched*, logs hits
-  for the Mentions panel and returns notifications to post. Own login: the account (`account::own_login`), `viewer` for the
+  `Attention` entity, which `ChannelHub::apply_batch` calls with each channel's events **after routing** (only for a channel that
+  has a store, so a closed or never-opened channel counts for nothing) and before its store sees them: it stamps messages
+  (cloning only the ones a rule hit), counts unread / unseen mentions for channels that are not *watched*, logs hits for the
+  Mentions panel and returns notifications to post and banners to dismiss. The hub also tells it which messages are the *copy*
+  of a shared-chat line another open channel shows (`ChannelHub::open_rooms`): drawn, never counted. Matching runs all regexes in
+  one `RegexSet` pass and looks users up in a map; unseen mentions are kept per channel (`Activity::unseen`, O(1) for the
+  sidebar) and the log has a `generation` the panel's cached rows follow. Own login: the account (`account::own_login`), `viewer` for the
   offline sources; the display name is learned from the user's own messages. History is stamped but never counted;
   deletes / timeouts / clears take hits out of the log. `activity.rs` is the state: a channel is watched while a pane shows it
   and the window is active (`AppShell::push_view` tells `Attention::set_view` from `sync_layout` and window-activation
   changes); showing it in the *focused* pane clears its unread count and unseen mentions. The sidebar row's suffix draws the
-  mention pill or unread dot (`shell::Dots`), `mentions.rs` the panel beside the panes (`View ▸ Show Mentions`, ⇧⌘M; click =
-  `AppShell::show_message`: show the channel, `ChatView::scroll_to_message`, mark seen). `notifications.rs` builds the text and
+  mention pill or unread dot (`shell::Dots`), `mentions.rs` the panel beside the panes (a `uniform_list` of fixed-height rows) (`View ▸ Show Mentions`, ⇧⌘M; click =
+  `AppShell::show_message`: show the channel, `ChatView::scroll_to_message`, mark seen; the view holds still (`jump_hold`, ended by
+  scrolling or the pill), flashes the row and the shell says so when the message left the scrollback). `notifications.rs` builds the text and
   the tag (`hit:<channel>:<message id>` / `summary`, parsed back on a click) and rate-limits (one per 5 s, the rest one summary
   after a timer); `platform/notify.rs` is the only place that calls GPUI's `show_system_notification` /
   `on_system_notification_response` (macOS `UNUserNotificationCenter`; authorisation is requested by GPUI on the first

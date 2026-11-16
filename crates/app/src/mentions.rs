@@ -1,7 +1,9 @@
 //! The Mentions view (PR 5.3): a panel beside the chat listing the recent highlight hits of every
 //! channel, newest first, each with its channel, time and author; a click shows the message in its
 //! channel. It is drawn from [`crate::activity::Activity`]'s log (the rows are copied out so the
-//! panel owns its data), and the shell decides what a click does.
+//! panel owns its data, rebuilt only when the log's generation moved), and the shell decides what a
+//! click does. The list is virtualised (`uniform_list`, fixed row height), so only the rows on
+//! screen are built each frame however many hits are logged.
 
 use std::rc::Rc;
 
@@ -10,7 +12,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
 use crate::activity::MentionEntry;
@@ -20,8 +22,10 @@ use crate::theme::Tokens;
 
 /// Width of the panel.
 pub const WIDTH: f32 = 340.0;
-/// Rows drawn (the log keeps more; the oldest are not worth scrolling to).
+/// Rows listed (the log keeps up to 500; the oldest are not worth scrolling to).
 const SHOWN: usize = 200;
+/// Height of a row: the channel line and two lines of text, with padding.
+const ROW_HEIGHT: f32 = 76.0;
 
 /// One row of the panel.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +35,7 @@ pub struct Row {
     pub author: String,
     /// `HH:MM`.
     pub time: String,
-    pub text: String,
+    pub text: SharedString,
     pub color: HighlightColor,
     pub unseen: bool,
 }
@@ -50,7 +54,7 @@ pub fn rows<'a>(entries: impl Iterator<Item = &'a MentionEntry>) -> Vec<Row> {
                     .as_ref()
                     .map_or_else(String::new, |author| author_name(author).to_owned()),
                 time: clock(message.timestamp.unix_millis()),
-                text: message.plain_text(),
+                text: SharedString::from(entry.text.clone()),
                 color: entry.color,
                 unseen: entry.unseen,
             }
@@ -63,7 +67,8 @@ pub type Pick = Rc<dyn Fn(&ChannelId, &MessageId, &mut Window, &mut App)>;
 
 /// The panel. `on_close` hides it.
 pub fn panel(
-    rows: Vec<Row>,
+    rows: Rc<Vec<Row>>,
+    scroll: &UniformListScrollHandle,
     tokens: &Tokens,
     on_pick: Pick,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
@@ -104,6 +109,7 @@ pub fn panel(
                 .accessibility_label("Close Mentions")
                 .on_click(move |_, window, cx| on_close(window, cx)),
         );
+    let (muted, surface, border) = (tokens.text_muted, tokens.surface, tokens.border);
     let body = if rows.is_empty() {
         div()
             .p_3()
@@ -112,64 +118,71 @@ pub fn panel(
             .child("No highlights yet. Messages that mention you, match a phrase or come from a highlighted user show up here.")
             .into_any_element()
     } else {
-        v_flex()
-            .children(rows.into_iter().enumerate().map(|(index, row)| {
-                let color = palette.rule_color(row.color);
-                let (channel, id) = (row.channel.clone(), row.id.clone());
-                let on_pick = on_pick.clone();
-                h_flex()
-                    .id(SharedString::from(format!("mention-{index}")))
-                    .w_full()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(tokens.surface))
-                    .border_b_1()
-                    .border_color(tokens.border.opacity(0.5))
-                    .on_click(move |_, window, cx| on_pick(&channel, &id, window, cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(3.0))
-                            .self_stretch()
-                            .bg(color.opacity(0.9)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .px_3()
-                            .py_2()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .text_xs()
-                                    .text_color(tokens.text_muted)
-                                    .children(row.unseen.then(|| {
-                                        div().flex_none().size(px(6.0)).rounded_full().bg(color)
-                                    }))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .font_weight(if row.unseen {
-                                                FontWeight::SEMIBOLD
-                                            } else {
-                                                FontWeight::NORMAL
-                                            })
-                                            .child(format!("#{} · {}", row.channel, row.author)),
-                                    )
-                                    .child(div().flex_none().child(row.time)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .line_clamp(3)
-                                    .child(SharedString::from(row.text)),
-                            ),
-                    )
-            }))
-            .into_any_element()
+        let count = rows.len();
+        uniform_list("mentions-list", count, move |range, _, _| {
+            range
+                .filter_map(|index| rows.get(index).map(|row| (index, row.clone())))
+                .map(|(index, row)| {
+                    let color = palette.rule_color(row.color);
+                    let (channel, id) = (row.channel.clone(), row.id.clone());
+                    let on_pick = on_pick.clone();
+                    h_flex()
+                        .id(SharedString::from(format!("mention-{index}")))
+                        .w_full()
+                        .h(px(ROW_HEIGHT))
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(surface))
+                        .border_b_1()
+                        .border_color(border.opacity(0.5))
+                        .on_click(move |_, window, cx| on_pick(&channel, &id, window, cx))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(3.0))
+                                .self_stretch()
+                                .bg(color.opacity(0.9)),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .px_3()
+                                .py_2()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .children(row.unseen.then(|| {
+                                            div().flex_none().size(px(6.0)).rounded_full().bg(color)
+                                        }))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_weight(if row.unseen {
+                                                    FontWeight::SEMIBOLD
+                                                } else {
+                                                    FontWeight::NORMAL
+                                                })
+                                                .child(format!(
+                                                    "#{} · {}",
+                                                    row.channel, row.author
+                                                )),
+                                        )
+                                        .child(div().flex_none().child(row.time)),
+                                )
+                                .child(div().text_sm().line_clamp(2).child(row.text)),
+                        )
+                })
+                .collect()
+        })
+        .track_scroll(scroll)
+        .size_full()
+        .into_any_element()
     };
     v_flex()
         .id("mentions-panel")
@@ -182,14 +195,7 @@ pub fn panel(
         .border_l_1()
         .border_color(tokens.border)
         .child(header)
-        .child(
-            div()
-                .id("mentions-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(body),
-        )
+        .child(div().flex_1().min_h_0().child(body))
         .into_any_element()
 }
 
@@ -210,6 +216,7 @@ mod tests {
                 Author::new("alice", "Alice"),
                 vec![Fragment::Text(format!("text {id}"))],
             )),
+            text: format!("text {id}").into(),
             color: HighlightColor::Red,
             unseen,
         }

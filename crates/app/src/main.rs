@@ -30,6 +30,7 @@ mod hud;
 mod images;
 mod keymap;
 mod live;
+mod logging;
 mod login;
 mod mentions;
 mod moderation;
@@ -207,6 +208,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    logging::init();
     // Read the log before any window exists, so a bad path fails with a message, not a blank app.
     let replay_log: Option<Arc<str>> = cli.replay.as_ref().map(|path| {
         std::fs::read_to_string(path)

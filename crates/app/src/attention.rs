@@ -39,6 +39,8 @@ pub struct Processed {
     pub notifications: Vec<Notification>,
     /// A hit was held back: a summary is due at [`Coalescer::summary_due`].
     pub held: bool,
+    /// Tags of notifications to take back (their message was removed by a moderator).
+    pub dismiss: Vec<String>,
 }
 
 /// The state and rules of [`Attention`], with no GPUI.
@@ -74,15 +76,22 @@ impl Core {
         engine.set_own(own);
         self.engine = engine;
         self.config = config.clone();
+        if !config.notifications {
+            // Nothing held may fire after the user switched notifications off.
+            self.coalescer.clear();
+        }
         true
     }
 
     /// Stamps the rules' verdict on the messages of `events`, counts activity, logs hits and
-    /// decides on notifications. `own` is the user's login (`None`: anonymous).
+    /// decides on notifications. `own` is the user's login (`None`: anonymous). `is_copy` says a
+    /// message is the copy of one that a channel the user has open shows too (shared chat): it is
+    /// drawn like any other, but counts for nothing, so one line is one hit.
     pub fn process(
         &mut self,
         own: Option<&str>,
         events: &mut [ChatEvent],
+        is_copy: &dyn Fn(&Message) -> bool,
         now: Instant,
     ) -> Processed {
         let mut out = Processed::default();
@@ -95,7 +104,7 @@ impl Core {
                     let hit = self.engine.evaluate(message);
                     let live = is_countable(message);
                     stamp(message, hit, &self.engine);
-                    if !live || self.engine.is_own(message) {
+                    if !live || self.engine.is_own(message) || is_copy(message) {
                         continue;
                     }
                     out.changed |= self.activity.note_message(channel);
@@ -104,10 +113,14 @@ impl Core {
                     out.changed |= self.activity.note_hit(channel, message.clone(), color);
                     if hit.notify && self.config.notifications && !self.activity.is_watched(channel)
                     {
-                        match self.coalescer.offer(now, channel) {
+                        match self.coalescer.offer(now, channel, &message.id) {
                             Verdict::Send => {
-                                let (title, body) =
-                                    notifications::describe(message, channel, hit.reason);
+                                let (title, body) = notifications::describe(
+                                    message,
+                                    channel,
+                                    hit.reason,
+                                    self.config.notification_previews,
+                                );
                                 out.notifications.push(Notification {
                                     tag: notifications::message_tag(channel, &message.id),
                                     title,
@@ -130,7 +143,14 @@ impl Core {
                     channel,
                     message_id,
                     ..
-                } => out.changed |= self.activity.message_removed(channel, message_id),
+                } => {
+                    let gone = self.activity.message_removed(channel, message_id);
+                    out.changed |= !gone.is_empty();
+                    // Whatever was said about it is taken back, logged or not.
+                    self.coalescer.forget(channel, message_id);
+                    out.dismiss
+                        .push(notifications::message_tag(channel, message_id));
+                }
                 ChatEvent::ClearChat {
                     channel, target, ..
                 } => {
@@ -138,7 +158,12 @@ impl Core {
                         ClearTarget::Channel => None,
                         ClearTarget::User { login, .. } => Some(login.as_str()),
                     };
-                    out.changed |= self.activity.user_removed(channel, login);
+                    let gone = self.activity.user_removed(channel, login);
+                    out.changed |= !gone.is_empty();
+                    for id in gone {
+                        self.coalescer.forget(channel, &id);
+                        out.dismiss.push(notifications::message_tag(channel, &id));
+                    }
                 }
                 _ => {}
             }
@@ -148,6 +173,10 @@ impl Core {
 
     /// The summary of held notifications, once it is due.
     pub fn summary(&mut self, now: Instant) -> Option<Notification> {
+        if !self.config.notifications {
+            self.coalescer.clear();
+            return None;
+        }
         let (count, channels) = self.coalescer.next_summary(now)?;
         let (title, body) = notifications::summary_text(count, &channels);
         Some(Notification {
@@ -258,11 +287,21 @@ impl Attention {
 
     /// Runs `events` (one frame's batch, before the stores take it) through the rules; see the
     /// module docs.
-    pub fn process(&mut self, events: &mut [ChatEvent], cx: &mut Context<Self>) {
+    pub fn process(
+        &mut self,
+        events: &mut [ChatEvent],
+        is_copy: &dyn Fn(&Message) -> bool,
+        cx: &mut Context<Self>,
+    ) {
         let own = self.own_login(cx);
-        let out = self.core.process(own.as_deref(), events, Instant::now());
+        let out = self
+            .core
+            .process(own.as_deref(), events, is_copy, Instant::now());
         for notification in out.notifications {
             notify::show(notification, cx);
+        }
+        for tag in &out.dismiss {
+            notify::dismiss(tag, cx);
         }
         if out.held {
             self.schedule_summary(cx);
@@ -368,7 +407,7 @@ mod tests {
     }
 
     fn run(core: &mut Core, events: &mut [ChatEvent]) -> Processed {
-        core.process(Some("viewer"), events, Instant::now())
+        core.process(Some("viewer"), events, &|_| false, Instant::now())
     }
 
     fn core_watching(config: HighlightConfig, watching: &str) -> Core {
@@ -553,13 +592,13 @@ mod tests {
         let mut core = core_watching(HighlightConfig::default(), "a");
         let t0 = Instant::now();
         let mut first = [chat("b", "1", "alice", "viewer")];
-        let out = core.process(Some("viewer"), &mut first, t0);
+        let out = core.process(Some("viewer"), &mut first, &|_| false, t0);
         assert_eq!(out.notifications.len(), 1);
         let mut more = [
             chat("b", "2", "alice", "viewer"),
             chat("c", "3", "alice", "viewer"),
         ];
-        let out = core.process(Some("viewer"), &mut more, t0);
+        let out = core.process(Some("viewer"), &mut more, &|_| false, t0);
         assert!(out.notifications.is_empty() && out.held);
         assert!(core.summary(t0).is_none(), "not yet");
         let summary = core.summary(t0 + MIN_GAP).unwrap();
@@ -590,7 +629,7 @@ mod tests {
     fn nobody_is_mentioned_without_a_login_and_new_rules_apply_to_new_messages() {
         let mut core = core_watching(HighlightConfig::default(), "a");
         let mut events = [chat("b", "1", "alice", "viewer")];
-        core.process(None, &mut events, Instant::now());
+        core.process(None, &mut events, &|_| false, Instant::now());
         assert_eq!(flags(&events[0]).highlight, None);
         assert!(!core.set_config(&HighlightConfig::default()), "unchanged");
         let config = HighlightConfig {
@@ -623,5 +662,114 @@ mod tests {
         );
         assert!(out.changed);
         assert_eq!(core.activity.mention_count(), 0);
+    }
+
+    #[test]
+    fn a_removed_message_takes_its_banner_and_its_place_in_the_summary_with_it() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        let t0 = Instant::now();
+        let mut events = [
+            chat("b", "1", "alice", "viewer"),
+            chat("b", "2", "alice", "viewer again"),
+            chat("c", "3", "bob", "viewer too"),
+        ];
+        let out = core.process(Some("viewer"), &mut events, &|_| false, t0);
+        assert_eq!(
+            out.notifications.len(),
+            1,
+            "the first is sent, two are held"
+        );
+        let (b, c) = (ChannelId::new("b"), ChannelId::new("c"));
+        // Deleting a held message: its banner (if any) is dismissed, and it is not summarised.
+        let out = core.process(
+            Some("viewer"),
+            &mut [ChatEvent::DeleteMessage {
+                channel: b.clone(),
+                message_id: MessageId::from("2"),
+                login: None,
+            }],
+            &|_| false,
+            t0,
+        );
+        assert_eq!(out.dismiss, ["hit:b:2"]);
+        // Deleting the one that was sent dismisses its banner too (logged or not).
+        let out = core.process(
+            Some("viewer"),
+            &mut [ChatEvent::DeleteMessage {
+                channel: b.clone(),
+                message_id: MessageId::from("1"),
+                login: None,
+            }],
+            &|_| false,
+            t0,
+        );
+        assert_eq!(out.dismiss, ["hit:b:1"]);
+        let summary = core.summary(t0 + MIN_GAP).unwrap();
+        assert_eq!(summary.title, "1 more highlight");
+        assert_eq!(summary.body, "in #c");
+        // A timeout dismisses every banner of that user's logged hits.
+        let out = core.process(
+            Some("viewer"),
+            &mut [ChatEvent::ClearChat {
+                channel: c,
+                target: ClearTarget::User {
+                    login: "bob".into(),
+                    duration: None,
+                },
+                at: None,
+            }],
+            &|_| false,
+            t0 + MIN_GAP,
+        );
+        assert_eq!(out.dismiss, ["hit:c:3"]);
+    }
+
+    #[test]
+    fn a_held_summary_does_not_fire_after_notifications_are_switched_off() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        let t0 = Instant::now();
+        let mut events = [
+            chat("b", "1", "alice", "viewer"),
+            chat("b", "2", "alice", "viewer"),
+        ];
+        core.process(Some("viewer"), &mut events, &|_| false, t0);
+        assert!(core.coalescer.summary_due().is_some());
+        let off = HighlightConfig {
+            notifications: false,
+            ..HighlightConfig::default()
+        };
+        assert!(core.set_config(&off));
+        assert_eq!(core.summary(t0 + MIN_GAP), None);
+        assert!(
+            core.coalescer.summary_due().is_none(),
+            "nothing is held any more"
+        );
+    }
+
+    #[test]
+    fn previews_off_keeps_the_text_and_the_author_out_of_the_notification() {
+        let config = HighlightConfig {
+            notification_previews: false,
+            ..HighlightConfig::default()
+        };
+        let mut core = core_watching(config, "a");
+        let mut events = [chat("b", "1", "alice", "my secret, viewer")];
+        let out = run(&mut core, &mut events);
+        assert_eq!(out.notifications[0].title, "New highlight in #b");
+        assert_eq!(out.notifications[0].body, "");
+        // The row itself and the Mentions log are unaffected.
+        assert!(flags(&events[0]).mention);
+        assert_eq!(core.activity.mention_count(), 1);
+    }
+
+    #[test]
+    fn the_copy_of_a_line_an_open_channel_shows_is_drawn_but_not_counted() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        let mut events = [chat("b", "1", "alice", "hi viewer")];
+        let out = core.process(Some("viewer"), &mut events, &|_| true, Instant::now());
+        assert!(flags(&events[0]).mention, "still a mention on screen");
+        assert!(!out.changed && out.notifications.is_empty());
+        assert_eq!(core.activity.mention_count(), 0);
+        assert_eq!(core.activity.unread(&ChannelId::new("b")), 0);
     }
 }

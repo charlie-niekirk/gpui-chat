@@ -26,6 +26,8 @@ pub const MENTION_LOG: usize = 500;
 pub struct MentionEntry {
     pub channel: ChannelId,
     pub message: Arc<Message>,
+    /// The message's text, read once when the hit is logged (the panel draws it every frame).
+    pub text: Arc<str>,
     pub color: HighlightColor,
     /// The user has not looked at it yet (it arrived while the channel was not watched).
     pub unseen: bool,
@@ -49,6 +51,11 @@ pub struct Activity {
     unread: HashMap<ChannelId, u32>,
     /// Oldest first.
     mentions: VecDeque<MentionEntry>,
+    /// Unseen entries of `mentions` per channel, kept in step so the sidebar asks in O(1).
+    unseen: HashMap<ChannelId, usize>,
+    /// Bumped whenever the log changes (an entry added, dropped or marked seen), so the Mentions
+    /// panel rebuilds its rows only then.
+    generation: u64,
     /// Channels shown by a pane.
     visible: HashSet<ChannelId>,
     /// The channel of the focused pane.
@@ -82,8 +89,12 @@ impl Activity {
     /// Clears the unread count and the unseen mentions of `channel`; whether there was any.
     pub fn mark_seen(&mut self, channel: &ChannelId) -> bool {
         let mut changed = self.unread.remove(channel).is_some();
-        for entry in self.mentions.iter_mut().filter(|e| &e.channel == channel) {
-            changed |= std::mem::take(&mut entry.unseen);
+        if self.unseen.remove(channel).is_some() {
+            for entry in self.mentions.iter_mut().filter(|e| &e.channel == channel) {
+                entry.unseen = false;
+            }
+            self.generation += 1;
+            changed = true;
         }
         changed
     }
@@ -108,11 +119,18 @@ impl Activity {
         color: HighlightColor,
     ) -> bool {
         let unseen = !self.is_watched(channel);
-        if self.mentions.len() >= MENTION_LOG {
-            self.mentions.pop_front();
+        if self.mentions.len() >= MENTION_LOG
+            && let Some(old) = self.mentions.pop_front()
+        {
+            self.uncount(&old);
         }
+        if unseen {
+            *self.unseen.entry(channel.clone()).or_insert(0) += 1;
+        }
+        self.generation += 1;
         self.mentions.push_back(MentionEntry {
             channel: channel.clone(),
+            text: message.plain_text().into(),
             message,
             color,
             unseen,
@@ -127,10 +145,12 @@ impl Activity {
 
     /// Mentions of `channel` the user has not looked at.
     pub fn unseen_mentions(&self, channel: &ChannelId) -> usize {
-        self.mentions
-            .iter()
-            .filter(|e| e.unseen && &e.channel == channel)
-            .count()
+        self.unseen.get(channel).copied().unwrap_or(0)
+    }
+
+    /// Changes whenever the Mentions log does; see [`Activity::mentions`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The Mentions view's rows, newest first.
@@ -150,14 +170,14 @@ impl Activity {
         self.mentions.iter().filter(|e| e.unseen).count()
     }
 
-    /// A moderator deleted the message: it leaves the log. Whether it was in it.
-    pub fn message_removed(&mut self, channel: &ChannelId, id: &MessageId) -> bool {
+    /// A moderator deleted the message: it leaves the log. The ids that were in it.
+    pub fn message_removed(&mut self, channel: &ChannelId, id: &MessageId) -> Vec<MessageId> {
         self.retain(|e| !(&e.channel == channel && e.message.id == *id))
     }
 
     /// `login` was timed out or banned in `channel` (or, with `None`, the whole chat was cleared):
-    /// their hits leave the log.
-    pub fn user_removed(&mut self, channel: &ChannelId, login: Option<&str>) -> bool {
+    /// their hits leave the log. The ids that were in it.
+    pub fn user_removed(&mut self, channel: &ChannelId, login: Option<&str>) -> Vec<MessageId> {
         self.retain(|e| {
             &e.channel != channel
                 || login.is_some_and(|login| {
@@ -172,14 +192,40 @@ impl Activity {
     /// The channel was closed: nothing of it is left to show.
     pub fn forget(&mut self, channel: &ChannelId) -> bool {
         let unread = self.unread.remove(channel).is_some();
-        let log = self.retain(|e| &e.channel != channel);
+        let log = !self.retain(|e| &e.channel != channel).is_empty();
+        self.unseen.remove(channel);
         unread || log
     }
 
-    fn retain(&mut self, keep: impl Fn(&MentionEntry) -> bool) -> bool {
-        let before = self.mentions.len();
-        self.mentions.retain(keep);
-        self.mentions.len() != before
+    /// Keeps the entries `keep` says yes to; the ids of the ones dropped.
+    fn retain(&mut self, keep: impl Fn(&MentionEntry) -> bool) -> Vec<MessageId> {
+        let mut dropped = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.mentions.len());
+        for entry in std::mem::take(&mut self.mentions) {
+            if keep(&entry) {
+                kept.push_back(entry);
+            } else {
+                self.uncount(&entry);
+                dropped.push(entry.message.id.clone());
+            }
+        }
+        self.mentions = kept;
+        if !dropped.is_empty() {
+            self.generation += 1;
+        }
+        dropped
+    }
+
+    /// An entry leaves the log: it no longer counts as unseen.
+    fn uncount(&mut self, entry: &MentionEntry) {
+        if entry.unseen
+            && let Some(count) = self.unseen.get_mut(&entry.channel)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.unseen.remove(&entry.channel);
+            }
+        }
     }
 }
 
@@ -319,16 +365,46 @@ mod tests {
             HighlightColor::Accent,
         );
         a.note_hit(&channel("b"), message("3", "troll"), HighlightColor::Accent);
-        assert!(a.message_removed(&channel("a"), &"2".into()));
-        assert!(!a.message_removed(&channel("a"), &"2".into()));
+        assert_eq!(a.message_removed(&channel("a"), &"2".into()), ["2".into()]);
+        assert!(a.message_removed(&channel("a"), &"2".into()).is_empty());
         assert_eq!(a.unseen_mentions(&channel("a")), 1);
         // A timeout removes that user's hits in that channel only.
-        assert!(a.user_removed(&channel("a"), Some("TROLL")));
+        assert_eq!(a.user_removed(&channel("a"), Some("TROLL")), ["1".into()]);
         assert_eq!(a.unseen_mentions(&channel("a")), 0);
         assert_eq!(a.unseen_mentions(&channel("b")), 1);
         // A clear removes the channel's.
-        assert!(a.user_removed(&channel("b"), None));
+        assert_eq!(a.user_removed(&channel("b"), None), ["3".into()]);
         assert_eq!(a.mention_count(), 0);
+        assert_eq!(a.total_unseen_mentions(), 0);
+    }
+
+    #[test]
+    fn the_counters_follow_the_log_through_eviction_seeing_and_the_generation() {
+        let mut a = Activity::default();
+        let g0 = a.generation();
+        for n in 0..MENTION_LOG + 10 {
+            a.note_hit(
+                &channel("a"),
+                message(&n.to_string(), "x"),
+                HighlightColor::Accent,
+            );
+        }
+        assert_eq!(
+            a.unseen_mentions(&channel("a")),
+            MENTION_LOG,
+            "evicted ones stop counting"
+        );
+        assert_eq!(a.unseen_mentions(&channel("a")), a.total_unseen_mentions());
+        let g1 = a.generation();
+        assert!(g1 > g0);
+        assert!(a.mark_seen(&channel("a")));
+        assert_eq!(a.unseen_mentions(&channel("a")), 0);
+        assert!(a.generation() > g1, "the rows' dots changed");
+        let g2 = a.generation();
+        assert!(!a.mark_seen(&channel("a")));
+        assert_eq!(a.generation(), g2, "nothing changed, nothing to rebuild");
+        // The text is read once.
+        assert_eq!(&*a.mentions().next().unwrap().text, "hi");
     }
 
     #[test]

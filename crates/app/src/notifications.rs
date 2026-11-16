@@ -18,8 +18,17 @@ pub const MIN_GAP: Duration = Duration::from_secs(5);
 /// Longest notification body, in characters.
 const BODY_CHARS: usize = 160;
 
-/// What to put in a notification for `message`, hit in `channel`.
-pub fn describe(message: &Message, channel: &ChannelId, reason: HitReason) -> (String, String) {
+/// What to put in a notification for `message`, hit in `channel`. Without `previews` it only says
+/// there is a new highlight in the channel: no name and no text reaches a locked screen.
+pub fn describe(
+    message: &Message,
+    channel: &ChannelId,
+    reason: HitReason,
+    previews: bool,
+) -> (String, String) {
+    if !previews {
+        return (format!("New highlight in #{channel}"), String::new());
+    }
     let author = message.author.as_ref().map_or("Someone", author_name);
     let title = match reason {
         HitReason::Mention => format!("{author} mentioned you in #{channel}"),
@@ -101,8 +110,8 @@ pub fn summary_text(count: usize, channels: &[ChannelId]) -> (String, String) {
 #[derive(Debug, Default)]
 pub struct Coalescer {
     last: Option<Instant>,
-    held: usize,
-    channels: Vec<ChannelId>,
+    /// The hits held back, oldest first.
+    held: Vec<(ChannelId, MessageId)>,
 }
 
 /// What to do with a hit.
@@ -115,26 +124,36 @@ pub enum Verdict {
 }
 
 impl Coalescer {
-    /// A notification-worthy hit in `channel` at `now`.
-    pub fn offer(&mut self, now: Instant, channel: &ChannelId) -> Verdict {
+    /// A notification-worthy hit, message `id` in `channel`, at `now`.
+    pub fn offer(&mut self, now: Instant, channel: &ChannelId, id: &MessageId) -> Verdict {
         if self
             .last
             .is_none_or(|last| now.saturating_duration_since(last) >= MIN_GAP)
-            && self.held == 0
+            && self.held.is_empty()
         {
             self.last = Some(now);
             return Verdict::Send;
         }
-        self.held += 1;
-        if !self.channels.contains(channel) {
-            self.channels.push(channel.clone());
-        }
+        self.held.push((channel.clone(), id.clone()));
         Verdict::Held
+    }
+
+    /// A held message was removed by a moderator: it is not in the summary any more. Whether it
+    /// was held.
+    pub fn forget(&mut self, channel: &ChannelId, id: &MessageId) -> bool {
+        let before = self.held.len();
+        self.held.retain(|(c, m)| !(c == channel && m == id));
+        self.held.len() != before
+    }
+
+    /// Nothing is held (the settings switched notifications off).
+    pub fn clear(&mut self) {
+        self.held.clear();
     }
 
     /// When the summary of the held hits is due, if there are any.
     pub fn summary_due(&self) -> Option<Instant> {
-        (self.held > 0).then(|| self.last.map_or_else(Instant::now, |last| last + MIN_GAP))
+        (!self.held.is_empty()).then(|| self.last.map_or_else(Instant::now, |last| last + MIN_GAP))
     }
 
     /// The held hits as one summary, once its time has come: how many and in which channels.
@@ -143,10 +162,14 @@ impl Coalescer {
             return None;
         }
         self.last = Some(now);
-        Some((
-            std::mem::take(&mut self.held),
-            std::mem::take(&mut self.channels),
-        ))
+        let held = std::mem::take(&mut self.held);
+        let mut channels: Vec<ChannelId> = Vec::new();
+        for (channel, _) in &held {
+            if !channels.contains(channel) {
+                channels.push(channel.clone());
+            }
+        }
+        Some((held.len(), channels))
     }
 }
 
@@ -172,11 +195,17 @@ mod tests {
             &message("Alice", "hey @viewer\nlook   at this"),
             &channel,
             HitReason::Mention,
+            true,
         );
         assert_eq!(title, "Alice mentioned you in #forsen");
         assert_eq!(body, "hey @viewer look at this");
-        let (title, _) = describe(&message("Bob", "hi"), &channel, HitReason::Rule(0));
+        let (title, _) = describe(&message("Bob", "hi"), &channel, HitReason::Rule(0), true);
         assert_eq!(title, "Bob in #forsen");
+        // Without previews nothing of the message or its author is in it.
+        let secret = message("Alice", "my password is hunter2");
+        let (title, body) = describe(&secret, &channel, HitReason::Mention, false);
+        assert_eq!(title, "New highlight in #forsen");
+        assert_eq!(body, "");
     }
 
     #[test]
@@ -204,27 +233,55 @@ mod tests {
         );
     }
 
+    fn id(n: u32) -> MessageId {
+        MessageId::from(format!("m{n}"))
+    }
+
     #[test]
     fn the_first_hit_is_sent_and_a_burst_is_held_for_one_summary() {
         let mut c = Coalescer::default();
         let t0 = Instant::now();
         let (a, b) = (ChannelId::new("a"), ChannelId::new("b"));
-        assert_eq!(c.offer(t0, &a), Verdict::Send);
+        assert_eq!(c.offer(t0, &a, &id(0)), Verdict::Send);
         assert_eq!(c.summary_due(), None);
-        assert_eq!(c.offer(t0 + Duration::from_secs(1), &a), Verdict::Held);
-        assert_eq!(c.offer(t0 + Duration::from_secs(2), &b), Verdict::Held);
-        assert_eq!(c.offer(t0 + Duration::from_secs(3), &a), Verdict::Held);
+        let secs = Duration::from_secs;
+        assert_eq!(c.offer(t0 + secs(1), &a, &id(1)), Verdict::Held);
+        assert_eq!(c.offer(t0 + secs(2), &b, &id(2)), Verdict::Held);
+        assert_eq!(c.offer(t0 + secs(3), &a, &id(3)), Verdict::Held);
         assert_eq!(c.summary_due(), Some(t0 + MIN_GAP));
         // Too early: nothing.
-        assert_eq!(c.next_summary(t0 + Duration::from_secs(4)), None);
+        assert_eq!(c.next_summary(t0 + secs(4)), None);
         let (count, channels) = c.next_summary(t0 + MIN_GAP).unwrap();
         assert_eq!((count, channels), (3, vec![a.clone(), b]));
         assert_eq!(c.next_summary(t0 + MIN_GAP), None, "said once");
         // The summary counts as a notification: a hit right after is held again.
-        assert_eq!(
-            c.offer(t0 + MIN_GAP + Duration::from_secs(1), &a),
-            Verdict::Held
-        );
+        assert_eq!(c.offer(t0 + MIN_GAP + secs(1), &a, &id(4)), Verdict::Held);
+    }
+
+    #[test]
+    fn a_removed_message_leaves_the_held_summary_and_an_empty_one_is_not_sent() {
+        let mut c = Coalescer::default();
+        let t0 = Instant::now();
+        let (a, b) = (ChannelId::new("a"), ChannelId::new("b"));
+        c.offer(t0, &a, &id(0));
+        c.offer(t0, &a, &id(1));
+        c.offer(t0, &b, &id(2));
+        assert!(c.forget(&a, &id(1)));
+        assert!(!c.forget(&a, &id(1)), "gone already");
+        assert!(!c.forget(&b, &id(1)), "another channel's id is not it");
+        assert!(c.forget(&b, &id(2)));
+        assert_eq!(c.next_summary(t0 + MIN_GAP), None, "nothing left to say");
+        assert_eq!(c.summary_due(), None);
+        // Only the channels that still have a held hit are named.
+        c.offer(t0 + MIN_GAP, &a, &id(3));
+        c.offer(t0 + MIN_GAP, &b, &id(4));
+        c.offer(t0 + MIN_GAP, &b, &id(5));
+        c.forget(&a, &id(3));
+        assert_eq!(c.next_summary(t0 + MIN_GAP * 2), Some((2, vec![b])));
+        c.offer(t0 + MIN_GAP * 3, &a, &id(6));
+        c.offer(t0 + MIN_GAP * 3, &a, &id(7));
+        c.clear();
+        assert_eq!(c.next_summary(t0 + MIN_GAP * 9), None);
     }
 
     #[test]
@@ -232,8 +289,8 @@ mod tests {
         let mut c = Coalescer::default();
         let t0 = Instant::now();
         let a = ChannelId::new("a");
-        assert_eq!(c.offer(t0, &a), Verdict::Send);
-        assert_eq!(c.offer(t0 + MIN_GAP, &a), Verdict::Send);
+        assert_eq!(c.offer(t0, &a, &id(0)), Verdict::Send);
+        assert_eq!(c.offer(t0 + MIN_GAP, &a, &id(1)), Verdict::Send);
     }
 
     #[test]

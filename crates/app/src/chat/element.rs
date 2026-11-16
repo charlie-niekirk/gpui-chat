@@ -138,6 +138,8 @@ pub type OpenThread = Rc<dyn Fn(&MessageId, &mut Window, &mut App)>;
 /// only and resolves the right-click menu against it.
 pub type HoveredRow = Rc<Cell<Option<u64>>>;
 
+/// Opacity of the flash behind a message a jump brought into view.
+const FLASH_TINT: f32 = 0.35;
 /// Opacity of the tint behind a row a highlight rule hit.
 const RULE_TINT: f32 = 0.16;
 
@@ -178,6 +180,9 @@ pub struct MessageStyle {
     /// Where rows report their geometry and find their part of the selection (PR 5.6); all
     /// selection and link handling lives there ([`super::selection_layer`]).
     pub selection: Option<Rc<Surface>>,
+    /// The row to flash for a moment after a jump to it (the Mentions view, a notification):
+    /// its sequence number, shared with the view that sets and clears it.
+    pub flash: Option<Rc<Cell<Option<u64>>>>,
 }
 
 /// One message in the chat list.
@@ -799,6 +804,15 @@ impl Element for MessageElement {
         }
 
         window.paint_layer(bounds, |window| {
+            // The message a jump just brought into view.
+            if style
+                .flash
+                .as_ref()
+                .is_some_and(|flash| flash.get() == Some(self.seq))
+            {
+                let color = palette.rule_color(HighlightColor::Accent);
+                window.paint_quad(fill(bounds, color.opacity(FLASH_TINT)));
+            }
             // Event rows (PR 5.1) have a bar and a tint of their own, which also covers a
             // channel-points highlight; a mention of the viewer is the stronger signal.
             let look = shaped.look;

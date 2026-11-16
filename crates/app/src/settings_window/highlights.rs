@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use gpui_chat_core::{HighlightColor, HighlightRule, HighlightUser, RuleKind};
+use gpui_chat_core::{
+    HighlightColor, HighlightRule, HighlightUser, RuleKind, rule_problem, user_problem,
+};
 use gpui_chat_settings::{EditValue, SettingEdit};
 use gpui_kit::component::Icon;
 use gpui_kit::component::setting::{SettingField, SettingGroup, SettingItem, SettingPage};
@@ -92,6 +94,25 @@ fn parse_rule(line: &str, kind: RuleKind) -> Result<HighlightRule, String> {
         color: options.color,
         notify: options.notify,
     })
+}
+
+/// A line as a rule the engine can use: parsed, and compiled once to see that it works, so a bad
+/// regular expression is reported on its own line of its own field (the file-level check numbers
+/// phrases and regular expressions together).
+fn checked_rule(line: &str, kind: RuleKind) -> Result<HighlightRule, String> {
+    let rule = parse_rule(line, kind)?;
+    match rule_problem(&rule) {
+        Some(problem) => Err(problem),
+        None => Ok(rule),
+    }
+}
+
+fn checked_user(line: &str) -> Result<HighlightUser, String> {
+    let user = parse_user(line)?;
+    match user_problem(&user) {
+        Some(problem) => Err(problem),
+        None => Ok(user),
+    }
 }
 
 fn parse_user(line: &str) -> Result<HighlightUser, String> {
@@ -329,7 +350,7 @@ pub fn page(this: &WeakEntity<SettingsView>) -> SettingPage {
                             .collect()
                     },
                     Rc::new(|lines: Vec<String>, cx: &mut App| {
-                        let new = parse_all(&lines, |line| parse_rule(line, RuleKind::Phrase))?;
+                        let new = parse_all(&lines, |line| checked_rule(line, RuleKind::Phrase))?;
                         let all = current(cx).highlights.rules.clone();
                         write_rules(&replace_kind(&all, RuleKind::Phrase, new), cx)
                     }),
@@ -354,7 +375,7 @@ pub fn page(this: &WeakEntity<SettingsView>) -> SettingPage {
                             .collect()
                     },
                     Rc::new(|lines: Vec<String>, cx: &mut App| {
-                        let new = parse_all(&lines, |line| parse_rule(line, RuleKind::Regex))?;
+                        let new = parse_all(&lines, |line| checked_rule(line, RuleKind::Regex))?;
                         let all = current(cx).highlights.rules.clone();
                         write_rules(&replace_kind(&all, RuleKind::Regex, new), cx)
                     }),
@@ -381,7 +402,7 @@ pub fn page(this: &WeakEntity<SettingsView>) -> SettingPage {
                             .collect()
                     },
                     Rc::new(|lines: Vec<String>, cx: &mut App| {
-                        let users = parse_all(&lines, parse_user)?;
+                        let users = parse_all(&lines, checked_user)?;
                         config::edit(
                             &[SettingEdit::set(
                                 "highlights.users",
@@ -496,6 +517,20 @@ mod tests {
         let lines = vec!["fine".to_owned(), "{nope} x".to_owned()];
         let error = parse_all(&lines, |l| parse_rule(l, RuleKind::Phrase)).unwrap_err();
         assert!(error.starts_with("Line 2: "), "{error}");
+    }
+
+    #[test]
+    fn a_bad_regex_is_reported_on_its_own_line_of_its_own_field() {
+        // The regular expressions field has two lines; the second is bad. Whatever phrases the
+        // file holds, it is "Line 2" of this field.
+        let lines = vec![r"\bgg\b".to_owned(), "(".to_owned()];
+        let error = parse_all(&lines, |l| checked_rule(l, RuleKind::Regex)).unwrap_err();
+        assert_eq!(error, "Line 2: `(`: unclosed group");
+        let error = parse_all(&["{red} bad user".to_owned()], checked_user).unwrap_err();
+        assert!(error.starts_with("Line 1: "), "{error}");
+        let error =
+            parse_all(&["a".repeat(501)], |l| checked_rule(l, RuleKind::Phrase)).unwrap_err();
+        assert!(error.contains("longer than 500 characters"), "{error}");
     }
 
     #[test]

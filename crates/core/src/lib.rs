@@ -37,7 +37,7 @@ pub use event::{
 };
 pub use highlight::{
     HighlightColor, HighlightConfig, HighlightRule, HighlightUser, Highlights, Hit, HitReason, Own,
-    ProblemKind, RuleKind, RuleProblem,
+    ProblemKind, RuleKind, RuleProblem, rule_problem, user_problem,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
 pub use message::{
