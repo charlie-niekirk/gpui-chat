@@ -3,6 +3,8 @@
 //! * [`Message`] / [`Fragment`]: the immutable chat message (shared as `Arc<Message>`)
 //!   and its tokenized body.
 //! * [`MessageStore`]: per-channel ring buffer with lookup by id and change tracking.
+//! * [`ignore`], [`filter`], [`search`]: ignored users and phrases, the find bar's filters and the
+//!   incremental in-channel search (PR 5.7).
 //! * [`compose`]: what the input box does with typed text (commands, limits, history).
 //! * [`tokenizer`]: text → fragments (emote ranges, links, mentions, emoji, cheers).
 //! * [`ChatEvent`]: what network backends send to the UI.
@@ -13,10 +15,13 @@ pub mod complete;
 pub mod compose;
 pub mod emote;
 pub mod event;
+pub mod filter;
 pub mod highlight;
 pub mod ids;
+pub mod ignore;
 pub mod message;
 pub mod moderation;
+pub mod search;
 pub mod special;
 pub mod store;
 pub mod tokenizer;
@@ -36,11 +41,16 @@ pub use event::{
     ChannelRole, ChatEvent, ClearTarget, ConnectionState, FollowersOnly, Moderation, RoomState,
     RoomStateUpdate,
 };
+pub use filter::{
+    BotList, DEFAULT_BOTS, FilterConfig, Filters, IgnoreCache, MAX_BOTS, Visibility, visibility,
+    visibility_with,
+};
 pub use highlight::{
     HighlightColor, HighlightConfig, HighlightRule, HighlightUser, Highlights, Hit, HitReason, Own,
     ProblemKind, RuleKind, RuleProblem, rule_problem, user_problem,
 };
 pub use ids::{ChannelId, EmoteId, MessageId};
+pub use ignore::{IgnoreConfig, IgnoreRule, Ignores, ignore_rule_problem, ignore_user_problem};
 pub use message::{
     Author, Fragment, Message, MessageFlags, MessageKind, Removal, ReplyRef, Rgb, Timestamp,
 };
@@ -48,6 +58,10 @@ pub use moderation::{
     COMMANDS, CommandError, CommandInfo, CommandRole, DEFAULT_TIMEOUT_SECS, FOLLOWER_PRESETS,
     ModCommand, RoomChange, RoomMode, RowActions, SLOW_PRESETS, TIMEOUT_PRESETS, clear_line,
     command_hint, command_info, format_seconds, row_actions,
+};
+pub use search::{
+    IndexChange, MAX_QUERY_CHARS, Needle, Query, Search, SearchIndex, find_ranges, fold,
+    parse_query, search_text,
 };
 pub use special::{AnnouncementColor, EventKind, Recipient, SharedChat, SubPlan};
 pub use store::{DEFAULT_CAPACITY, MessageStore, Rebuild, Thread};

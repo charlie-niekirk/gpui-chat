@@ -38,13 +38,13 @@ pub const MAX_USERS: usize = 500;
 /// Longest pattern (characters).
 pub const MAX_PATTERN_CHARS: usize = 500;
 /// Longest Twitch login.
-const MAX_LOGIN_CHARS: usize = 25;
+pub(crate) const MAX_LOGIN_CHARS: usize = 25;
 /// Memory one compiled phrase or regular expression may take (and its lazy DFA cache).
-const REGEX_SIZE_LIMIT: usize = 256 << 10;
+pub(crate) const REGEX_SIZE_LIMIT: usize = 256 << 10;
 /// The budget for all regular expressions together (the one set they are searched with).
-const REGEX_SET_SIZE_LIMIT: usize = 4 << 20;
+pub(crate) const REGEX_SET_SIZE_LIMIT: usize = 4 << 20;
 /// Nesting depth a regular expression may have.
-const REGEX_NEST_LIMIT: u32 = 50;
+pub(crate) const REGEX_NEST_LIMIT: u32 = 50;
 
 /// The colour of a highlighted row: one of the theme's own colours, so every theme (and light and
 /// dark) gets a suitable one. The names are what `settings.toml` says.
@@ -209,7 +209,7 @@ pub fn normalise_user(text: &str) -> String {
     text.trim().trim_start_matches('@').to_lowercase()
 }
 
-fn login_problem(login: &str) -> Option<String> {
+pub(crate) fn login_problem(login: &str) -> Option<String> {
     if login.is_empty() {
         return Some("a login is required".to_owned());
     }
@@ -246,7 +246,7 @@ struct UserEntry {
 
 /// A phrase, or the own-name pattern, ready to run.
 #[derive(Debug, Clone)]
-struct Matcher {
+pub(crate) struct Matcher {
     regex: Regex,
     /// Needs a word boundary at each end.
     whole_word: bool,
@@ -273,7 +273,7 @@ fn builder(pattern: &str, size_limit: usize) -> RegexBuilder {
 }
 
 /// A regular expression that compiles within the limits and does not match everything.
-fn check_regex(pattern: &str) -> Result<(), String> {
+pub(crate) fn check_regex(pattern: &str) -> Result<(), String> {
     if pattern.trim().is_empty() {
         return Err("a regular expression is required".to_owned());
     }
@@ -288,7 +288,7 @@ fn check_regex(pattern: &str) -> Result<(), String> {
 }
 
 impl Matcher {
-    fn phrase(phrase: &str, whole_word: bool) -> Result<Self, String> {
+    pub(crate) fn phrase(phrase: &str, whole_word: bool) -> Result<Self, String> {
         check_length(phrase)?;
         let phrase = phrase.trim();
         if phrase.is_empty() {
@@ -304,7 +304,7 @@ impl Matcher {
         Ok(Self { regex, whole_word })
     }
 
-    fn is_match(&self, text: &str) -> bool {
+    pub(crate) fn is_match(&self, text: &str) -> bool {
         if !self.whole_word {
             return self.regex.is_match(text);
         }
@@ -356,7 +356,7 @@ pub fn user_problem(user: &HighlightUser) -> Option<String> {
 }
 
 /// `text` in lowercase, without copying when it already is (Twitch logins are).
-fn lowercase(text: &str) -> Cow<'_, str> {
+pub(crate) fn lowercase(text: &str) -> Cow<'_, str> {
     if text.chars().any(char::is_uppercase) {
         Cow::Owned(text.to_lowercase())
     } else {

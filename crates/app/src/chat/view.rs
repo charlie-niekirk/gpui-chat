@@ -35,13 +35,20 @@
 //!   it (and asks the owner to focus the input box again); with nothing selected both go on. The
 //!   pane also handles Copy, so the command palette reaches it from the input box.
 
+mod find;
+
+pub use find::{SearchHighlight, bindings as find_bindings};
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_chat_core::{ChannelRole, Message, MessageId, Rebuild};
+use gpui_chat_core::{
+    BotList, ChannelRole, Filters, IgnoreCache, Ignores, Message, MessageId, Rebuild, Visibility,
+    visibility_with,
+};
 use gpui_chat_settings::DeletedMessages;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
@@ -54,7 +61,7 @@ use gpui_kit::{
 use super::display::DisplayOptions;
 use super::element::{BadgeStyle, EmoteStyle, HoveredRow, MessageStyle, OpenThread, Palette};
 use super::layout::LayoutCache;
-use super::list_sync::ListMirror;
+use super::list_sync::{Change, Rows, Splice};
 use super::row::{RowContext, message_row, row_menu};
 use super::selection_layer::{ClearSelection, CopySelection, OnUser, Surface, UserTarget};
 use super::thread::{self, ThreadPanel};
@@ -65,6 +72,7 @@ use crate::badges::Badges;
 use crate::channels::ChannelStore;
 use crate::config;
 use crate::fonts::FontConfig;
+use crate::ignores;
 use crate::images::{FrameImages, Images, LayoutChanges};
 use crate::moderation::RowAction;
 use crate::theme::Tokens;
@@ -119,6 +127,19 @@ pub enum ChatViewEvent {
         user_id: Option<String>,
         action: RowAction,
     },
+    /// *Block on Twitch…* was chosen for this user (PR 5.7): the owner asks first, then blocks.
+    BlockUser {
+        login: String,
+        user_id: Option<String>,
+    },
+    /// A jump went to a message that is hidden because its author is ignored (PR 5.7): the owner
+    /// says so instead of leaving the user wondering why nothing moved.
+    MessageHidden,
+    /// *Unblock on Twitch* was chosen for this user.
+    UnblockUser {
+        login: String,
+        user_id: Option<String>,
+    },
 }
 
 impl EventEmitter<ChatViewEvent> for ChatView {}
@@ -126,7 +147,22 @@ impl EventEmitter<ChatViewEvent> for ChatView {}
 pub struct ChatView {
     store: Entity<ChannelStore>,
     list: ListState,
-    mirror: ListMirror,
+    /// Which message each item of the list shows: all of them, or only those that are not hidden by
+    /// an ignore or a filter (PR 5.7). Shared with the selection surface.
+    rows: Rc<RefCell<Rows>>,
+    /// What is ignored and which bots are hidden, as of `ignore_generation` of the hub.
+    engine: Arc<Ignores>,
+    bots: Arc<BotList>,
+    ignore_generation: u64,
+    /// The find bar's filters (PR 5.7).
+    filters: Filters,
+    /// Whether each message is ignored, asked once ([`IgnoreCache`]).
+    ignore_cache: RefCell<IgnoreCache>,
+    /// The find bar, while it is open (PR 5.7).
+    find: Option<find::Find>,
+    /// The search over the store's text: kept after the bar closes (the index is the costly part
+    /// and is only brought up to date while the bar is open).
+    search: gpui_chat_core::Search,
     cache: Rc<RefCell<LayoutCache>>,
     text_config: Option<TextConfig>,
     generation: u64,
@@ -192,14 +228,39 @@ pub struct ChatView {
 
 impl ChatView {
     pub fn new(store: Entity<ChannelStore>, cx: &mut Context<Self>) -> Self {
-        let (mirror, rebuilds_seen) = {
+        let hub = ignores::current(cx);
+        let (engine, bots, ignore_generation) = hub.as_ref().map_or_else(
+            || (Arc::default(), Arc::default(), 0),
+            |hub| {
+                let hub = hub.read(cx);
+                (hub.engine(), hub.bots(), hub.generation())
+            },
+        );
+        let filters = Filters::default();
+        let ignore_cache = RefCell::new(IgnoreCache::default());
+        let (rows, rebuilds_seen) = {
             let messages = store.read(cx).messages();
-            (
-                ListMirror::new(messages.first_seq(), messages.next_seq()),
-                messages.rebuild_serial(),
-            )
+            let mut rows = Rows::new(messages.first_seq(), messages.next_seq());
+            // Ignored users are hidden from the first frame.
+            if !engine.is_empty() {
+                let shows = |seq: u64| {
+                    messages
+                        .get_by_seq(seq)
+                        .map_or(Visibility::Shown, |message| {
+                            visibility_with(
+                                message,
+                                || ignore_cache.borrow_mut().ignored(seq, message, &engine),
+                                engine.show_collapsed(),
+                                &filters,
+                                &bots,
+                            )
+                        })
+                };
+                rows.show_only(Some(&shows), messages.first_seq(), messages.next_seq());
+            }
+            (rows, messages.rebuild_serial())
         };
-        let list = ListState::new(mirror.len(), ListAlignment::Bottom, OVERDRAW);
+        let list = ListState::new(rows.len(), ListAlignment::Bottom, OVERDRAW);
         list.set_follow_mode(FollowMode::Tail);
         let subscriptions = vec![
             // One notify per frame batch from the store becomes one sync here.
@@ -213,6 +274,10 @@ impl ChatView {
             cx.observe_global::<Badges>(|_, cx| cx.notify()),
         ];
         let mut subscriptions = subscriptions;
+        // What is ignored changed (the settings, the block list, a login): rows come and go.
+        if let Some(hub) = &hub {
+            subscriptions.push(cx.observe(hub, |this, _, cx| this.ignores_changed(cx)));
+        }
         // An account lookup arriving redraws the user card (nothing else shows it).
         if let Some(directory) = user_directory::current(cx) {
             subscriptions.push(cx.observe(&directory, |this, _, cx| {
@@ -222,12 +287,22 @@ impl ChatView {
             }));
         }
         let cache = Rc::new(RefCell::new(LayoutCache::default()));
+        let rows = Rc::new(RefCell::new(rows));
+        let surface = Surface::new(Some(list.clone()), cache.clone());
+        surface.set_rows(rows.clone());
         Self {
             store,
-            surface: Surface::new(Some(list.clone()), cache.clone()),
+            surface,
             focus_handle: cx.focus_handle(),
             list,
-            mirror,
+            rows,
+            engine,
+            bots,
+            ignore_generation,
+            filters,
+            ignore_cache,
+            find: None,
+            search: gpui_chat_core::Search::new(),
             cache,
             text_config: None,
             generation: 0,
@@ -273,6 +348,22 @@ impl ChatView {
         }
     }
 
+    /// *Block on Twitch…* (`block`) or *Unblock on Twitch* was chosen for `login`: tell the owner,
+    /// which asks first and runs it.
+    pub fn request_block(
+        &mut self,
+        login: String,
+        user_id: Option<String>,
+        block: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(if block {
+            ChatViewEvent::BlockUser { login, user_id }
+        } else {
+            ChatViewEvent::UnblockUser { login, user_id }
+        });
+    }
+
     /// A moderation action was chosen on `message`: tell the owner.
     pub fn request_moderation(
         &mut self,
@@ -290,6 +381,8 @@ impl ChatView {
         }
         let seq = self.store.read(cx).messages().seq_of(id.as_str());
         if let Some(seq) = seq {
+            // An opened ignored line is the message now (searched, copied, with its menu).
+            self.rows.borrow_mut().open_placeholder(seq);
             self.remeasure_seqs(&[seq]);
         }
         cx.notify();
@@ -302,13 +395,22 @@ impl ChatView {
         let Some(seq) = self.store.read(cx).messages().seq_of(id.as_str()) else {
             return false;
         };
-        let Some(ix) = seq
-            .checked_sub(self.mirror.first_seq())
-            .map(|ix| ix as usize)
-            .filter(|&ix| ix < self.mirror.len())
-        else {
+        let mut index = self.rows.borrow().index_of(seq);
+        // A filter hides it: the user wants to see the message, so the filters go.
+        if index.is_none() && self.filters.is_active() {
+            self.clear_filters(cx);
+            index = self.rows.borrow().index_of(seq);
+        }
+        let Some(ix) = index else {
             return false;
         };
+        self.scroll_to_row(ix, seq, cx);
+        true
+    }
+
+    /// Scrolls to row `ix`, which shows message `seq`: a few rows below the top, held there, with
+    /// the row flashing.
+    fn scroll_to_row(&mut self, ix: usize, seq: u64, cx: &mut Context<Self>) {
         self.list.scroll_to(ListOffset {
             item_ix: ix.saturating_sub(JUMP_CONTEXT_ROWS),
             offset_in_item: px(0.0),
@@ -317,6 +419,11 @@ impl ChatView {
         // target away: it stands still instead, behind the "new messages" pill.
         self.jump_hold = true;
         self.update_hold();
+        self.flash_row(seq, cx);
+    }
+
+    /// Flashes the row of message `seq` for a moment.
+    fn flash_row(&mut self, seq: u64, cx: &mut Context<Self>) {
         self.flash.set(Some(seq));
         let flash = self.flash.clone();
         self.flash_task = Some(cx.spawn(async move |this, cx| {
@@ -325,7 +432,6 @@ impl ChatView {
             this.update(cx, |_, cx| cx.notify()).ok();
         }));
         cx.notify();
-        true
     }
 
     /// The pointer entered (`true`) or left a row's moderation strip. While it is on it the list
@@ -521,8 +627,11 @@ impl ChatView {
             .messages()
             .get_by_seq(seq)
             .map(|message| message.id.clone());
-        if let Some(id) = id {
-            self.scroll_to_message(&id, cx);
+        if let Some(id) = id
+            && !self.scroll_to_message(&id, cx)
+            && self.is_hidden_by_ignore(&id, cx)
+        {
+            cx.emit(ChatViewEvent::MessageHidden);
         }
     }
 
@@ -584,7 +693,7 @@ impl ChatView {
         match &rebuilds {
             Some(rebuilds) => rebuilds
                 .iter()
-                .for_each(|rebuild| self.apply_rebuild(rebuild)),
+                .for_each(|rebuild| self.apply_rebuild(rebuild, cx)),
             // The list replaces every row below: nothing keyed by an old number means anything.
             None => {
                 self.surface.reset();
@@ -597,17 +706,30 @@ impl ChatView {
             let messages = self.store.read(cx).messages();
             (messages.first_seq(), messages.next_seq())
         };
-        self.sync_range(first, next);
-        debug_assert_eq!(self.list.item_count(), self.mirror.len());
+        self.sync_range(first, next, cx);
+        debug_assert_eq!(self.list.item_count(), self.rows.borrow().len());
+        self.sync_find(cx);
         // A message replaced in place (the user's echo swapped for Twitch's copy, with its real
         // emotes) can be a different height: measure those rows again.
         let (replaced, serial) = self.store.read(cx).replaced_since(self.replaced_seen);
         if serial != self.replaced_seen {
             self.replaced_seen = serial;
-            match replaced {
-                Some(seqs) => self.remeasure_seqs(&seqs),
+            // What the replacement says may change: ignored or not, matching or not.
+            match &replaced {
+                Some(seqs) => {
+                    let mut cache = self.ignore_cache.borrow_mut();
+                    seqs.iter().for_each(|&seq| cache.invalidate(seq));
+                }
+                None => self.ignore_cache.borrow_mut().clear(),
+            }
+            match &replaced {
+                Some(seqs) => self.remeasure_seqs(seqs),
                 None => self.list.remeasure(),
             }
+            if self.hiding() {
+                self.update_rows(cx);
+            }
+            self.find_replaced(replaced.as_deref(), cx);
         }
         // Messages struck out: when removed ones are drawn collapsed that is another row height,
         // for those rows only.
@@ -632,10 +754,46 @@ impl ChatView {
         cx.notify();
     }
 
+    /// What the chat draws for message `seq`: nothing, itself, or (ignored, with
+    /// `ignores.show_collapsed`) one collapsed line, unless the user opened that line (PR 5.7). The
+    /// filters are checked before the ignores, whose verdicts are cached.
+    pub(super) fn verdict(&self, seq: u64, message: &Message) -> Visibility {
+        let verdict = visibility_with(
+            message,
+            || {
+                self.ignore_cache
+                    .borrow_mut()
+                    .ignored(seq, message, &self.engine)
+            },
+            self.engine.show_collapsed(),
+            &self.filters,
+            &self.bots,
+        );
+        if verdict == Visibility::Collapsed && self.revealed.borrow().contains(&message.id) {
+            Visibility::Shown
+        } else {
+            verdict
+        }
+    }
+
+    /// Whether any message may be hidden, so the rows are an explicit list.
+    fn hiding(&self) -> bool {
+        !self.engine.is_empty() || self.filters.is_active()
+    }
+
     /// Moves the list from the range it shows to `first..next` of the store's sequence numbers.
-    fn sync_range(&mut self, first: u64, next: u64) {
-        let previous_next = self.mirror.next_seq();
-        let change = self.mirror.sync(first, next);
+    fn sync_range(&mut self, first: u64, next: u64, cx: &App) {
+        let previous_next = self.rows.borrow().next_seq();
+        self.ignore_cache.borrow_mut().trim(first);
+        let change: Change = {
+            let messages = self.store.read(cx).messages();
+            let shows = |seq: u64| {
+                messages
+                    .get_by_seq(seq)
+                    .map_or(Visibility::Shown, |m| self.verdict(seq, m))
+            };
+            self.rows.borrow_mut().sync(first, next, &shows)
+        };
         if !change.is_empty() {
             if change.removed > 0 {
                 self.list.splice(0..change.removed, 0);
@@ -656,15 +814,26 @@ impl ChatView {
     /// Replays one history merge that renumbered the store: the list first catches up with the
     /// state the merge started from, then the rows it dropped at the front go and the rows it
     /// brought are inserted, and everything keyed by an old sequence number is moved to its new one.
-    fn apply_rebuild(&mut self, rebuild: &Rebuild) {
-        self.sync_range(rebuild.old_first, rebuild.old_next);
-        if rebuild.removed_front > 0 {
-            self.list.splice(0..rebuild.removed_front, 0);
-        }
-        for &(at, count) in &rebuild.inserts {
-            self.list.splice(at..at, count);
-        }
-        self.mirror = ListMirror::new(rebuild.new_first, rebuild.new_next);
+    fn apply_rebuild(&mut self, rebuild: &Rebuild, cx: &App) {
+        self.sync_range(rebuild.old_first, rebuild.old_next, cx);
+        // Every number moved: the remembered verdicts belong to the old ones.
+        self.ignore_cache.borrow_mut().clear();
+        let splices = {
+            let messages = self.store.read(cx).messages();
+            let shows = |seq: u64| {
+                messages
+                    .get_by_seq(seq)
+                    .map_or(Visibility::Shown, |m| self.verdict(seq, m))
+            };
+            self.rows.borrow_mut().renumber(
+                &|old| rebuild.map_seq(old),
+                rebuild.new_first,
+                rebuild.new_next,
+                self.hiding()
+                    .then_some(&shows as &dyn Fn(u64) -> Visibility),
+            )
+        };
+        self.apply_splices(&splices);
         for cache in self.caches() {
             cache.borrow_mut().remap(|seq| rebuild.map_seq(seq));
         }
@@ -678,6 +847,10 @@ impl ChatView {
         self.surface.remap(&map);
         if let Some(panel) = &self.thread {
             panel.surface.remap(&map);
+        }
+        // The match the user was on follows its message (gone: none).
+        if let Some(find) = &mut self.find {
+            find.current = find.current.and_then(|seq| rebuild.map_seq(seq));
         }
         // The row under the pointer is found again by the next mouse move.
         self.hovered.set(None);
@@ -701,9 +874,8 @@ impl ChatView {
 
     /// New messages below the paused view that are still in the store.
     pub fn unseen(&self) -> usize {
-        self.unseen_from.map_or(0, |from| {
-            (self.mirror.next_seq() - from.max(self.mirror.first_seq())) as usize
-        })
+        self.unseen_from
+            .map_or(0, |from| self.rows.borrow().rows_from(from))
     }
 
     #[cfg(test)]
@@ -807,17 +979,14 @@ impl ChatView {
 
     /// Asks the list to measure the rows of the messages `seqs` again.
     fn remeasure_seqs(&self, seqs: &[u64]) {
-        let first = self.mirror.first_seq();
-        let count = self.list.item_count();
+        let rows = self.rows.borrow();
         // `seqs` is ascending: merge neighbours into one call.
         let mut run: Option<std::ops::Range<usize>> = None;
         for &seq in seqs {
-            let Some(ix) = seq.checked_sub(first).map(|ix| ix as usize) else {
+            // A hidden message has no row to measure.
+            let Some(ix) = rows.index_of(seq) else {
                 continue;
             };
-            if ix >= count {
-                continue;
-            }
             run = match run {
                 Some(range) if range.end == ix => Some(range.start..ix + 1),
                 Some(range) => {
@@ -866,13 +1035,8 @@ impl Render for ChatView {
         let regular = font(config.family.clone());
         self.line_height = px((config.size.as_f32() * config.line_height).round());
         let selection_color = tokens.accent.opacity(0.3);
-        self.surface.begin_frame(
-            self.text_generation,
-            self.mirror.first_seq(),
-            config.options,
-            selection_color,
-            None,
-        );
+        self.surface
+            .begin_frame(self.text_generation, config.options, selection_color, None);
         // Moderation controls appear for a moderator of this channel, when the pane can run them.
         let (channel, role) = {
             let store = self.store.read(cx);
@@ -921,6 +1085,7 @@ impl Render for ChatView {
             hovered_row: track_hover.then(|| self.hovered.clone()),
             selection: Some(self.surface.clone()),
             flash: Some(self.flash.clone()),
+            search: self.search_highlight(),
         });
         let handle = cx.entity().downgrade();
         // A click on a name or mention opens its card (the callback is the live view's).
@@ -951,6 +1116,8 @@ impl Render for ChatView {
             panel.surface.set_on_user(on_user);
         }
         let card = self.user_card_element(&tokens, config.deleted, window, cx);
+        let find_bar = self.find_bar(&tokens, window, cx);
+        let filter_strip = self.filter_strip(&tokens, cx);
         let rows = |id, hovered: &HoveredRow| RowContext {
             id,
             view: handle.clone(),
@@ -962,6 +1129,7 @@ impl Render for ChatView {
             deleted: config.deleted,
             revealed: self.revealed.clone(),
             own_login: own_login.clone(),
+            rows: self.rows.clone(),
         };
         let thread_panel = self.thread.as_ref().map(|panel| {
             // The thread is the context: no reply lines inside it, and no popover on top of it.
@@ -972,12 +1140,12 @@ impl Render for ChatView {
                 hovered_row: track_hover.then(|| panel.hovered.clone()),
                 selection: Some(panel.surface.clone()),
                 flash: None,
+                search: None,
                 ..(*style).clone()
             });
             let view = thread::thread_view(self.store.read(cx).messages(), panel.root.as_str());
             panel.surface.begin_frame(
                 self.text_generation,
-                self.mirror.first_seq(),
                 config.options,
                 selection_color,
                 Some(view.seqs()),
@@ -987,10 +1155,12 @@ impl Render for ChatView {
         });
         let store = self.store.clone();
         let cache = self.cache.clone();
-        let first = self.mirror.first_seq();
+        let order = self.rows.clone();
         let list_rows = rows("chat-row", &self.hovered);
         let messages = list(self.list.clone(), move |ix, _window, cx| {
-            let seq = first + ix as u64;
+            let Some(seq) = order.borrow().seq_at(ix) else {
+                return div().into_any_element();
+            };
             match store.read(cx).messages().get_by_seq(seq) {
                 Some(message) => {
                     message_row(seq, message, style.clone(), cache.clone(), &list_rows)
@@ -1080,6 +1250,8 @@ impl Render for ChatView {
             .size_full()
             .flex()
             .flex_col()
+            .children(find_bar)
+            .children(filter_strip)
             .child(
                 div()
                     .relative()
@@ -1245,11 +1417,24 @@ mod tests {
 
     impl Harness {
         fn new(cx: &mut TestAppContext, capacity: usize) -> (Self, &mut VisualTestContext) {
+            Self::with_settings(cx, capacity, Settings::default(), false)
+        }
+
+        /// A harness whose settings are `settings`, with the app's ignore hub when `ignores`.
+        fn with_settings(
+            cx: &mut TestAppContext,
+            capacity: usize,
+            settings: Settings,
+            ignores: bool,
+        ) -> (Self, &mut VisualTestContext) {
             let settings = cx.update(|cx| {
                 gpui_kit::init(cx);
-                let settings = config::install_for_test(Settings::default(), cx);
+                let settings = config::install_for_test(settings, cx);
                 fonts::init(&AppearanceSettings::default(), cx);
                 theme::apply_settings(&AppearanceSettings::default(), None, cx);
+                if ignores {
+                    crate::ignores::init(true, cx);
+                }
                 settings
             });
             let store = cx.new(|_| ChannelStore::new(ChannelId::new("test"), capacity));
@@ -2126,7 +2311,7 @@ mod tests {
         // 30 + 120 with a cap of 100: the 50 oldest are spliced out at the front.
         h.push(120, "hello", cx);
         assert_eq!(h.items(cx), 100);
-        assert_eq!(h.view.read_with(cx, |v, _| v.mirror.first_seq()), 50);
+        assert_eq!(h.view.read_with(cx, |v, _| v.rows.borrow().first_seq()), 50);
         assert!(h.following(cx), "still at the bottom");
         assert_eq!(h.view.read_with(cx, |v, _| v.unseen()), 0);
         // Only rows that were drawn were shaped, and evicted ones were dropped from the cache.
@@ -2275,7 +2460,7 @@ mod tests {
             .view
             .read_with(cx, |v, _| v.list_state().logical_scroll_top());
         let id = h.view.read_with(cx, |v, cx| {
-            let seq = v.mirror.first_seq() + top.item_ix as u64;
+            let seq = v.rows.borrow().first_seq() + top.item_ix as u64;
             let id = v
                 .store
                 .read(cx)
@@ -3096,5 +3281,614 @@ mod tests {
             v.user_card.as_ref().and_then(|c| c.origin_id.clone())
         });
         assert_eq!(origin.as_deref(), Some("55"));
+    }
+
+    // ---- ignores, filters and find (PR 5.7) ----
+
+    fn ignoring(users: &[&str]) -> Settings {
+        let mut settings = Settings::default();
+        settings.ignores.users = users.iter().map(|u| (*u).to_owned()).collect();
+        settings
+    }
+
+    fn reload(h: &Harness, settings: Settings, cx: &mut VisualTestContext) {
+        h.settings.update(cx, |store, cx| {
+            if store.apply_events([SettingsEvent::Reloaded(settings)]) {
+                cx.notify();
+            }
+        });
+        cx.run_until_parked();
+    }
+
+    /// The rows the view reports, as the texts of the messages they show.
+    fn row_texts(h: &Harness, cx: &mut VisualTestContext) -> Vec<String> {
+        h.view.read_with(cx, |view, cx| {
+            let rows = view.rows.borrow();
+            let store = view.store.read(cx);
+            rows.seqs()
+                .iter()
+                .map(|seq| store.messages().get_by_seq(*seq).unwrap().plain_text())
+                .collect()
+        })
+    }
+
+    /// The list and its rows agree, and the rows are exactly what the view shows of the store.
+    fn assert_consistent(h: &Harness, cx: &mut VisualTestContext) {
+        h.view.read_with(cx, |view, cx| {
+            let rows = view.rows.borrow();
+            assert_eq!(view.list.item_count(), rows.len());
+            let store = view.store.read(cx);
+            let expected: Vec<u64> = store
+                .messages()
+                .iter_with_seq()
+                .filter(|(seq, m)| view.verdict(*seq, m).is_visible())
+                .map(|(seq, _)| seq)
+                .collect();
+            assert_eq!(rows.seqs(), expected);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_ignored_user_has_no_row_and_the_settings_change_brings_rows_back_and_takes_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, ignoring(&["bo"]), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "one"),
+                said(1, "bo", "two"),
+                said(2, "al", "three"),
+                said(3, "BO", "four"),
+            ],
+            cx,
+        );
+        assert_eq!(row_texts(&h, cx), ["one", "three"]);
+        assert_eq!(h.items(cx), 2);
+        assert_consistent(&h, cx);
+        // More messages: only the ones that pass get rows.
+        push_events(
+            &mut h,
+            vec![said(4, "bo", "five"), said(5, "cy", "six")],
+            cx,
+        );
+        assert_eq!(row_texts(&h, cx), ["one", "three", "six"]);
+        // Unignored: what they said is still in the scrollback, and comes back in order.
+        reload(&h, Settings::default(), cx);
+        assert_eq!(h.items(cx), 6);
+        assert_consistent(&h, cx);
+        // Ignored again, another one.
+        reload(&h, ignoring(&["al"]), cx);
+        assert_eq!(row_texts(&h, cx), ["two", "four", "five", "six"]);
+        assert_consistent(&h, cx);
+    }
+
+    #[gpui_kit::test]
+    fn ignored_messages_collapse_to_one_line_when_asked_and_a_click_opens_them(
+        cx: &mut TestAppContext,
+    ) {
+        let mut settings = ignoring(&["bo"]);
+        settings.ignores.show_collapsed = true;
+        let (mut h, cx) = Harness::with_settings(cx, 100, settings, true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "one"),
+                said(1, "bo", "secret words"),
+                said(2, "al", "two"),
+            ],
+            cx,
+        );
+        assert_eq!(h.items(cx), 3, "the ignored message keeps a row");
+        let (shown, ignored) = h.view.read_with(cx, |v, _| {
+            let cache = v.cache.borrow();
+            (
+                cache.shaped(0).unwrap().display.text.clone(),
+                cache.shaped(1).unwrap().display.text.clone(),
+            )
+        });
+        assert!(shown.contains("one"), "{shown}");
+        assert!(ignored.contains("1 ignored message"), "{ignored}");
+        assert!(
+            !ignored.contains("secret") && !ignored.contains("bo"),
+            "{ignored}"
+        );
+        // A filter shows no placeholders.
+        h.view.update(cx, |view, cx| view.toggle_links_filter(cx));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 0);
+        h.view.update(cx, |view, cx| view.clear_filters(cx));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 3);
+        assert_consistent(&h, cx);
+        // Revealed, it is drawn in full.
+        h.view
+            .update(cx, |view, cx| view.reveal(&MessageId::from("m1"), cx));
+        cx.run_until_parked();
+        let revealed = h.view.read_with(cx, |v, _| {
+            v.cache.borrow().shaped(1).unwrap().display.text.clone()
+        });
+        assert!(revealed.contains("secret words"), "{revealed}");
+    }
+
+    #[gpui_kit::test]
+    fn filters_hide_rows_the_strip_counts_and_clearing_brings_them_back(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, Settings::default(), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "plain"),
+                said(1, "bo", "see https://example.com"),
+                said(2, "al", "hey @viewer"),
+                said(3, "nightbot", "!rules"),
+            ],
+            cx,
+        );
+        assert_eq!(h.items(cx), 4);
+        h.view.update(cx, |view, cx| view.toggle_links_filter(cx));
+        cx.run_until_parked();
+        assert_eq!(row_texts(&h, cx), ["see https://example.com"]);
+        assert_eq!(h.view.read_with(cx, |v, cx| v.row_counts(cx)), (1, 4));
+        h.view.update(cx, |view, cx| view.toggle_links_filter(cx));
+        h.view
+            .update(cx, |view, cx| view.filter_from(Some("AL"), cx));
+        cx.run_until_parked();
+        assert_eq!(row_texts(&h, cx), ["plain", "hey @viewer"]);
+        h.view.update(cx, |view, cx| view.toggle_bots_filter(cx));
+        h.view.update(cx, |view, cx| view.filter_from(None, cx));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 3, "the bot's line is hidden");
+        h.view.update(cx, |view, cx| view.clear_filters(cx));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 4);
+        assert!(!h.view.read_with(cx, |v, _| v.filters().is_active()));
+        assert_consistent(&h, cx);
+    }
+
+    #[gpui_kit::test]
+    fn new_messages_follow_the_filter_and_history_merges_keep_the_rows_consistent(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::with_settings(cx, 12, ignoring(&["bo"]), true);
+        h.view
+            .update(cx, |view, cx| view.filter_from(Some("al"), cx));
+        // Everything from "al" and "bo" mixed; the ignore and the filter both apply.
+        let events: Vec<_> = (0..10)
+            .map(|n| said(n, if n % 2 == 0 { "al" } else { "bo" }, &format!("m{n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        assert_eq!(h.items(cx), 5);
+        assert_consistent(&h, cx);
+        // History arrives before them and the cap drops the oldest: still consistent.
+        history_before(6, cx, &h);
+        assert_consistent(&h, cx);
+        // Wait: history is by "old", which the filter hides.
+        assert!(row_texts(&h, cx).iter().all(|t| t != "earlier"));
+        h.view.update(cx, |view, cx| view.clear_filters(cx));
+        cx.run_until_parked();
+        assert_consistent(&h, cx);
+        assert!(row_texts(&h, cx).iter().any(|t| t == "earlier"));
+    }
+
+    #[gpui_kit::test]
+    fn a_jump_to_a_message_a_filter_hides_clears_the_filter_first(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        let events: Vec<_> = (0..40)
+            .map(|n| said(n, if n == 7 { "bo" } else { "al" }, "text"))
+            .collect();
+        push_events(&mut h, events, cx);
+        h.view
+            .update(cx, |view, cx| view.filter_from(Some("bo"), cx));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 1);
+        let found = h.view.update(cx, |view, cx| {
+            view.scroll_to_message(&MessageId::from("m3"), cx)
+        });
+        cx.run_until_parked();
+        assert!(found);
+        assert!(!h.view.read_with(cx, |v, _| v.filters().is_active()));
+        assert_eq!(h.items(cx), 40);
+    }
+
+    /// Types `text` into the open find bar.
+    fn type_find(h: &Harness, text: &str, cx: &mut VisualTestContext) {
+        let input = h
+            .view
+            .read_with(cx, |v, _| v.find.as_ref().unwrap().input.clone());
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        });
+        h.view
+            .update(cx, |view, cx| view.find_text_changed(true, cx));
+        cx.run_until_parked();
+    }
+
+    fn open_find(h: &Harness, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            h.view.update(cx, |view, cx| view.open_find(window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn find_counts_matches_steps_through_them_and_wraps(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        let events: Vec<_> = (0..200)
+            .map(|n| said(n, "al", &format!("line {n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        open_find(&h, cx);
+        assert!(h.view.read_with(cx, |v, _| v.find_is_open()));
+        type_find(&h, "LINE 1", cx);
+        // line 1, line 10..19, line 100..199: 1 + 10 + 100.
+        let status = h.view.read_with(cx, |v, _| v.find_status().unwrap());
+        assert_eq!(status.matches, 111);
+        assert_eq!(status.position, Some(111), "starts on the newest match");
+        assert_eq!(status.label().as_deref(), Some("111 of 111"));
+        // The newest match is on screen; stepping back goes to the one before and scrolls there.
+        h.view.update(cx, |v, cx| v.find_step(false, cx));
+        cx.run_until_parked();
+        let status = h.view.read_with(cx, |v, _| v.find_status().unwrap());
+        assert_eq!(status.position, Some(110));
+        // Forward from the newest wraps to the oldest, which is far above: the list scrolled there.
+        h.view.update(cx, |v, cx| v.find_step(true, cx));
+        h.view.update(cx, |v, cx| v.find_step(true, cx));
+        cx.run_until_parked();
+        let (status, top) = h.view.read_with(cx, |v, _| {
+            (
+                v.find_status().unwrap(),
+                v.list_state().logical_scroll_top(),
+            )
+        });
+        assert_eq!(status.position, Some(1));
+        assert!(top.item_ix <= 1, "{top:?}");
+        assert!(!h.following(cx), "a jump pauses following");
+        // No match.
+        type_find(&h, "zzz", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().label()),
+            Some("No matches".to_owned())
+        );
+        // Closing returns focus to the box (the pane hears the event) and clears the search.
+        let closed = h.view.update(cx, |v, cx| v.close_find(cx));
+        assert!(closed);
+        assert!(h.view.read_with(cx, |v, _| v.find_status().is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn find_follows_new_messages_and_a_from_token_filters_instead_of_searching(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "needle one"),
+                said(1, "bo", "needle two"),
+                said(2, "al", "hay"),
+            ],
+            cx,
+        );
+        open_find(&h, cx);
+        type_find(&h, "needle", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            2
+        );
+        push_events(&mut h, vec![said(3, "cy", "another needle")], cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            3
+        );
+        type_find(&h, "from:bo needle", cx);
+        assert_eq!(row_texts(&h, cx), ["needle two"]);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            1
+        );
+        // Taking the token away takes the filter away.
+        type_find(&h, "needle", cx);
+        assert_eq!(h.items(cx), 4);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            3
+        );
+        assert_consistent(&h, cx);
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_bar_asks_the_owner_for_the_input_box_and_keeps_the_filters(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        push_events(&mut h, vec![said(0, "al", "a"), said(1, "bo", "b")], cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                sink.borrow_mut().push(format!("{event:?}"));
+            })
+        });
+        open_find(&h, cx);
+        type_find(&h, "from:al", cx);
+        assert_eq!(h.items(cx), 1);
+        h.view.update(cx, |v, cx| {
+            v.close_find(cx);
+        });
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| e.contains("SelectionDismissed"))
+        );
+        assert_eq!(h.items(cx), 1, "the filter outlives the bar");
+        // Reopened, the bar starts with the filter it still has.
+        open_find(&h, cx);
+        let text = h.view.read_with(cx, |v, cx| {
+            v.find.as_ref().unwrap().input.read(cx).value().to_string()
+        });
+        assert_eq!(text, "from:al ");
+        // Closing again with Esc does nothing when the bar is already closed.
+        h.view.update(cx, |v, cx| {
+            v.close_find(cx);
+        });
+        assert!(!h.view.update(cx, |v, cx| v.close_find(cx)));
+    }
+
+    /// The keys of the find bar as the app binds them, with the shell's part (what ⌘F, ⌘G and ↑ / ↓
+    /// do) stood in for by global handlers that call the view.
+    fn bind_find_keys(h: &Harness, cx: &mut VisualTestContext) -> Rc<Cell<usize>> {
+        let finds = Rc::new(Cell::new(0));
+        let counted = finds.clone();
+        let view = h.view.clone();
+        cx.update(|window, cx| {
+            cx.bind_keys(find_bindings());
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "cmd-f",
+                crate::actions::Find,
+                None,
+            )]);
+            #[cfg(not(target_os = "macos"))]
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "ctrl-f",
+                crate::actions::Find,
+                None,
+            )]);
+            let window_handle = window.window_handle();
+            let find_view = view.clone();
+            cx.on_action(move |_: &crate::actions::Find, cx| {
+                counted.set(counted.get() + 1);
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        find_view.update(cx, |view, cx| view.open_find(window, cx));
+                    })
+                    .ok();
+            });
+            let next = view.clone();
+            cx.on_action(move |_: &crate::actions::FindNext, cx| {
+                next.update(cx, |view, cx| view.find_step(true, cx));
+            });
+            let previous = view;
+            cx.on_action(move |_: &crate::actions::FindPrevious, cx| {
+                previous.update(cx, |view, cx| view.find_step(false, cx));
+            });
+        });
+        finds
+    }
+
+    #[gpui_kit::test]
+    fn the_find_bars_keys_step_close_and_find_again_reaches_the_app_through_a_text_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        let events: Vec<_> = (0..60)
+            .map(|n| said(n, "al", &format!("line {n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        let finds = bind_find_keys(&h, cx);
+        open_find(&h, cx);
+        type_find(&h, "line 1", cx);
+        let position = |cx: &mut VisualTestContext| {
+            h.view
+                .read_with(cx, |v, _| v.find_status().and_then(|s| s.position))
+        };
+        // 1, 10 .. 19: 11 matches, on the newest to start with.
+        assert_eq!(position(cx), Some(11));
+        // Enter goes to the next (newer, wrapping to the first), Shift-Enter back, ↑ and ↓ too.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(position(cx), Some(1));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(position(cx), Some(11));
+        cx.simulate_keystrokes("up");
+        assert_eq!(position(cx), Some(10));
+        cx.simulate_keystrokes("down");
+        assert_eq!(position(cx), Some(11));
+        // ⌘F inside the bar's own text field (which binds it too, for searching its text) still
+        // reaches the app's Find.
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        assert_eq!(finds.get(), 1);
+        assert!(h.view.read_with(cx, |v, _| v.find_is_open()));
+        // Esc closes it (and tells the pane to give the input box focus back).
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &ChatViewEvent, _| {
+                sink.borrow_mut().push(format!("{event:?}"));
+            })
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!h.view.read_with(cx, |v, _| v.find_is_open()));
+        assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+        // With the bar closed Esc in the chat does what it did: nothing to clear, so it goes on.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(*events.borrow(), ["SelectionDismissed"]);
+    }
+
+    fn collapsing(users: &[&str]) -> Settings {
+        let mut settings = ignoring(users);
+        settings.ignores.show_collapsed = true;
+        settings
+    }
+
+    #[gpui_kit::test]
+    fn a_collapsed_ignored_line_is_not_copied_searched_or_offered_a_menu(cx: &mut TestAppContext) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, collapsing(&["bo"]), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "al", "one needle"),
+                said(1, "bo", "secret needle words"),
+                said(2, "al", "two"),
+            ],
+            cx,
+        );
+        assert_eq!(h.items(cx), 3);
+        assert!(h.view.read_with(cx, |v, _| v.surface.is_placeholder(1)));
+        // A selection across the placeholder copies the lines around it and nothing of it.
+        let from = point(px(1.0), point_of(&h, 0, 0, cx).y);
+        let to = point(px(799.0), point_of(&h, 2, 0, cx).y);
+        press(from, to, 1, cx);
+        let copied = selected(&h, cx).expect("something is selected");
+        assert!(
+            copied.contains("one needle") && copied.contains("two"),
+            "{copied}"
+        );
+        assert!(
+            !copied.contains("secret") && !copied.to_lowercase().contains("bo"),
+            "{copied}"
+        );
+        // The find bar does not search it: only the shown message counts, and the placeholder's
+        // hidden text and author find nothing.
+        open_find(&h, cx);
+        type_find(&h, "needle", cx);
+        let status = h.view.read_with(cx, |v, _| v.find_status().unwrap());
+        assert_eq!(status.matches, 1, "the ignored line is not a match");
+        type_find(&h, "secret", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            0
+        );
+        type_find(&h, "bo", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            0
+        );
+        // Opened by a click, it is the message: searched and copyable.
+        h.view
+            .update(cx, |view, cx| view.reveal(&MessageId::from("m1"), cx));
+        cx.run_until_parked();
+        assert!(!h.view.read_with(cx, |v, _| v.surface.is_placeholder(1)));
+        type_find(&h, "secret", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            1
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_from_token_waits_until_it_is_finished_and_each_prefix_does_not_filter(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::with_settings(cx, 100, Settings::default(), true);
+        push_events(
+            &mut h,
+            vec![
+                said(0, "alice", "x"),
+                said(1, "bob", "y"),
+                said(2, "alice", "z"),
+            ],
+            cx,
+        );
+        open_find(&h, cx);
+        let input = h
+            .view
+            .read_with(cx, |v, _| v.find.as_ref().unwrap().input.clone());
+        let type_text = |text: &str, settled: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+            });
+            h.view
+                .update(cx, |view, cx| view.find_text_changed(settled, cx));
+            cx.run_until_parked();
+        };
+        // Typing `from:alice` letter by letter: nothing is filtered while it may still grow.
+        for prefix in ["from:a", "from:al", "from:ali"] {
+            type_text(prefix, false, cx);
+            assert_eq!(h.items(cx), 3, "{prefix}");
+            assert!(
+                !h.view.read_with(cx, |v, _| v.filters().is_active()),
+                "{prefix}"
+            );
+        }
+        // A pause (the settle timer's call), Enter, or a space after it finishes it.
+        type_text("from:alice", true, cx);
+        assert_eq!(h.items(cx), 2);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.filters().from.clone())
+                .as_deref(),
+            Some("alice")
+        );
+        type_text("from:alice ", false, cx);
+        assert_eq!(h.items(cx), 2);
+        // The timer does fire on its own after the pause.
+        type_text("from:bob", false, cx);
+        assert_eq!(h.items(cx), 2, "still the old one while it may grow");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        assert_eq!(h.items(cx), 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_match_the_user_is_on_follows_its_message_when_history_renumbers_the_store(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 100);
+        let events: Vec<_> = (0..10)
+            .map(|n| said(n, "al", &format!("hit {n}")))
+            .collect();
+        push_events(&mut h, events, cx);
+        open_find(&h, cx);
+        type_find(&h, "hit", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find.as_ref().unwrap().current),
+            Some(9)
+        );
+        history_before(3, cx, &h);
+        let (current, position, matches) = h.view.read_with(cx, |v, _| {
+            let status = v.find_status().unwrap();
+            (
+                v.find.as_ref().unwrap().current,
+                status.position,
+                status.matches,
+            )
+        });
+        let newest = h.store.read_with(cx, |s, _| s.messages().seq_of("m9"));
+        assert_eq!(
+            current, newest,
+            "the match follows its message to its new number"
+        );
+        assert_eq!((position, matches), (Some(10), 10));
+        // Backspacing the query goes through the saved stages with the new numbers.
+        type_find(&h, "hi", cx);
+        assert_eq!(
+            h.view
+                .read_with(cx, |v, _| v.find_status().unwrap().matches),
+            10
+        );
     }
 }

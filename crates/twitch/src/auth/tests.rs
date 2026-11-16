@@ -1007,6 +1007,54 @@ async fn enabling_moderation_asks_for_the_extra_scopes_and_the_login_has_them() 
     assert!(!account.needs_relogin());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_block_list_scopes_are_opt_in_and_never_a_reason_to_log_in_again() {
+    let server = MockServer::start().await;
+    mount_device_login(&server, false, WANTED).await;
+    let auth = Auth::with_scopes(
+        OAuthClient::with_base(CLIENT, server.uri()).unwrap(),
+        Arc::new(MemoryTokenStore::new()),
+        WANTED,
+    );
+    auth.restore().await;
+    let code = auth.request_device_code().await.unwrap();
+    let account = auth.complete_device_login(&code, polling()).await.unwrap();
+    assert!(!account.block_list_enabled());
+    assert!(!account.needs_relogin());
+    assert!(
+        !WANTED.iter().any(|scope| BLOCK_LIST_SCOPES.contains(scope)),
+        "a normal login never asks for them"
+    );
+
+    // Granted both: enabled; only one of the two is not enough (blocking needs the second).
+    let server = MockServer::start().await;
+    let granted: Vec<&str> = WANTED.iter().chain(BLOCK_LIST_SCOPES).copied().collect();
+    mount_device_login(&server, false, &granted).await;
+    let auth = Auth::with_scopes(
+        OAuthClient::with_base(CLIENT, server.uri()).unwrap(),
+        Arc::new(MemoryTokenStore::new()),
+        WANTED,
+    );
+    auth.restore().await;
+    let code = auth
+        .request_device_code_with(BLOCK_LIST_SCOPES)
+        .await
+        .unwrap();
+    let account = auth
+        .complete_device_login_with(&code, polling(), BLOCK_LIST_SCOPES)
+        .await
+        .unwrap();
+    assert!(account.block_list_enabled());
+    assert!(account.has_scope("user:read:blocked_users"));
+    assert!(account.has_scope("user:manage:blocked_users"));
+    assert!(!account.moderation_enabled(), "the sets are independent");
+    assert!(!account.needs_relogin());
+    let mut one = account.clone();
+    one.scopes
+        .retain(|scope| scope != "user:manage:blocked_users");
+    assert!(!one.block_list_enabled());
+}
+
 #[test]
 fn expiry_margin() {
     let token = stored("a", "r", 1000);

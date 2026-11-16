@@ -38,8 +38,10 @@ use super::display::{self, BadgeSlot, DisplayEmote, DisplayOptions, Role};
 use super::events;
 use super::flow::{AtomKind, Flow};
 use super::layout::{LayoutCache, LayoutKey, MessageLayout, ReplyFit, ReplyLine, ShapedMessage};
+use super::selection;
 use super::selection_layer::Surface;
 use super::tooltip::{EmoteHover, Target};
+use super::view::SearchHighlight;
 use crate::badges::Badges;
 use crate::images::{EmoteBox, FrameImages, Images, Lookup};
 use crate::theme::Tokens;
@@ -183,6 +185,8 @@ pub struct MessageStyle {
     /// The row to flash for a moment after a jump to it (the Mentions view, a notification):
     /// its sequence number, shared with the view that sets and clears it.
     pub flash: Option<Rc<Cell<Option<u64>>>>,
+    /// The text the find bar is looking for (PR 5.7): its matches are drawn behind the text.
+    pub search: Option<Rc<SearchHighlight>>,
 }
 
 /// One message in the chat list.
@@ -193,6 +197,8 @@ pub struct MessageElement {
     cache: Rc<RefCell<LayoutCache>>,
     /// Drawn as `name: <message deleted>` (PR 5.2): same element, selection and copy, another text.
     collapsed: bool,
+    /// Drawn as `1 ignored message` (PR 5.7).
+    ignored: bool,
 }
 
 impl MessageElement {
@@ -208,6 +214,7 @@ impl MessageElement {
             style,
             cache,
             collapsed: false,
+            ignored: false,
         }
     }
 
@@ -215,6 +222,13 @@ impl MessageElement {
     #[must_use]
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.collapsed = collapsed;
+        self
+    }
+
+    /// Draws an ignored message as the line `1 ignored message` (`ignores.show_collapsed`).
+    #[must_use]
+    pub fn ignored(mut self, ignored: bool) -> Self {
+        self.ignored = ignored;
         self
     }
 }
@@ -312,12 +326,15 @@ fn shape_reply(reply: &ReplyRef, style: &MessageStyle, window: &Window) -> Reply
 /// Shapes `message` as one line with the window text system.
 fn shape(
     message: &Message,
-    collapsed: bool,
+    mode: Mode,
     style: &MessageStyle,
     window: &Window,
     cx: &mut App,
 ) -> ShapedMessage {
-    let display = if collapsed {
+    let Mode { collapsed, ignored } = mode;
+    let display = if ignored {
+        display::build_ignored(message, style.options)
+    } else if collapsed {
         display::build_collapsed(message, style.options)
     } else {
         let slots = badge_slots(message, style, window, cx);
@@ -344,10 +361,10 @@ fn shape(
     let layout = window
         .text_system()
         .layout_line(&display.text, style.font_size, &runs, None);
-    let shaped =
-        ShapedMessage::from_layout(display, &layout, &boxes).with_look(events::look(message));
+    let look = if ignored { None } else { events::look(message) };
+    let shaped = ShapedMessage::from_layout(display, &layout, &boxes).with_look(look);
     match &message.reply {
-        Some(reply) if style.reply_line && !collapsed => {
+        Some(reply) if style.reply_line && !collapsed && !ignored => {
             shaped.with_reply(shape_reply(reply, style, window))
         }
         _ => shaped,
@@ -361,6 +378,14 @@ struct Subject<'a> {
     seq: u64,
     message: &'a Arc<Message>,
     collapsed: bool,
+    ignored: bool,
+}
+
+/// How a message is drawn instead of in full (see [`Subject`]).
+#[derive(Clone, Copy)]
+struct Mode {
+    collapsed: bool,
+    ignored: bool,
 }
 
 /// The cached layout of a message for a content width (width minus padding).
@@ -376,15 +401,18 @@ fn layout_for(
         seq,
         message,
         collapsed,
+        ignored,
     } = subject;
-    let key = LayoutKey::new(style.generation, window.scale_factor()).collapsed(collapsed);
+    let key = LayoutKey::new(style.generation, window.scale_factor())
+        .collapsed(collapsed)
+        .ignored(ignored);
     cache.borrow_mut().layout(
         seq,
         message,
         key,
         content_width.as_f32(),
         style.line_height.as_f32(),
-        || shape(message, collapsed, style, window, cx),
+        || shape(message, Mode { collapsed, ignored }, style, window, cx),
     )
 }
 
@@ -570,6 +598,49 @@ impl MessageElement {
         window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| sync(false, cx));
     }
 
+    /// Draws what the find bar is looking for behind the text: every match in the author and the
+    /// body (not the timestamp or the badges), the one the list was scrolled to stronger.
+    fn paint_search(&self, origin: Point<Pixels>, layout: &MessageLayout, window: &mut Window) {
+        let Some(search) = &self.style.search else {
+            return;
+        };
+        let MessageLayout { shaped, flow } = layout;
+        let text = &shaped.display.text;
+        let layout_id = Rc::as_ptr(&layout.shaped) as usize;
+        let ranges = search
+            .ranges
+            .borrow_mut()
+            .get(self.seq, layout_id, text, &search.needle);
+        if ranges.is_empty() {
+            return;
+        }
+        let current = search.current == Some(self.seq);
+        let color = self
+            .style
+            .palette
+            .rule_color(HighlightColor::Yellow)
+            .opacity(if current { 0.7 } else { 0.38 });
+        for range in ranges.iter().cloned() {
+            let role = shaped
+                .display
+                .spans
+                .iter()
+                .find(|span| span.range.contains(&range.start))
+                .map(|span| span.role);
+            if matches!(role, Some(Role::Timestamp | Role::Badge | Role::Separator)) {
+                continue;
+            }
+            for rect in selection::highlight(flow, &shaped.atoms, range) {
+                let line = &flow.lines[rect.line];
+                let bounds = Bounds::new(
+                    origin + point(px(rect.x), px(line.top)),
+                    size(px(rect.width), px(line.height)),
+                );
+                window.paint_quad(fill(bounds, color));
+            }
+        }
+    }
+
     /// Where the flowed text starts: inside the padding, under the reply line.
     fn content_origin(&self, bounds: Bounds<Pixels>, layout: &MessageLayout) -> Point<Pixels> {
         bounds.origin + self.style.padding + point(px(0.0), px(layout.reply_height()))
@@ -719,12 +790,13 @@ impl Element for MessageElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let (seq, message, style, cache, collapsed) = (
+        let (seq, message, style, cache, collapsed, ignored) = (
             self.seq,
             self.message.clone(),
             self.style.clone(),
             self.cache.clone(),
             self.collapsed,
+            self.ignored,
         );
         let layout_id = window.request_measured_layout(
             Style::default(),
@@ -740,6 +812,7 @@ impl Element for MessageElement {
                         seq,
                         message: &message,
                         collapsed,
+                        ignored,
                     },
                     &style,
                     content,
@@ -773,6 +846,7 @@ impl Element for MessageElement {
                 seq: self.seq,
                 message: &self.message,
                 collapsed: self.collapsed,
+                ignored: self.ignored,
             },
             &self.style,
             content,
@@ -838,6 +912,13 @@ impl Element for MessageElement {
         let mut flags = message.flags;
         // A collapsed line is muted text, not struck-through text.
         flags.deleted &= !self.collapsed;
+        if self.ignored {
+            // What was ignored is not tinted either.
+            flags.deleted = false;
+            flags.highlight = None;
+            flags.mention = false;
+            flags.highlighted = false;
+        }
         let MessageLayout { shaped, flow } = &prepainted.layout;
 
         if let Some(hitbox) = &prepainted.hitbox {
@@ -913,6 +994,9 @@ impl Element for MessageElement {
                     &prepainted.links,
                     window,
                 );
+            }
+            if !self.collapsed && !self.ignored {
+                self.paint_search(origin, &prepainted.layout, window);
             }
             let line_height = style.line_height;
             let baseline = (line_height - shaped.ascent - shaped.descent) / 2.0 + shaped.ascent;

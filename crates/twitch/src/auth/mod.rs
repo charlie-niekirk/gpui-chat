@@ -72,6 +72,12 @@ pub const MODERATION_SCOPES: &[&str] = &[
     "channel:manage:raids",
 ];
 
+/// The scopes only the block list uses (PR 5.7), **not** part of [`SCOPES`], like
+/// [`MODERATION_SCOPES`]: reading the block list (so blocked users are ignored here too) and
+/// blocking a user from the row menu. Requested by *Enable block list sync…* through the same
+/// device-code flow as extra scopes; a login without them just has no synced block list.
+pub const BLOCK_LIST_SCOPES: &[&str] = &["user:read:blocked_users", "user:manage:blocked_users"];
+
 /// The client id to use: `$GPUI_CHAT_TWITCH_CLIENT_ID` when set and not blank, else
 /// [`DEFAULT_CLIENT_ID`].
 pub fn client_id() -> String {

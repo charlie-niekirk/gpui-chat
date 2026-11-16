@@ -405,6 +405,18 @@ pub fn build_collapsed(message: &Message, options: DisplayOptions) -> DisplayTex
     out
 }
 
+/// The text an ignored message collapses to under `ignores.show_collapsed` (PR 5.7): `[time] 1 ignored
+/// message`, muted. No name: what the user did not want to see is not named either.
+pub fn build_ignored(message: &Message, options: DisplayOptions) -> DisplayText {
+    let mut out = DisplayText::default();
+    if options.timestamps {
+        out.push(&clock(message.timestamp.unix_millis()), Role::Timestamp);
+        out.push(" ", Role::Separator);
+    }
+    out.push("1 ignored message", Role::System);
+    out
+}
+
 /// The display text of `message`; `badges` are drawn before the author's name.
 ///
 /// An event row (PR 5.1, [`super::events`]) has its header first and the message on the line

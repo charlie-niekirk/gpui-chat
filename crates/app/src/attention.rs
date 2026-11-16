@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_chat_core::{
-    ChannelId, ChatEvent, ClearTarget, HighlightConfig, Highlights, Hit, Message, Own,
+    ChannelId, ChatEvent, ClearTarget, HighlightConfig, Highlights, Hit, Ignores, Message, Own,
 };
 use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
@@ -52,6 +52,9 @@ pub struct Core {
     /// The user's display name as Twitch writes it, learned from their own messages (the login
     /// alone is known from the account).
     display_name: Option<String>,
+    /// What is ignored (PR 5.7): such a message is drawn by the chat view as the user decided, but
+    /// counts for no dot, no Mentions entry and no notification.
+    ignores: Arc<Ignores>,
 }
 
 impl Core {
@@ -63,7 +66,22 @@ impl Core {
             activity: Activity::default(),
             coalescer: Coalescer::default(),
             display_name: None,
+            ignores: Arc::default(),
         }
+    }
+
+    /// Takes what is ignored now. Entries of users who are ignored now leave the Mentions log, a
+    /// summary is not held for them and their banners are taken back: whether the log changed, and
+    /// the tags of the notifications to dismiss.
+    pub fn set_ignores(&mut self, ignores: Arc<Ignores>) -> (bool, Vec<String>) {
+        let gone = self.activity.drop_ignored(&ignores);
+        self.ignores = ignores;
+        let mut tags = Vec::new();
+        for (channel, id) in &gone {
+            self.coalescer.forget(channel, id);
+            tags.push(notifications::message_tag(channel, id));
+        }
+        (!gone.is_empty(), tags)
     }
 
     /// Takes new rules (what `[highlights]` says now). Whether they differ from the ones in force.
@@ -104,7 +122,11 @@ impl Core {
                     let hit = self.engine.evaluate(message);
                     let live = is_countable(message);
                     stamp(message, hit, &self.engine);
-                    if !live || self.engine.is_own(message) || is_copy(message) {
+                    if !live
+                        || self.engine.is_own(message)
+                        || is_copy(message)
+                        || self.ignores.is_ignored(message)
+                    {
                         continue;
                     }
                     out.changed |= self.activity.note_message(channel);
@@ -253,11 +275,26 @@ impl Attention {
                     cx.notify();
                 }
             });
+            let mut subscriptions = vec![subscription];
+            let mut core = Core::new(config::current(cx).highlights.clone());
+            // What is ignored (PR 5.7): counted for nothing, and out of the Mentions log.
+            if let Some(hub) = crate::ignores::current(cx) {
+                core.set_ignores(hub.read(cx).engine());
+                subscriptions.push(cx.observe(&hub, |this: &mut Self, hub, cx| {
+                    let (changed, dismiss) = this.core.set_ignores(hub.read(cx).engine());
+                    for tag in &dismiss {
+                        notify::dismiss(tag, cx);
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }));
+            }
             Self {
-                core: Core::new(config::current(cx).highlights.clone()),
+                core,
                 offline,
                 summary: None,
-                _subscriptions: vec![subscription],
+                _subscriptions: subscriptions,
             }
         });
         let weak = entity.downgrade();
@@ -464,6 +501,81 @@ mod tests {
         assert!(!out.changed && out.notifications.is_empty());
         assert_eq!(core.activity.unread(&ChannelId::new("b")), 0);
         assert_eq!(flags(&events[0]).highlight, None);
+    }
+
+    fn ignoring(users: &[&str], phrases: &[&str]) -> Arc<Ignores> {
+        use gpui_chat_core::{IgnoreConfig, IgnoreRule};
+        let (engine, problems) = Ignores::compile(&IgnoreConfig {
+            users: users.iter().map(|u| (*u).to_owned()).collect(),
+            rules: phrases
+                .iter()
+                .map(|pattern| IgnoreRule {
+                    pattern: (*pattern).to_owned(),
+                    ..IgnoreRule::default()
+                })
+                .collect(),
+            ..IgnoreConfig::default()
+        });
+        assert!(problems.is_empty());
+        Arc::new(engine)
+    }
+
+    #[test]
+    fn an_ignored_message_counts_for_no_dot_no_log_entry_and_no_notification() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        core.set_ignores(ignoring(&["spammer"], &["buy followers"]));
+        let b = ChannelId::new("b");
+        for (id, login, text) in [
+            ("1", "spammer", "hey @viewer"),
+            ("2", "alice", "viewer: buy followers now"),
+        ] {
+            let out = run(&mut core, &mut [chat("b", id, login, text)]);
+            assert!(!out.changed && out.notifications.is_empty(), "{id}");
+        }
+        assert_eq!(core.activity.unread(&b), 0);
+        assert_eq!(core.activity.mention_count(), 0);
+        // Anyone else still counts.
+        let out = run(&mut core, &mut [chat("b", "3", "alice", "hello viewer")]);
+        assert!(out.changed);
+        assert_eq!(core.activity.unseen_mentions(&b), 1);
+    }
+
+    #[test]
+    fn ignoring_someone_takes_their_held_notifications_back_so_no_summary_names_them() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        let t0 = Instant::now();
+        // The first notifies, the next two are held for the summary.
+        for (id, login) in [("1", "alice"), ("2", "spammer"), ("3", "spammer")] {
+            core.process(
+                Some("viewer"),
+                &mut [chat("b", id, login, "hi viewer")],
+                &|_| false,
+                t0,
+            );
+        }
+        assert!(core.coalescer.summary_due().is_some());
+        let (_, tags) = core.set_ignores(ignoring(&["spammer"], &[]));
+        assert_eq!(tags, ["hit:b:2", "hit:b:3"]);
+        assert!(
+            core.coalescer.summary_due().is_none(),
+            "nothing is left to summarise"
+        );
+    }
+
+    #[test]
+    fn ignoring_someone_takes_their_earlier_hits_out_of_the_log() {
+        let mut core = core_watching(HighlightConfig::default(), "a");
+        run(&mut core, &mut [chat("b", "1", "spammer", "hi viewer")]);
+        run(&mut core, &mut [chat("b", "2", "alice", "hi viewer")]);
+        let b = ChannelId::new("b");
+        assert_eq!(core.activity.unseen_mentions(&b), 2);
+        assert!(core.set_ignores(ignoring(&["spammer"], &[])).0);
+        assert_eq!(core.activity.unseen_mentions(&b), 1);
+        assert_eq!(core.activity.mention_count(), 1);
+        assert!(
+            !core.set_ignores(ignoring(&["spammer"], &[])).0,
+            "nothing more to drop"
+        );
     }
 
     #[test]

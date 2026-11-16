@@ -14,7 +14,7 @@ use gpui_kit::{
     Render, Styled, Subscription, Window, div, px,
 };
 
-use crate::account::{AccountHub, SignIn};
+use crate::account::{AccountHub, Features, SignIn};
 
 /// What the sheet shows for the activation link (the real link carries the code as well).
 const ACTIVATE_LABEL: &str = "twitch.tv/activate";
@@ -141,8 +141,8 @@ impl SignInSheet {
                         .label("Try again")
                         .on_click(move |_, _, cx| {
                             hub.update(cx, |hub, cx| {
-                                let moderation = hub.sign_in_moderation();
-                                hub.begin_sign_in(moderation, cx);
+                                let features = hub.sign_in_features();
+                                hub.begin_sign_in(features, cx);
                             });
                         }),
                 ),
@@ -172,27 +172,28 @@ impl Render for SignInSheet {
 
 /// Opens the login sheet and starts a sign-in. Does nothing while another dialog is open.
 pub fn open(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
-    open_with(hub, false, window, cx);
+    open_with(hub, Features::NONE, window, cx);
 }
 
 /// [`open`] asking for the moderation scopes too (PR 5.2): *Enable moderation tools*.
 pub fn open_for_moderation(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
-    open_with(hub, true, window, cx);
+    open_with(hub, Features::MODERATION, window, cx);
 }
 
-fn open_with(hub: Entity<AccountHub>, moderation: bool, window: &mut Window, cx: &mut App) {
+/// [`open`] asking for the block list scopes too (PR 5.7): *Enable block list sync…*.
+pub fn open_for_block_list(hub: Entity<AccountHub>, window: &mut Window, cx: &mut App) {
+    open_with(hub, Features::BLOCK_LIST, window, cx);
+}
+
+fn open_with(hub: Entity<AccountHub>, features: Features, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
-    hub.update(cx, |hub, cx| hub.begin_sign_in(moderation, cx));
+    hub.update(cx, |hub, cx| hub.begin_sign_in(features, cx));
     let sheet = cx.new(|cx| SignInSheet::new(hub, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
-            .title(if moderation {
-                "Enable moderation tools"
-            } else {
-                "Log in to Twitch"
-            })
+            .title(features.title())
             .w(px(420.))
             .child(sheet.clone())
             .footer(

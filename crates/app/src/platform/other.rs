@@ -7,11 +7,11 @@ use super::{
     about_item, account_items, channel_menu, quit_item, settings_item, view_menu, window_menu,
 };
 use crate::actions::{
-    AddChannel, CHAT_CONTEXT, COMPOSER_CONTEXT, ClosePane, CloseWindow, FocusPaneDown,
-    FocusPaneLeft, FocusPaneRight, FocusPaneUp, MinimizeWindow, MoveChannelDown, MoveChannelUp,
-    OpenChannelSwitcher, OpenPalette, OpenSettings, Quit, RemoveChannel, SHELL_CONTEXT,
-    SelectNextChannel, SelectPreviousChannel, ShowMentions, SplitDown, SplitRight, ToggleDebugHud,
-    ToggleSidebar,
+    AddChannel, CHAT_CONTEXT, COMPOSER_CONTEXT, ClosePane, CloseWindow, Find, FindNext,
+    FindPrevious, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, MinimizeWindow,
+    MoveChannelDown, MoveChannelUp, OpenChannelSwitcher, OpenPalette, OpenSettings, Quit,
+    RemoveChannel, SHELL_CONTEXT, SelectNextChannel, SelectPreviousChannel, ShowMentions,
+    SplitDown, SplitRight, ToggleDebugHud, ToggleSidebar,
 };
 use crate::chat::selection_layer::CopySelection;
 use crate::completion::ComposerToggleEmotePicker;
@@ -44,6 +44,10 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-shift-down", FocusPaneDown, Some(SHELL_CONTEXT)),
         KeyBinding::new("ctrl-e", ComposerToggleEmotePicker, Some(COMPOSER_CONTEXT)),
         KeyBinding::new("ctrl-c", CopySelection, Some(CHAT_CONTEXT)),
+        // In-channel search (PR 5.7).
+        KeyBinding::new("ctrl-f", Find, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-g", FindNext, Some(SHELL_CONTEXT)),
+        KeyBinding::new("ctrl-shift-g", FindPrevious, Some(SHELL_CONTEXT)),
     ]
 }
 

@@ -465,7 +465,8 @@ pub fn render(env: Env<'_>, window: &mut Window, cx: &mut Context<ChatView>) -> 
     });
 
     // --- actions ---
-    let actions = actions_row(model, &view);
+    let ignoring = ignore_buttons(model, &view, cx);
+    let actions = actions_row(model, &view, ignoring);
     let moderation = moderation_rows(model, &view, &tokens);
 
     // --- messages ---
@@ -599,8 +600,90 @@ fn badge_chips(
     any.then(|| chips.into_any_element())
 }
 
-/// Copy username, Mention, Reply, Profile.
-fn actions_row(model: &CardModel, view: &WeakEntity<ChatView>) -> AnyElement {
+/// *Ignore* / *Unignore* and, with a login, *Block on Twitch…* / *Unblock* (PR 5.7): none for the user's
+/// own card. Every one closes the card.
+fn ignore_buttons(
+    model: &CardModel,
+    view: &WeakEntity<ChatView>,
+    cx: &mut Context<ChatView>,
+) -> Vec<AnyElement> {
+    let login = model.login.clone();
+    let own = crate::account::own_login(cx);
+    if own
+        .as_deref()
+        .is_some_and(|own| own.eq_ignore_ascii_case(&login))
+    {
+        return Vec::new();
+    }
+    let Some(hub) = crate::ignores::current(cx) else {
+        return Vec::new();
+    };
+    let (listed, blocked) = {
+        let hub = hub.read(cx);
+        (hub.is_listed(&login), hub.is_blocked(&login))
+    };
+    let mut buttons = Vec::new();
+    let ignore_view = view.clone();
+    let ignore_login = login.clone();
+    buttons.push(
+        Button::new("user-card-ignore")
+            .ghost()
+            .xsmall()
+            .label(if listed { "Unignore" } else { "Ignore" })
+            .tooltip(if listed {
+                "Show their messages again"
+            } else {
+                "Hide their messages everywhere"
+            })
+            .on_click(move |_, _, cx| {
+                let login = ignore_login.clone();
+                ignore_view
+                    .update(cx, |view, cx| {
+                        if listed {
+                            view.unignore_user(&login, cx);
+                        } else {
+                            view.ignore_user(&login, cx);
+                        }
+                        view.close_user_card(cx);
+                    })
+                    .ok();
+            })
+            .into_any_element(),
+    );
+    if own.is_some() {
+        let block_view = view.clone();
+        let user_id = model.user_id.clone();
+        buttons.push(
+            Button::new("user-card-block")
+                .ghost()
+                .xsmall()
+                .label(if blocked { "Unblock" } else { "Block…" })
+                .tooltip(if blocked {
+                    "Unblock on Twitch"
+                } else {
+                    "Block on Twitch"
+                })
+                .on_click(move |_, _, cx| {
+                    let (login, user_id) = (login.clone(), user_id.clone());
+                    block_view
+                        .update(cx, |view, cx| {
+                            view.close_user_card(cx);
+                            view.request_block(login, user_id, !blocked, cx);
+                        })
+                        .ok();
+                })
+                .into_any_element(),
+        );
+    }
+    buttons
+}
+
+/// Copy username, Mention, Reply, Profile (and what `ignoring` adds).
+fn actions_row(
+    model: &CardModel,
+    view: &WeakEntity<ChatView>,
+    ignoring: Vec<AnyElement>,
+) -> AnyElement {
     let login = model.login.clone();
     let copy_login = login.clone();
     let copy_view = view.clone();
@@ -677,6 +760,7 @@ fn actions_row(model: &CardModel, view: &WeakEntity<ChatView>) -> AnyElement {
                         .ok();
                 }),
         )
+        .children(ignoring)
         .into_any_element()
 }
 

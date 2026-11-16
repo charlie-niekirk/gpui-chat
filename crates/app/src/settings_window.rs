@@ -11,6 +11,7 @@
 
 mod fields;
 mod highlights;
+mod ignores;
 
 use std::rc::Rc;
 
@@ -209,6 +210,7 @@ impl SettingsView {
             chat_page(&this),
             emotes_page(&this),
             highlights::page(&this),
+            ignores::page(&this),
             streamlink_page(),
             account_page(),
         ]
@@ -801,6 +803,13 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
             ..
         })
     );
+    let block_list_off = matches!(
+        &state,
+        Some(AccountStatus::LoggedIn {
+            block_list: false,
+            ..
+        })
+    );
     let (status, detail, logged_in) = match state {
         None => (
             "Not available".to_owned(),
@@ -813,6 +822,7 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
             login,
             relogin,
             moderation,
+            ..
         }) => (
             format!("Logged in as {login}"),
             if relogin {
@@ -872,6 +882,16 @@ fn account_row(cx: &App) -> impl IntoElement + use<> {
                                 }
                             })
                     }))
+                    .children(block_list_off.then(|| {
+                        Button::new("settings-enable-block-list-account")
+                            .small()
+                            .label("Enable block list sync…")
+                            .on_click(|_, window, cx| {
+                                if let Some(hub) = account::current(cx) {
+                                    sign_in::open_for_block_list(hub, window, cx);
+                                }
+                            })
+                    }))
                     .child(
                         Button::new("settings-log-out")
                             .small()
@@ -897,6 +917,7 @@ enum AccountStatus {
         login: String,
         relogin: bool,
         moderation: bool,
+        block_list: bool,
     },
 }
 
@@ -909,6 +930,7 @@ fn hub_state(hub: &gpui_kit::Entity<AccountHub>, cx: &App) -> AccountStatus {
             login: account.login.clone(),
             relogin: account.needs_relogin(),
             moderation: account.moderation_enabled(),
+            block_list: account.block_list_enabled(),
         },
     }
 }

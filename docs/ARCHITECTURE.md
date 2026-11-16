@@ -546,12 +546,100 @@ A card over the chat with a user's avatar, names, badges, account age, this sess
   to a user not seen in a message, or to a user known only from shared-chat copies of another room; Unban is always offered to a moderator (the card has no ban to
   read it off). Every action closes the card.
 
+### Search, filters and ignores (PR 5.7)
+
+In-channel search (⌘F), the find bar's filters, ignored users / phrases and the Twitch block list. The logic is pure and
+tested in `gpui-chat-core`; the app only draws it.
+
+- **`core::search`.** `Needle` (a trimmed, lowercased query) and `find_ranges` (byte ranges into the *original* text, so the
+  row can highlight them even where lowercasing changes a character's length); `search_text(&Message)` is what a message offers
+  (display name, login, system line, body with emotes by code, lowercased, newline-separated so a one-line query never matches
+  across them); `parse_query` takes a `from:login` token out of what was typed. **`SearchIndex`** keeps that text for every
+  message of a `MessageStore`, in step with it (`sync`: the first call and any history merge that renumbered the store, i.e.
+  `rebuild_serial` moved, index everything; otherwise only the evicted ones drop and the new ones are added). **`Search`** holds
+  the matches of one query and never rescans the scrollback per keystroke: a query that extends the last one narrows the previous
+  matches (so only they are looked at), going back to a shorter one restores its saved matches and scans only what arrived since
+  (`Stage`s), a new message is checked once when it arrives, and a scan of the whole index happens only for an unrelated query
+  (the first character, a paste) or a changed `allowed` set (a filter). A test pins the numbers at 100 000 messages. `step`
+  walks the matches with wrap-around.
+- **`core::filter`.** `Filters` (`from`, `mentions`, `links`, `hide_bots`) with `matches(message, &BotList)`;
+  `visibility(message, &Ignores, &Filters, &BotList) -> Shown | Collapsed | Hidden` is the one answer to "does this message
+  get a row, and which"; `FilterConfig` is `[filters] bots`.
+- **`core::ignore`.** `IgnoreConfig` (`[ignores]`) compiled into `Ignores` with the conventions and code of
+  `core::highlight` (`Matcher`, `check_regex`, the size / nesting limits; phrases one by one, regular expressions in one
+  `RegexSet`), plus the block list (`set_blocked`: ids and logins) and the local user (`set_own`: never ignored). `is_ignored`:
+  chat / `/me` by user or text, event cards by user only, notices and system lines never.
+- **`ignores.rs` (`IgnoreHub`).** One GPUI entity per app (created at startup after the account hub, `ignores::init`) that owns the
+  compiled `Ignores` (an `Arc`), the bot list, the block list and a `generation`. It observes the settings (recompiling only when
+  `[ignores]` / `[filters]` changed) and the account hub (the user's login: own messages; the block list). Observers: every
+  `ChatView`, `Attention` and the settings page. `ignore_user` / `unignore_user` write `ignores.users` through `config::edit` (the
+  hub then sees its own write like any settings change). **Block list** (`crates/twitch/src/blocks.rs`): `HelixClient::get_blocked_users`
+  (`GET users/blocks?broadcaster_id=<own id>`, paged, 100 at a time), `block_user` (`PUT users/blocks?target_user_id=`) and
+  `unblock_user` (`DELETE`), each checking the login's scope first (`BlockError::MissingScope`, nothing sent) and turning
+  Twitch's answers into sentences. The scopes (`auth::BLOCK_LIST_SCOPES`) are opt-in exactly like the moderation ones:
+  `account::Features { moderation, block_list }` is what a sign-in asks for on top of the normal scopes, and a later login keeps
+  what was enabled; `Account::block_list_enabled` is not part of `needs_relogin`. The hub fetches the list when a login with the
+  scopes is there and `ignores.sync_block_list` is on (a stale answer, from another account or an older fetch, is dropped by
+  an epoch), and has `block` / `unblock` (the id the message carried, else a `GET users?login=`) returning the result to the
+  pane, which asks for confirmation first (`ChannelPane::confirm_block`) and shows a failure in the same dismissible strip the
+  moderation tools use, with an *Enable block list sync* button for `FailureKind::BlockListScope`.
+- **Rows (`chat/list_sync.rs`, `Rows`).** The chat list's items used to be every message of the store (item `i` is
+  `first_seq + i`). `Rows` is that, *or*, when something may be hidden (`!engine.is_empty() || filters.is_active()`), an explicit
+  ascending list of the sequence numbers that have a row. `sync` (evictions at the front, appended messages at the back, each
+  asked whether it gets a row), `show_only` (the filter changed: the new list is diffed against the old one, `diff_rows`) and
+  `renumber` (a history merge: old rows renumbered through `Rebuild::map_seq`, the new store range filtered, diffed) all return
+  `Splice`s (and a row can be a *placeholder*, `Rows::is_placeholder`: the `1 ignored message` line of an ignored message
+  with `show_collapsed`; it is a row, but the message is not on screen, so it is not searched, not copied and has no
+  right-click menu, until a click opens it), so the list is still only ever *spliced*: measured rows and the scroll position of what stays survive every change.
+  Everything that mapped a message to an item through `first_seq` goes through `Rows` now (`index_of` / `seq_at`): the render
+  closure, `scroll_to_message`, `remeasure_seqs`, the pill's count (`rows_from`), and the selection surface (`set_rows`: scrolling
+  to hold the list, the autoscroll's first / last row, and **copying skips hidden rows** between the two ends of a selection).
+- **Visibility is cheap per keystroke.** `core::visibility_with` checks the filters (a few comparisons) *before* it asks whether
+  a message is ignored, and the ignore verdict (text read, phrases, `RegexSet`) is cached per message
+  (`core::IgnoreCache`, forgotten when the ignores change, the store is renumbered or a message is replaced in place). Typing
+  `from:` therefore never runs the ignore rules again over the scrollback, and a `from:` token that may still be being typed is
+  not applied until it is finished (a space after it, Enter, or 250 ms without a key), so each prefix of a login is not a filter
+  of its own.
+- **The view (`chat/view/find.rs`).** `ChatView` has the `Rows`, the engine / bots it last got from the hub (its `generation`
+  says when to recompute), the `Filters` and, while the bar is open, a `Find` (the Kit `Input`, the `Search`, the current match).
+  `sync` takes the store's changes into the rows first and then the search (`allowed` = has a row). The bar is a `h_flex` above
+  the list with key context `FindBar`; its Esc / ↑ / ↓ are bound to `FindClose` / `FindPrevious` / `FindNext` in
+  `FindBar > Input` (registered in `platform::default_bindings`, like the picker's), Enter / Shift-Enter arrive as
+  `InputEvent::PressEnter { shift }`. Stepping and typing scroll with the Mentions view's path (`scroll_to_row`: a few rows of
+  context, following paused, the row flashed); closing emits `ChatViewEvent::SelectionDismissed`, which the pane already turns into
+  "focus the input box", so the box's own Esc chain (completion list, then reply mode, then propagate) is untouched: it only runs
+  while the box is focused. ⌘F / ⌘G / ⇧⌘G are shell-level bindings that act on the focused pane's chat (`AppShell::with_chat`).
+  The `Search` (index and matches) lives on the `ChatView`, not on the bar: ⌘F again only catches the index up (new messages,
+  evictions, a renumbering) instead of reading every message; while the bar is closed it is not kept current. A query only
+  matches messages that are shown as themselves (`Rows::is_shown`: not hidden by a filter, not an ignored placeholder); a message
+  replaced in place (an echo swapped for Twitch's copy) is read again (`Search::replaced`, `IgnoreCache::invalidate`) and
+  its visibility re-checked; after a history merge the saved stages are dropped and the current match follows
+  `Rebuild::map_seq`. Matches are painted by `MessageElement::paint_search` from `MessageStyle::search` (`SearchHighlight`: the needle and the current
+  seq): `find_ranges` over the row's display text, skipping the timestamp and badge spans, theme `warning` at 38 % (70 % for the
+  current match), behind the text and after the selection. The strip below the bar ("Showing N of M messages · from alice ·
+  mentions", **Clear filter**) is drawn whenever a filter is on.
+- **Collapsed ignored rows.** With `ignores.show_collapsed` and no filter, `Visibility::Collapsed` rows stay in the list and
+  `message_row` draws them with `MessageElement::ignored(true)`: another display text (`display::build_ignored`, `1 ignored
+  message`, no name), another `LayoutKey` (`ignored`), no tints or reply line; a click reveals the message through the same
+  `revealed` set as a collapsed removed message.
+- **Block list upkeep.** The fetch is keyed by the account's user id (another account's list is cleared the moment a fetch for
+  this one starts and never applies to it), a failure is retried with a 30 s → 15 min backoff, and while sync is on the list is
+  fetched again every 15 minutes (so blocks made on twitch.tv are picked up) or on **Refresh** (Settings → Ignores). A block or
+  unblock from the app only edits the list when sync is on and a list is loaded. The hub rebuilds (and every chat view
+  re-checks its rows) only when the user's own login, the account id or the block-list scope state actually changed, not on every
+  `AccountHub` notification. The user can never be ignored or blocked (`IgnoreHub::can_target`, checked in `ignore_user`,
+  `block`, the pane's confirmation and the key-bound actions).
+- **Attention.** `Core::set_ignores` takes the engine; an ignored message is stamped as usual but never counted (no dot, no
+  Mentions entry, no notification), and `Activity::drop_ignored` takes an ignored author's earlier entries out of the log when the
+  engine changes, `Coalescer::forget` takes their held notifications out of the summary and their banners are dismissed.
+  A jump (Mentions, a notification, the user card) to a message hidden by an ignore says *That message is hidden (ignored user).*
+
 ### Domain model (`crates/core`)
 
 Dependency-free (std only), no I/O, no clock. Modules: `ids` (`ChannelId` = lowercase login,
 `MessageId`, `EmoteId`), `emote` (`Emote`, `EmoteProvider`, `ImageUrls` by scale, `BadgeId` /
 `Badge`), `message` (`Message`, `Author`, `Fragment`, `MessageKind`, `MessageFlags`, `ReplyRef`),
-`store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`, `compose` (PR 3.2: `parse_input`,
+`store` (`MessageStore`), `event` (`ChatEvent`, `RoomState`), `tokenizer`, `search` / `filter` / `ignore` (PR 5.7, above), `compose` (PR 3.2: `parse_input`,
 `sanitize_line`, `InputHistory`), `complete` (PR 3.3: `find_trigger`, `rank`, `apply`, `recent_chatters`, `Recents`).
 
 - **`MessageStore`** hands out a monotonically increasing *sequence number* per pushed message

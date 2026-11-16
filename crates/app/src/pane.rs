@@ -478,6 +478,11 @@ impl ChannelPane {
             .update(cx, |chat, cx| chat.scroll_to_message(id, cx))
     }
 
+    /// The pane's chat view: the find bar, the filters and the ignore actions act on it (PR 5.7).
+    pub fn chat(&self) -> Entity<ChatView> {
+        self.chat.clone()
+    }
+
     pub fn set_in_split(&mut self, in_split: bool, cx: &mut Context<Self>) {
         if self.in_split != in_split {
             self.in_split = in_split;
@@ -618,6 +623,96 @@ impl ChannelPane {
         });
     }
 
+    /// *Block on Twitch…*: asks first, since it changes the user's Twitch account (the block applies
+    /// everywhere on Twitch, not just in this app), then blocks.
+    pub fn confirm_block(
+        &mut self,
+        login: &str,
+        user_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Never the user themselves (the menu and the card do not offer it; a key can).
+        if let Some(hub) = crate::ignores::current(cx)
+            && let Err(why) = hub.read(cx).can_target(login, cx)
+        {
+            self.mod_notice = Some((why.into(), FailureKind::Other));
+            cx.notify();
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let pane = cx.entity().downgrade();
+        let login = login.to_owned();
+        let title = SharedString::from(format!("Block {login} on Twitch?"));
+        let body = SharedString::from(format!(
+            "{login} is added to your Twitch block list: you will no longer see their messages on \
+             Twitch or in this app, and they cannot whisper you. You can unblock them from the \
+             message menu or on twitch.tv."
+        ));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (pane, login, user_id) = (pane.clone(), login.clone(), user_id.clone());
+            dialog
+                .title(title.clone())
+                .child(body.clone())
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|button| button.label("Cancel")))
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("confirm-block").danger().label("Block")),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    pane.update(cx, |pane, cx| {
+                        pane.run_block(login.clone(), user_id.clone(), true, cx);
+                    })
+                    .ok();
+                    true
+                })
+        });
+    }
+
+    /// Blocks (`block`) or unblocks `login` on Twitch; a failure shows in the strip under the header
+    /// (with a button to enable block list sync when the login lacks the permission).
+    fn run_block(
+        &mut self,
+        login: String,
+        user_id: Option<String>,
+        block: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hub) = crate::ignores::current(cx) else {
+            return;
+        };
+        let task = hub.update(cx, |hub, cx| {
+            if block {
+                hub.block(login, user_id, cx)
+            } else {
+                hub.unblock(login, user_id, cx)
+            }
+        });
+        self.mod_notice = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let Err(error) = task.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let kind = if error.is_missing_scope() {
+                    FailureKind::BlockListScope
+                } else {
+                    FailureKind::Other
+                };
+                this.mod_notice = Some((error.to_string().into(), kind));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Whether the logged-in user is a moderator here and there is something to run commands.
     fn can_moderate(&self, cx: &App) -> bool {
         self.moderator.is_some() && self.store.read(cx).role().can_moderate()
@@ -659,6 +754,17 @@ impl ChannelPane {
                         .on_click(|_, window, cx| {
                             if let Some(hub) = crate::account::current(cx) {
                                 crate::sign_in::open_for_moderation(hub, window, cx);
+                            }
+                        })
+                }))
+                .children((kind == FailureKind::BlockListScope).then(|| {
+                    Button::new("mod-notice-enable-blocks")
+                        .small()
+                        .primary()
+                        .label("Enable block list sync")
+                        .on_click(|_, window, cx| {
+                            if let Some(hub) = crate::account::current(cx) {
+                                crate::sign_in::open_for_block_list(hub, window, cx);
                             }
                         })
                 }))
@@ -1037,6 +1143,19 @@ impl Render for ChannelPane {
                         user_id,
                         action,
                     } => this.user_action(login, user_id.clone(), *action, window, cx),
+                    ChatViewEvent::MessageHidden => {
+                        this.mod_notice = Some((
+                            "That message is hidden (ignored user).".into(),
+                            FailureKind::Other,
+                        ));
+                        cx.notify();
+                    }
+                    ChatViewEvent::BlockUser { login, user_id } => {
+                        this.confirm_block(login, user_id.clone(), window, cx);
+                    }
+                    ChatViewEvent::UnblockUser { login, user_id } => {
+                        this.run_block(login.clone(), user_id.clone(), false, cx);
+                    }
                 },
             ));
         }

@@ -355,6 +355,50 @@ x = 1
     }
 
     #[test]
+    fn ignoring_a_user_adds_to_the_list_in_place_and_a_bad_rule_is_refused() {
+        let text = "[ignores]\n# the usual suspects\nusers = [\"spam\"]\nshow_collapsed = true\n\n[chat]\ntimestamps = false\n";
+        let (out, settings) = edit(
+            text,
+            &[SettingEdit::set(
+                "ignores.users",
+                EditValue::StrList(vec!["spam".into(), "bob".into()]),
+            )],
+        );
+        assert_eq!(settings.ignores.users, ["spam", "bob"]);
+        assert!(settings.ignores.show_collapsed);
+        assert!(
+            out.contains("# the usual suspects") && out.contains("timestamps = false"),
+            "{out}"
+        );
+        let (out, settings) = edit(
+            &out,
+            &[SettingEdit::set(
+                "ignores.rules",
+                EditValue::Tables(vec![vec![
+                    ("kind", EditValue::Str("regex".into())),
+                    ("pattern", EditValue::Str("^!\\w+".into())),
+                ]]),
+            )],
+        );
+        assert_eq!(settings.ignores.rules.len(), 1);
+        assert!(out.contains("[[ignores.rules]]"), "{out}");
+        // A regular expression that does not compile is never written.
+        let error = apply_edits(
+            &out,
+            Path::new("settings.toml"),
+            &[SettingEdit::set(
+                "ignores.rules",
+                EditValue::Tables(vec![vec![
+                    ("kind", EditValue::Str("regex".into())),
+                    ("pattern", EditValue::Str("(".into())),
+                ]]),
+            )],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ignores.rules"), "{error}");
+    }
+
+    #[test]
     fn a_list_of_tables_becomes_blocks_and_the_rest_of_the_file_stays() {
         let text = "# mine\n[highlights]\nmentions = false # off\n\n[chat]\ntimestamps = false\n";
         let (out, settings) = edit(
