@@ -474,7 +474,19 @@ impl Driver {
                 return Ok(value);
             }
             if Instant::now() > deadline {
-                return Err(format!("timed out after {limit:?}"));
+                let (draws, held, channels, images) = cx.update(|cx| {
+                    let sizes = self.hub.read(cx).sizes(cx);
+                    (
+                        self.diagnostics.total_draws(),
+                        sizes.iter().map(|s| s.len).sum::<usize>(),
+                        sizes.len(),
+                        image_stats(cx).map_or(0, |s| s.in_flight),
+                    )
+                });
+                return Err(format!(
+                    "timed out after {limit:?} ({draws} draws, {held} messages in \
+                     {channels} channels, {images} image loads in flight)"
+                ));
             }
             cx.background_executor()
                 .timer(Duration::from_millis(10))
@@ -640,10 +652,11 @@ impl Driver {
                 if sent == n && index > 0 {
                     // The channel exists once its first batch is in: show it.
                     let hub = self.hub.clone();
-                    self.until(cx, Duration::from_secs(10), move |_, cx| {
+                    self.until(cx, Duration::from_secs(60), move |_, cx| {
                         (hub.read(cx).channels().len() > index).then_some(())
                     })
-                    .await?;
+                    .await
+                    .map_err(|e| format!("channel {} never appeared: {e}", index + 1))?;
                     self.window
                         .update(cx, |_, window, cx| {
                             window.dispatch_action(Box::new(crate::actions::SelectNextChannel), cx);
