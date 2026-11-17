@@ -474,6 +474,14 @@ impl AppShell {
                 pane.update(cx, |pane, cx| pane.set_in_split(in_split, cx));
             }
         }
+        // Panes no split shows keep their scrollback and scroll position, but not their layouts
+        // or pinned images (PR 6.1).
+        for (channel, pane) in &self.panes {
+            if !shown.contains(channel) {
+                let chat = pane.read(cx).chat();
+                chat.update(cx, |chat, _| chat.release_hidden());
+            }
+        }
         self.push_view(cx);
         let focus = (
             self.layout.focused(),

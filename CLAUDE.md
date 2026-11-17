@@ -10,6 +10,7 @@ section of `PLAN.md` for your PR before changing anything.
 cargo run -p gpui-chat                                # launch the app
 cargo run -p gpui-chat --release -- --firehose 1000 --hud  # offline synthetic chat + debug HUD (⌘⇧D)
 cargo run -p gpui-chat --release -- --replay fixtures/irc/privmsg.irc --hud   # replay a recorded IRC log
+scripts/bench.sh                                      # performance budgets, offline (PR 6.1)
 cargo fmt --all --check                               # formatting
 cargo clippy --workspace --all-targets -- -D warnings # lints (must be warning-free)
 cargo test --workspace                                # all tests

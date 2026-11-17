@@ -99,14 +99,34 @@ pub fn init(appearance: &AppearanceSettings, cx: &mut App) {
     apply(appearance, cx);
 }
 
+/// The font settings the current [`FontConfig`] was resolved from.
+struct ResolvedFrom {
+    chain: Vec<String>,
+    size: f32,
+}
+
+impl Global for ResolvedFrom {}
+
 /// Resolves the font for `appearance` against the installed families and stores it as the
-/// [`FontConfig`] global. Callers re-apply the theme afterwards (see `theme::apply_settings`)
-/// so Kit components pick the new font up too.
+/// [`FontConfig`] global, unless it was already resolved for the same family chain and size.
+/// Callers re-apply the theme afterwards (see `theme::apply_settings`) so Kit components pick
+/// the new font up too.
 pub fn apply(appearance: &AppearanceSettings, cx: &mut App) {
+    let from = ResolvedFrom {
+        chain: appearance.font_chain().map(str::to_owned).collect(),
+        size: appearance.font_size,
+    };
+    let same = cx.try_global::<ResolvedFrom>().is_some_and(|resolved| {
+        resolved.chain == from.chain && resolved.size.to_bits() == from.size.to_bits()
+    });
+    if same && cx.has_global::<FontConfig>() {
+        return;
+    }
     let installed = cx.text_system().all_font_names();
     let config = resolve(appearance, &installed);
     tracing::info!(family = %config.family, size = config.size.as_f32(), "resolved UI font");
     cx.set_global(config);
+    cx.set_global(from);
 }
 
 /// The family and size to use for `appearance`, given the installed family names.

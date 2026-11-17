@@ -270,7 +270,7 @@ impl Render for ImageView {
                             drawn.borrow_mut().push(image);
                         }
                     }
-                    Images::arm_retry(cx);
+                    Images::after_paint(cx);
                 },
             )
             .size_full(),
@@ -370,6 +370,38 @@ fn an_evicted_image_nothing_shows_is_released_by_the_pump(cx: &mut TestAppContex
     h.cache(cx).clear_memory();
     h.pump(cx);
     assert!(!w.in_atlas(&render, cx));
+}
+
+#[gpui_kit::test]
+fn an_idle_texture_is_released_but_the_image_stays_cached(cx: &mut TestAppContext) {
+    let h = Harness::new(&[("a", "static.png")], 1 << 30, cx);
+    let w = Window1::open(&["a"], cx);
+    h.load("a", cx);
+    let render = w.drawn.borrow()[0].render_image().clone();
+    let later = Instant::now() + TEXTURE_IDLE + Duration::from_secs(1);
+
+    // On screen: kept however long ago it was first painted.
+    cx.update(|cx| Images::release_idle_textures(later, cx));
+    assert!(w.in_atlas(&render, cx), "pinned by the view");
+
+    // Off screen but painted a moment ago: kept for now, and a later sweep is due.
+    w.show.set(false);
+    w.redraw(cx);
+    w.redraw(cx);
+    assert!(cx.update(|cx| Images::release_idle_textures(Instant::now(), cx)));
+    assert!(w.in_atlas(&render, cx));
+
+    // Idle long enough: the texture goes, the decoded image stays in memory.
+    assert!(!cx.update(|cx| Images::release_idle_textures(later, cx)));
+    assert!(!w.in_atlas(&render, cx), "texture released");
+    assert!(matches!(h.cache(cx).status("a"), ImageStatus::Ready(_)));
+    assert_eq!(cx.read(|cx| cx.global::<Images>().textured_len()), 0);
+
+    // Shown again: uploaded from memory, nothing fetched.
+    w.show.set(true);
+    w.redraw(cx);
+    assert!(w.in_atlas(&render, cx));
+    assert_eq!(h.requests(), 1);
 }
 
 #[gpui_kit::test]

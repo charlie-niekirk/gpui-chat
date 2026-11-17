@@ -192,6 +192,9 @@ pub struct ChatView {
     /// Line height of the last render.
     line_height: Pixels,
     images: Rc<RefCell<FrameImages>>,
+    /// The pane went out of sight and this view let go of its layouts and pinned images
+    /// ([`Self::release_hidden`]); the next render re-measures if emote boxes changed meanwhile.
+    released: bool,
     hover: Rc<RefCell<EmoteHover>>,
     /// Whether rows offer Reply (there is a composer to reply with).
     can_reply: bool,
@@ -327,6 +330,7 @@ impl ChatView {
             rebuilds_seen,
             line_height: px(0.0),
             images: Rc::default(),
+            released: false,
             hover: Rc::default(),
             can_reply: false,
             hovered: Rc::default(),
@@ -699,6 +703,19 @@ impl ChatView {
     }
 
     /// The layout caches in use: the list's and the thread popover's.
+    /// The pane left the screen (another channel took it, or its split closed): drop the cached
+    /// layouts (shaped again lazily, only for the rows drawn, when it comes back) and the images
+    /// pinned for its last frame, so a hidden pane holds neither (PR 6.1: ten channels' layouts
+    /// and pins were most of the memory not counted by the image budget). The store, the list's
+    /// measured heights and the scroll position stay.
+    pub fn release_hidden(&mut self) {
+        for cache in self.caches() {
+            cache.borrow_mut().clear();
+        }
+        self.images.borrow_mut().release();
+        self.released = true;
+    }
+
     fn caches(&self) -> impl Iterator<Item = &Rc<RefCell<LayoutCache>>> {
         std::iter::once(&self.cache).chain(self.thread.as_ref().map(|panel| &panel.cache))
     }
@@ -958,7 +975,16 @@ impl ChatView {
         let Some(seen) = self.image_version.replace(version) else {
             return;
         };
-        match images.changes_since(seen) {
+        let changes = images.changes_since(seen);
+        if std::mem::take(&mut self.released) {
+            // Nothing is cached to drop, but rows measured before the pane was hidden may have
+            // another height now: let the list measure again as rows are drawn.
+            if changes != LayoutChanges::None {
+                self.list.remeasure();
+            }
+            return;
+        }
+        match changes {
             LayoutChanges::None => {}
             LayoutChanges::Urls(urls) => {
                 // The popover's rows are not in the list: they are measured at every frame, so
@@ -2404,6 +2430,34 @@ mod tests {
         // Only rows that were drawn were shaped, and evicted ones were dropped from the cache.
         let cached = h.view.read_with(cx, |v, _| v.cache.borrow().len());
         assert!(cached > 0 && cached < 100, "{cached} layouts cached");
+    }
+
+    #[gpui_kit::test]
+    fn a_hidden_view_lets_go_of_its_layouts_and_shapes_only_what_it_draws_again(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        h.scroll(300.0, cx);
+        let (cached, top) = h.view.read_with(cx, |v, _| {
+            (v.cache.borrow().len(), v.list_state().logical_scroll_top())
+        });
+        assert!(cached > 0);
+        h.view.update(cx, |v, _| v.release_hidden());
+        assert_eq!(h.view.read_with(cx, |v, _| v.cache.borrow().len()), 0);
+        // Shown again: the same place in the scrollback, and only the rows drawn are shaped.
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let (again, top_again, items) = h.view.read_with(cx, |v, _| {
+            (
+                v.cache.borrow().len(),
+                v.list_state().logical_scroll_top(),
+                v.list_state().item_count(),
+            )
+        });
+        assert_eq!(top_again, top, "the scroll position survives");
+        assert!(again > 0 && again <= cached, "{again} of {cached}");
+        assert_eq!(items, 200);
     }
 
     #[gpui_kit::test]

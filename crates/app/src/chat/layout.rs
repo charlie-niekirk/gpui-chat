@@ -617,7 +617,15 @@ struct Entry {
     flow: Rc<Flow>,
     /// `f32::to_bits` of the width `flow` was made for.
     width_bits: u32,
+    /// When it was last asked for ([`LayoutCache::tick`]).
+    used: u64,
 }
+
+/// Most layouts one cache keeps (a few KB each). Above the default scrollback (1 000), so a
+/// default channel keeps every layout; a 100 000-message scrollback that is followed live would
+/// otherwise keep a layout for every message it ever drew (hundreds of MB, PR 6.1). The least
+/// recently used go first, so the rows on screen always stay.
+pub const MAX_LAYOUTS: usize = 2_048;
 
 /// Counters for tests and diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -627,14 +635,31 @@ pub struct CacheStats {
     pub hits: u64,
 }
 
-/// Per-message layouts by store sequence number.
-#[derive(Default)]
+/// Per-message layouts by store sequence number, at most [`MAX_LAYOUTS`] of them.
 pub struct LayoutCache {
     entries: BTreeMap<u64, Entry>,
     stats: CacheStats,
+    /// Use counter: every lookup takes the next number.
+    tick: u64,
+    capacity: usize,
+}
+
+impl Default for LayoutCache {
+    fn default() -> Self {
+        Self::with_capacity(MAX_LAYOUTS)
+    }
 }
 
 impl LayoutCache {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            stats: CacheStats::default(),
+            tick: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
     /// The layout of message `seq` at `width`. Shapes with `shape` only when nothing reusable is
     /// cached (new message, changed message, or a different `key`); re-flows when only the width
     /// changed.
@@ -648,10 +673,12 @@ impl LayoutCache {
         shape: impl FnOnce() -> ShapedMessage,
     ) -> MessageLayout {
         let width_bits = width.to_bits();
+        self.tick += 1;
         if let Some(entry) = self.entries.get_mut(&seq)
             && entry.key == key
             && Arc::ptr_eq(&entry.message, message)
         {
+            entry.used = self.tick;
             if entry.width_bits != width_bits {
                 entry.flow = Rc::new(flow::flow(&entry.shaped.atoms, width, line_height));
                 entry.width_bits = width_bits;
@@ -676,9 +703,26 @@ impl LayoutCache {
                 shaped: shaped.clone(),
                 flow: flow.clone(),
                 width_bits,
+                used: self.tick,
             },
         );
+        // Trimmed in steps of an eighth, so the sort runs once per that many new layouts.
+        if self.entries.len() > self.capacity + self.capacity / 8 {
+            self.trim();
+        }
         MessageLayout { shaped, flow }
+    }
+
+    /// Drops the least recently used layouts down to the capacity.
+    fn trim(&mut self) {
+        let excess = self.entries.len().saturating_sub(self.capacity);
+        if excess == 0 {
+            return;
+        }
+        let mut uses: Vec<u64> = self.entries.values().map(|entry| entry.used).collect();
+        let (_, &mut cutoff, _) = uses.select_nth_unstable(excess - 1);
+        // Ticks are unique, so exactly `excess` entries are at or below the cutoff.
+        self.entries.retain(|_, entry| entry.used > cutoff);
     }
 
     /// Drops the layouts that draw any of `urls`, so they are shaped again (with the boxes the
@@ -714,6 +758,11 @@ impl LayoutCache {
             .into_iter()
             .filter_map(|(seq, entry)| Some((map(seq)?, entry)))
             .collect();
+    }
+
+    /// Drops every layout (the view is hidden; rows are shaped again when drawn).
+    pub fn clear(&mut self) {
+        self.entries = BTreeMap::new();
     }
 
     /// Drops the layouts of messages before `first_seq` (evicted from the store).
@@ -1437,6 +1486,34 @@ mod tests {
             LayoutCache::default().layout(1, &m, key, 1000.0, 10.0, || shaped("hello world"));
         assert_eq!(plain.reply_height(), 0.0);
         assert_eq!(plain.height(), plain.flow.height());
+    }
+
+    #[test]
+    fn the_cache_keeps_the_most_recently_used_layouts_up_to_its_capacity() {
+        let mut cache = LayoutCache::with_capacity(8);
+        let m = message("x");
+        let key = LayoutKey::new(1, 1.0);
+        let shapes = std::cell::Cell::new(0);
+        let layout = |cache: &mut LayoutCache, seq| {
+            cache.layout(seq, &m, key, 100.0, 10.0, || {
+                shapes.set(shapes.get() + 1);
+                shaped("x")
+            })
+        };
+        // Rows 0 and 1 stay "on screen" (asked for again and again) while 30 others pass by.
+        for seq in 2..32 {
+            layout(&mut cache, 0);
+            layout(&mut cache, 1);
+            layout(&mut cache, seq);
+            assert!(cache.len() <= 9, "{} layouts", cache.len());
+        }
+        let before = shapes.get();
+        layout(&mut cache, 0);
+        layout(&mut cache, 1);
+        layout(&mut cache, 31);
+        assert_eq!(shapes.get(), before, "the rows in use were never dropped");
+        layout(&mut cache, 2);
+        assert_eq!(shapes.get(), before + 1, "an old row is shaped again");
     }
 
     #[test]

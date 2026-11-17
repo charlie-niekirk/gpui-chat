@@ -118,7 +118,7 @@ fn paint(
         }
         Lookup::Ready(_) | Lookup::Failed { .. } => {}
     }
-    Images::arm_retry(cx);
+    Images::after_paint(cx);
 }
 
 /// The largest box of the image's proportions that fits in `bounds`, centred.

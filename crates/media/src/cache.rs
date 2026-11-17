@@ -71,7 +71,7 @@ impl Default for ImageCacheConfig {
         Self {
             disk_dir: None,
             disk_max_bytes: 256 * 1024 * 1024,
-            memory_budget_bytes: 256 * 1024 * 1024,
+            memory_budget_bytes: 64 * 1024 * 1024,
             max_concurrent_fetches: 8,
             max_concurrent_decodes: (cpus / 2).clamp(1, 4),
             request_timeout: http.request_timeout,
@@ -215,8 +215,8 @@ impl<V: CacheValue> ImageCacheBuilder<V> {
         self
     }
 
-    /// Called when a load finishes, successfully or not (so the UI can repaint). Same threading
-    /// rules as [`Self::on_evict`].
+    /// Called when a load finishes, successfully or not (so the UI can repaint), before the
+    /// load's handles resolve. Same threading rules as [`Self::on_evict`].
     #[must_use]
     pub fn on_ready(mut self, f: impl Fn(&ImageKey) + Send + Sync + 'static) -> Self {
         self.on_ready = Some(Arc::new(f));
@@ -549,7 +549,11 @@ impl<V: CacheValue> ImageCache<V> {
         .map_err(MediaError::from)
     }
 
-    /// Publishes a finished load to the memory cache, waiters and callbacks.
+    /// Publishes a finished load to the memory cache, then the callbacks, then the waiters: by
+    /// the time a handle resolves, `on_evict` and `on_ready` for that load have run. (They used
+    /// to run after the waiters were woken, so a caller could see the image before the callbacks
+    /// had fired; two tests raced on it, PR 6.1.) Anyone asking in between finds the result in
+    /// the memory or failure cache.
     fn finish(&self, key: &ImageKey, result: LoadResult<V>) {
         let mut state = self.state();
         let evicted = match &result {
@@ -571,13 +575,14 @@ impl<V: CacheValue> ImageCache<V> {
                 Vec::new()
             }
         };
-        if let Some(tx) = state.in_flight.remove(key) {
-            tx.send_replace(Some(result));
-        }
+        let waiters = state.in_flight.remove(key);
         drop(state);
         self.notify_evicted(evicted);
         if let Some(f) = &self.inner.on_ready {
             f(key);
+        }
+        if let Some(tx) = waiters {
+            tx.send_replace(Some(result));
         }
     }
 
