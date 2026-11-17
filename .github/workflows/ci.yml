@@ -34,6 +34,11 @@ jobs:
         run: cargo test --locked --workspace
       - name: Build
         run: cargo build --locked --workspace
+      # The performance budgets that do not depend on the machine's speed (PR 6.1): an idle
+      # window draws nothing and the 10 × 1 000 memory scenario stays under a generous resident
+      # size with the image cache within its byte budget. Offline, synthetic images, ~30 s.
+      - name: Budgets (idle, memory)
+        run: scripts/bench.sh --ci --no-build --bin target/debug/gpui-chat --only idle,memory
 
   # Everything except the GPUI app crate must build and pass on Linux
   # (cross-platform guardrail, see docs/ARCHITECTURE.md).

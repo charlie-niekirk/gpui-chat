@@ -55,6 +55,9 @@ tempfile = "3"
 # HTTP mock server for the auth / Helix tests.
 wiremock = "0.6"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Heap accounting for the memory / allocation budget tests (PR 6.1): a counting global allocator
+# without `unsafe` in our code.
+dhat = "0.3"
 
 # Text
 unicode-segmentation = "1.13"

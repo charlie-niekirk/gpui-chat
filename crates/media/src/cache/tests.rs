@@ -159,11 +159,13 @@ async fn get_if_ready_and_status_follow_the_load() {
     let handle = cache.request(URL);
     assert!(handle.try_get().is_none());
     let img = handle.await.unwrap();
+    // `on_ready` runs before the handle resolves, so this needs no waiting.
+    assert_eq!(*ready.lock().unwrap(), vec![URL.to_owned()]);
     assert_eq!((img.width(), img.height()), (8, 8));
     assert!(matches!(cache.status(URL), ImageStatus::Ready(_)));
     assert!(cache.get_if_ready(URL).is_some());
     assert!(cache.get_or_request(URL).is_some());
-    assert_eq!(*ready.lock().unwrap(), vec![URL.to_owned()]);
+    assert_eq!(ready.lock().unwrap().len(), 1, "memory hits do not report");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -244,6 +246,7 @@ async fn lru_evicts_by_bytes_and_notifies() {
     assert!(cache.get_if_ready("u1").is_some());
     cache.load("u3").await.unwrap();
 
+    // `on_evict` for u3's insert ran before its handle resolved.
     assert_eq!(*evicted.lock().unwrap(), vec![("u2".to_owned(), 32)]);
     let stats = cache.stats();
     assert_eq!(stats.evictions, 1);

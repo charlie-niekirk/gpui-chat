@@ -32,6 +32,10 @@ Options:
                                at and time the painting (with --firehose; the badge images load
                                from their CDNs)
   --hud                        Start with the debug HUD visible (toggle: View > Toggle Debug HUD)
+  --bench <name>               Run one performance-budget scenario offline, print its numbers as a
+                               `BENCH {json}` line and quit: scroll, burst, idle, memory, images
+                               or launch
+                               (see scripts/bench.sh, which runs them all in an isolated HOME)
   -h, --help                   Print this help
 ";
 
@@ -50,6 +54,8 @@ pub struct Cli {
     pub hud: bool,
     /// Give the synthetic users paints and third-party badges.
     pub cosmetics: bool,
+    /// Run a performance-budget scenario and quit (`--bench`).
+    pub bench: Option<crate::bench::BenchKind>,
 }
 
 impl Default for Cli {
@@ -62,6 +68,7 @@ impl Default for Cli {
             replay_speed: 1.0,
             hud: false,
             cosmetics: false,
+            bench: None,
         }
     }
 }
@@ -140,6 +147,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError>
                 }
                 cli.firehose_channels = count;
             }
+            "--bench" => {
+                let raw = value("--bench")?;
+                cli.bench = Some(crate::bench::BenchKind::parse(&raw).ok_or_else(|| {
+                    error(format!(
+                        "--bench: `{raw}` is not one of {}",
+                        crate::bench::BenchKind::NAMES.join(", ")
+                    ))
+                })?);
+            }
             "--replay" => cli.replay = Some(PathBuf::from(value("--replay")?)),
             "--replay-speed" => {
                 let raw = value("--replay-speed")?;
@@ -165,6 +181,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, CliError>
     }
     if speed_given && cli.replay.is_none() {
         return Err(error("--replay-speed needs --replay"));
+    }
+    if cli.bench.is_some() && (cli.firehose.is_some() || cli.replay.is_some()) {
+        return Err(error(
+            "--bench brings its own source; leave out --firehose / --replay",
+        ));
     }
     Ok(Parsed::Run(cli))
 }
@@ -192,6 +213,7 @@ mod tests {
             replay_speed: 1.0,
             hud: true,
             cosmetics: false,
+            bench: None,
         });
         assert_eq!(
             parse_args(&[
@@ -259,6 +281,24 @@ mod tests {
             &["--replay", "x", "--replay-speed", "-1"],
             &["--replay", "x", "--replay-speed", "fast"],
             &["--replay", "x", "--replay-speed", "1e9"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn bench_names() {
+        assert_eq!(
+            parse_args(&["--bench", "memory"]),
+            Ok(Parsed::Run(Cli {
+                bench: Some(crate::bench::BenchKind::Memory),
+                ..Cli::default()
+            }))
+        );
+        for args in [
+            &["--bench"][..],
+            &["--bench", "everything"],
+            &["--bench", "idle", "--firehose", "10"],
         ] {
             assert!(parse_args(args).is_err(), "{args:?} should be rejected");
         }

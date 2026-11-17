@@ -18,6 +18,10 @@
 //! * **Frame interval** is the time between the starts of consecutive draws. Gaps over
 //!   [`IDLE_GAP`] are idle time, not slow frames, and are left out.
 //!
+//! * **Input latency** (`--bench`, PR 6.1) is the time from when an input event was due (the
+//!   bench driver's schedule, so a busy main thread that delays the event counts) to the end of
+//!   the first draw that started after it was dispatched ([`Diagnostics::record_input`]).
+//!
 //! Recording never schedules a frame: the HUD reads these numbers when it renders.
 
 use std::cell::RefCell;
@@ -93,6 +97,11 @@ pub struct FrameSummary {
     pub interval_p99: Duration,
     /// Draws that started within the last second.
     pub draws_last_second: usize,
+    /// Input events whose draw was seen, and their latency (see the module docs).
+    pub inputs: usize,
+    pub input_p50: Duration,
+    pub input_p99: Duration,
+    pub input_max: Duration,
 }
 
 /// Rolling draw times and intervals.
@@ -109,9 +118,39 @@ pub struct FrameStats {
     /// Start times of the draws in the last second (for the draws-per-second figure).
     recent_starts: VecDeque<Instant>,
     total_draws: u64,
+    /// When the first draw ended (launch time, `--bench launch`).
+    first_draw_end: Option<Instant>,
+    /// An input event dispatched and not drawn yet: (due, dispatched).
+    pending_input: Option<(Instant, Instant)>,
+    input_latencies: VecDeque<Duration>,
 }
 
 impl FrameStats {
+    /// An input event that was due at `due` was dispatched at `dispatched`; the next draw that
+    /// starts after `dispatched` shows it. A second event before that draw is folded into the
+    /// first (one draw shows both; the older due time is kept).
+    pub fn record_input(&mut self, due: Instant, dispatched: Instant) {
+        if self.pending_input.is_none() {
+            self.pending_input = Some((due, dispatched));
+        }
+    }
+
+    /// Forgets the rolling windows (not the totals), so a measurement starts clean.
+    pub fn reset_window(&mut self) {
+        self.draws.clear();
+        self.applies.clear();
+        self.totals.clear();
+        self.intervals.clear();
+        self.input_latencies.clear();
+        self.pending_input = None;
+        self.pending_apply = None;
+        self.last_start = None;
+    }
+
+    pub fn first_draw_end(&self) -> Option<Instant> {
+        self.first_draw_end
+    }
+
     /// Records one bridge `apply` that started at `at` and took `took`. It is charged to the
     /// next draw.
     pub fn record_apply(&mut self, at: Instant, took: Duration) {
@@ -125,6 +164,17 @@ impl FrameStats {
     /// Records one draw that started at `start` and ended at `end`.
     pub fn record_draw(&mut self, start: Instant, end: Instant) {
         self.total_draws += 1;
+        self.first_draw_end.get_or_insert(end);
+        if let Some((due, dispatched)) = self.pending_input
+            && start >= dispatched
+        {
+            self.pending_input = None;
+            push_capped(
+                &mut self.input_latencies,
+                end.saturating_duration_since(due),
+                FRAME_WINDOW,
+            );
+        }
         let draw = end.saturating_duration_since(start);
         push_capped(&mut self.draws, draw, FRAME_WINDOW);
         // Apply work belongs to this frame if it just preceded the draw; an apply that changed
@@ -162,6 +212,7 @@ impl FrameStats {
         let applies = sorted(&self.applies);
         let totals = sorted(&self.totals);
         let intervals = sorted(&self.intervals);
+        let inputs = sorted(&self.input_latencies);
         FrameSummary {
             total_draws: self.total_draws,
             window_draws: draws.len(),
@@ -182,6 +233,10 @@ impl FrameStats {
                 .iter()
                 .filter(|t| now.saturating_duration_since(**t) <= Duration::from_secs(1))
                 .count(),
+            inputs: inputs.len(),
+            input_p50: percentile(&inputs, 0.50),
+            input_p99: percentile(&inputs, 0.99),
+            input_max: inputs.last().copied().unwrap_or_default(),
         }
     }
 }
@@ -333,6 +388,20 @@ impl Diagnostics {
 
     pub fn total_draws(&self) -> u64 {
         self.inner.borrow().frames.total_draws()
+    }
+
+    /// See [`FrameStats::record_input`].
+    pub fn record_input(&self, due: Instant, dispatched: Instant) {
+        self.inner.borrow_mut().frames.record_input(due, dispatched);
+    }
+
+    /// See [`FrameStats::reset_window`].
+    pub fn reset_frame_window(&self) {
+        self.inner.borrow_mut().frames.reset_window();
+    }
+
+    pub fn first_draw_end(&self) -> Option<Instant> {
+        self.inner.borrow().frames.first_draw_end()
     }
 
     pub fn total_batches(&self) -> u64 {
@@ -494,6 +563,28 @@ mod tests {
         );
         assert_eq!(s.apply_max, ms(50), "the apply itself is still reported");
         assert_eq!(s.over_budget, 0);
+    }
+
+    #[test]
+    fn input_latency_runs_from_due_time_to_the_end_of_the_next_draw() {
+        let t0 = Instant::now();
+        let mut stats = FrameStats::default();
+        // Due at 0, dispatched 3 ms late; a draw already under way does not show it.
+        stats.record_input(t0, t0 + ms(3));
+        stats.record_draw(t0 + ms(1), t0 + ms(2));
+        stats.record_draw(t0 + ms(4), t0 + ms(6));
+        // A second event before its draw is folded into the first.
+        stats.record_input(t0 + ms(10), t0 + ms(10));
+        stats.record_input(t0 + ms(12), t0 + ms(12));
+        stats.record_draw(t0 + ms(13), t0 + ms(20));
+        let s = stats.summary(t0 + ms(20));
+        assert_eq!(s.inputs, 2);
+        assert_eq!(s.input_max, ms(10));
+        assert_eq!(s.input_p50, ms(6));
+        assert_eq!(stats.first_draw_end(), Some(t0 + ms(2)));
+        stats.reset_window();
+        assert_eq!(stats.summary(t0 + ms(20)).inputs, 0);
+        assert_eq!(stats.total_draws(), 3, "totals survive a reset");
     }
 
     #[test]

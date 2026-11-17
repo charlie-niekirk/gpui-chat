@@ -192,6 +192,9 @@ pub struct ChatView {
     /// Line height of the last render.
     line_height: Pixels,
     images: Rc<RefCell<FrameImages>>,
+    /// The pane went out of sight and this view let go of its layouts and pinned images
+    /// ([`Self::release_hidden`]); the next render re-measures if emote boxes changed meanwhile.
+    released: bool,
     hover: Rc<RefCell<EmoteHover>>,
     /// Whether rows offer Reply (there is a composer to reply with).
     can_reply: bool,
@@ -327,6 +330,7 @@ impl ChatView {
             rebuilds_seen,
             line_height: px(0.0),
             images: Rc::default(),
+            released: false,
             hover: Rc::default(),
             can_reply: false,
             hovered: Rc::default(),
@@ -698,6 +702,21 @@ impl ChatView {
         self.thread.as_ref().map(|panel| &panel.root)
     }
 
+    /// The pane left the screen (another channel took it, or its split closed): drop the cached
+    /// layouts (shaped again lazily, only for the rows drawn, when it comes back) and the images
+    /// pinned for its last frame, so a hidden pane holds neither (PR 6.1: ten channels' layouts
+    /// and pins were most of the memory not counted by the image budget). The store, the list's
+    /// measured heights and the scroll position stay.
+    pub fn release_hidden(&mut self) {
+        for cache in self.caches() {
+            cache.borrow_mut().clear();
+        }
+        self.images.borrow_mut().release();
+        // Before its first image-aware render nothing was measured with an emote box, so there
+        // is nothing to re-measure (and `apply_image_changes` would not consume the flag).
+        self.released = self.image_version.is_some();
+    }
+
     /// The layout caches in use: the list's and the thread popover's.
     fn caches(&self) -> impl Iterator<Item = &Rc<RefCell<LayoutCache>>> {
         std::iter::once(&self.cache).chain(self.thread.as_ref().map(|panel| &panel.cache))
@@ -954,11 +973,21 @@ impl ChatView {
             return;
         };
         let version = images.layout_version();
+        let released = std::mem::take(&mut self.released);
         // Nothing is cached before the first render, so there is nothing to apply.
         let Some(seen) = self.image_version.replace(version) else {
             return;
         };
-        match images.changes_since(seen) {
+        let changes = images.changes_since(seen);
+        if released {
+            // Nothing is cached to drop, but rows measured before the pane was hidden may have
+            // another height now: let the list measure again as rows are drawn.
+            if changes != LayoutChanges::None {
+                self.list.remeasure();
+            }
+            return;
+        }
+        match changes {
             LayoutChanges::None => {}
             LayoutChanges::Urls(urls) => {
                 // The popover's rows are not in the list: they are measured at every frame, so
@@ -2407,6 +2436,34 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_hidden_view_lets_go_of_its_layouts_and_shapes_only_what_it_draws_again(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut h, cx) = Harness::new(cx, 1000);
+        h.push(200, "hello", cx);
+        h.scroll(300.0, cx);
+        let (cached, top) = h.view.read_with(cx, |v, _| {
+            (v.cache.borrow().len(), v.list_state().logical_scroll_top())
+        });
+        assert!(cached > 0);
+        h.view.update(cx, |v, _| v.release_hidden());
+        assert_eq!(h.view.read_with(cx, |v, _| v.cache.borrow().len()), 0);
+        // Shown again: the same place in the scrollback, and only the rows drawn are shaped.
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let (again, top_again, items) = h.view.read_with(cx, |v, _| {
+            (
+                v.cache.borrow().len(),
+                v.list_state().logical_scroll_top(),
+                v.list_state().item_count(),
+            )
+        });
+        assert_eq!(top_again, top, "the scroll position survives");
+        assert!(again > 0 && again <= cached, "{again} of {cached}");
+        assert_eq!(items, 200);
+    }
+
+    #[gpui_kit::test]
     fn scrolling_up_pauses_counts_new_messages_and_the_pill_jumps_back(cx: &mut TestAppContext) {
         let (mut h, cx) = Harness::new(cx, 1000);
         h.push(200, "hello", cx);
@@ -2930,6 +2987,48 @@ mod tests {
         h.view.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert_eq!(shaped(cx, &h) - baseline, 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_pane_hidden_before_its_first_render_still_reshapes_changed_emote_boxes(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut h, cx) = Harness::new(cx, 100);
+        // Hidden before it ever rendered with an image store (a pane created behind another).
+        h.view.update(cx, |v, _| v.release_hidden());
+        cx.update(|_, cx| {
+            Images::install(
+                gpui_chat_media::ImageCache::builder(runtime.handle().clone())
+                    .fetcher(Arc::new(NeverFetcher)),
+                cx,
+            );
+        });
+        h.store.update(cx, |store, cx| {
+            store.apply_all([emote_message(0, &["wide"]), emote_message(1, &["plain"])]);
+            cx.notify();
+        });
+        h.next += 2;
+        cx.run_until_parked();
+        let shaped = |cx: &mut VisualTestContext, h: &Harness| {
+            h.view.read_with(cx, |v, _| v.cache_stats().shaped)
+        };
+        let baseline = shaped(cx, &h);
+        assert_eq!(baseline, 2);
+        cx.update(|_, cx| {
+            cx.global_mut::<Images>()
+                .record_layout_change(&gpui_chat_media::ImageKey::new("wide"));
+        });
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(
+            shaped(cx, &h) - baseline,
+            1,
+            "the row drawing the changed emote is shaped again with its real box"
+        );
     }
 
     #[gpui_kit::test]

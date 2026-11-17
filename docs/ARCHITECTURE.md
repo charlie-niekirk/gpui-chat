@@ -158,6 +158,14 @@ bundle ID, `User-Agent`) reads them from there, so a rename is one small PR.
   backwards stamps never rewind, untimestamped events go with the previous one; a log with no
   stamps runs at 100 events/s); speed 0 is as fast as the UI takes events. Lossless (`send().await`),
   unlike the firehose; rejected lines are counted as parse errors on the HUD.
+- `bench.rs` (PR 6.1) — `--bench <scenario>`: the performance budgets as offline scenarios (see
+  *Performance budgets*). Each starts its own synthetic source (the firehose `Generator` with
+  `ThirdPartyEmotes`: synthetic 7TV / BTTV sets resolved with `resolve_fragments`), installs the image
+  store with `SyntheticFetcher` (sizes and animation read from the URL, a few shapes encoded once),
+  drives the window (`Window::dispatch_event` scroll events, `SelectNextChannel`), prints one
+  `BENCH {json}` line and quits. Input latency comes from `Diagnostics::record_input`; process
+  numbers from `ps` / `footprint`. `GPUI_CHAT_BENCH_HOLD_S` keeps the process up after measuring
+  (for `vmmap`, `footprint`, Instruments).
 - `diagnostics.rs` / `hud.rs` — debug HUD (⌘⇧D, View menu). `FrameProbe` wraps the window content
   and times the draw (layout request → paint end) with `Instant`s; ingest is timestamped in the
   bridge `apply`. The HUD re-renders only when something happened (ingest, drops, foreign draws)
@@ -723,10 +731,13 @@ memory insert. 404/410 and undecodable images are remembered for 10 min, other f
   browsers). Delays of 10 ms or less become 100 ms. `DecodeLimits` (default 2048 px per side,
   1024 frames, 64 MB decoded) reject oversized canvases and truncate long animations.
   Decode cost is benchmarked in `crates/media/benches/decode.rs`.
-- **Memory:** `ByteLru` with a byte budget (default 256 MB). `V: CacheValue` lets the app store
+- **Memory:** `ByteLru` with a byte budget (default 64 MB since PR 6.1: images on screen are
+  pinned by the views whatever the budget, so it only decides how much *off-screen* is kept, and
+  256 MB put the app over its memory budget on its own). `V: CacheValue` lets the app store
   its own value (e.g. `Arc<RenderImage>` plus a `Timeline`) so pixels are held once.
   `on_evict` fires for every entry leaving memory (to release GPU textures), `on_ready` when a
-  load finishes (to repaint); both run off the UI thread with no locks held.
+  load finishes (to repaint); both run off the UI thread with no locks held, and both have run
+  before the load's handles resolve.
 - **Render path:** `get_if_ready(url)` (memory only, never blocks) or `get_or_request(url)`;
   `Timeline::frame_at(elapsed)` maps one global animation clock to a frame index and the time
   to the next frame change.
@@ -896,7 +907,12 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   generation, scale factor). Two levels: the shaped atoms survive a width change, so a resize
   only re-flows (no shaping); a font family/size, line-height or timestamp change bumps the
   generation and re-shapes on next use; a replaced message (`Arc` differs, e.g. deleted)
-  re-shapes. Evicted messages' layouts are dropped on the next sync.
+  re-shapes. Evicted messages' layouts are dropped on the next sync. At most `MAX_LAYOUTS` (2 048,
+  above the default scrollback) are kept, least recently used dropped first, so a big scrollback
+  followed live does not keep a layout (a few KB) per message. A pane no split shows drops all of
+  its layouts and pins (`ChatView::release_hidden`, called by the shell's `sync_layout`); its
+  store, measured row heights and scroll position stay, and only the rows drawn are shaped again
+  when it comes back (PR 6.1).
 - **Virtualisation** with GPUI `list()` / `ListState` (`ListAlignment::Bottom`,
   `FollowMode::Tail`). The view keeps a `ListMirror` of the store's sequence range and turns
   each store notification into at most two `splice`s (evicted at the front, appended at the
@@ -914,13 +930,16 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
   below what reads as a delay — while scrolling still draws at the display's full rate.
 - **Images (`crates/app/src/images.rs`):** fetched and decoded off the UI thread by
   `gpui-chat-media` (de-duplicated in flight, disk cache keyed by URL hash, LRU with a byte budget,
-  default 256 MB). The cached value is an `EmoteImage`: the decoded BGRA straight-alpha frames
+  default 64 MB). The cached value is an `EmoteImage`: the decoded BGRA straight-alpha frames
   moved (no copy) into one GPUI `RenderImage` on the blocking pool, plus the frame `Timeline`;
   its atlas textures are uploaded lazily by the first `paint_image` of each frame. Each chat view
   keeps the images it painted last frame (`FrameImages`) and paints from there first, so an image
   the budget evicts while on screen keeps drawing instead of thrashing. Evicted images wait until
-  no view holds them, then `App::drop_image` releases their textures. Finished loads wake every
-  view that painted a placeholder, once per batch.
+  no view holds them, then `App::drop_image` releases their textures. A cached image that no view
+  has on screen loses its texture `TEXTURE_IDLE` (5 s) after its last paint (one timer, running
+  only while such an image exists) and is uploaded again from memory if it is drawn later, so the
+  GPU holds roughly what is on screen rather than everything the cache holds (PR 6.1). Finished
+  loads wake every view that painted a placeholder, once per batch.
 - **Inline emotes:** shaped as one `Inline` atom per emote with its final logical size (the
   provider's base size, or 28 px for Twitch, × `emotes.scale`; the image's own size once known),
   so a placeholder box holds the space while loading and lines never jump. Each flowed line is as
@@ -967,15 +986,37 @@ it; Kit components (sidebar, dock, menus, dialogs, …) stay in `crates/app`.
 
 ## Performance budgets
 
-Measured with the replay harness (PR 1.3); enforced in PR 6.1.
+Measured by `scripts/bench.sh` (PR 6.1), which runs `gpui-chat --bench <scenario>` for each row
+in a throwaway `HOME`, offline: synthetic chat from the firehose generator (paints, third-party
+badges, 7TV / BTTV emotes resolved as `EmoteService` does) and synthetic images served by
+`bench::SyntheticFetcher` (no network, no disk cache). See `crates/app/src/bench.rs` for exactly
+what each scenario does.
 
-| Metric | Target on Apple Silicon |
-|---|---|
-| Frame time while scrolling, one pane at 100 msg/s | p99 under 8.3 ms |
-| Burst ingest | 1 000 msg/s without input lag |
-| Idle CPU, no animated emote visible | under 1 % |
-| Memory, 10 channels × 1 000 messages, default image budget | under 300 MB |
-| Launch to first window | under 300 ms |
+| Metric | Target on Apple Silicon | Scenario and number |
+|---|---|---|
+| Frame time while scrolling, one pane at 100 msg/s | p99 under 8.3 ms | `scroll`: full scrollback, a scroll event every 8 ms for 10 s; apply + draw p99 (the HUD's frame total) |
+| Burst ingest | 1 000 msg/s without input lag | `burst`: 1 000 msg/s, a scroll event every 16 ms; event due → end of the draw showing it, p99 under one 60 Hz frame (16.7 ms), nothing dropped |
+| Idle CPU, no animated emote visible | under 1 % | `idle`: 3 full channels of stills; CPU over 10 s (and draws: 0) |
+| Memory, 10 channels × 1 000 messages, default image budget | under 300 MB | `memory`: each channel shown while its 1 000 messages arrive; resident size (footprint shown too) |
+| Launch to first window | under 300 ms | `launch`: exec → end of the first draw, median of 5 warm runs, offline startup path |
+
+`images` is a sanity check that the image cache stays within its byte budget under thousands of
+distinct animated emotes (the LRU enforces that on insert, so it catches a broken report or a
+budget no longer applied, not a gradual regression). `burst` also fails if the source fell behind
+or reached less than 950 msg/s.
+
+**Resident size, not footprint.** Activity Monitor's "Memory" is the physical footprint, which
+also counts GPU memory the process owns: with GPUI's Metal renderer an *empty* 1100 × 700 window
+already shows ~165 MB there while it draws (~48 MB of drawables, ~116 MB the driver marks
+purgeable when the window goes idle), none of it the app's to control. The budget is checked on
+resident size; the footprint is printed next to it.
+
+**Enforcement.** CI's `macos` job runs `scripts/bench.sh --ci --only idle,memory` on the debug
+build (no timing gates on shared runners: an idle window must draw nothing, the memory scenario
+must stay under the 300 MB budget resident with the image cache within its byte budget; ~3.5 min
+on the runner). The `linux` job runs
+`crates/core/tests/budget.rs`, which counts with `dhat` what ten full channels hold in the store
+and search index and how many allocations ingesting a message takes.
 
 ## Cross-platform guardrails
 

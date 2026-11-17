@@ -551,7 +551,7 @@ impl MessageElement {
             }
         }
         drop(frame);
-        Images::arm_retry(cx);
+        Images::after_paint(cx);
 
         let Some(hitbox) = prepainted.hitbox.clone() else {
             return;

@@ -10,6 +10,11 @@
 //! * **Textures are released on eviction.** Media's `on_evict` hands evicted images over; they wait
 //!   in a graveyard until nothing on screen holds them any more and then `App::drop_image` removes
 //!   their tiles from every window's atlas.
+//! * **…and when not drawn for a while** (PR 6.1). An image still in the memory cache keeps its
+//!   pixels there, but its texture is dropped once no view has it on screen and it was last painted
+//!   [`TEXTURE_IDLE`] ago; the next paint uploads it again. Without this every image ever painted
+//!   kept a GPU copy until the LRU evicted it, doubling what the byte budget allows. A timer runs
+//!   only while some painted image is not on screen any more.
 //! * **Visible images are pinned.** Each view keeps the images it painted in its last frame
 //!   ([`FrameImages`]); paint looks there before asking the cache, so an image the byte budget
 //!   evicted while on screen keeps drawing (and keeps its texture) instead of being refetched
@@ -32,7 +37,7 @@
 //!   [`Images`] was created, so identical emotes animate in sync wherever they are.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use gpui_chat_core::{Badge, Emote, ImageScale};
@@ -62,6 +67,9 @@ const CHANGE_LOG_CAPACITY: usize = 1024;
 /// How often a view showing a transiently failed image asks for it again (media remembers the
 /// failure for its back-off, 30 s by default, and answers from memory until then).
 pub const RETRY_POLL: Duration = Duration::from_secs(5);
+
+/// How long after its last paint an image no view shows keeps its GPU texture.
+pub const TEXTURE_IDLE: Duration = Duration::from_secs(5);
 
 /// Shortest wait between animation wake-ups, so a frame change due "now" cannot spin.
 const MIN_ANIMATION_WAKE: Duration = Duration::from_millis(4);
@@ -214,6 +222,8 @@ pub struct FrameImages {
     /// Soonest frame change among animated images painted this frame.
     next_change: Option<Duration>,
     wake: Option<(Instant, Task<()>)>,
+    /// When the frame being drawn began (what paints are stamped with).
+    frame_start: Option<Instant>,
 }
 
 impl FrameImages {
@@ -224,6 +234,7 @@ impl FrameImages {
         std::mem::swap(&mut self.shown, &mut self.painting);
         self.painting.clear();
         self.next_change = None;
+        self.frame_start = Some(Instant::now());
     }
 
     fn get(&self, key: &str) -> Option<&Arc<EmoteImage>> {
@@ -234,6 +245,15 @@ impl FrameImages {
         if !self.painting.contains_key(key.url()) {
             self.painting.insert(key.clone(), image.clone());
         }
+    }
+
+    /// Lets every pin go and cancels the animation wake: the view is no longer on screen. (Its
+    /// next render pins again whatever it paints.)
+    pub fn release(&mut self) {
+        self.shown = HashMap::new();
+        self.painting = HashMap::new();
+        self.next_change = None;
+        self.wake = None;
     }
 
     /// Notes that an animated image painted this frame changes frame after `delay`.
@@ -377,6 +397,10 @@ pub struct Images {
     /// Views that painted a transiently failed image, woken by `retry`.
     retry_waiters: HashSet<EntityId>,
     retry: Option<Task<()>>,
+    /// Images painted since their texture was last released, and when they were last painted.
+    textured: HashMap<ImageKey, (Weak<EmoteImage>, Instant)>,
+    /// Releases idle textures (see the module docs); runs only while one may be due.
+    texture_sweep: Option<Task<()>>,
     _pump: Option<Task<()>>,
 }
 
@@ -395,6 +419,8 @@ impl Images {
             to_text: HashSet::new(),
             retry_waiters: HashSet::new(),
             retry: None,
+            textured: HashMap::new(),
+            texture_sweep: None,
             _pump: None,
         }
     }
@@ -445,6 +471,16 @@ impl Images {
     #[cfg(test)]
     pub fn cache(&self) -> Option<&ImageCache<EmoteImage>> {
         self.cache.as_ref()
+    }
+
+    /// The media cache's counters and sizes (`--bench`), if there is a cache.
+    pub fn stats(&self) -> Option<gpui_chat_media::CacheStats> {
+        self.cache.as_ref().map(ImageCache::stats)
+    }
+
+    /// Evicted images still held by a view, waiting for their textures to be released.
+    pub fn graveyard_len(&self) -> usize {
+        self.graveyard.len()
     }
 
     /// Time on the global animation clock.
@@ -638,6 +674,19 @@ impl Images {
             },
         };
         frame.record(url, &image);
+        let painted = frame.frame_start.unwrap_or_else(Instant::now);
+        match self.textured.get_mut(url.url()) {
+            Some((weak, at)) => {
+                *at = painted;
+                if !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&image)) {
+                    *weak = Arc::downgrade(&image);
+                }
+            }
+            None => {
+                self.textured
+                    .insert(url.clone(), (Arc::downgrade(&image), painted));
+            }
+        }
         Lookup::Ready(image)
     }
 
@@ -652,9 +701,15 @@ impl Images {
             })
     }
 
-    /// Wakes the views that painted a transiently failed image after [`RETRY_POLL`], so they ask
-    /// for it again. Call after painting; one timer serves every view.
-    pub fn arm_retry(cx: &mut App) {
+    /// Call after painting: wakes the views that painted a transiently failed image after
+    /// [`RETRY_POLL`] so they ask for it again, and starts releasing idle textures. One timer
+    /// each serves every view.
+    pub fn after_paint(cx: &mut App) {
+        Self::arm_texture_sweep(cx);
+        Self::arm_retry(cx);
+    }
+
+    fn arm_retry(cx: &mut App) {
         match cx.try_global::<Self>() {
             Some(images) if !images.retry_waiters.is_empty() && images.retry.is_none() => {}
             _ => return,
@@ -672,6 +727,80 @@ impl Images {
             });
         });
         cx.global_mut::<Self>().retry = Some(task);
+    }
+
+    /// Starts the idle-texture timer unless it runs or nothing was painted. It stops by itself
+    /// once every painted image is on screen (pinned by a view), so a still window has no timer.
+    fn arm_texture_sweep(cx: &mut App) {
+        match cx.try_global::<Self>() {
+            Some(images) if images.texture_sweep.is_none() && !images.textured.is_empty() => {}
+            _ => return,
+        }
+        let task = cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(TEXTURE_IDLE).await;
+                let more = cx.update(|cx| Self::release_idle_textures(Instant::now(), cx));
+                if !more {
+                    break;
+                }
+            }
+            cx.update(|cx| {
+                if cx.has_global::<Self>() {
+                    cx.global_mut::<Self>().texture_sweep = None;
+                }
+            });
+        });
+        cx.global_mut::<Self>().texture_sweep = Some(task);
+    }
+
+    /// Drops the textures of images that are in the memory cache, on no view's screen and were
+    /// last painted [`TEXTURE_IDLE`] before `now`. Returns whether a later sweep may find more
+    /// (an image not on screen whose time has not come yet).
+    pub fn release_idle_textures(now: Instant, cx: &mut App) -> bool {
+        if !cx.has_global::<Self>() {
+            return false;
+        }
+        let (released, more) = cx.global_mut::<Self>().idle_textures(now);
+        for image in released {
+            cx.drop_image(image, None);
+        }
+        more
+    }
+
+    fn idle_textures(&mut self, now: Instant) -> (Vec<Arc<RenderImage>>, bool) {
+        let Some(cache) = &self.cache else {
+            self.textured.clear();
+            return (Vec::new(), false);
+        };
+        let mut released = Vec::new();
+        let mut more = false;
+        self.textured.retain(|key, (weak, painted)| {
+            let Some(image) = weak.upgrade() else {
+                // Gone (evicted and released by the graveyard).
+                return false;
+            };
+            // Only an image the cache holds, and nothing else but this upgrade: an evicted one
+            // is the graveyard's to release, and a view pinning it has it on screen.
+            let cached =
+                matches!(cache.status(key.url()), ImageStatus::Ready(v) if Arc::ptr_eq(&v, &image));
+            if !cached || Arc::strong_count(&image) > 2 {
+                // On screen (or the graveyard's): looked at again after it is painted next.
+                return cached;
+            }
+            if now.saturating_duration_since(*painted) < TEXTURE_IDLE {
+                more = true;
+                return true;
+            }
+            released.push(image.render_image().clone());
+            false
+        });
+        (released, more)
+    }
+
+    /// Images that may have a texture (painted since their last release).
+    #[cfg(test)]
+    pub fn textured_len(&self) -> usize {
+        self.textured.len()
     }
 
     /// Releases the textures of evicted images nothing on screen holds any more. Call from a
@@ -757,8 +886,14 @@ impl Images {
 }
 
 /// Starts the image store on the backend runtime, with the disk cache under the app's cache dir
-/// (`<cache>/images`; none if the cache dir is unknown).
-pub fn init(cx: &mut App) {
+/// (`<cache>/images`; none if the cache dir is unknown). With `fetcher` (`--bench`: synthetic
+/// images, no network) there is no disk cache.
+pub fn init(fetcher: Option<Arc<dyn gpui_chat_media::Fetcher>>, cx: &mut App) {
+    if let Some(fetcher) = fetcher {
+        let runtime = cx.global::<crate::runtime::Backend>().handle();
+        Images::install(ImageCache::builder(runtime).fetcher(fetcher), cx);
+        return;
+    }
     let disk_dir = match gpui_chat_settings::SettingsPaths::from_env() {
         Ok(paths) => Some(paths.cache_dir().join("images")),
         Err(error) => {

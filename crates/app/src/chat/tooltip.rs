@@ -362,7 +362,7 @@ fn paint_preview(
         }
         Lookup::Ready(_) | Lookup::Failed { .. } => {}
     }
-    Images::arm_retry(cx);
+    Images::after_paint(cx);
     frame.schedule_wake(entity, animate, window.is_window_active(), cx);
 }
 
