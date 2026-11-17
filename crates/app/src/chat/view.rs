@@ -702,7 +702,6 @@ impl ChatView {
         self.thread.as_ref().map(|panel| &panel.root)
     }
 
-    /// The layout caches in use: the list's and the thread popover's.
     /// The pane left the screen (another channel took it, or its split closed): drop the cached
     /// layouts (shaped again lazily, only for the rows drawn, when it comes back) and the images
     /// pinned for its last frame, so a hidden pane holds neither (PR 6.1: ten channels' layouts
@@ -713,9 +712,12 @@ impl ChatView {
             cache.borrow_mut().clear();
         }
         self.images.borrow_mut().release();
-        self.released = true;
+        // Before its first image-aware render nothing was measured with an emote box, so there
+        // is nothing to re-measure (and `apply_image_changes` would not consume the flag).
+        self.released = self.image_version.is_some();
     }
 
+    /// The layout caches in use: the list's and the thread popover's.
     fn caches(&self) -> impl Iterator<Item = &Rc<RefCell<LayoutCache>>> {
         std::iter::once(&self.cache).chain(self.thread.as_ref().map(|panel| &panel.cache))
     }
@@ -971,12 +973,13 @@ impl ChatView {
             return;
         };
         let version = images.layout_version();
+        let released = std::mem::take(&mut self.released);
         // Nothing is cached before the first render, so there is nothing to apply.
         let Some(seen) = self.image_version.replace(version) else {
             return;
         };
         let changes = images.changes_since(seen);
-        if std::mem::take(&mut self.released) {
+        if released {
             // Nothing is cached to drop, but rows measured before the pane was hidden may have
             // another height now: let the list measure again as rows are drawn.
             if changes != LayoutChanges::None {
@@ -2984,6 +2987,48 @@ mod tests {
         h.view.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert_eq!(shaped(cx, &h) - baseline, 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_pane_hidden_before_its_first_render_still_reshapes_changed_emote_boxes(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut h, cx) = Harness::new(cx, 100);
+        // Hidden before it ever rendered with an image store (a pane created behind another).
+        h.view.update(cx, |v, _| v.release_hidden());
+        cx.update(|_, cx| {
+            Images::install(
+                gpui_chat_media::ImageCache::builder(runtime.handle().clone())
+                    .fetcher(Arc::new(NeverFetcher)),
+                cx,
+            );
+        });
+        h.store.update(cx, |store, cx| {
+            store.apply_all([emote_message(0, &["wide"]), emote_message(1, &["plain"])]);
+            cx.notify();
+        });
+        h.next += 2;
+        cx.run_until_parked();
+        let shaped = |cx: &mut VisualTestContext, h: &Harness| {
+            h.view.read_with(cx, |v, _| v.cache_stats().shaped)
+        };
+        let baseline = shaped(cx, &h);
+        assert_eq!(baseline, 2);
+        cx.update(|_, cx| {
+            cx.global_mut::<Images>()
+                .record_layout_change(&gpui_chat_media::ImageKey::new("wide"));
+        });
+        h.view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(
+            shaped(cx, &h) - baseline,
+            1,
+            "the row drawing the changed emote is shaped again with its real box"
+        );
     }
 
     #[gpui_kit::test]

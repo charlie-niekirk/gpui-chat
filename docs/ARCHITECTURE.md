@@ -1000,7 +1000,10 @@ what each scenario does.
 | Memory, 10 channels × 1 000 messages, default image budget | under 300 MB | `memory`: each channel shown while its 1 000 messages arrive; resident size (footprint shown too) |
 | Launch to first window | under 300 ms | `launch`: exec → end of the first draw, median of 5 warm runs, offline startup path |
 
-`images` checks that the image byte budget holds under thousands of distinct animated emotes.
+`images` is a sanity check that the image cache stays within its byte budget under thousands of
+distinct animated emotes (the LRU enforces that on insert, so it catches a broken report or a
+budget no longer applied, not a gradual regression). `burst` also fails if the source fell behind
+or reached less than 950 msg/s.
 
 **Resident size, not footprint.** Activity Monitor's "Memory" is the physical footprint, which
 also counts GPU memory the process owns: with GPUI's Metal renderer an *empty* 1100 × 700 window
@@ -1010,7 +1013,8 @@ resident size; the footprint is printed next to it.
 
 **Enforcement.** CI's `macos` job runs `scripts/bench.sh --ci --only idle,memory` on the debug
 build (no timing gates on shared runners: an idle window must draw nothing, the memory scenario
-must stay under 400 MB resident with the image cache within its byte budget). The `linux` job runs
+must stay under the 300 MB budget resident with the image cache within its byte budget; ~3.5 min
+on the runner). The `linux` job runs
 `crates/core/tests/budget.rs`, which counts with `dhat` what ten full channels hold in the store
 and search index and how many allocations ingesting a message takes.
 

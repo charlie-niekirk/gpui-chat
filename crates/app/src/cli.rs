@@ -33,7 +33,8 @@ Options:
                                from their CDNs)
   --hud                        Start with the debug HUD visible (toggle: View > Toggle Debug HUD)
   --bench <name>               Run one performance-budget scenario offline, print its numbers as a
-                               `BENCH {json}` line and quit: scroll, burst, idle, memory or launch
+                               `BENCH {json}` line and quit: scroll, burst, idle, memory, images
+                               or launch
                                (see scripts/bench.sh, which runs them all in an isolated HOME)
   -h, --help                   Print this help
 ";

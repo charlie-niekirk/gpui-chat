@@ -11,8 +11,8 @@
 //! | `scroll` | 1 channel at 100 msg/s after a full scrollback; a scroll event every 8 ms, direction flipping every second | apply + draw p99 (the HUD's frame total) |
 //! | `burst` | 1 channel at 1 000 msg/s; a scroll event every 16 ms | input latency (event due → end of the draw showing it) p99, frame total p99, dropped events |
 //! | `idle` | 3 channels × 1 000 messages, static images only, then nothing | CPU over 10 s, draws in that time |
-//! | `memory` | 10 channels × 1 000 messages (the default scrollback), each channel shown while its messages arrive (2 000 msg/s), so every emote in them is loaded as in a watched chat | resident size and physical footprint |
-//! | `images` | 1 channel whose messages are all distinct animated emotes, scrolled end to end | the image budget holds: decoded bytes, footprint |
+//! | `memory` | 10 channels × 1 000 messages (the default scrollback), each channel shown while its messages arrive (2 000 msg/s) and until they are all applied, drawn and their images loaded, as in a watched chat | resident size and physical footprint |
+//! | `images` | 1 channel whose messages are all distinct animated emotes, scrolled end to end | sanity check: decoded bytes within the cache's budget; footprint |
 //! | `launch` | the offline startup path | process start (`GPUI_CHAT_BENCH_T0_NS`, else `main`) → end of the first draw |
 //!
 //! Numbers that come from outside the process (resident size, footprint, CPU time) are read with
@@ -665,9 +665,37 @@ impl Driver {
                 }
                 Self::sleep(cx, Duration::from_millis(8)).await;
             }
+            // Fully loaded before the next channel: all its messages applied and drawn, its
+            // images loaded and drawn (a slow machine must not move on early and understate).
+            let (hub, want) = (self.hub.clone(), plan.prefill_per_channel);
+            let shown = channel.clone();
+            self.until(cx, Duration::from_secs(60), move |_, cx| {
+                let held = hub
+                    .read(cx)
+                    .sizes(cx)
+                    .into_iter()
+                    .find(|s| s.channel == shown);
+                held.is_some_and(|s| s.len >= want).then_some(())
+            })
+            .await
+            .map_err(|e| format!("channel {} never held its messages: {e}", index + 1))?;
+            self.drawn_after_now(cx).await?;
             self.settle_images(cx).await?;
+            self.drawn_after_now(cx).await?;
         }
         Ok(())
+    }
+
+    /// Asks the window to draw and waits until a draw has finished after this point.
+    async fn drawn_after_now(&self, cx: &mut AsyncApp) -> Result<(), String> {
+        let before = self.diagnostics.total_draws();
+        self.window
+            .update(cx, |_, window, _| window.refresh())
+            .map_err(|e| e.to_string())?;
+        self.until(cx, Duration::from_secs(60), move |d, _| {
+            (d.total_draws() > before).then_some(())
+        })
+        .await
     }
 
     async fn memory(&self, report: &mut Report, cx: &mut AsyncApp) -> Result<(), String> {

@@ -8,7 +8,7 @@
 #   scripts/bench.sh --bin path/to/gpui-chat --no-build
 #   scripts/bench.sh --launch-runs 9      # launch is the median of n runs (default 5)
 #   scripts/bench.sh --ci --only idle,memory --bin target/debug/gpui-chat --no-build
-#                                         # CI gates: counts and generous memory, no timings
+#                                         # CI gates: counts, rates and memory, no timings
 #
 # Every scenario opens a real window for a few seconds (macOS, needs a logged-in session).
 # Numbers depend on the machine; the table says which one ran them.
@@ -101,35 +101,40 @@ if launches:
                          "min_ms": min(values), "max_ms": max(values), "key": key}
 
 # Each row: scenario, label, the value shown, the target text and the check (None: informational).
-# Timings are not gated with --ci (shared CI machines); counts and memory are, with room for the VM.
+# Timings are not gated with --ci (shared CI machines); counts, rates and memory are.
 def under(key, limit):
     return lambda r: r.get(key) is not None and r[key] < limit
 
 def within_budget(r):
-    return r.get("image_bytes_mb", 0) <= r.get("image_budget_mb", 0) + 0.01
+    # A sanity check: the LRU enforces this on every insert, so it catches a broken report (or a
+    # budget no longer applied) rather than a gradual regression. Missing numbers fail.
+    used, budget = r.get("image_bytes_mb"), r.get("image_budget_mb")
+    return used is not None and budget is not None and used <= budget + 0.01
+
+def at_rate(r):
+    # The source kept its 1 000 msg/s: nothing dropped, never behind, the rate actually reached.
+    return (r.get("dropped") == 0 and r.get("behind") == 0
+            and r.get("ingest_per_s") is not None and r["ingest_per_s"] >= 950)
 
 rows = [
     ("scroll", "Frame time while scrolling, 1 pane at 100 msg/s (apply+draw p99)",
      "frame_total_p99_ms", "ms", "< 8.3 ms", None if ci else under("frame_total_p99_ms", 8.3),
      ["draw_p99_ms", "input_p99_ms", "frames", "dropped"]),
-    ("burst", "Burst ingest 1 000 msg/s: input event → drawn (p99), no drops",
-     "input_p99_ms", "ms", "< 16.7 ms, 0 dropped",
-     (lambda r: r.get("dropped", 1) == 0) if ci else
-     (lambda r: under("input_p99_ms", 16.7)(r) and r.get("dropped", 1) == 0),
-     ["frame_total_p99_ms", "dropped", "ingest_per_s"]),
+    ("burst", "Burst ingest 1 000 msg/s: input event → drawn (p99), at rate",
+     "input_p99_ms", "ms", "< 16.7 ms; ≥ 950 msg/s, 0 behind, 0 dropped",
+     at_rate if ci else (lambda r: under("input_p99_ms", 16.7)(r) and at_rate(r)),
+     ["frame_total_p99_ms", "ingest_per_s", "behind", "dropped"]),
     ("idle", "Idle CPU, nothing animated", "cpu_percent", "%",
      "0 draws, < 5 %" if ci else "< 1 %",
      (lambda r: r.get("draws", 1) == 0 and under("cpu_percent", 5.0)(r)) if ci else under("cpu_percent", 1.0),
      ["draws"]),
-    ("memory", "Memory, 10 channels × 1 000 messages (resident)", "rss_mb", "MB",
-     "< 400 MB" if ci else "< 300 MB",
-     (lambda r: under("rss_mb", 400.0)(r) and within_budget(r)) if ci else
-     (lambda r: under("rss_mb", 300.0)(r) and within_budget(r)),
+    ("memory", "Memory, 10 channels × 1 000 messages (resident)", "rss_mb", "MB", "< 300 MB",
+     lambda r: under("rss_mb", 300.0)(r) and within_budget(r),
      ["image_bytes_mb", "image_budget_mb", "images", "graveyard"]),
     ("memory", "… same, physical footprint (Activity Monitor: adds GPU and driver memory)",
      "footprint_mb", "MB", "(shown)", None, []),
-    ("images", "Image byte budget holds under a flood of distinct animated emotes", "image_bytes_mb", "MB",
-     "≤ budget", within_budget, ["image_budget_mb", "evictions", "rss_mb", "footprint_mb"]),
+    ("images", "Sanity: image cache within its byte budget under a flood of animated emotes",
+     "image_bytes_mb", "MB", "≤ budget", within_budget, ["image_budget_mb", "evictions", "rss_mb", "footprint_mb"]),
     ("launch", "Launch to first window (median)", "median_ms", "ms", "< 300 ms",
      None if ci else under("median_ms", 300.0), ["min_ms", "max_ms", "runs"]),
 ]
