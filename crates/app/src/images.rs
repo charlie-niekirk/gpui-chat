@@ -447,6 +447,16 @@ impl Images {
         self.cache.as_ref()
     }
 
+    /// The media cache's counters and sizes (`--bench`), if there is a cache.
+    pub fn stats(&self) -> Option<gpui_chat_media::CacheStats> {
+        self.cache.as_ref().map(ImageCache::stats)
+    }
+
+    /// Evicted images still held by a view, waiting for their textures to be released.
+    pub fn graveyard_len(&self) -> usize {
+        self.graveyard.len()
+    }
+
     /// Time on the global animation clock.
     pub fn clock(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.clock_start)
@@ -757,8 +767,14 @@ impl Images {
 }
 
 /// Starts the image store on the backend runtime, with the disk cache under the app's cache dir
-/// (`<cache>/images`; none if the cache dir is unknown).
-pub fn init(cx: &mut App) {
+/// (`<cache>/images`; none if the cache dir is unknown). With `fetcher` (`--bench`: synthetic
+/// images, no network) there is no disk cache.
+pub fn init(fetcher: Option<Arc<dyn gpui_chat_media::Fetcher>>, cx: &mut App) {
+    if let Some(fetcher) = fetcher {
+        let runtime = cx.global::<crate::runtime::Backend>().handle();
+        Images::install(ImageCache::builder(runtime).fetcher(fetcher), cx);
+        return;
+    }
     let disk_dir = match gpui_chat_settings::SettingsPaths::from_env() {
         Ok(paths) => Some(paths.cache_dir().join("images")),
         Err(error) => {

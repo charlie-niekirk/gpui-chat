@@ -24,11 +24,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use gpui_chat_core::{
-    Author, Badge, BadgeId, ChannelId, ChatEvent, ImageScale, ImageUrls, Message, MessageKind, Rgb,
-    Timestamp, Tokenizer, twitch_emote_ranges,
+    Author, Badge, BadgeId, ChannelId, ChatEvent, Emote, EmoteProvider, Fragment, ImageScale,
+    ImageUrls, Message, MessageKind, Rgb, Timestamp, Tokenizer, resolve_fragments,
+    twitch_emote_ranges,
 };
-use gpui_chat_emotes::{Cosmetics, Paint, PaintColor, PaintFill, Shadow, Stop};
+use gpui_chat_emotes::{
+    Cosmetics, EmoteRegistry, EmoteResolver, EmoteScope, EmoteSet, Paint, PaintColor, PaintFill,
+    ProviderResults, Providers, SetEmote, Shadow, Stop,
+};
 use tokio::time::{Instant, sleep_until};
 
 use crate::bridge::{BridgeSender, TrySendError};
@@ -54,6 +60,161 @@ pub struct FirehoseConfig {
     pub start_ts_ms: i64,
     /// `--cosmetics`: the store the users' paints and third-party badges are put in (PR 6.2).
     pub cosmetics: Option<Arc<Cosmetics>>,
+    /// Third-party (7TV / BTTV) emotes typed into the chat and resolved like the live
+    /// `EmoteService` does (`--bench`, PR 6.1); `None` keeps the stream exactly as before.
+    pub third_party: Option<Arc<ThirdPartyEmotes>>,
+}
+
+/// Synthetic 7TV and BTTV emote sets for the firehose: per channel a 7TV set and a BTTV set,
+/// plus global ones, with realistic proportions of animated and wide emotes. The image URLs
+/// have the providers' shape (`.../<id>/2x.webp`) but are only ever served by the bench's
+/// synthetic fetcher. Which emotes appear follows a steep popularity curve, like real chat.
+pub struct ThirdPartyEmotes {
+    resolvers: HashMap<ChannelId, EmoteResolver>,
+    /// Names typed in each channel: its own sets first, then the global ones.
+    names: HashMap<ChannelId, Vec<Arc<str>>>,
+    /// `Some`: names are typed in order, each once, instead of by popularity
+    /// ([`Self::distinct`]).
+    next: Option<std::sync::atomic::AtomicUsize>,
+}
+
+impl ThirdPartyEmotes {
+    /// Emotes in each channel's 7TV set; BTTV's channel set and the global sets are smaller.
+    pub const CHANNEL_SEVENTV: usize = 300;
+    const CHANNEL_BTTV: usize = 40;
+    const GLOBAL_SEVENTV: usize = 60;
+    const GLOBAL_BTTV: usize = 30;
+
+    pub fn synthetic(channels: &[ChannelId]) -> Self {
+        Self::build(channels, Self::CHANNEL_SEVENTV, false)
+    }
+
+    /// Thousands of animated emotes per channel, typed in order so no two messages share one:
+    /// the image cache sees far more decoded bytes than its budget (`--bench images`).
+    pub fn distinct(channels: &[ChannelId]) -> Self {
+        let mut emotes = Self::build(channels, 4_000, true);
+        emotes.next = Some(std::sync::atomic::AtomicUsize::new(0));
+        emotes
+    }
+
+    fn build(channels: &[ChannelId], channel_seventv: usize, all_animated: bool) -> Self {
+        let set = |provider: EmoteProvider,
+                   scope: EmoteScope,
+                   tag: &str,
+                   count: usize|
+         -> (EmoteSet, Vec<Arc<str>>) {
+            const STEMS: &[&str] = &[
+                "Jam", "Pog", "Sadge", "Wide", "Peepo", "Clap", "Kek", "Hype", "Bonk", "Dance",
+                "Pray", "Shake", "Cry", "Lul", "Nod", "Wave",
+            ];
+            let cdn = match provider {
+                EmoteProvider::Bttv => "https://cdn.betterttv.net/emote",
+                _ => "https://cdn.7tv.app/emote",
+            };
+            let mut names = Vec::with_capacity(count);
+            let emotes = (0..count)
+                .map(|i| {
+                    // About a third animated, one in ten twice as wide (sizes the fetcher reads
+                    // back from the id).
+                    let animated = all_animated || i % 3 == 1;
+                    let wide = i % 10 == 7;
+                    let id = format!(
+                        "bench{tag}{i}{}{}",
+                        if animated { "a" } else { "s" },
+                        if wide { "w" } else { "n" }
+                    );
+                    let name: Arc<str> = format!("{tag}{}{i}", STEMS[i % STEMS.len()]).into();
+                    names.push(name.clone());
+                    let urls = ImageUrls::new()
+                        .with(ImageScale::X1, format!("{cdn}/{id}/1x.webp"))
+                        .with(ImageScale::X2, format!("{cdn}/{id}/2x.webp"))
+                        .with(ImageScale::X4, format!("{cdn}/{id}/4x.webp"));
+                    SetEmote {
+                        emote: Arc::new(Emote {
+                            id: id.into(),
+                            name,
+                            provider,
+                            urls,
+                            animated,
+                            zero_width: false,
+                            width: Some(if wide { 64 } else { 32 }),
+                            height: Some(32),
+                        }),
+                        original_name: None,
+                        owner: None,
+                    }
+                })
+                .collect();
+            (EmoteSet::new(provider, scope, emotes), names)
+        };
+        let results = |seven_tv: EmoteSet, bttv: EmoteSet| ProviderResults {
+            seven_tv: Ok(seven_tv),
+            bttv: Ok(bttv),
+            ffz: Ok(EmoteSet::empty(EmoteProvider::Ffz, EmoteScope::Global)),
+            requested: Providers::ALL,
+        };
+        let registry = EmoteRegistry::new(Providers::ALL);
+        let (global_7tv, mut global_names) = set(
+            EmoteProvider::SevenTv,
+            EmoteScope::Global,
+            "g",
+            Self::GLOBAL_SEVENTV,
+        );
+        let (global_bttv, bttv_names) = set(
+            EmoteProvider::Bttv,
+            EmoteScope::Global,
+            "gb",
+            Self::GLOBAL_BTTV,
+        );
+        global_names.extend(bttv_names);
+        registry.store_global(&results(global_7tv, global_bttv));
+        let mut names = HashMap::new();
+        let mut resolvers = HashMap::new();
+        for (n, channel) in channels.iter().enumerate() {
+            let (seven_tv, mut own) = set(
+                EmoteProvider::SevenTv,
+                EmoteScope::Channel,
+                &format!("c{n}"),
+                channel_seventv,
+            );
+            let (bttv, bttv_names) = set(
+                EmoteProvider::Bttv,
+                EmoteScope::Channel,
+                &format!("c{n}b"),
+                Self::CHANNEL_BTTV,
+            );
+            own.extend(bttv_names);
+            own.extend(global_names.iter().cloned());
+            registry.store_channel(channel, &results(seven_tv, bttv));
+            resolvers.insert(channel.clone(), registry.resolver(channel));
+            names.insert(channel.clone(), own);
+        }
+        Self {
+            resolvers,
+            names,
+            next: None,
+        }
+    }
+
+    /// A name to type in `channel`; `skew` in `0.0..1.0` picks popular ones far more often.
+    fn pick(&self, channel: &ChannelId, skew: f64) -> Option<&str> {
+        let names = self.names.get(channel)?;
+        let index = match &self.next {
+            Some(next) => next.fetch_add(1, Ordering::Relaxed) % names.len(),
+            None => ((skew * skew * skew) * names.len() as f64) as usize,
+        };
+        names
+            .get(index.min(names.len().saturating_sub(1)))
+            .map(|n| &**n)
+    }
+
+    /// `fragments` with the channel's third-party emotes resolved (as `EmoteService::process`).
+    fn resolve(&self, channel: &ChannelId, fragments: Vec<Fragment>) -> Vec<Fragment> {
+        match self.resolvers.get(channel) {
+            Some(resolver) => resolve_fragments(&fragments, resolver).unwrap_or(fragments),
+            None => fragments,
+        }
+    }
 }
 
 /// Defines the demo paints and badges of `--cosmetics` in `cosmetics`: five paints (two of them
@@ -498,6 +659,9 @@ pub struct Generator {
     index: u64,
     start_ts_ms: i64,
     ms_per_message: f64,
+    third_party: Option<Arc<ThirdPartyEmotes>>,
+    /// Every message is a run of third-party emotes (`--bench images`).
+    emote_only: bool,
 }
 
 impl Generator {
@@ -521,7 +685,15 @@ impl Generator {
             index: 0,
             start_ts_ms: config.start_ts_ms,
             ms_per_message: 1000.0 / config.rate,
+            third_party: config.third_party.clone(),
+            emote_only: false,
         }
+    }
+
+    /// Makes every later message a line of five third-party emotes (needs
+    /// [`FirehoseConfig::third_party`]).
+    pub fn set_emote_only(&mut self, on: bool) {
+        self.emote_only = on;
     }
 
     /// How many events have been produced.
@@ -543,10 +715,13 @@ impl Generator {
             self.channels[i].clone()
         };
 
-        let body = self.body(user_index);
+        let body = self.body(user_index, &channel);
         let tokenizer = Tokenizer::new().with_own_login(OWN_LOGIN);
         let ranges = twitch_emote_ranges(&body.emotes_tag(), &body.text);
-        let tokenized = tokenizer.tokenize(&body.text, &ranges);
+        let mut tokenized = tokenizer.tokenize(&body.text, &ranges);
+        if let Some(third_party) = &self.third_party {
+            tokenized.fragments = third_party.resolve(&channel, tokenized.fragments);
+        }
 
         let timestamp = Timestamp::from_unix_millis(
             self.start_ts_ms + (index as f64 * self.ms_per_message) as i64,
@@ -570,13 +745,21 @@ impl Generator {
         }
     }
 
-    fn body(&mut self, author_index: usize) -> Body {
+    fn body(&mut self, author_index: usize, channel: &ChannelId) -> Body {
         let mut body = Body::default();
+        if self.emote_only {
+            for _ in 0..5 {
+                self.third_party_emote(&mut body, channel, 1.0);
+            }
+            return body;
+        }
         // Emote spam: a line of nothing but emotes.
         if self.rng.chance(0.07) {
             for _ in 0..self.rng.range(1, 5) {
-                let (id, name) = *self.rng.pick(EMOTES);
-                body.emote(id, name);
+                if !self.third_party_emote(&mut body, channel, 0.5) {
+                    let (id, name) = *self.rng.pick(EMOTES);
+                    body.emote(id, name);
+                }
             }
             return body;
         }
@@ -592,7 +775,9 @@ impl Generator {
             if body.chars > MAX_MESSAGE_CHARS - 100 {
                 break;
             }
-            self.push_piece(&mut body, author_index, shouting);
+            if !self.third_party_emote(&mut body, channel, 0.12) {
+                self.push_piece(&mut body, author_index, shouting);
+            }
         }
         // Never exceed Twitch's limit, even with the last long piece.
         if body.chars > MAX_MESSAGE_CHARS {
@@ -641,6 +826,26 @@ impl Generator {
                 word.push_str(self.rng.pick(PUNCTUATION));
             }
             body.word(&word);
+        }
+    }
+
+    /// With third-party emotes configured, types one of the channel's emote names with
+    /// probability `p` and says so. Draws no random numbers without them, so the plain stream
+    /// is the same as before they existed.
+    fn third_party_emote(&mut self, body: &mut Body, channel: &ChannelId, p: f64) -> bool {
+        let Some(third_party) = self.third_party.clone() else {
+            return false;
+        };
+        if !self.rng.chance(p) {
+            return false;
+        }
+        let skew = self.rng.unit();
+        match third_party.pick(channel, skew) {
+            Some(name) => {
+                body.word(name);
+                true
+            }
+            None => false,
         }
     }
 
@@ -708,12 +913,24 @@ async fn run_with(
     counters: Arc<IngestCounters>,
     limits: WorkLimits,
 ) {
-    let rate = config.rate;
-    let mut generator = Generator::new(&config);
+    let generator = Generator::new(&config);
+    drive(sender, generator, config.rate, counters, limits).await;
+}
+
+/// Paces `generator` at `rate` from now on (what [`run`] does after building it). Messages it
+/// produced before are not re-timed: `--bench` fills the scrollback first, then paces the rest.
+pub async fn drive(
+    sender: BridgeSender<ChatEvent>,
+    mut generator: Generator,
+    rate: f64,
+    counters: Arc<IngestCounters>,
+    limits: WorkLimits,
+) {
+    let base = generator.produced();
     let start = Instant::now();
     loop {
         let now = Instant::now();
-        let due = due_count(now - start, rate);
+        let due = base + due_count(now - start, rate);
         // Real elapsed time, not tokio's (which stands still under paused test time).
         let work_started = std::time::Instant::now();
         let mut done = 0usize;
@@ -740,7 +957,7 @@ async fn run_with(
             .behind
             .store(due.saturating_sub(generator.produced()), Ordering::Relaxed);
         // The sleep also yields to other tasks when the cap cut this wake-up short.
-        let next_due = start + due_time(generator.produced(), rate);
+        let next_due = start + due_time(generator.produced() - base, rate);
         sleep_until(next_due.max(now + MIN_TICK)).await;
     }
 }
@@ -749,7 +966,6 @@ async fn run_with(
 mod tests {
     use super::*;
     use crate::bridge;
-    use gpui_chat_core::Fragment;
 
     fn config(rate: f64, seed: u64) -> FirehoseConfig {
         FirehoseConfig {
@@ -758,6 +974,7 @@ mod tests {
             channels: channel_names(3),
             start_ts_ms: 1_700_000_000_000,
             cosmetics: None,
+            third_party: None,
         }
     }
 
@@ -905,6 +1122,51 @@ mod tests {
             }
         }
         assert!(checked > 500);
+    }
+
+    #[test]
+    fn third_party_emotes_are_typed_and_resolved_per_channel() {
+        let channels = channel_names(3);
+        let third_party = Arc::new(ThirdPartyEmotes::synthetic(&channels));
+        let mut generator = Generator::new(&FirehoseConfig {
+            third_party: Some(third_party),
+            ..config(1000.0, 3)
+        });
+        let evs: Vec<_> = (0..3000).map(|_| generator.next_event()).collect();
+        let mut by_provider = std::collections::HashMap::<EmoteProvider, usize>::new();
+        let mut distinct = std::collections::HashSet::new();
+        for event in &evs {
+            let ChatEvent::Message { channel, message } = event else {
+                continue;
+            };
+            for fragment in &message.fragments {
+                if let Fragment::Emote { emote, .. } = fragment {
+                    *by_provider.entry(emote.provider).or_default() += 1;
+                    if emote.provider != EmoteProvider::Twitch {
+                        distinct.insert(emote.id.as_str().to_owned());
+                        // A channel's own emotes appear only in that channel.
+                        let own =
+                            format!("c{}", channels.iter().position(|c| c == channel).unwrap());
+                        let tag = emote.id.as_str().trim_start_matches("bench");
+                        assert!(
+                            tag.starts_with('g') || tag.starts_with(&own),
+                            "{tag} in {channel}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            by_provider[&EmoteProvider::SevenTv] > 500,
+            "{by_provider:?}"
+        );
+        assert!(by_provider[&EmoteProvider::Bttv] > 20, "{by_provider:?}");
+        assert!(by_provider[&EmoteProvider::Twitch] > 500, "{by_provider:?}");
+        assert!(
+            distinct.len() > 150,
+            "a long tail of emotes: {}",
+            distinct.len()
+        );
     }
 
     #[test]

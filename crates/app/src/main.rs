@@ -10,6 +10,7 @@ mod add_channel;
 mod assets;
 mod attention;
 mod badges;
+mod bench;
 mod bridge;
 mod channel_list;
 mod channels;
@@ -133,7 +134,7 @@ fn start_chat(
 ) -> ShellParts {
     let diagnostics = Diagnostics::new();
     let scrollback = config::current(cx).chat.scrollback;
-    let offline = cli.firehose.is_some() || replay_log.is_some();
+    let offline = cli.firehose.is_some() || replay_log.is_some() || cli.bench.is_some();
     let hub = cx.new(|_| {
         let mut hub = ChannelHub::new(scrollback, diagnostics.clone());
         // Live channels exist because the user opened them; offline ones through their events.
@@ -183,6 +184,7 @@ fn start_chat(
             cosmetics: cli
                 .cosmetics
                 .then(|| cx.global::<badges::Badges>().cosmetics().clone()),
+            third_party: None,
         };
         if let Some(cosmetics) = &config.cosmetics {
             firehose::seed_cosmetics(cosmetics);
@@ -192,6 +194,17 @@ fn start_chat(
             cx,
             firehose::run(sender.clone(), config, diagnostics.counters()),
         ));
+    }
+    if let Some(kind) = cli.bench {
+        bench::start_source(kind, sender.clone(), diagnostics.counters(), cx);
+        bench::Driver {
+            kind,
+            window: window.window_handle(),
+            hub: hub.clone(),
+            diagnostics: diagnostics.clone(),
+            sender: sender.clone(),
+        }
+        .start(cx);
     }
     let mut loopback = None;
     if let Some(log) = replay_log {
@@ -216,6 +229,7 @@ fn start_chat(
 }
 
 fn main() {
+    bench::mark_process_start();
     let cli = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Run(cli)) => cli,
         Ok(Parsed::Help) => {
@@ -248,7 +262,7 @@ fn main() {
             // The backend runtime exists before any window and stops when the app quits.
             runtime::init(cx)
                 .unwrap_or_else(|error| panic!("failed to start the backend runtime: {error}"));
-            images::init(cx);
+            images::init(cli.bench.map(bench::fetcher), cx);
             badges::Badges::install(cx);
             user_directory::init(cx);
             // Settings (a bad file falls back to defaults and is shown in the window), then
