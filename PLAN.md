@@ -98,7 +98,7 @@ ChatView → list() → MessageElement (custom Element)  ← ImageCache
 - **Layout cache** per message keyed by (width, font generation, scale factor); invalidated on resize or settings change.
 - **Virtualisation** with GPUI `list()` / `ListState` in bottom-follow mode. Scrolling up pauses following and shows a "new messages" pill.
 - **Ingest batching:** events are drained once per frame; a burst of 1 000 messages causes one layout pass, not 1 000.
-- **Images:** fetched and decoded off the UI thread; de-duplicated in flight; disk cache keyed by URL hash; in-memory LRU with a byte budget (default 256 MB); GPU textures released on eviction.
+- **Images:** fetched and decoded off the UI thread; de-duplicated in flight; disk cache keyed by URL hash; in-memory LRU with a byte budget (default 64 MB since PR 6.1); GPU textures released on eviction and for images off screen.
 - **Animation:** one global clock so identical emotes stay in sync. Animation frames are requested only while an animated emote is visible and the window is active. Setting to disable animation.
 - **Fallback** if the custom element is blocked by an API gap: wrap-flex of per-word elements to keep the phase moving, with a backlog item to return.
 
@@ -292,6 +292,6 @@ Left in `docs/BACKLOG.md` for the owner to pull in: whispers, polls and predicti
 - [x] Phase 3: ~~3.1~~ ✅ · ~~3.2~~ ✅ · ~~3.3~~ ✅ · ~~3.4~~ ✅ · ~~3.5~~ ✅ → M3 ✅
 - [x] Phase 4: ~~4.1~~ ✅ · ~~4.2~~ ✅ · ~~4.3~~ ✅ · ~~4.4~~ ✅ → M4 ✅
 - [x] Phase 5: ~~5.1~~ ✅ · ~~5.2~~ ✅ · ~~5.3~~ ✅ · ~~5.4~~ ✅ · ~~5.5~~ ✅ · ~~5.6~~ ✅ · ~~5.7~~ ✅ → M5 ✅
-- [ ] Phase 6: 6.1 · ~~6.2~~ ✅ · ~~6.3~~ ✅ → M6
+- [ ] Phase 6: ~~6.1~~ ✅ · ~~6.2~~ ✅ · ~~6.3~~ ✅ → M6
 - [ ] Phase 7: 7.1 · 7.2 → v0.1.0
 - [ ] Phase 8: 8.1 · 8.2
