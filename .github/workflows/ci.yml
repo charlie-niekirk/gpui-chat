@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -34,6 +34,16 @@ jobs:
         run: cargo test --locked --workspace
       - name: Build
         run: cargo build --locked --workspace
+      # The .app assembly (PR 7.1) around the debug binary built above: Info.plist, icon, ad-hoc
+      # signature. No second compile; the universal build and the DMG are the Release workflow's.
+      - name: Bundle smoke test
+        run: |
+          scripts/bundle-macos.sh --bin target/debug/gpui-chat --out "$RUNNER_TEMP/dist" --no-dmg
+          const() { sed -n "s/^pub const $1: &str = \"\(.*\)\";\$/\1/p" crates/core/src/lib.rs; }
+          app="$RUNNER_TEMP/dist/$(const APP_NAME).app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "$(const APP_ID)"
+          test -s "$app/Contents/Resources/AppIcon.icns"
+          codesign --verify --strict "$app"
       # The performance budgets that do not depend on the machine's speed (PR 6.1): an idle
       # window draws nothing and the 10 × 1 000 memory scenario stays under the 300 MB resident
       # budget with the image cache within its byte budget. Offline, synthetic images. The debug
@@ -51,7 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Test (all crates except the GPUI app)
         run: cargo test --locked --workspace --exclude gpui-chat
