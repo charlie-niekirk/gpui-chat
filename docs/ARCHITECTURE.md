@@ -1013,8 +1013,8 @@ resident size; the footprint is printed next to it.
 
 **Enforcement.** CI's `macos` job runs `scripts/bench.sh --ci --only idle,memory` on the debug
 build (no timing gates on shared runners: an idle window must draw nothing, the memory scenario
-must stay under the 300 MB budget resident with the image cache within its byte budget; ~3.5 min
-on the runner). The `linux` job runs
+must stay under the 300 MB budget resident with the image cache within its byte budget; 3.5 to
+over 5 min on the runner, so CI passes `--timeout 900`). The `linux` job runs
 `crates/core/tests/budget.rs`, which counts with `dhat` what ten full channels hold in the store
 and search index and how many allocations ingesting a message takes.
 
