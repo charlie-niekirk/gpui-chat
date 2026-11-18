@@ -293,5 +293,5 @@ Left in `docs/BACKLOG.md` for the owner to pull in: whispers, polls and predicti
 - [x] Phase 4: ~~4.1~~ ✅ · ~~4.2~~ ✅ · ~~4.3~~ ✅ · ~~4.4~~ ✅ → M4 ✅
 - [x] Phase 5: ~~5.1~~ ✅ · ~~5.2~~ ✅ · ~~5.3~~ ✅ · ~~5.4~~ ✅ · ~~5.5~~ ✅ · ~~5.6~~ ✅ · ~~5.7~~ ✅ → M5 ✅
 - [x] Phase 6: ~~6.1~~ ✅ · ~~6.2~~ ✅ · ~~6.3~~ ✅ → M6 ✅
-- [ ] Phase 7: 7.1 · 7.2 → v0.1.0
+- [ ] Phase 7: ~~7.1~~ ✅ · 7.2 → v0.1.0
 - [ ] Phase 8: 8.1 · 8.2
