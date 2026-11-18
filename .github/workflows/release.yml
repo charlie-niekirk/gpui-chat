@@ -1,0 +1,190 @@
+name: Release
+
+# Tag-driven macOS release (PR 7.1, docs/RELEASING.md):
+#   * push of a `v*` tag      -> build the universal DMG, attach it to a DRAFT GitHub Release
+#   * workflow_dispatch       -> dry run: build the DMG and keep it as a workflow artifact only
+#   * pull_request (paths)    -> same dry run, only when the packaging itself changes; never signs
+#                                with secrets and never publishes
+# Signing and notarization happen only when their secrets exist; otherwise the DMG is ad-hoc
+# signed and the log says so.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/bundle-macos.sh"
+      - "assets/icon/**"
+      - "rust-toolchain.toml"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      # Release builds from tags never read or write the cache.
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Version
+        id: version
+        env:
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          cargo_version="$(awk '/^\[workspace.package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)"
+          if [ "$REF_TYPE" = tag ]; then
+            tag_version="${REF#refs/tags/v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error title=Version mismatch::tag v$tag_version does not match the workspace version $cargo_version in Cargo.toml. Bump it (and Cargo.lock) in a PR, then re-tag."
+              exit 1
+            fi
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+      # Secrets cannot be tested in an `if:`, so look at them here. Pull requests never sign.
+      - name: Signing configuration
+        id: signing
+        env:
+          EVENT: ${{ github.event_name }}
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          sign=false
+          notarize=false
+          if [ "$EVENT" = pull_request ]; then
+            echo "::notice title=Signing skipped::pull request dry run: secrets are not used, the DMG is ad-hoc signed."
+          elif [ -n "$CERTIFICATE" ] && [ -n "$CERTIFICATE_PASSWORD" ]; then
+            sign=true
+            if [ -n "$API_KEY" ] && [ -n "$API_KEY_ID" ] && [ -n "$API_ISSUER_ID" ]; then
+              notarize=true
+              echo "::notice title=Signing::Developer ID signing and notarization are enabled."
+            else
+              echo "::notice title=Notarization skipped::the APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID secrets are not all set: the DMG is Developer ID signed but not notarized, so Gatekeeper will still warn (docs/RELEASING.md)."
+            fi
+          else
+            echo "::notice title=Signing skipped::the MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD secrets are not set: producing an ad-hoc signed DMG, no notarization (docs/RELEASING.md)."
+          fi
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "notarize=$notarize" >> "$GITHUB_OUTPUT"
+
+      - name: Import the Developer ID certificate
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "::error title=No identity::the MACOS_CERTIFICATE secret holds no \"Developer ID Application\" identity."
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+
+      - name: Write the notarization API key
+        if: steps.signing.outputs.notarize == 'true'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          printf '%s' "$API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_ISSUER_ID=$APPLE_API_ISSUER_ID" >> "$GITHUB_ENV"
+
+      - name: Build the universal app and DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTARIZE: ${{ steps.signing.outputs.notarize }}
+        run: |
+          args=(--version "$VERSION" --out dist)
+          if [ "$NOTARIZE" = true ]; then args+=(--notarize); fi
+          scripts/bundle-macos.sh "${args[@]}"
+
+      - name: Verify
+        run: |
+          app="$(ls -d dist/*.app)"
+          dmg="$(ls dist/*.dmg)"
+          lipo -info "$app/Contents/MacOS/"*
+          codesign -dvv "$app" 2>&1 | grep -E 'Identifier|Authority|Signature|TeamIdentifier' || true
+          hdiutil verify "$dmg"
+          # The arm64 slice runs on this runner: the binary starts and prints its usage.
+          "$app/Contents/MacOS/"* --help > "$RUNNER_TEMP/help.txt"
+          head -n 3 "$RUNNER_TEMP/help.txt"
+          if [ "${{ steps.signing.outputs.notarize }}" = true ]; then
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --context context:primary-signature --verbose "$dmg"
+          fi
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/AuthKey.p8"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # Only a pushed `v*` tag publishes, and only as a draft the owner reviews and publishes by hand.
+  release:
+    name: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists: replacing its assets."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --draft --verify-tag --title "$TAG" --generate-notes
+          fi

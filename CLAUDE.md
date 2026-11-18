@@ -11,6 +11,7 @@ cargo run -p gpui-chat                                # launch the app
 cargo run -p gpui-chat --release -- --firehose 1000 --hud  # offline synthetic chat + debug HUD (⌘⇧D)
 cargo run -p gpui-chat --release -- --replay fixtures/irc/privmsg.irc --hud   # replay a recorded IRC log
 scripts/bench.sh                                      # performance budgets, offline (PR 6.1)
+scripts/bundle-macos.sh                                # universal .app + DMG in dist/ (PR 7.1; --arch native is faster)
 cargo fmt --all --check                               # formatting
 cargo clippy --workspace --all-targets -- -D warnings # lints (must be warning-free)
 cargo test --workspace                                # all tests

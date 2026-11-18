@@ -34,6 +34,16 @@ jobs:
         run: cargo test --locked --workspace
       - name: Build
         run: cargo build --locked --workspace
+      # The .app assembly (PR 7.1) around the debug binary built above: Info.plist, icon, ad-hoc
+      # signature. No second compile; the universal build and the DMG are the Release workflow's.
+      - name: Bundle smoke test
+        run: |
+          scripts/bundle-macos.sh --bin target/debug/gpui-chat --out "$RUNNER_TEMP/dist" --no-dmg
+          const() { sed -n "s/^pub const $1: &str = \"\(.*\)\";\$/\1/p" crates/core/src/lib.rs; }
+          app="$RUNNER_TEMP/dist/$(const APP_NAME).app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "$(const APP_ID)"
+          test -s "$app/Contents/Resources/AppIcon.icns"
+          codesign --verify --strict "$app"
       # The performance budgets that do not depend on the machine's speed (PR 6.1): an idle
       # window draws nothing and the 10 × 1 000 memory scenario stays under a generous resident
       # size with the image cache within its byte budget. Offline, synthetic images, ~30 s.
