@@ -7,6 +7,7 @@
 #   scripts/bench.sh --only memory,idle   # some scenarios
 #   scripts/bench.sh --bin path/to/gpui-chat --no-build
 #   scripts/bench.sh --launch-runs 9      # launch is the median of n runs (default 5)
+#   scripts/bench.sh --timeout 900        # seconds before a scenario is killed (default 300)
 #   scripts/bench.sh --ci --only idle,memory --bin target/debug/gpui-chat --no-build
 #                                         # CI gates: counts, rates and memory, no timings
 #
@@ -20,6 +21,7 @@ only="scroll,burst,idle,memory,images,launch"
 bin="target/release/gpui-chat"
 build=1
 launch_runs=5
+timeout=300
 ci=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,9 +30,11 @@ while [ $# -gt 0 ]; do
     --bin) bin="$2"; shift 2 ;;
     --bin=*) bin="${1#*=}"; shift ;;
     --no-build) build=0; shift ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --timeout=*) timeout="${1#*=}"; shift ;;
     --launch-runs) launch_runs="$2"; shift 2 ;;
     --ci) ci=1; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -48,9 +52,9 @@ run() {
   local name="$1" t0 line
   t0="$(python3 -c 'import time; print(time.time_ns())')"
   # The isolated HOME keeps the user's settings, state and caches out of it (and untouched).
-  # At most five minutes per scenario (perl's alarm: macOS has no `timeout`).
+  # At most `--timeout` seconds per scenario (perl's alarm: macOS has no `timeout`).
   if ! line="$(HOME="$home" GPUI_CHAT_BENCH_T0_NS="$t0" RUST_LOG=warn \
-      perl -e 'alarm shift; exec @ARGV' 300 "$bin" --bench "$name" 2>>"$home/stderr.log" \
+      perl -e 'alarm shift; exec @ARGV' "$timeout" "$bin" --bench "$name" 2>>"$home/stderr.log" \
       | grep '^BENCH ' | tail -n 1)"; then
     line=""
   fi
