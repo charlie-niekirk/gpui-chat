@@ -18,12 +18,16 @@ published until the owner presses *Publish release* by hand.
 3. When the run is green, open the draft release, check the notes, download the DMG and open it on a
    Mac that is not the build machine, then publish.
 
+Re-running the workflow for a tag whose release is still a draft replaces the draft's assets. Once a
+release is published, a re-run fails instead: published assets are never replaced, cut a new version.
+
 ### Dry run
 
 *Actions → Release → Run workflow* (or any pull request that touches the packaging: the workflow,
 `scripts/bundle-macos.sh`, `assets/icon/`, `rust-toolchain.toml`) runs the same build and keeps the DMG
-as the `macos-dmg` workflow artifact for 14 days. It never creates a release, and pull requests never
-use the signing secrets.
+as the `macos-dmg` workflow artifact for 14 days. It never creates a release. **Dry runs never sign:**
+only a pushed `v*` tag uses the signing secrets, so a workflow dispatched from any branch produces an
+ad-hoc signed DMG.
 
 ### Building locally
 
@@ -33,15 +37,30 @@ scripts/bundle-macos.sh --arch native   # only this Mac's architecture, about ha
 open dist/gpui-chat.app
 ```
 
-`rust-toolchain.toml` lists both macOS targets, so `rustup toolchain install` fetches them. A
-toolchain not managed by rustup (for example Homebrew's Rust) needs the `x86_64-apple-darwin` standard
-library added by hand, or use `--arch native`. The icon is built from `assets/icon/icon-1024.png`.
+A universal build needs a **rustup-managed toolchain**. `rust-toolchain.toml` lists both macOS targets,
+and the script runs `rustup target add` for each before building. Homebrew's Rust has no rustup: it
+ignores `rust-toolchain.toml` and cannot build the other architecture, so the script stops with an
+error for a universal build there; `--arch native` still works. Install rustup from https://rustup.rs.
+The icon is built from `assets/icon/icon-1024.png`.
 
 ## Signing and notarization
 
-Both are optional. Without secrets the workflow logs a notice (`Signing skipped …`), and the DMG is
+Both are optional. Only a pushed `v*` tag signs, and only with the secrets below. Without them (or on a
+dispatch or pull request run) the workflow logs a notice (`Signing skipped …`), and the DMG is
 signed ad hoc (`codesign -s -`), which Apple Silicon requires for any binary to run but which carries no
 identity: Gatekeeper treats the app as from an unidentified developer.
+
+### The `release` environment
+
+Store the five secrets as secrets of a GitHub **Environment** named `release` (*Settings →
+Environments → New environment*), not as repository secrets, and under *Deployment branches and tags*
+choose *Selected branches and tags* and add the tag rule `v*`. A tag push runs the `bundle` job in that
+environment; every other run uses a `dry-run` environment that holds no secrets, so a workflow edited
+on a branch and dispatched cannot read them. Optionally add yourself as a required reviewer to approve
+each release run.
+
+The certificate and the API key are only on the runner for the packaging step: both triples are
+compiled before they are written, and the keychain and key file are deleted before anything else runs.
 
 | Secret | Value | Needed for |
 |---|---|---|
@@ -51,7 +70,7 @@ identity: Gatekeeper treats the app as from an unidentified developer.
 | `APPLE_API_KEY_ID` | the key's ID (10 characters) | notarization |
 | `APPLE_API_ISSUER_ID` | the issuer ID (a UUID) | notarization |
 
-Signing needs the first two; notarization needs all five. With only the certificate the DMG is Developer
+Signing needs the first two; notarization needs all five (add them with `gh secret set NAME --env release`). With only the certificate the DMG is Developer
 ID signed but not notarized, and the log says that Gatekeeper will still warn. The signing identity is
 found in the imported certificate, so its name is not a secret to maintain.
 
@@ -65,17 +84,17 @@ You need a paid Apple Developer Program membership.
    *Export…* as `.p12` with a password. Then:
 
    ```bash
-   base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE
-   gh secret set MACOS_CERTIFICATE_PASSWORD
+   base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE --env release
+   gh secret set MACOS_CERTIFICATE_PASSWORD --env release
    ```
 2. **API key.** At appstoreconnect.apple.com → Users and Access → Integrations → Team Keys, generate a
    key with the *Developer* role and download the `.p8` (Apple offers it once). Note the Key ID and the
    Issuer ID shown on that page:
 
    ```bash
-   base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set APPLE_API_KEY
-   gh secret set APPLE_API_KEY_ID
-   gh secret set APPLE_API_ISSUER_ID
+   base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set APPLE_API_KEY --env release
+   gh secret set APPLE_API_KEY_ID --env release
+   gh secret set APPLE_API_ISSUER_ID --env release
    ```
 3. Delete the local `.p12` and `.p8` once they are in a password manager.
 

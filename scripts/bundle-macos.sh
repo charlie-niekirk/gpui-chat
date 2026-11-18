@@ -6,6 +6,8 @@
 #   scripts/bundle-macos.sh --arch native      # this Mac's architecture only (faster)
 #   scripts/bundle-macos.sh --bin target/debug/gpui-chat --no-dmg   # wrap a binary you already built
 #   scripts/bundle-macos.sh --version 0.1.0 --out /tmp/dist
+#   scripts/bundle-macos.sh --build-only       # just the cargo builds (CI runs this before it has any secrets)
+#   scripts/bundle-macos.sh --no-build         # assemble from the binaries a --build-only run left in target/
 #   scripts/bundle-macos.sh --sign "Developer ID Application: Name (TEAMID)" --notarize
 #
 # Signing: ad-hoc (`codesign -s -`) unless `--sign IDENTITY` (or $MACOS_SIGN_IDENTITY) names a real
@@ -15,13 +17,17 @@
 # (docs/RELEASING.md).
 #
 # The app name and bundle identifier are read from `APP_NAME` / `APP_ID` in crates/core/src/lib.rs,
-# the version from `[workspace.package]` in Cargo.toml. Output (all under --out, default dist/):
+# the version from `[workspace.package]` in Cargo.toml, the package and binary names from
+# crates/app/Cargo.toml. A universal build needs rustup (it adds the missing Rust target); without
+# rustup only the host architecture can be built (--arch native). Output (all under --out, default dist/):
 #   <APP_NAME>.app
 #   <APP_NAME>-<version>-macos-<universal|arm64|x86_64>.dmg (+ .sha256)
 set -euo pipefail
 
+# Relative --out / --bin paths are relative to where the script was started, not the repo root.
+invoked_from="$PWD"
 cd "$(dirname "$0")/.."
-root="$PWD"
+absolute() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$invoked_from/$1" ;; esac; }
 
 # The oldest macOS GPUI supports (gpui-pre-macos refuses to run below 12.0, and its Objective-C is
 # compiled with -mmacosx-version-min=12.0).
@@ -34,6 +40,8 @@ out="dist"
 sign="${MACOS_SIGN_IDENTITY:-}"
 notarize=0
 dmg=1
+build=1
+assemble=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --arch) arch="$2"; shift 2 ;;
@@ -48,6 +56,8 @@ while [ $# -gt 0 ]; do
     --sign=*) sign="${1#*=}"; shift ;;
     --notarize) notarize=1; shift ;;
     --no-dmg) dmg=0; shift ;;
+    --build-only) assemble=0; shift ;;
+    --no-build) build=0; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -56,6 +66,9 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+[ "$build" = 1 ] || [ "$assemble" = 1 ] || die "--build-only and --no-build leave nothing to do"
+[ -z "$bin" ] || bin="$(absolute "$bin")"
+out="$(absolute "$out")"
 [ "$(uname -s)" = Darwin ] || die "this script builds a macOS bundle and only runs on macOS"
 case "$arch" in universal|native|arm64|x86_64) ;; *) die "--arch must be universal, native, arm64 or x86_64" ;; esac
 if [ "$arch" = native ]; then arch="$(uname -m)"; fi
@@ -82,9 +95,27 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/bundle-macos.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 # ---- the binary ---------------------------------------------------------------------------------
+# The app crate's package and binary names come from its manifest, not from APP_NAME.
+app_manifest=crates/app/Cargo.toml
+pkg_name="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name *=/{gsub(/[" ]/,"",$3); print $3; exit}' "$app_manifest")"
+bin_name="$(awk '/^\[\[bin\]\]/{b=1;next} /^\[/{b=0} b && /^name *=/{gsub(/[" ]/,"",$3); print $3; exit}' "$app_manifest")"
+[ -n "$bin_name" ] || bin_name="$pkg_name"
+[ -n "$pkg_name" ] && [ -n "$bin_name" ] || die "could not read the package / binary name from $app_manifest"
+
+ensure_target() { # triple: make sure the Rust standard library for it is installed
+  local triple="$1"
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add "$triple"
+  elif [ -d "$(rustc --print target-libdir --target "$triple" 2>/dev/null)" ]; then
+    :
+  else
+    die "the Rust target $triple is not installed and rustup is not available to add it. A universal build needs a rustup-managed toolchain (rust-toolchain.toml lists both macOS targets; see https://rustup.rs). Without rustup only the host architecture can be built: use --arch native."
+  fi
+}
+
 if [ -n "$bin" ]; then
   [ -f "$bin" ] || die "--bin $bin does not exist"
-  binary="$work/$app_name"
+  binary="$work/$bin_name"
   cp "$bin" "$binary"
 else
   export MACOSX_DEPLOYMENT_TARGET="$min_macos"
@@ -95,13 +126,18 @@ else
   esac
   slices=()
   for triple in $triples; do
-    # The targets come from rust-toolchain.toml (`targets`), installed by `rustup toolchain install`.
-    log "cargo build --release --target $triple"
-    cargo build --locked --release -p gpui-chat --target "$triple" ||
-      die "build for $triple failed (is its Rust target installed? rust-toolchain.toml lists it: run \`rustup toolchain install\`)"
-    slices+=("target/$triple/release/$app_name")
+    if [ "$build" = 1 ]; then
+      ensure_target "$triple"
+      log "cargo build --release --target $triple"
+      cargo build --locked --release -p "$pkg_name" --target "$triple"
+    fi
+    slices+=("target/$triple/release/$bin_name")
   done
-  binary="$work/$app_name"
+  [ "$assemble" = 1 ] || { log "built: ${slices[*]}"; exit 0; }
+  for slice in "${slices[@]}"; do
+    [ -f "$slice" ] || die "$slice is missing: run without --no-build, or run --build-only first"
+  done
+  binary="$work/$bin_name"
   if [ "${#slices[@]}" -gt 1 ]; then
     log "lipo -create"
     lipo -create -output "$binary" "${slices[@]}"
@@ -138,8 +174,8 @@ iconutil --convert icns --output "$work/AppIcon.icns" "$iconset"
 app="$out/$app_name.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$binary" "$app/Contents/MacOS/$app_name"
-chmod 755 "$app/Contents/MacOS/$app_name"
+cp "$binary" "$app/Contents/MacOS/$bin_name"
+chmod 755 "$app/Contents/MacOS/$bin_name"
 cp "$work/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 [ -f LICENSE ] && cp LICENSE "$app/Contents/Resources/LICENSE"
 
@@ -149,7 +185,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>$app_name</string>
+  <key>CFBundleExecutable</key><string>$bin_name</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>$app_id</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
@@ -182,9 +218,19 @@ sign_path() {
 notarize_path() { # path (a .zip or .dmg)
   [ -n "${APPLE_API_KEY_PATH:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER_ID:-}" ] ||
     die "--notarize needs APPLE_API_KEY_PATH, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID"
+  local auth=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
+  local result="$work/notarytool.json"
   log "notarizing $(basename "$1") (this waits for Apple, usually a few minutes)"
-  xcrun notarytool submit "$1" --wait \
-    --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID"
+  # `--wait` can exit 0 for an Invalid submission, so read the status out of the JSON result.
+  xcrun notarytool submit "$1" --wait --output-format json "${auth[@]}" > "$result" || true
+  cat "$result"; echo
+  local status id
+  status="$(plutil -extract status raw -o - "$result" 2>/dev/null || true)"
+  id="$(plutil -extract id raw -o - "$result" 2>/dev/null || true)"
+  if [ "$status" != "Accepted" ]; then
+    [ -z "$id" ] || xcrun notarytool log "$id" "${auth[@]}" || true
+    die "notarization of $(basename "$1") finished with status '${status:-unknown}', not Accepted"
+  fi
 }
 
 log "codesign $app_name.app"
