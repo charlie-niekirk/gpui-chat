@@ -269,6 +269,17 @@ mod tests {
     }
 
     #[test]
+    fn the_update_check_defaults_on_reads_off_and_a_file_without_the_key_means_on() {
+        let old = Settings::parse("[chat]\nscrollback = 500\n", Path::new("x")).unwrap();
+        assert!(old.updates.check_automatically);
+        let off =
+            Settings::parse("[updates]\ncheck_automatically = false\n", Path::new("x")).unwrap();
+        assert!(!off.updates.check_automatically);
+        let bad = Settings::parse("[updates]\ncheck_automatically = \"no\"\n", Path::new("x"));
+        assert!(bad.is_err(), "a non-boolean is refused, not guessed");
+    }
+
+    #[test]
     fn deleted_messages_default_to_strikethrough_and_unknown_values_fall_back() {
         use crate::DeletedMessages::{Collapse, Strikethrough};
         let load = |text: &str| {

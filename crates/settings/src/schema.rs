@@ -50,6 +50,8 @@ pub struct Settings {
     /// `[badges]`: third-party badges and 7TV name paints (PR 6.2).
     pub badges: BadgeSettings,
     pub streamlink: StreamlinkSettings,
+    /// `[updates]`: the check for a newer release (PR 7.2).
+    pub updates: UpdateSettings,
     /// `[highlights]` and its `[[highlights.rules]]` / `[[highlights.users]]` tables (PR 5.3).
     pub highlights: HighlightConfig,
     /// `[ignores]` and its `[[ignores.rules]]` table (PR 5.7).
@@ -69,6 +71,7 @@ impl Default for Settings {
             emotes: EmoteSettings::default(),
             badges: BadgeSettings::default(),
             streamlink: StreamlinkSettings::default(),
+            updates: UpdateSettings::default(),
             highlights: HighlightConfig::default(),
             ignores: IgnoreConfig::default(),
             filters: FilterConfig::default(),
@@ -265,6 +268,24 @@ impl Default for StreamlinkSettings {
     }
 }
 
+/// `[updates]`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Ask GitHub, at most once a day, whether a newer release is published, and show a notice
+    /// when there is one (nothing is downloaded). Off: the app makes no such request on its own;
+    /// "Check for Updates…" still checks when chosen.
+    pub check_automatically: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_automatically: true,
+        }
+    }
+}
+
 impl Settings {
     /// Check value ranges. Returns `(field, reason)` for the first problem.
     ///
@@ -369,6 +390,10 @@ mod tests {
         assert!(s.chat.history, "recent messages are on by default");
         assert_eq!((s.emotes.scale, s.emotes.animate), (1.0, true));
         assert_eq!(s.streamlink.default_quality, "best");
+        assert!(
+            s.updates.check_automatically,
+            "the update check is on by default"
+        );
         assert!(s.streamlink.path.is_none() && s.streamlink.player.is_none());
         assert!(s.streamlink.extra_args.is_empty());
         assert!(s.validate().is_ok());

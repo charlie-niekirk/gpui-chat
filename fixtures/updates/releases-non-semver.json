@@ -1,0 +1,95 @@
+[
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/3",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/3/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/3/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/nightly",
+    "id": 3,
+    "node_id": "RE_kwDOExample3",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "nightly",
+    "target_commitish": "main",
+    "name": "nightly",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 30,
+        "name": "gpui-chat-nightly-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for nightly.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/release-2026-11",
+    "id": 2,
+    "node_id": "RE_kwDOExample2",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "release-2026-11",
+    "target_commitish": "main",
+    "name": "release-2026-11",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 20,
+        "name": "gpui-chat-release-2026-11-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for release-2026-11.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/1",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/1/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/1/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v1",
+    "id": 1,
+    "node_id": "RE_kwDOExample1",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v1",
+    "target_commitish": "main",
+    "name": "v1",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 10,
+        "name": "gpui-chat-1-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v1.\n\n- A change\n- Another change\n"
+  }
+]

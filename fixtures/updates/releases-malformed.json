@@ -1,0 +1,13 @@
+[
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.2.0",
+    "id": 2,
+    "node_id": "RE_kwDOExample2",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": 

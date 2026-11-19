@@ -1306,6 +1306,10 @@ impl AppShell {
                             {
                                 account.update(cx, |account, cx| account.dismiss_notice(cx));
                             }
+                            // The update notice remembers which release was dismissed.
+                            if key == "update" {
+                                crate::updates::dismissed(cx);
+                            }
                             problems::dismiss(key, cx);
                         })
                         .ok();
@@ -1352,6 +1356,7 @@ impl AppShell {
             }
             Fix::EnableModeration => self.enable_moderation(window, cx),
             Fix::EnableBlockList => self.enable_block_list(window, cx),
+            Fix::ViewRelease => crate::updates::open_release(cx),
         }
     }
 

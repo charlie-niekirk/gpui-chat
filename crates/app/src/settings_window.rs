@@ -224,6 +224,7 @@ impl SettingsView {
             highlights::page(&this),
             ignores::page(&this),
             streamlink_page(),
+            updates_page(&this),
             account_page(),
         ]
     }
@@ -859,6 +860,27 @@ fn streamlink_page() -> SettingPage {
                 )
                 .description("One argument per line, placed before the channel."),
             ]),
+    )
+}
+
+fn updates_page(this: &WeakEntity<SettingsView>) -> SettingPage {
+    SettingPage::new("Updates").icon(IconName::Globe).group(
+        SettingGroup::new().title("Updates").item(
+            SettingItem::new(
+                "Check for updates automatically",
+                SettingField::switch(
+                    |cx| current(cx).updates.check_automatically,
+                    bool_writer(this, "updates.check_automatically"),
+                )
+                .default_value(true),
+            )
+            .description(
+                "Once a day the app asks GitHub whether a newer release is published and, if so, \
+                 shows a notice with a link to it. Nothing is downloaded or installed. Privacy: \
+                 GitHub sees your IP address and the app's name and version. Off: the app never \
+                 asks on its own; Check for Updates… in the app menu still works.",
+            ),
+        ),
     )
 }
 

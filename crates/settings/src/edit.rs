@@ -618,6 +618,33 @@ x = 1
     }
 
     #[test]
+    fn the_update_check_switch_writes_only_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "# mine\n[chat]\nscrollback = 500\n").unwrap();
+        Settings::update_file(
+            &path,
+            &[SettingEdit::set(
+                "updates.check_automatically",
+                EditValue::Bool(false),
+            )],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# mine") && text.contains("scrollback = 500"),
+            "{text}"
+        );
+        assert!(text.contains("check_automatically = false"), "{text}");
+        assert!(
+            !Settings::try_load(&path)
+                .unwrap()
+                .updates
+                .check_automatically
+        );
+    }
+
+    #[test]
     fn update_file_creates_the_file_and_its_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("settings.toml");

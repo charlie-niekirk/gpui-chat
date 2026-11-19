@@ -7,6 +7,8 @@ actions!(
     gpui_chat,
     [
         About,
+        /// Asks GitHub whether a newer release is published (PR 7.2).
+        CheckForUpdates,
         Quit,
         CloseWindow,
         MinimizeWindow,

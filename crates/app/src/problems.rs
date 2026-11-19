@@ -53,6 +53,8 @@ pub enum Fix {
     EnableModeration,
     /// Log in again asking for the block list permissions.
     EnableBlockList,
+    /// Open the page of the newer release in the browser (PR 7.2).
+    ViewRelease,
 }
 
 /// One problem as the strip shows it.

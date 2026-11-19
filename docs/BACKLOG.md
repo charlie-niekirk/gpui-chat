@@ -239,3 +239,9 @@ an entry here instead of expanding a PR. Format:
 - **Retry `hdiutil create` on hosted runners** (found in PR 7.1 review) — it can fail with "Resource busy" there; wrap it in a short retry loop.
 - **Dependabot for `github-actions`, and SHA-pin the actions in `ci.yml`** (found in PR 7.1 review) — only `Swatinem/rust-cache` is pinned by commit in `release.yml`; pin the rest (and `ci.yml`) and let Dependabot bump them.
 - **CI memory budget scenario is slow on the runner** (found after PR 6.1) — on the debug build in GitHub's macOS VM the 10 × 1 000 memory scenario takes 3.5 to over 5 min (locally ~30 s), so CI now allows 15 min per scenario. Faster options: decode-heavy dependencies (`image`, its codecs) at `opt-level = 2` in the dev profile, or a release build for the bench step.
+- **Update check: a self-clearing "up to date" notice** (found in PR 7.2) — the manual check's answers (up to date, no release, error) stay as a strip until dismissed; they could vanish after a few seconds like the jump notice.
+- **Update check: show the release notes** (found in PR 7.2) — the notice only links to the release page; the response already has the release body, which could be shown in a small dialog.
+- **Update check: a "Check for Updates" button on the Updates settings page** (found in PR 7.2) — the page only has the switch; the result strip is in the main window, so the button needs a way to show it there (or a result line in the page).
+- **Linux / Windows menu for the update check** (found in PR 7.2) — `CheckForUpdates` is in the shared app menu of `platform/other.rs` but unverified there; revisit in Phase 8 together with how updates are delivered (AppImage, AUR, winget).
+- **Sparkle-style in-app install** (found in PR 7.2) — the update check never downloads or installs; a real updater needs Developer ID signing and notarization first.
+

@@ -12,6 +12,7 @@ cargo run -p gpui-chat --release -- --firehose 1000 --hud  # offline synthetic c
 cargo run -p gpui-chat --release -- --replay fixtures/irc/privmsg.irc --hud   # replay a recorded IRC log
 scripts/bench.sh                                      # performance budgets, offline (PR 6.1)
 scripts/bundle-macos.sh                                # universal .app + DMG in dist/ (PR 7.1; --arch native is faster)
+scripts/update-cask.sh 0.1.0 --cask <tap>/Casks/gpui-chat.rb   # fill the Homebrew cask after a release (PR 7.2, docs/RELEASING.md)
 cargo fmt --all --check                               # formatting
 cargo clippy --workspace --all-targets -- -D warnings # lints (must be warning-free)
 cargo test --workspace                                # all tests
@@ -38,6 +39,7 @@ or ask for merge with red CI.
 | `crates/media` | `gpui-chat-media` | Image fetch, cache, decode |
 | `crates/settings` | `gpui-chat-settings` | Typed settings, load/save/watch |
 | `crates/streamlink` | `gpui-chat-streamlink` | Locate/launch/track streamlink |
+| `crates/update` | `gpui-chat-update` | Update check against GitHub Releases (notice only; HTTP, semver, cache) |
 
 Rules:
 - Non-app crates must build and test on Linux without GPUI. Never add a GPUI dependency to them.
