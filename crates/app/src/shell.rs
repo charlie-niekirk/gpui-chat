@@ -1307,7 +1307,7 @@ impl AppShell {
                                 account.update(cx, |account, cx| account.dismiss_notice(cx));
                             }
                             // The update notice remembers which release was dismissed.
-                            if key == "update" {
+                            if key == crate::updates::KEY {
                                 crate::updates::dismissed(cx);
                             }
                             problems::dismiss(key, cx);

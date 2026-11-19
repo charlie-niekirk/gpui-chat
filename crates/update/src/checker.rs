@@ -35,6 +35,10 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 /// How many releases one request asks for.
 const PER_PAGE: u32 = 20;
 
+/// Where an override of the API base keeps its state, so a fixture server can never write into the
+/// real cache and make the normal app announce a release that does not exist.
+pub const OVERRIDE_CACHE_FILE: &str = "update-check-override.json";
+
 /// The GitHub REST API.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// Environment variable that points the check at another server speaking the same API. It is for
@@ -98,12 +102,25 @@ impl UpdateChecker {
     /// (`CARGO_PKG_REPOSITORY`), remembering its state in `cache_file` when given. The API base is
     /// [`DEFAULT_API_BASE`] unless [`API_BASE_ENV`] is set.
     pub fn new(current: &str, cache_file: Option<PathBuf>) -> Result<Self, CheckError> {
+        let api_override = std::env::var(API_BASE_ENV)
+            .ok()
+            .filter(|base| !base.trim().is_empty());
+        Self::with_override(current, cache_file, api_override)
+    }
+
+    /// [`new`](Self::new) with the value of [`API_BASE_ENV`] given (tests).
+    pub(crate) fn with_override(
+        current: &str,
+        cache_file: Option<PathBuf>,
+        api_override: Option<String>,
+    ) -> Result<Self, CheckError> {
         let current =
             Version::parse(current).map_err(|_| CheckError::BadVersion(current.to_owned()))?;
-        let api_base = std::env::var(API_BASE_ENV)
-            .ok()
-            .filter(|base| !base.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_API_BASE.to_owned());
+        let cache_file = cache_file_for(cache_file, api_override.is_some());
+        if let Some(base) = &api_override {
+            tracing::warn!(%base, "{API_BASE_ENV} is set: the update check asks that server, with its own cache file");
+        }
+        let api_base = api_override.unwrap_or_else(|| DEFAULT_API_BASE.to_owned());
         let record = cache_file.as_deref().map(cache::load).unwrap_or_default();
         Ok(Self {
             client: client(REQUEST_TIMEOUT)?,
@@ -156,14 +173,14 @@ impl UpdateChecker {
         let record = self.snapshot();
         let known = record.checked_at.is_some();
         let remembered = || self.evaluate(record.latest_tag.as_deref());
-        if let Some(until) = record.rate_limited_until.filter(|until| *until > now) {
+        if let Some(until) = pause(record.rate_limited_until, now, MAX_RATE_WAIT) {
             return if known {
                 Ok(remembered())
             } else {
                 Err(CheckError::RateLimited { until })
             };
         }
-        if let Some(until) = record.retry_after.filter(|until| *until > now) {
+        if let Some(until) = pause(record.retry_after, now, FAILURE_PAUSE) {
             return if known {
                 Ok(remembered())
             } else {
@@ -183,11 +200,7 @@ impl UpdateChecker {
     /// not while a rate limit runs.
     pub async fn check_now(&self) -> Result<Outcome, CheckError> {
         let now = self.now();
-        if let Some(until) = self
-            .snapshot()
-            .rate_limited_until
-            .filter(|until| *until > now)
-        {
+        if let Some(until) = pause(self.snapshot().rate_limited_until, now, MAX_RATE_WAIT) {
             return Err(CheckError::RateLimited { until });
         }
         self.fetch(now).await
@@ -201,8 +214,8 @@ impl UpdateChecker {
             .checked_at
             .map_or(now, |checked| checked.saturating_add(CHECK_INTERVAL));
         due = due
-            .max(record.rate_limited_until.unwrap_or(0))
-            .max(record.retry_after.unwrap_or(0));
+            .max(pause(record.rate_limited_until, now, MAX_RATE_WAIT).unwrap_or(0))
+            .max(pause(record.retry_after, now, FAILURE_PAUSE).unwrap_or(0));
         Duration::from_secs(due.saturating_sub(now).clamp(MIN_WAIT, CHECK_INTERVAL))
     }
 
@@ -230,13 +243,11 @@ impl UpdateChecker {
 
     /// Changes the remembered state and writes it out.
     fn update(&self, change: impl FnOnce(&mut Record)) {
-        let record = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            change(&mut state);
-            state.clone()
-        };
+        // Written while the lock is held, so two writers never interleave on the temp file.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        change(&mut state);
         if let Some(path) = &self.cache_file {
-            cache::save(path, &record);
+            cache::save(path, &state);
         }
     }
 
@@ -354,6 +365,25 @@ impl UpdateChecker {
             other => Err(CheckError::Status(other)),
         }
     }
+}
+
+/// A remembered pause still in force at `now`: later than now, and no further off than `max`
+/// seconds. A value beyond that (written under a clock that was wrong) is ignored, so a bad clock
+/// cannot block the check for long.
+fn pause(until: Option<u64>, now: u64, max: u64) -> Option<u64> {
+    until.filter(|until| *until > now && *until <= now.saturating_add(max))
+}
+
+/// The state file to use: `cache_file`, or its sibling [`OVERRIDE_CACHE_FILE`] when the API base is
+/// overridden.
+fn cache_file_for(cache_file: Option<PathBuf>, overridden: bool) -> Option<PathBuf> {
+    cache_file.map(|path| {
+        if overridden {
+            path.with_file_name(OVERRIDE_CACHE_FILE)
+        } else {
+            path
+        }
+    })
 }
 
 /// `owner/name` of a GitHub URL (`https://github.com/owner/name`, with or without `.git`).

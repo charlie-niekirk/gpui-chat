@@ -245,3 +245,7 @@ an entry here instead of expanding a PR. Format:
 - **Linux / Windows menu for the update check** (found in PR 7.2) — `CheckForUpdates` is in the shared app menu of `platform/other.rs` but unverified there; revisit in Phase 8 together with how updates are delivered (AppImage, AUR, winget).
 - **Sparkle-style in-app install** (found in PR 7.2) — the update check never downloads or installs; a real updater needs Developer ID signing and notarization first.
 
+- **Update check: `per_page=20` can miss a stable release** (found in PR 7.2 review) — 20 or more prereleases listed after the newest stable release hide it; use `/releases/latest` or follow the pages.
+- **Update check: flat one-hour failure pause** (found in PR 7.2 review) — no exponential backoff for a server that keeps failing.
+- **Update check: a dismissed release's automatic `Notice::Clear` also removes a manual answer** (found in PR 7.2 review) — a manual "up to date" the user is reading can be cleared by the daily check; track who filed the strip.
+- **Cask `zap` list** (found in PR 7.2 review) — add `~/Library/Saved Application State/dev.gpui-chat.app.savedState` and `~/Library/Preferences/dev.gpui-chat.app.plist` if GPUI creates them.

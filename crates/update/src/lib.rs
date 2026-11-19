@@ -24,8 +24,8 @@ pub mod release;
 pub use auto::run_automatic;
 pub use cache::FILE_NAME as CACHE_FILE_NAME;
 pub use checker::{
-    API_BASE_ENV, CHECK_INTERVAL, CheckError, DEFAULT_API_BASE, FAILURE_PAUSE, Outcome,
-    REQUEST_TIMEOUT, UpdateChecker, repo_from_url,
+    API_BASE_ENV, CHECK_INTERVAL, CheckError, DEFAULT_API_BASE, FAILURE_PAUSE, OVERRIDE_CACHE_FILE,
+    Outcome, REQUEST_TIMEOUT, UpdateChecker, repo_from_url,
 };
 pub use release::Release;
 pub use semver::Version;

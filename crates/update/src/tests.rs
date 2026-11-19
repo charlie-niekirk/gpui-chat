@@ -578,6 +578,82 @@ async fn switching_the_setting_on_checks_and_reports_then_waits_a_day() {
     task.abort();
 }
 
+#[tokio::test]
+async fn an_overridden_api_base_keeps_its_state_in_a_file_of_its_own() {
+    let server = MockServer::start().await;
+    serve(&server, json(RELEASES)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join(CACHE_FILE_NAME);
+    let checker = UpdateChecker::with_override("0.3.0", Some(real.clone()), Some(server.uri()))
+        .unwrap()
+        .with_clock(|| START);
+    assert_eq!(checker.check_now().await, Ok(available("v0.10.0")));
+    assert!(!real.exists(), "the real cache file must stay untouched");
+    assert!(dir.path().join(OVERRIDE_CACHE_FILE).exists());
+}
+
+#[tokio::test]
+async fn pauses_written_under_a_wrong_clock_are_ignored() {
+    let server = MockServer::start().await;
+    serve(&server, json(EMPTY)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(CACHE_FILE_NAME);
+    // A rate limit and a failure pause years ahead, and a check "from the future".
+    let far = START + 5 * 365 * DAY;
+    std::fs::write(
+        &file,
+        format!(r#"{{"rate_limited_until": {far}, "retry_after": {far}, "checked_at": {far}}}"#),
+    )
+    .unwrap();
+    let checker = UpdateChecker::new("0.0.0", Some(file))
+        .unwrap()
+        .with_api_base(server.uri())
+        .with_clock(|| START);
+    assert!(checker.next_check_in() <= Duration::from_secs(DAY));
+    assert_eq!(checker.check_if_due().await, Ok(Outcome::NoRelease));
+    assert_eq!(requests(&server).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn waking_from_sleep_is_noticed_within_the_hour_and_an_answer_is_reported_once() {
+    let server = MockServer::start().await;
+    serve(&server, json(RELEASES)).await;
+    let (checker, now) = checker(&server, "0.3.0");
+    let checker = Arc::new(
+        checker
+            .with_timeout(Duration::from_secs(1000 * DAY))
+            .unwrap(),
+    );
+    let wake = Arc::new(Notify::new());
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task = tokio::spawn({
+        let (checker, wake, reports) = (checker.clone(), wake.clone(), reports.clone());
+        async move {
+            run_automatic(
+                &checker,
+                || true,
+                &wake,
+                |outcome| reports.lock().unwrap().push(outcome),
+            )
+            .await
+        }
+    });
+    settle().await;
+    assert_eq!(requests(&server).await, 1);
+    // Hourly wake-ups within the day neither ask nor repeat the answer.
+    now.fetch_add(3 * 3600, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3 * 3600)).await;
+    settle().await;
+    assert_eq!(requests(&server).await, 1);
+    assert_eq!(reports.lock().unwrap().len(), 1);
+    // The machine slept two days: the wall clock jumped, tokio's clock moved one hour.
+    now.fetch_add(2 * DAY, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3600 + 1)).await;
+    settle().await;
+    assert_eq!(requests(&server).await, 2);
+    task.abort();
+}
+
 #[test]
 fn the_repository_is_read_from_the_manifest() {
     assert_eq!(

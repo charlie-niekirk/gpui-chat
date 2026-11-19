@@ -31,7 +31,7 @@ use crate::problems::{self, Fix, Problem};
 use crate::{config, runtime};
 
 /// The cause key of the strip.
-const KEY: &str = "update";
+pub const KEY: &str = "update";
 
 /// The first automatic check waits this long after launch: startup has better things to do with
 /// the network.
@@ -55,6 +55,14 @@ struct Updates {
 }
 
 impl gpui_kit::Global for Updates {}
+
+/// Whether the daily check may ask GitHub. It **fails closed**: the setting must be on *and* the
+/// settings file must have loaded. A file that does not load (at startup the defaults are used, and
+/// the defaults say "on") might hold `check_automatically = false`, so nothing is asked until the
+/// file is fixed.
+fn automatic_wanted(store: &config::SettingsStore) -> bool {
+    store.error().is_none() && store.settings().updates.check_automatically
+}
 
 /// What the strip should do about a result.
 #[derive(Debug, PartialEq)]
@@ -99,16 +107,16 @@ pub fn init(offline: bool, cx: &mut App) {
     if offline {
         return;
     }
-    let enabled = Arc::new(AtomicBool::new(
-        config::current(cx).updates.check_automatically,
-    ));
+    let enabled = Arc::new(AtomicBool::new(automatic_wanted(
+        config::store(cx).read(cx),
+    )));
     let wake = Arc::new(Notify::new());
     // Switching the setting on or off wakes the task: on checks at once (if a day is up), off
     // lets it sleep until it is switched on again.
     cx.observe(&config::store(cx), {
         let (enabled, wake) = (enabled.clone(), wake.clone());
         move |store, cx| {
-            let on = store.read(cx).settings().updates.check_automatically;
+            let on = automatic_wanted(store.read(cx));
             if enabled.swap(on, Ordering::SeqCst) != on {
                 wake.notify_one();
             }
@@ -280,6 +288,54 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_from(text: &str) -> config::SettingsStore {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.toml");
+        std::fs::write(&file, text).unwrap();
+        config::SettingsStore::new(gpui_chat_settings::Settings::load_or_default(&file))
+    }
+
+    #[test]
+    fn the_daily_check_follows_the_setting() {
+        assert!(automatic_wanted(&store_from("")));
+        assert!(automatic_wanted(&store_from(
+            "[updates]\ncheck_automatically = true\n"
+        )));
+        assert!(!automatic_wanted(&store_from(
+            "[updates]\ncheck_automatically = false\n"
+        )));
+    }
+
+    #[test]
+    fn a_settings_file_that_does_not_load_switches_the_daily_check_off() {
+        // `check_automatically = false` next to an unrelated bad value: the whole file is
+        // rejected and the defaults (check on) would apply; the check must stay off.
+        let broken = "[updates]\ncheck_automatically = false\n[chat]\nscrollback = \"lots\"\n";
+        let store = store_from(broken);
+        assert!(store.error().is_some());
+        assert!(
+            store.settings().updates.check_automatically,
+            "the defaults are in effect"
+        );
+        assert!(!automatic_wanted(&store));
+        // Not valid TOML at all, and a value out of range, likewise.
+        assert!(!automatic_wanted(&store_from("[updates\n")));
+        assert!(!automatic_wanted(&store_from("[chat]\nscrollback = 1\n")));
+    }
+
+    #[test]
+    fn a_reload_that_fails_switches_it_off_and_a_good_one_back_on() {
+        use gpui_chat_settings::{Settings, SettingsEvent};
+        let mut store = store_from("");
+        assert!(automatic_wanted(&store));
+        let error =
+            Settings::parse("[chat]\nscrollback = \"x\"\n", std::path::Path::new("x")).unwrap_err();
+        store.apply_events([SettingsEvent::Failed(error)]);
+        assert!(!automatic_wanted(&store));
+        store.apply_events([SettingsEvent::Reloaded(Settings::default())]);
+        assert!(automatic_wanted(&store));
+    }
 
     fn release(tag: &str) -> Release {
         gpui_chat_update::release::release_for_tag("charlie-niekirk/gpui-chat", tag).unwrap()

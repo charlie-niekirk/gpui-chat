@@ -1183,7 +1183,10 @@ age but not during a rate limit. A request has a 10 s timeout, a 2 MiB body cap,
 (`checked_at`, `etag`, `latest_tag`, the two pauses, the dismissed tag) is held in memory and written to
 `update-check.json` in the cache directory, best effort; a corrupt file reads as empty. `run_automatic` is the
 long-running task: while `enabled()` is false it only awaits a `Notify` — **no request at all** — and otherwise
-checks, reports and sleeps until `next_check_in` or a wake. `GPUI_CHAT_UPDATE_API` replaces the API base (tests, trying
+checks, reports a changed answer and sleeps until `next_check_in` or a wake (each sleep at most an hour, so a night of laptop
+sleep is noticed: the checker compares wall-clock times, and a stored pause further off than it could have been is ignored).
+While `GPUI_CHAT_UPDATE_API` is set the state goes to `update-check-override.json`. The app's `enabled` closure is
+`updates::automatic_wanted`: the setting on **and** no settings load error. `GPUI_CHAT_UPDATE_API` replaces the API base (tests, trying
 the notice against `fixtures/updates/`).
 
 `crates/app/src/updates.rs` starts it (`updates::init`, after the backend runtime and the settings; offline runs only get

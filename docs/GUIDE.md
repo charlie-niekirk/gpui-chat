@@ -240,7 +240,9 @@ Every action can be rebound in `~/.config/gpui-chat/keymap.toml` ([`KEYMAP.md`](
 ## Settings and files
 
 *Settings* (**⌘,**) writes `settings.toml` for you and follows hand edits of the file at once; a file with a
-mistake keeps the last good values and says what is wrong in a banner.
+mistake says what is wrong in a banner. If you edit the file while the app runs, the last good values stay
+in effect; if the file is already broken at launch the defaults are used until you fix it. (The one
+exception is the daily update check, which stays **off** whenever the settings file does not load.)
 
 | What | Where |
 |---|---|
@@ -251,7 +253,8 @@ mistake keeps the last good values and says what is wrong in a banner.
 | Cache (emote images, update check) | `~/Library/Caches/gpui-chat/` |
 | Twitch login | the macOS keychain, service `dev.gpui-chat.app` |
 
-`GPUI_CHAT_CONFIG_DIR` and `GPUI_CHAT_CACHE_DIR` point the app at other folders. Deleting a file resets what it
+`GPUI_CHAT_CONFIG_DIR` and `GPUI_CHAT_CACHE_DIR` point the app at other folders for the settings, keymap and themes
+and for the cache; `state.toml` stays in `~/Library/Application Support/gpui-chat/` either way. Deleting a file resets what it
 holds; deleting `~/.config/gpui-chat` gives you the defaults.
 
 ## Updates

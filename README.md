@@ -45,9 +45,10 @@ a thousand messages a second.
   bundled colour themes plus your own, JetBrains Mono bundled (or the font you choose).
 - **Fast.** A custom virtualised chat view with enforced performance budgets for scrolling, bursts, idle CPU,
   memory and launch (`scripts/bench.sh`).
-- **Quiet about the network.** It talks to Twitch, the emote providers you leave on, a recent-messages service
-  (switchable) and, once a day, GitHub's release list for an update notice (switchable, never downloads
-  anything). The [guide](docs/GUIDE.md) and [`docs/SETTINGS.md`](docs/SETTINGS.md) say exactly what is sent.
+- **Quiet about the network.** It talks to Twitch; the emote providers you leave on (7TV, BetterTTV,
+  FrankerFaceZ); the badge and cosmetics providers you leave on (7TV, FrankerFaceZ, Chatterino); a
+  recent-messages service (switchable); and, once a day, GitHub's release list for an update notice
+  (switchable, never downloads anything). The [guide](docs/GUIDE.md) and [`docs/SETTINGS.md`](docs/SETTINGS.md) say exactly what is sent.
 
 ## Install
 

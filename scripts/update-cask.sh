@@ -11,8 +11,15 @@
 # release the version names; the script creates no tag, release or repository.
 set -euo pipefail
 
+# Relative --cask / --dmg paths are relative to where the script was started, not the repo root.
+invoked_from="$PWD"
 cd "$(dirname "$0")/.."
-template="packaging/homebrew/gpui-chat.rb"
+absolute() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$invoked_from/$1" ;; esac; }
+
+# The app name is read from `APP_NAME` in crates/core/src/lib.rs, like scripts/bundle-macos.sh does.
+app_name="$(sed -n 's/^pub const APP_NAME: &str = "\(.*\)";$/\1/p' crates/core/src/lib.rs)"
+[ -n "$app_name" ] || { echo "error: could not read APP_NAME from crates/core/src/lib.rs" >&2; exit 1; }
+template="packaging/homebrew/$app_name.rb"
 repo="charlie-niekirk/gpui-chat"
 
 usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
@@ -24,8 +31,8 @@ cask="$template"
 while [ $# -gt 0 ]; do
   case "$1" in
     --sha256) sha="$2"; shift 2 ;;
-    --dmg) dmg="$2"; shift 2 ;;
-    --cask) cask="$2"; shift 2 ;;
+    --dmg) dmg="$(absolute "$2")"; shift 2 ;;
+    --cask) cask="$(absolute "$2")"; shift 2 ;;
     -h|--help) usage 0 ;;
     -*) echo "unknown option: $1" >&2; usage ;;
     *) if [ -n "$version" ]; then usage; fi; version="${1#v}"; shift ;;
@@ -41,7 +48,7 @@ if [ -z "$sha" ]; then
   if [ -n "$dmg" ]; then
     sha="$(shasum -a 256 "$dmg" | cut -d' ' -f1)"
   else
-    asset="gpui-chat-$version-macos-universal.dmg.sha256"
+    asset="$app_name-$version-macos-universal.dmg.sha256"
     echo "Reading $asset from the v$version release of $repo…"
     sha="$(gh release download "v$version" --repo "$repo" --pattern "$asset" --output - | cut -d' ' -f1)"
   fi
@@ -52,6 +59,9 @@ if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$'; then
 fi
 
 [ -f "$cask" ] || { echo "error: no cask at $cask" >&2; exit 1; }
+# The cask must download the DMG this app's bundle script names.
+grep -Fq "$app_name-#{version}-macos-universal.dmg" "$cask" ||
+  { echo "error: $cask does not point at $app_name-#{version}-macos-universal.dmg" >&2; exit 1; }
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 awk -v version="$version" -v sha="$sha" '
@@ -59,6 +69,9 @@ awk -v version="$version" -v sha="$sha" '
   /^  sha256 "/  { print "  sha256 \"" sha "\""; next }
   { print }
 ' "$cask" > "$tmp"
+# Both lines must be there with the new values before anything is written.
+grep -Fxq "  version \"$version\"" "$tmp" && grep -Fxq "  sha256 \"$sha\"" "$tmp" ||
+  { echo "error: $cask has no \`  version \"…\"\` / \`  sha256 \"…\"\` lines to fill in" >&2; exit 1; }
 cat "$tmp" > "$cask"
 echo "Updated $cask: version $version, sha256 $sha"
 if command -v ruby >/dev/null 2>&1; then ruby -c "$cask" >/dev/null && echo "ruby -c: syntax OK"; fi
