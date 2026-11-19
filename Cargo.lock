@@ -2437,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
  "gpui-chat-core",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dhat",
  "regex",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-emotes"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "gpui-chat-core",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-media"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "gpui-chat-core",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-settings"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
  "gpui-chat-core",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-streamlink"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-twitch"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "gpui-chat-core",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-chat-update"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "gpui-chat-core",
  "reqwest",
