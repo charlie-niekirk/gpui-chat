@@ -249,3 +249,4 @@ an entry here instead of expanding a PR. Format:
 - **Update check: flat one-hour failure pause** (found in PR 7.2 review) — no exponential backoff for a server that keeps failing.
 - **Update check: a dismissed release's automatic `Notice::Clear` also removes a manual answer** (found in PR 7.2 review) — a manual "up to date" the user is reading can be cleared by the daily check; track who filed the strip.
 - **Cask `zap` list** (found in PR 7.2 review) — add `~/Library/Saved Application State/dev.gpui-chat.app.savedState` and `~/Library/Preferences/dev.gpui-chat.app.plist` if GPUI creates them.
+- **Flaky test `waking_from_sleep_is_noticed_within_the_hour_and_an_answer_is_reported_once`** (found on PR 39, Linux CI) — saw 1 request where 2 were expected after the simulated two-day sleep; passed on re-run. Paused tokio time races the real wiremock I/O in `settle()`; wait for the request count instead of a fixed settle.
