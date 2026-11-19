@@ -4,7 +4,8 @@ use gpui_chat_core::APP_NAME;
 use gpui_kit::{KeyBinding, Menu};
 
 use super::{
-    about_item, account_items, channel_menu, quit_item, settings_item, view_menu, window_menu,
+    about_item, account_items, channel_menu, check_updates_item, quit_item, settings_item,
+    view_menu, window_menu,
 };
 use crate::actions::{
     AddChannel, CHAT_CONTEXT, COMPOSER_CONTEXT, ClosePane, CloseWindow, Find, FindNext,
@@ -54,7 +55,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub fn menus() -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items(
-            [about_item(), settings_item()]
+            [about_item(), check_updates_item(), settings_item()]
                 .into_iter()
                 .chain(account_items())
                 .chain([quit_item()]),

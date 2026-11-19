@@ -18,9 +18,11 @@ crates/
   media/       image fetch, disk cache, decode (static + animated), memory budget
   settings/    typed settings, load/save/watch, paths
   streamlink/  locate binary, launch, track child processes
+  update/      update check against the GitHub Releases (PR 7.2): semver compare, daily, ETag, rate limits; no UI
 assets/        fonts, icons, bundled themes (`themes/*.toml`); badges/global.json = bundled global-badge snapshot (PR 2.5)
 fixtures/      recorded raw IRC lines, API JSON samples                      (added by later PRs)
-docs/          ARCHITECTURE.md, BACKLOG.md, SETTINGS.md, THEMES.md
+docs/          ARCHITECTURE.md, BACKLOG.md, GUIDE.md, KEYMAP.md, RELEASING.md, SETTINGS.md, THEMES.md
+packaging/     homebrew/ cask template (PR 7.2); `scripts/update-cask.sh` fills it in
 ```
 
 Package names are `gpui-chat-<dir>` for libraries (`gpui-chat-core`, …); the
@@ -29,7 +31,7 @@ they are unit-testable on any OS and let PR sessions work in parallel without
 touching the same files.
 
 Dependency direction: `app` → everything; `twitch`, `emotes`, `media`,
-`settings`, `streamlink` → `core` at most; `core` depends on nothing but `std`
+`settings`, `streamlink` → `core` at most (`update` → `core` for the app name); `core` depends on nothing but `std`
 (plus pure-data crates such as `serde`). No cycles.
 
 Third-party versions are pinned once in the root `Cargo.toml`
@@ -1164,3 +1166,32 @@ Started | Failed(error) | Exited { stopped } }` to the caller's sink. Stop signa
 (`SIGTERM`, `SIGKILL` after 3 s) with `/bin/kill`, so the player streamlink started goes down too;
 `stop_all(timeout)` is the blocking variant for quit, and `Drop` does the same. Launching a channel that
 is running restarts it under a new session id.
+
+### Update check (`crates/update`, PR 7.2)
+
+`gpui-chat-update` answers one question — is a newer release published on GitHub? — and shows nothing and
+installs nothing. `release::parse_releases` reads the `GET /repos/<owner>/<repo>/releases?per_page=20` body: a JSON
+array, each element read on its own (one of the wrong shape is skipped), drafts and prereleases dropped, tags
+that are not semver (`v0.1.0` / `0.1.0`) or carry a semver pre-release part dropped, the rest sorted by
+`Version::cmp_precedence` (build metadata ignored). The release URL is built from the repository and the tag, never
+taken from the response. `UpdateChecker` (the repository is `CARGO_PKG_REPOSITORY`, the running version is passed in) has
+two entry points: `check_if_due` (automatic) asks only when the last answer is older than a day and no rate limit or
+failure pause (an hour) is running, else answers from what it remembers; `check_now` (the menu item) asks whatever the
+age but not during a rate limit. A request has a 10 s timeout, a 2 MiB body cap, `If-None-Match` from the remembered
+`ETag` (`304` keeps the answer), and a `403` / `429` with `Retry-After` or `x-ratelimit-remaining: 0` is remembered until
+`x-ratelimit-reset` (clamped to between a minute and a day). A `404` or an empty list is `Outcome::NoRelease`. State
+(`checked_at`, `etag`, `latest_tag`, the two pauses, the dismissed tag) is held in memory and written to
+`update-check.json` in the cache directory, best effort; a corrupt file reads as empty. `run_automatic` is the
+long-running task: while `enabled()` is false it only awaits a `Notify` — **no request at all** — and otherwise
+checks, reports a changed answer and sleeps until `next_check_in` or a wake (each sleep at most an hour, so a night of laptop
+sleep is noticed: the checker compares wall-clock times, and a stored pause further off than it could have been is ignored).
+While `GPUI_CHAT_UPDATE_API` is set the state goes to `update-check-override.json`. The app's `enabled` closure is
+`updates::automatic_wanted`: the setting on **and** no settings load error. `GPUI_CHAT_UPDATE_API` replaces the API base (tests, trying
+the notice against `fixtures/updates/`).
+
+`crates/app/src/updates.rs` starts it (`updates::init`, after the backend runtime and the settings; offline runs only get
+the manual check), observes `updates.check_automatically` to wake the task, and turns each result into the `update`
+strip of `problems` (`Fix::ViewRelease` opens the release page with `cx.open_url`). The daily check speaks only for
+a newer release the user has not dismissed; the menu item (`CheckForUpdates`, in the app menu and the palette)
+always answers, and a result for a release the user dismissed through the strip is remembered by tag.
+

@@ -48,7 +48,7 @@ pub use paths::{
 pub use schema::{
     AppearanceSettings, BadgeSettings, ChatSettings, DeletedMessages, EMOTE_SCALE_RANGE,
     EmoteSettings, FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, SCHEMA_VERSION, SCROLLBACK_RANGE, Settings,
-    StreamlinkSettings, ThemeMode, UNVERSIONED_SCHEMA_VERSION,
+    StreamlinkSettings, ThemeMode, UNVERSIONED_SCHEMA_VERSION, UpdateSettings,
 };
 pub use store::LoadOutcome;
 pub use theme::{

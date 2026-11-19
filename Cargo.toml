@@ -21,6 +21,7 @@ gpui-chat-emotes = { path = "crates/emotes" }
 gpui-chat-media = { path = "crates/media" }
 gpui-chat-settings = { path = "crates/settings" }
 gpui-chat-streamlink = { path = "crates/streamlink" }
+gpui-chat-update = { path = "crates/update" }
 
 # UI: only `crates/app` may depend on this.
 gpui-kit = "=0.9.1"
@@ -58,6 +59,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # Heap accounting for the memory / allocation budget tests (PR 6.1): a counting global allocator
 # without `unsafe` in our code.
 dhat = "0.3"
+
+# Update check (PR 7.2): compares the running version with the tags of the GitHub Releases.
+semver = "1.0"
 
 # Text
 unicode-segmentation = "1.13"

@@ -54,6 +54,7 @@ mod state;
 mod stream_info;
 mod streams;
 mod theme;
+mod updates;
 mod user_directory;
 
 use std::sync::Arc;
@@ -64,7 +65,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::account::AccountHub;
-use crate::actions::{OpenSettings, Quit};
+use crate::actions::{CheckForUpdates, OpenSettings, Quit};
 use crate::channel_list::ChannelList;
 use crate::channels::ChannelHub;
 use crate::cli::{Cli, Parsed};
@@ -165,6 +166,8 @@ fn start_chat(
         let account = account.map(|(auth, helix)| AccountHub::start(auth, helix, cx));
         (ChannelList::from_saved(&saved), Some(live), account)
     };
+    // The update check: the daily one needs a live run, the menu item works in any.
+    updates::init(offline, cx);
     // What is ignored (settings and, with a login that allows it, the Twitch block list): the chat
     // views and the attention state ask it.
     ignores::init(offline, cx);
@@ -279,6 +282,7 @@ fn main() {
             let keymap_events = keymap::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
+            cx.on_action(|_: &CheckForUpdates, cx| updates::check_now(cx));
 
             // Persist the last window placement and channel list on the way out (⌘Q and last-window close).
             cx.on_app_quit(|cx| {

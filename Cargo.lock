@@ -2446,6 +2446,7 @@ dependencies = [
  "gpui-chat-settings",
  "gpui-chat-streamlink",
  "gpui-chat-twitch",
+ "gpui-chat-update",
  "gpui-kit",
  "gpui-pre",
  "image",
@@ -2536,6 +2537,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twitch-irc",
+ "wiremock",
+]
+
+[[package]]
+name = "gpui-chat-update"
+version = "0.0.0"
+dependencies = [
+ "gpui-chat-core",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "wiremock",
 ]
 

@@ -79,6 +79,7 @@ OpenPalette = "secondary-p"                 # cmd on macOS, ctrl elsewhere
 | `ShowMentions` | Show Mentions (toggles the Mentions panel, PR 5.3) | ⌘⇧M |
 | `ToggleDebugHud` | Toggle Debug HUD | ⌘⇧D |
 | `LogIn` / `LogOut` | Log In to Twitch… / Log Out | |
+| `CheckForUpdates` | Check for Updates… (asks GitHub for a newer release, PR 7.2) | |
 | `About` `MinimizeWindow` `CloseWindow` `Quit` | | ⌘M ⌘W ⌘Q |
 
 Bindable but not in the palette (the input box and the emote picker; contexts

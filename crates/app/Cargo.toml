@@ -18,6 +18,7 @@ gpui-chat-media = { workspace = true }
 gpui-chat-settings = { workspace = true }
 gpui-chat-streamlink = { workspace = true }
 gpui-chat-twitch = { workspace = true }
+gpui-chat-update = { workspace = true }
 dirs = { workspace = true }
 gpui-kit = { workspace = true }
 # The Twitch login in the system keychain (`platform::keychain`).

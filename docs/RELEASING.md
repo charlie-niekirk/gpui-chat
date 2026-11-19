@@ -17,6 +17,7 @@ published until the owner presses *Publish release* by hand.
    The workflow refuses a tag that does not match the Cargo version.
 3. When the run is green, open the draft release, check the notes, download the DMG and open it on a
    Mac that is not the build machine, then publish.
+4. After publishing, [update the Homebrew cask](#homebrew) in the tap.
 
 Re-running the workflow for a tag whose release is still a draft replaces the draft's assets. Once a
 release is published, a re-run fails instead: published assets are never replaced, cut a new version.
@@ -42,6 +43,65 @@ and the script runs `rustup target add` for each before building. Homebrew's Rus
 ignores `rust-toolchain.toml` and cannot build the other architecture, so the script stops with an
 error for a universal build there; `--arch native` still works. Install rustup from https://rustup.rs.
 The icon is built from `assets/icon/icon-1024.png`.
+
+## What the update check sees
+
+Running apps look for updates with `GET /repos/<owner>/<repo>/releases` (the repository comes from
+`repository` in `Cargo.toml`) and compare `CARGO_PKG_VERSION` with the newest release that is
+**published** (not a draft), **not marked a prerelease**, and whose tag is semver (`v0.2.0`; a tag with a
+semver pre-release part such as `v0.2.0-rc.1`, or any tag that is not semver, is skipped). So:
+
+- A draft is invisible to every app until you press *Publish release*, and publishing is what makes users see
+  the notice. Do it only when the DMG is final.
+- Tag release candidates `vX.Y.Z-rc.N` and tick *Set as a pre-release*; they never produce a notice.
+- The notice links to the release page (`https://github.com/<owner>/<repo>/releases/tag/<tag>`); nothing is
+  downloaded by the app. Apps ask at most once a day, so a notice appears within a day of publishing.
+- To try the notice without a release, serve `fixtures/updates/releases.json` (or any list of releases) from a
+  local server at `$GPUI_CHAT_UPDATE_API/repos/<owner>/<repo>/releases`, run the app against it and choose
+  *Check for Updates…*. The running version must be lower than the newest tag in the file.
+
+## Homebrew
+
+`packaging/homebrew/gpui-chat.rb` is the cask for the universal DMG named by `scripts/bundle-macos.sh`
+(`gpui-chat-<version>-macos-universal.dmg`). The copy in this repository is a **template** with a placeholder
+`version` and `sha256`; the filled-in cask lives in a tap you own. Nothing in this repository creates the tap,
+pushes to it or touches `homebrew-cask`.
+
+### One-time tap setup
+
+A tap is a GitHub repository named `homebrew-<name>`. For the owner's account:
+
+```bash
+gh repo create charlie-niekirk/homebrew-tap --public --description "Homebrew tap for gpui-chat"
+git clone https://github.com/charlie-niekirk/homebrew-tap ../homebrew-tap
+mkdir -p ../homebrew-tap/Casks
+cp packaging/homebrew/gpui-chat.rb ../homebrew-tap/Casks/gpui-chat.rb
+```
+
+Users then install with `brew install --cask charlie-niekirk/tap/gpui-chat` (Homebrew adds the
+`charlie-niekirk/tap` tap by itself), or `brew tap charlie-niekirk/tap` first.
+
+### For each release
+
+After *Publish release* (the DMG must be downloadable), in this repository:
+
+```bash
+scripts/update-cask.sh 0.1.0 --cask ../homebrew-tap/Casks/gpui-chat.rb
+cd ../homebrew-tap && git add Casks/gpui-chat.rb && git commit -m "gpui-chat 0.1.0" && git push
+```
+
+The script reads `gpui-chat-0.1.0-macos-universal.dmg.sha256` from the release with `gh` (or use `--dmg <file>` to
+hash a local DMG, or `--sha256 <digest>`), writes the `version` and `sha256` lines and checks the Ruby syntax. Then
+try it on a Mac:
+
+```bash
+brew install --cask charlie-niekirk/tap/gpui-chat
+brew audit --cask --online charlie-niekirk/tap/gpui-chat
+```
+
+The cask's `livecheck` follows the latest GitHub release, so `brew livecheck` reports when the tap is behind. The
+cask's `caveats` carry the Gatekeeper advice from "Installing an unsigned release" below; drop them once releases
+are Developer ID signed and notarized.
 
 ## Signing and notarization
 

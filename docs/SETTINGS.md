@@ -81,6 +81,9 @@ whole_word = true                          # phrases only: whole words (default)
 [filters]
 bots = ["nightbot", "streamelements"]      # what the find bar's "No bots" filter hides (the default list has seven usual chat bots)
 
+[updates]                                  # PR 7.2, see "Update check" below
+check_automatically = true                 # ask GitHub once a day whether a newer release exists (a notice only; nothing is downloaded)
+
 [streamlink]
 # path = "/opt/homebrew/bin/streamlink"   # unset: found automatically (see below)
 # player = "mpv"                          # --player; unset: streamlink's default player
@@ -397,3 +400,34 @@ The play button in a pane header runs
   whitespace or start with `-`, otherwise the whole file is rejected like any other bad value.
 - Changes apply the next time play is pressed; a running stream is not restarted.
 - The `[streamlink]` section is new: a file without it loads with the defaults above.
+
+## Update check (PR 7.2)
+
+`updates.check_automatically` (default `true`; a file without the section means on) lets the app ask
+GitHub, **at most once a day**, whether a newer release of this repository is published. The request is
+`GET https://api.github.com/repos/<owner>/<repo>/releases` (unauthenticated; GitHub sees your IP address, a `User-Agent` of `<APP_NAME>/<version>` and the usual request
+headers (`Accept`, `X-GitHub-Api-Version`, `If-None-Match` with the last answer's `ETag`); nothing that identifies
+you). A newer *published, non-draft,
+non-prerelease* release with a semver tag (`v0.2.0`) shows a notice with a link to its page; nothing is
+downloaded or installed.
+
+- **Fails closed:** the daily check runs only while the setting is on **and** `settings.toml` loaded without error.
+  A file that does not load (at launch the defaults, which say "on", would otherwise apply) keeps it off until the
+  file is fixed.
+- **Off** makes the app send **no** such request on its own, ever; switching it on checks at once if the
+  last answer is a day old. The *Check for Updates…* menu item (app menu, and the command palette) checks
+  when you choose it, whatever this setting says.
+- The automatic check runs after startup and then once a day while the app stays open. Offline runs
+  (`--firehose`, `--replay`, `--bench`) never check on their own.
+- The answer, GitHub's `ETag` and the release whose notice you dismissed are remembered in
+  `update-check.json` in the cache directory (see Locations); delete it to forget them. A `304 Not
+  Modified` costs no body. When GitHub says the rate limit is used up (`403` / `429`), the app waits
+  for the time it names (at most a day; a pause longer than that, written under a wrong clock, is ignored).
+  After a failed request (no network, an error status, an answer
+  that is not a list of releases) the *automatic* check waits an hour.
+- A dismissed notice is not shown again for that release (it comes back for a newer one);
+  *Check for Updates…* always reports.
+- `GPUI_CHAT_UPDATE_API` points the check at another server speaking the same API (for trying the notice
+  against a local copy of `fixtures/updates/`); nothing else reads it. While it is set the app logs a warning and
+  keeps its state in `update-check-override.json`, so the real `update-check.json` never learns about a fixture's
+  releases.

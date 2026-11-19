@@ -1,0 +1,250 @@
+[
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/9",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/9/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/9/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.9.0",
+    "id": 9,
+    "node_id": "RE_kwDOExample9",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.9.0",
+    "target_commitish": "main",
+    "name": "v0.9.0",
+    "draft": true,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 90,
+        "name": "gpui-chat-0.9.0-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.9.0.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/8",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/8/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/8/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.4.0-rc.1",
+    "id": 8,
+    "node_id": "RE_kwDOExample8",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.4.0-rc.1",
+    "target_commitish": "main",
+    "name": "v0.4.0-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 80,
+        "name": "gpui-chat-0.4.0-rc.1-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.4.0-rc.1.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/7",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/7/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/7/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.3.1",
+    "id": 7,
+    "node_id": "RE_kwDOExample7",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.3.1",
+    "target_commitish": "main",
+    "name": "0.3.1 preview",
+    "draft": false,
+    "prerelease": true,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 70,
+        "name": "gpui-chat-0.3.1-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.3.1.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/6",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/6/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/6/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/nightly",
+    "id": 6,
+    "node_id": "RE_kwDOExample6",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "nightly",
+    "target_commitish": "main",
+    "name": "nightly",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 60,
+        "name": "gpui-chat-nightly-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for nightly.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/5",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/5/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/5/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.3.0",
+    "id": 5,
+    "node_id": "RE_kwDOExample5",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.3.0",
+    "target_commitish": "main",
+    "name": "v0.3.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 50,
+        "name": "gpui-chat-0.3.0-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.3.0.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/4",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/4/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/4/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.10.0",
+    "id": 4,
+    "node_id": "RE_kwDOExample4",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.10.0",
+    "target_commitish": "main",
+    "name": "v0.10.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 40,
+        "name": "gpui-chat-0.10.0-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.10.0.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/3",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/3/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/3/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/v0.2.0",
+    "id": 3,
+    "node_id": "RE_kwDOExample3",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "v0.2.0",
+    "target_commitish": "main",
+    "name": "v0.2.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 30,
+        "name": "gpui-chat-0.2.0-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for v0.2.0.\n\n- A change\n- Another change\n"
+  },
+  {
+    "url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2",
+    "assets_url": "https://api.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets",
+    "upload_url": "https://uploads.github.com/repos/charlie-niekirk/gpui-chat/releases/2/assets{?name,label}",
+    "html_url": "https://github.com/charlie-niekirk/gpui-chat/releases/tag/0.1.0",
+    "id": 2,
+    "node_id": "RE_kwDOExample2",
+    "author": {
+      "login": "release-bot",
+      "id": 1,
+      "type": "User",
+      "site_admin": false
+    },
+    "tag_name": "0.1.0",
+    "target_commitish": "main",
+    "name": "0.1.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-01T10:00:00Z",
+    "published_at": "2026-11-01T10:00:00Z",
+    "assets": [
+      {
+        "id": 20,
+        "name": "gpui-chat-0.1.0-macos-universal.dmg",
+        "size": 31457280,
+        "content_type": "application/x-apple-diskimage",
+        "state": "uploaded"
+      }
+    ],
+    "body": "Release notes for 0.1.0.\n\n- A change\n- Another change\n"
+  }
+]

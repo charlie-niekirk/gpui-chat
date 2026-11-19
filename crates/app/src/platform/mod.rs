@@ -5,7 +5,7 @@
 use gpui_kit::{KeyBinding, Menu, MenuItem};
 
 use crate::actions::{
-    About, AddChannel, ClearFilter, ClosePane, CloseWindow, ComposerHistoryNext,
+    About, AddChannel, CheckForUpdates, ClearFilter, ClosePane, CloseWindow, ComposerHistoryNext,
     ComposerHistoryPrevious, Find, FindNext, FindPrevious, FocusPaneDown, FocusPaneLeft,
     FocusPaneRight, FocusPaneUp, LogIn, LogOut, MinimizeWindow, MoveChannelDown, MoveChannelUp,
     OpenChannelSwitcher, OpenPalette, OpenSettings, Quit, ReloadEmotes, RemoveChannel,
@@ -118,6 +118,11 @@ fn account_items() -> [MenuItem; 2] {
 /// Opens the settings window (the application menu).
 fn settings_item() -> MenuItem {
     MenuItem::action("Settings…", OpenSettings)
+}
+
+/// Asks GitHub for a newer release (the application menu).
+fn check_updates_item() -> MenuItem {
+    MenuItem::action("Check for Updates…", CheckForUpdates)
 }
 
 fn about_item() -> MenuItem {
